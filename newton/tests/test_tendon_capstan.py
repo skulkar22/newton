@@ -18,7 +18,7 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
-from newton._src.solvers.tendon_kernels import tendon_segment_length_rate
+from newton._src.solvers.tendon_kernels import tendon_material_transfer_delta, tendon_segment_length_rate
 from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
@@ -3375,10 +3375,156 @@ def test_slack_tendon_settles_without_chasing_vanishing_tension(test, device):
         np.testing.assert_allclose(np.sum(early_rest), np.sum(initial_rest), rtol=1.0e-6, atol=1.0e-6)
 
 
+@wp.kernel
+def _material_transfer_delta_kernel(
+    inputs: wp.array2d[float],
+    ea_low: float,
+    ea_ratio: float,
+    transition_strain: float,
+    transition_width: float,
+    delta_out: wp.array[float],
+):
+    i = wp.tid()
+    delta_out[i] = tendon_material_transfer_delta(
+        inputs[i, 0],
+        inputs[i, 1],
+        inputs[i, 2],
+        inputs[i, 3],
+        inputs[i, 4],
+        inputs[i, 5],
+        inputs[i, 6],
+        inputs[i, 7],
+        inputs[i, 8],
+        inputs[i, 9],
+        ea_low,
+        ea_ratio,
+        transition_strain,
+        transition_width,
+    )
+
+
+def _junction_tension_np(length, rest_length, compliance, material):
+    if material["tendon_sigmoid_ea_low"] <= 0.0:
+        return np.maximum(length - rest_length, 0.0) / np.maximum(compliance, 1.0e-30)
+    return sigmoid_tendon_tension(length, rest_length, material)
+
+
+def test_material_transfer_delta_reaches_capstan_bound(test, device):
+    """The junction rest-length transfer must land on the capstan bound whenever it is reachable.
+
+    g(delta) = T_high(delta) - cap_ratio * T_low(delta) is monotone on [0, max_delta]. For states
+    with an interior root (g(0) > 0 > g(max_delta)) the Warp solve is compared with a 60-step
+    bisection: the imbalance left after the transfer must stay below 10 % of the junction
+    tension and the root error below 5 % of the feasible interval. A solve that stops early on
+    a wide bracket violates both by an order of magnitude; the 12-step blind bisection meets
+    them with more than a 2x margin (float32 evaluation vs float64 reference near sign changes).
+    Random states cover both knees of the sigmoid law, positive and negative damping tension
+    and capstan ratios between 1.05 and 8.
+    """
+    rng = np.random.default_rng(7)
+    n = 4000
+    materials = {
+        "sigmoid_low": {
+            "tendon_sigmoid_ea_low": 500.0,
+            "tendon_sigmoid_ea_ratio": 10.0,
+            "tendon_sigmoid_transition_strain": 0.01,
+            "tendon_sigmoid_transition_width": 0.003,
+        },
+        "sigmoid_high": {
+            "tendon_sigmoid_ea_low": 1.0e5,
+            "tendon_sigmoid_ea_ratio": 10.0,
+            "tendon_sigmoid_transition_strain": 0.01,
+            "tendon_sigmoid_transition_width": 0.003,
+        },
+        "linear": {
+            "tendon_sigmoid_ea_low": 0.0,
+            "tendon_sigmoid_ea_ratio": 1.0,
+            "tendon_sigmoid_transition_strain": 0.0,
+            "tendon_sigmoid_transition_width": 1.0,
+        },
+    }
+    for name, m in materials.items():
+        length = rng.uniform(0.05, 1.0, size=(n, 2))
+        strain = 10.0 ** rng.uniform(-5.0, np.log10(0.03), size=(n, 2))
+        stretch = strain * length / (1.0 + strain)
+        compliance = np.full((n, 2), 1.0e-5 if m["tendon_sigmoid_ea_low"] <= 0.0 else 1.0e-3)
+        scale = _junction_tension_np(length, length - stretch, compliance, m)
+        damping = rng.uniform(-0.3, 0.3, size=(n, 2)) * scale
+        cap_ratio = np.exp(rng.uniform(0.05, 2.1, size=n))
+        min_rest = np.full(n, 1.0e-3)
+        x = np.column_stack(
+            [
+                length[:, 0],
+                stretch[:, 0],
+                compliance[:, 0],
+                damping[:, 0],
+                length[:, 1],
+                stretch[:, 1],
+                compliance[:, 1],
+                damping[:, 1],
+                cap_ratio,
+                min_rest,
+            ]
+        ).astype(np.float32)
+        delta_out = wp.zeros(n, dtype=float, device=device)
+        wp.launch(
+            _material_transfer_delta_kernel,
+            dim=n,
+            inputs=[
+                wp.array(x, dtype=float, device=device),
+                m["tendon_sigmoid_ea_low"],
+                m["tendon_sigmoid_ea_ratio"],
+                m["tendon_sigmoid_transition_strain"],
+                m["tendon_sigmoid_transition_width"],
+            ],
+            outputs=[delta_out],
+            device=device,
+        )
+        delta = delta_out.numpy().astype(np.float64)
+        xf = x.astype(np.float64)
+
+        def imbalance(d, xf=xf, m=m):
+            t_high = np.maximum(_junction_tension_np(xf[:, 0], xf[:, 0] - xf[:, 1] + d, xf[:, 2], m) + xf[:, 3], 0.0)
+            t_low = np.maximum(_junction_tension_np(xf[:, 4], xf[:, 4] - xf[:, 5] - d, xf[:, 6], m) + xf[:, 7], 0.0)
+            return t_high - xf[:, 8] * t_low, np.maximum(t_high, t_low)
+
+        max_delta = np.minimum(np.maximum(xf[:, 1], 0.0), np.maximum(xf[:, 4] - xf[:, 5] - xf[:, 9], 0.0))
+        lo = np.zeros(n)
+        hi = max_delta.copy()
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            positive = imbalance(mid)[0] > 0.0
+            lo = np.where(positive, mid, lo)
+            hi = np.where(positive, hi, mid)
+        delta_ref = 0.5 * (lo + hi)
+        interior = (max_delta > 0.0) & (imbalance(np.zeros(n))[0] > 0.0) & (imbalance(max_delta)[0] < 0.0)
+        test.assertGreater(int(interior.sum()), n // 4, f"{name}: too few interior-root states")
+        residual, tension = imbalance(delta)
+        rel_residual = np.abs(residual[interior]) / np.maximum(tension[interior], 1.0e-6)
+        root_error = np.abs(delta - delta_ref)[interior] / max_delta[interior]
+        test.assertLess(
+            float(rel_residual.max()),
+            0.1,
+            f"{name}: transfer leaves {100 * rel_residual.max():.1f} % capstan imbalance",
+        )
+        test.assertLess(
+            float(root_error.max()),
+            0.05,
+            f"{name}: transfer misses the root by {100 * root_error.max():.1f} % of the interval",
+        )
+
+
 devices = ["cpu"]
 if wp.is_cuda_available():
     devices.append("cuda:0")
 cuda_devices = [device for device in devices if device.startswith("cuda")]
+
+add_test(
+    TestTendonCapstan,
+    "material_transfer_delta_reaches_capstan_bound",
+    devices,
+    test_material_transfer_delta_reaches_capstan_bound,
+)
 
 add_test(TestTendonCapstan, "pinhole_slip_atwood", devices, test_pinhole_slip_atwood)
 add_test(
