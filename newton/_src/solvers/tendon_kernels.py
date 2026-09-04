@@ -70,21 +70,70 @@ def tendon_material_transfer_delta(
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
 ) -> float:
-    """Find a conservative rest-length transfer that reaches the nonlinear capstan bound."""
+    """Find a conservative rest-length transfer that reaches the nonlinear capstan bound.
+
+    The residual ``T_high(delta) - cap_ratio * T_low(delta)`` is monotone in ``delta`` on
+    ``[0, max_delta]``, so a bracketing search is safe. Instead of 12 blind bisection steps
+    from the bracket midpoint, the bracket is first cut at the closed-form transfer of the
+    frozen-secant linearisation (the linear-law formula with the current secant compliances
+    ``stretch / tension`` of both segments), then bisected with an early exit once the
+    relative residual is below 1e-4. This is typically 1-3 tension evaluations per side
+    instead of 12 and never leaves the feasible bracket.
+    """
     max_delta = wp.min(
         wp.max(stretch_high, 0.0),
         wp.max(length_low - stretch_low - min_rest_length, 0.0),
     )
+    if max_delta <= 0.0:
+        return 0.0
+
+    force_high0 = wp.max(
+        tendon_material_tension(
+            length_high,
+            length_high - stretch_high,
+            compliance_high,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+        )
+        + damping_tension_high,
+        0.0,
+    )
+    force_low0 = wp.max(
+        tendon_material_tension(
+            length_low,
+            length_low - stretch_low,
+            compliance_low,
+            sigmoid_ea_low,
+            sigmoid_ea_ratio,
+            sigmoid_transition_strain,
+            sigmoid_transition_width,
+        )
+        + damping_tension_low,
+        0.0,
+    )
+    # Frozen-secant compliances of both segments (rest / EA(strain)); a slack low segment
+    # falls back to the low-strain plateau so the guess stays finite.
+    secant_high = wp.max(stretch_high, 0.0) / wp.max(force_high0, 1.0e-30)
+    secant_low = wp.max(stretch_low, 0.0) / wp.max(force_low0, 1.0e-30)
+    if force_low0 <= 0.0 or stretch_low <= 0.0:
+        secant_low = wp.max(length_low - stretch_low, 1.0e-8) / wp.max(sigmoid_ea_low, 1.0e-30)
+    guess = (secant_low * wp.max(stretch_high, 0.0) - cap_ratio * secant_high * wp.max(stretch_low, 0.0)) / (
+        secant_low + cap_ratio * secant_high
+    )
+    guess = wp.clamp(guess, 0.0, max_delta)
+
     lo = float(0.0)
     hi = max_delta
-    # This resolves the feasible transfer interval to 2^-12, below the default
-    # 1e-3 relative material-settling tolerance.
+    tol = 1.0e-4 * wp.max(force_high0, 1.0e-30)
+    trial = guess
+    # 12 steps bound the worst case at the original 2^-12 bracket resolution.
     for _iteration in range(12):
-        mid = 0.5 * (lo + hi)
         trial_force_high = wp.max(
             tendon_material_tension(
                 length_high,
-                length_high - stretch_high + mid,
+                length_high - stretch_high + trial,
                 compliance_high,
                 sigmoid_ea_low,
                 sigmoid_ea_ratio,
@@ -97,7 +146,7 @@ def tendon_material_transfer_delta(
         trial_force_low = wp.max(
             tendon_material_tension(
                 length_low,
-                length_low - stretch_low - mid,
+                length_low - stretch_low - trial,
                 compliance_low,
                 sigmoid_ea_low,
                 sigmoid_ea_ratio,
@@ -107,10 +156,14 @@ def tendon_material_transfer_delta(
             + damping_tension_low,
             0.0,
         )
-        if trial_force_high > cap_ratio * trial_force_low:
-            lo = mid
+        residual = trial_force_high - cap_ratio * trial_force_low
+        if wp.abs(residual) <= tol:
+            return trial
+        if residual > 0.0:
+            lo = trial
         else:
-            hi = mid
+            hi = trial
+        trial = 0.5 * (lo + hi)
     return 0.5 * (lo + hi)
 
 
