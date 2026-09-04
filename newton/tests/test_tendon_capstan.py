@@ -18,14 +18,19 @@ import warp as wp
 import newton
 from newton._src.sim.builder import Axis
 from newton._src.sim.tendon import TendonLinkFlags, TendonLinkType
-from newton._src.solvers.tendon_kernels import tendon_material_transfer_delta, tendon_segment_length_rate
+from newton._src.solvers.tendon_kernels import (
+    tendon_material_tangent,
+    tendon_material_tension,
+    tendon_material_transfer_delta,
+    tendon_segment_length_rate,
+)
 from newton._src.solvers.xpbd.tendon_kernels import solve_tendon_slip, solve_tendon_stretch
 from newton.examples.cable.cable import get_tendon_cable_lines
 from newton.examples.cable.example_tendon_capstan_friction import Example as DynamicCapstanExample
 from newton.examples.cable.example_tendon_mujoco_switch import Example as MujocoSwitchExample
 from newton.examples.cable.example_tendon_mujoco_switch_matrix import Example as MujocoSwitchMatrixExample
 from newton.examples.cable.example_tendon_mujoco_wrap import Example as MujocoWrapExample
-from newton.tests.unittest_utils import sanitize_identifier
+from newton.tests.unittest_utils import assert_np_equal, sanitize_identifier
 
 SIGMOID_TENDON_MATERIAL = {
     "tendon_sigmoid_ea_low": 2000.0,
@@ -315,6 +320,73 @@ def sigmoid_tendon_tension(length, rest_length, material=SIGMOID_TENDON_MATERIAL
         1.0 + (material["tendon_sigmoid_ea_ratio"] - 1.0) * 0.5 * (1.0 + transition)
     )
     return ea * strain
+
+
+BILINEAR_TENDON_MATERIAL = {
+    "tendon_sigmoid_ea_low": 2000.0,
+    "tendon_sigmoid_ea_ratio": 16.0,
+    "tendon_sigmoid_transition_strain": 0.005,
+    "tendon_sigmoid_transition_width": 0.0,  # <= 0 selects the bilinear law (prototype)
+}
+
+
+def bilinear_tendon_tension(length, rest_length, material=BILINEAR_TENDON_MATERIAL):
+    strain = np.maximum(length - rest_length, 0.0) / rest_length
+    ea_low = material["tendon_sigmoid_ea_low"]
+    ea_high = ea_low * material["tendon_sigmoid_ea_ratio"]
+    knee = material["tendon_sigmoid_transition_strain"]
+    return np.where(strain <= knee, ea_low * strain, ea_low * knee + ea_high * (strain - knee))
+
+
+def bilinear_tendon_tangent(length, rest_length, material=BILINEAR_TENDON_MATERIAL):
+    strain = np.maximum(length - rest_length, 0.0) / rest_length
+    ea_low = material["tendon_sigmoid_ea_low"]
+    ea_high = ea_low * material["tendon_sigmoid_ea_ratio"]
+    return np.where(strain <= material["tendon_sigmoid_transition_strain"], ea_low, ea_high) / rest_length
+
+
+@wp.kernel
+def _eval_material_law_kernel(
+    lengths: wp.array[float],
+    rest_length: float,
+    ea_low: float,
+    ea_ratio: float,
+    transition_strain: float,
+    transition_width: float,
+    tension_out: wp.array[float],
+    tangent_out: wp.array[float],
+):
+    i = wp.tid()
+    tension_out[i] = tendon_material_tension(
+        lengths[i], rest_length, 1.0e-3, ea_low, ea_ratio, transition_strain, transition_width
+    )
+    tangent_out[i] = tendon_material_tangent(
+        lengths[i], rest_length, 1.0e-3, ea_low, ea_ratio, transition_strain, transition_width
+    )
+
+
+def test_bilinear_material_law_matches_reference(test, device):
+    """Bilinear (width <= 0) tension/tangent match the numpy reference; tension is continuous at the knee."""
+    m = BILINEAR_TENDON_MATERIAL
+    rest = 1.0
+    knee = m["tendon_sigmoid_transition_strain"]
+    strains = np.array([0.0, 0.5 * knee, knee - 1.0e-6, knee, knee + 1.0e-6, 2.0 * knee, 10.0 * knee])
+    lengths = wp.array(rest * (1.0 + strains), dtype=float, device=device)
+    tension = wp.zeros(len(strains), dtype=float, device=device)
+    tangent = wp.zeros(len(strains), dtype=float, device=device)
+    wp.launch(
+        _eval_material_law_kernel,
+        dim=len(strains),
+        inputs=[lengths, rest, m["tendon_sigmoid_ea_low"], m["tendon_sigmoid_ea_ratio"], knee, m["tendon_sigmoid_transition_width"]],
+        outputs=[tension, tangent],
+        device=device,
+    )
+    t_np = tension.numpy()
+    k_np = tangent.numpy()
+    assert_np_equal(t_np, bilinear_tendon_tension(rest * (1.0 + strains), rest).astype(np.float32), tol=2.0e-5 * float(np.max(t_np)))
+    assert_np_equal(k_np, bilinear_tendon_tangent(rest * (1.0 + strains), rest).astype(np.float32), tol=2.0e-5 * float(np.max(k_np)))
+    # continuity of tension across the knee: |T(knee+) - T(knee-)| bounded by the stiffer slope times the 2e-6 strain gap
+    test.assertLess(abs(float(t_np[4] - t_np[2])), 2.0e-6 * m["tendon_sigmoid_ea_low"] * m["tendon_sigmoid_ea_ratio"] * 1.5)
 
 
 def sigmoid_tendon_tangent(length, rest_length, material=SIGMOID_TENDON_MATERIAL):
@@ -3525,6 +3597,7 @@ add_test(
     devices,
     test_material_transfer_delta_reaches_capstan_bound,
 )
+add_test(TestTendonCapstan, "bilinear_material_law_matches_reference", devices, test_bilinear_material_law_matches_reference)
 
 add_test(TestTendonCapstan, "pinhole_slip_atwood", devices, test_pinhole_slip_atwood)
 add_test(

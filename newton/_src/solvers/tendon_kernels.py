@@ -19,12 +19,19 @@ def tendon_material_tension(
     sigmoid_transition_strain: float,
     sigmoid_transition_width: float,
 ) -> float:
-    """Evaluate linear tension or the experimental sigmoid secant-stiffness law."""
+    """Evaluate linear tension, the experimental sigmoid secant-stiffness law, or (PROTOTYPE, Phase 14)
+    the bilinear law selected by ``sigmoid_transition_width <= 0``: tension is continuous, tangent
+    stiffness is EA_low below the knee strain and EA_low * EA_ratio above it."""
     stretch = wp.max(length - rest_length, 0.0)
     if sigmoid_ea_low <= 0.0:
         return stretch / wp.max(compliance, 1.0e-30)
 
     strain = stretch / wp.max(rest_length, 1.0e-8)
+    if sigmoid_transition_width <= 0.0:
+        knee = wp.max(sigmoid_transition_strain, 0.0)
+        if strain <= knee:
+            return sigmoid_ea_low * strain
+        return sigmoid_ea_low * knee + sigmoid_ea_low * sigmoid_ea_ratio * (strain - knee)
     transition = wp.tanh((strain - sigmoid_transition_strain) / sigmoid_transition_width)
     ea = sigmoid_ea_low * (1.0 + (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 + transition))
     return ea * strain
@@ -45,6 +52,11 @@ def tendon_material_tangent(
         return 1.0 / wp.max(compliance, 1.0e-30)
 
     strain = wp.max(length - rest_length, 0.0) / wp.max(rest_length, 1.0e-8)
+    if sigmoid_transition_width <= 0.0:
+        # bilinear: piecewise-constant tangent modulus, no strain-derivative term
+        if strain <= wp.max(sigmoid_transition_strain, 0.0):
+            return sigmoid_ea_low / wp.max(rest_length, 1.0e-8)
+        return sigmoid_ea_low * sigmoid_ea_ratio / wp.max(rest_length, 1.0e-8)
     transition = wp.tanh((strain - sigmoid_transition_strain) / sigmoid_transition_width)
     ea = sigmoid_ea_low * (1.0 + (sigmoid_ea_ratio - 1.0) * 0.5 * (1.0 + transition))
     dea_dstrain = (

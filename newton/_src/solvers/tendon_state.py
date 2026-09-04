@@ -141,10 +141,9 @@ class TendonStateMixin:
                     "tendon_sigmoid_transition_strain must be non-negative, "
                     f"got {self.tendon_sigmoid_transition_strain}"
                 )
-            if self.tendon_sigmoid_transition_width <= 0.0:
-                raise ValueError(
-                    f"tendon_sigmoid_transition_width must be positive, got {self.tendon_sigmoid_transition_width}"
-                )
+            # PROTOTYPE (Phase 14): transition_width <= 0 selects the bilinear (piecewise-linear) law with a hard knee at
+            # transition_strain — EA_low below, EA_low*EA_ratio above, tension continuous. A proper law selector is a
+            # question for the API owner; this encoding keeps the rigid-body solver signature untouched.
         if model.tendon_segment_count == 0:
             self.tendon_seg_rest_length = None
             self.tendon_seg_rest_length_step = None
