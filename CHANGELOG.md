@@ -41,6 +41,7 @@
 - Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.
 - Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
 - Fix routed tendon material transfer to use step-start snapshots so rolling rest-length transport is independent of solver iteration count.
+- Preserve the total tendon reaction moment on frictional rollers when using per-segment VBD stretch ALM.
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
 - Fix mesh-convex and heightfield-convex contacts missing when shapes are separated by margin but still within the contact envelope.
 - Fix a dynamic tendon roller that deactivates through a small negative oriented wrap injecting `2 * radius * |theta|` of rest length at the route merge: the merged bypass span now takes the oriented wrap arc, the quantity the rolling transfer conserves, instead of its absolute value. The wrap diagnostic also distinguishes a one-substep graze at the dynamic activation boundary from a static roller outside the supported wrap range.

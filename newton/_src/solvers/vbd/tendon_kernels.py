@@ -1047,6 +1047,11 @@ def _direct_rolling_spin_axis_component(
     cone is limited by its current adjacent span forces; cached diagnostic
     tensions would be stale after a preceding VBD body update.
     """
+    # Per-segment material projection constrains the same tensions applied to
+    # the bodies. An off-cone trial still needs its full endpoint wrench:
+    # independently clipping only its rim moment violates internal balance.
+    if alm_enabled == 2:
+        return wp.vec3(0.0)
     if tendon_link_type[link] != int(TendonLinkType.ROLLING):
         return wp.vec3(0.0)
     seg_left = tendon_link_cone_seg_l[link]

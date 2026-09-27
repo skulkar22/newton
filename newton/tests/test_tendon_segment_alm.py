@@ -151,22 +151,25 @@ def test_unequal_compliance_sticking(test, device):
 
 
 def test_roller_reaction_uses_alm_force(test, device):
-    """Limit roller torque with the same ALM loads used by the endpoint force assembly."""
-    model, solver, _, bodies, lengths, rest = _fixture(device)
-    compliance = model.tendon_seg_compliance.numpy().astype(float)
-    stretch = lengths.astype(float) - rest
-    physical = stretch / compliance
-    rho = np.full(2, 1.0e5)
-    target = np.array([80.0, 5.0])
-    lam = (1.0 + compliance * rho) * target - rho * stretch
-    solver.tendon_seg_alm_lambda.assign(lam.astype(np.float32))
-    solver.tendon_seg_alm_k.assign(rho.astype(np.float32))
-    vectors, _ = _body_force(model, solver, bodies[2], physical)
-    cap = float(solver.tendon_link_cap_ratio.numpy()[1])
-    beta = (cap - 1.0) / (cap + 1.0)
-    radius = float(model.tendon_link_radius.numpy()[1])
-    expected = radius * beta * target.sum()
-    test.assertAlmostEqual(float(np.linalg.norm(vectors[1])), expected, delta=0.003)
+    """Endpoint tractions must balance at a common origin, including off-cone trials."""
+    for target in (np.array([10.0, 20.0]), np.array([80.0, 5.0]), np.array([5.0, 80.0])):
+        model, solver, _, bodies, lengths, rest = _fixture(device)
+        compliance = model.tendon_seg_compliance.numpy().astype(float)
+        stretch = lengths.astype(float) - rest
+        physical = stretch / compliance
+        rho = np.full(2, 1.0e5)
+        lam = (1.0 + compliance * rho) * target - rho * stretch
+        solver.tendon_seg_alm_lambda.assign(lam.astype(np.float32))
+        solver.tendon_seg_alm_k.assign(rho.astype(np.float32))
+        wrenches = np.array([_body_force(model, solver, b, physical)[0] for b in range(model.body_count)])
+        positions = model.body_q.numpy()[:, :3]  # fixture COM offsets are zero
+        np.testing.assert_allclose(wrenches[:, 0].sum(axis=0), 0.0, atol=2.0e-5, rtol=0.0)
+        moments = wrenches[:, 1] + np.cross(positions, wrenches[:, 0])
+        np.testing.assert_allclose(moments.sum(axis=0), 0.0, atol=2.0e-5, rtol=0.0)
+        radius = float(model.tendon_link_radius.numpy()[1])
+        test.assertAlmostEqual(
+            float(np.linalg.norm(wrenches[bodies[2], 1])), radius * abs(target[0] - target[1]), delta=0.003
+        )
 
 
 def test_slack_releases_multiplier(test, device):
