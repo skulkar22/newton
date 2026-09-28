@@ -370,25 +370,53 @@ def update_tendon_link_active(
             and tendon_link_radius[next_link] > 0.0
         )
 
-        # The bypass span is the common external tangent of the two neighbors, so it only
-        # exists while their wrap circles stay apart. Once they interpenetrate there is no
-        # such tangent: the tangent helper falls back to its inside-the-circle branch, the
-        # span collapses and both alpha and the signed distance stop meaning anything.
-        # Hold the previous decision there instead of switching on garbage.
+        # Same-winding circles have an external tangent down to nesting, not
+        # merely touching. For coplanar parallel axes construct that tangent
+        # analytically; an iteration seeded at the centers is unreliable inside
+        # overlapping circles. Retain the conservative fallback for other planes.
         prev_radius = float(0.0)
         if prev_rolling:
             prev_radius = tendon_link_radius[prev_link]
         next_radius = float(0.0)
         if next_rolling:
             next_radius = tendon_link_radius[next_link]
-        neighbor_distance = wp.length(next_center - prev_center)
-        if neighbor_distance <= prev_radius + next_radius + 1.0e-9:
+        neighbor_delta = next_center - prev_center
+        neighbor_distance = wp.length(neighbor_delta)
+        external = False
+        external_normal = wp.vec3(0.0)
+        if prev_rolling and next_rolling:
+            pn = wp.transform_vector(prev_pose, tendon_link_axis[prev_link])
+            nn = wp.transform_vector(next_pose, tendon_link_axis[next_link])
+            pn_len = wp.length(pn)
+            nn_len = wp.length(nn)
+            if pn_len > 1.0e-8 and nn_len > 1.0e-8:
+                pn = pn / pn_len
+                nn = nn / nn_len
+                alignment = wp.dot(pn, nn)
+                external = (
+                    float(tendon_link_orientation[prev_link] * tendon_link_orientation[next_link]) * alignment > 0.0
+                    and wp.abs(alignment) >= 1.0 - 1.0e-6
+                    and wp.abs(wp.dot(neighbor_delta, pn)) <= 1.0e-6 * neighbor_distance
+                )
+                external_normal = pn
+        missing_distance = prev_radius + next_radius
+        if external:
+            missing_distance = wp.abs(prev_radius - next_radius)
+        if neighbor_distance <= missing_distance + 1.0e-9:
             continue
 
         bypass_l = prev_center
         bypass_r = next_center
         bypass_step = float(0.0)
-        if prev_rolling and next_rolling:
+        if external:
+            direction = neighbor_delta / neighbor_distance
+            h = (prev_radius - next_radius) / neighbor_distance
+            radial = h * direction - float(tendon_link_orientation[prev_link]) * wp.sqrt(
+                wp.max(0.0, 1.0 - h * h)
+            ) * wp.cross(external_normal, direction)
+            bypass_l = prev_center + prev_radius * radial
+            bypass_r = next_center + next_radius * radial
+        elif prev_rolling and next_rolling:
             prev_normal = wp.transform_vector(prev_pose, tendon_link_axis[prev_link])
             next_normal = wp.transform_vector(next_pose, tendon_link_axis[next_link])
             for _iter in range(10):
@@ -938,10 +966,13 @@ def update_tendon_cone_rows(
     seg_length: wp.array[float],
     report_unsupported_wrap: int,
     direct_material: bool,
+    latch_unsupported_wrap: bool,
     # outputs
     tendon_link_cone_seg_l: wp.array[int],
     tendon_link_cone_seg_r: wp.array[int],
     tendon_link_cap_ratio: wp.array[float],
+    route_failure: wp.array[int],
+    route_failure_angle: wp.array[float],
 ):
     """Cache one capstan-cone row's segment pair and tension ratio."""
     link_idx = wp.tid()
@@ -1026,6 +1057,18 @@ def update_tendon_cone_rows(
             u_right = r_right / len_r_right
             signed_wrap_angle = wp.atan2(wp.dot(wp.cross(u_left, u_right), normal), wp.dot(u_left, u_right))
             oriented_wrap_angle = signed_wrap_angle * float(tendon_link_orientation[link_idx])
+            if (
+                (tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) == 0
+                and oriented_wrap_angle < 0.0
+                and wp.abs(oriented_wrap_angle + wp.pi) <= 1.0e-6
+            ):
+                oriented_wrap_angle = wp.pi
+            # VBD calls this flag only on the final accepted route, after dynamic
+            # cleanup. Each thread owns one link: preserve its first failure even
+            # across CUDA graph replay, without atomics or host synchronization.
+            if latch_unsupported_wrap and oriented_wrap_angle < -1.0e-5 and route_failure[link_idx] == 0:
+                route_failure[link_idx] = 1
+                route_failure_angle[link_idx] = oriented_wrap_angle
             if oriented_wrap_angle < 0.0:
                 if (tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) != 0:
                     # A dynamic candidate decides on the pose accepted one substep earlier, so it

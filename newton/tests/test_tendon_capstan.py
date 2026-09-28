@@ -1960,9 +1960,14 @@ def test_dynamic_route_activation_tolerance_preserves_boundary_state(test, devic
 
 
 def test_dynamic_route_holds_state_when_neighbors_interpenetrate(test, device):
-    """Overlapping neighbors have no bypass tangent, so the last decision must hold."""
+    """Opposite-winding overlapping neighbors have no internal bypass tangent."""
     with wp.ScopedDevice(device):
         model, upper, candidate_link = build_interpenetrating_neighbor_route(device)
+        # Same-winding overlaps still have an external tangent. This control
+        # specifically requires the internal tangent that vanishes at contact.
+        orientations = model.tendon_link_orientation.numpy()
+        orientations[candidate_link + 1] = -orientations[candidate_link - 1]
+        model.tendon_link_orientation.assign(orientations)
         solver = newton.solvers.SolverXPBD(model, iterations=1)
 
         solver._update_tendon_link_active(model, model.body_q)

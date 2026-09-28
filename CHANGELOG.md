@@ -38,6 +38,8 @@
 
 ### Fixed
 
+- Resolve dynamic cable activation around overlapping same-winding rollers, and report invalid initial or accepted VBD routes through the direct material check.
+
 - Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.
 - Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
 - Fix routed tendon material transfer to use step-start snapshots so rolling rest-length transport is independent of solver iteration count.

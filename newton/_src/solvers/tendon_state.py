@@ -203,7 +203,9 @@ class TendonStateMixin:
         consuming its results. This synchronizes the failure status to the host.
         GPU execution is not rolled back on failure: discard the entire affected
         step/frame/batch and reconstruct the solver after correcting the input.
-        No material sweeps are used as a fallback. Does nothing in sweep mode.
+        No material sweeps are used as a fallback. In VBD direct mode this also
+        rejects latched unsupported accepted wraps after dynamic-route cleanup.
+        XPBD retains its existing route-warning behavior. Does nothing in sweep mode.
 
         Raises:
             RuntimeError: A direct solve received unsupported input, could not
@@ -212,6 +214,16 @@ class TendonStateMixin:
         state = self._tendon_material_state
         if not state.enabled:
             return
+        route_failed = np.flatnonzero(self._tendon_route_failure.numpy())
+        if route_failed.size:
+            link = int(route_failed[0])
+            tendon = int(self.tendon_link_tendon.numpy()[link])
+            angle = float(self._tendon_route_failure_angle.numpy()[link])
+            raise RuntimeError(
+                f"Unsupported accepted tendon route: tendon {tendon}, ROLLING link {link}, "
+                f"oriented wrap {angle:g} rad outside [0, pi]. Correct the route geometry "
+                "or link orientation. Discard this step/frame/batch and reconstruct the solver."
+            )
         failures = state.failure.numpy()
         failed = np.flatnonzero(failures)
         if failed.size:
@@ -242,6 +254,8 @@ class TendonStateMixin:
 
     def _init_tendon_state(self, model: Model, allocate_xpbd_lambdas: bool = True) -> None:
         """Allocate mutable tendon state arrays and build segment/link mappings."""
+        self._tendon_route_failure = wp.zeros(model.tendon_link_count, dtype=int, device=model.device)
+        self._tendon_route_failure_angle = wp.zeros(model.tendon_link_count, dtype=float, device=model.device)
         self._tendon_material_state = TendonMaterialState()
         self._tendon_material_state.enabled = False
         self._tendon_material_kernel = solve_tendon_material
@@ -602,6 +616,7 @@ class TendonStateMixin:
         model: Model,
         body_q: wp.array[wp.transform],
         report_unsupported_wrap: bool,
+        latch_unsupported_wrap: bool = False,
     ) -> None:
         """Cache geometry-dependent segment pairs and capstan ratios for material rows."""
         wp.launch(
@@ -628,11 +643,14 @@ class TendonStateMixin:
                 self.tendon_seg_length,
                 int(report_unsupported_wrap),
                 self._tendon_material_state.enabled,
+                latch_unsupported_wrap and self._tendon_material_state.enabled,
             ],
             outputs=[
                 self.tendon_link_cone_seg_l,
                 self.tendon_link_cone_seg_r,
                 self.tendon_link_cap_ratio,
+                self._tendon_route_failure,
+                self._tendon_route_failure_angle,
             ],
             device=model.device,
         )
@@ -845,6 +863,8 @@ class TendonStateMixin:
         seg_active_link_l_np = self.tendon_seg_active_link_l.numpy()
         seg_active_link_r_np = self.tendon_seg_active_link_r.numpy()
 
+        route_failure = np.zeros(model.tendon_link_count, dtype=np.int32)
+        route_failure_angle = np.zeros(model.tendon_link_count, dtype=np.float32)
         total_cable = np.zeros(model.tendon_count, dtype=np.float32)
         seg = 0
         for t in range(model.tendon_count):
@@ -896,6 +916,9 @@ class TendonStateMixin:
                         and abs(theta + np.pi) <= 1.0e-6
                     ):
                         theta = float(np.pi)
+                    if theta < -1.0e-5:
+                        route_failure[i] = 1
+                        route_failure_angle[i] = theta
                     if theta < 0.0:
                         dynamic_note = ""
                         if (link_flags_np[i] & int(TendonLinkFlags.DYNAMIC)) != 0:
@@ -918,4 +941,6 @@ class TendonStateMixin:
             total_cable[t] = cable_len
             seg += num_links - 1
 
+        self._tendon_route_failure.assign(route_failure)
+        self._tendon_route_failure_angle.assign(route_failure_angle)
         self.tendon_total_cable = wp.array(total_cable, dtype=float, device=model.device)

@@ -2623,7 +2623,9 @@ class SolverVBD(TendonStateMixin, SolverBase):
             device=self.device,
         )
 
-        self._update_tendon_cone_rows(model, state_in.body_q, report_unsupported_wrap)
+        self._update_tendon_cone_rows(
+            model, state_in.body_q, report_unsupported_wrap, latch_unsupported_wrap=report_unsupported_wrap
+        )
 
         # Direct mode only. The opening iterations run on poses the solver has not settled
         # yet: iteration 0 is the raw inertial predictor, which on toy4 swings each copy's
