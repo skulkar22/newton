@@ -1449,5 +1449,53 @@ add_function_test(
 )
 
 
+def test_sparse_body_particle_attachment_reactions(test, device):
+    """Transfer particle loads to both sparse articulation and local fallback bodies."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 0.1)
+    parent = builder.add_link(mass=1.0, inertia=inertia)
+    child = builder.add_link(mass=1.0, inertia=inertia)
+    builder.add_articulation(
+        [builder.add_joint_free(child=parent), builder.add_joint_fixed(parent=parent, child=child)]
+    )
+    standalone = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 2.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=inertia,
+        lock_inertia=True,
+    )
+    particles = []
+    for body, y in [(parent, 0.0), (standalone, 2.0)]:
+        particle = builder.add_particle(pos=wp.vec3(0.0, y, 0.0), vel=wp.vec3(1.0, 0.0, 0.0), mass=1.0)
+        builder.add_attachment_body_particle(body, particle, stiffness=2.0e4, damping=100.0)
+        particles.append(particle)
+    builder.color()
+    model = builder.finalize(device=device)
+    state_in, state_out = model.state(), model.state()
+    solver = newton.solvers.SolverVBD(
+        model, iterations=10, rigid_compliant_alm=False, rigid_articulation_solve="block_sparse_joints"
+    )
+    test.assertGreater(solver.rigid_articulation_sparse_layout.articulation_count, 0)
+    for _ in range(20):
+        state_in.clear_forces()
+        solver.step(state_in, state_out, None, None, 2.0e-3)
+        state_in, state_out = state_out, state_in
+    body_q, particle_q = state_in.body_q.numpy(), state_in.particle_q.numpy()
+    test.assertTrue(np.isfinite(body_q).all())
+    test.assertTrue(np.isfinite(particle_q).all())
+    for body, particle in zip([parent, standalone], particles, strict=True):
+        test.assertGreater(float(body_q[body, 0]), 1.0e-3)
+        test.assertLess(float(np.linalg.norm(particle_q[particle] - body_q[body, :3])), 2.0e-2)
+    test.assertGreater(float(body_q[child, 0]), 1.0e-3)
+
+
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_body_particle_attachment_reactions",
+    test_sparse_body_particle_attachment_reactions,
+    devices=devices,
+)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
