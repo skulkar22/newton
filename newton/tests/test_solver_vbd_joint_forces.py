@@ -184,8 +184,8 @@ def test_vbd_joint_force_mimic(test, device, *, solve="local", standalone=False)
                     builder.add_joint_prismatic(-1, body, axis=newton.Axis.X, friction=friction[i], damping=damping[i])
                 )
             builder.add_articulation(joints)
-            builder.set_joint_mimic(joints[1], joints[0], (0.0, -1.0))
-            builder.set_joint_mimic(joints[2], joints[0], (0.0, 2.0))
+            builder.set_joint_mimic(joints[1], joints[0], coeffs=(0.0, -1.0))
+            builder.set_joint_mimic(joints[2], joints[0], coeffs=(0.0, 2.0))
             builder.joint_qd[:] = ratios.tolist()
             if standalone:
                 # Exercise the local-body sweep after the sparse assembly.
