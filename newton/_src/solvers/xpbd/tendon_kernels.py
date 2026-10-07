@@ -234,10 +234,10 @@ def solve_tendon_slip(
     seg_compliance: wp.array[float],
     seg_material_tension: wp.array[float],
     seg_damping_tension: wp.array[float],
-    seg_delta_lambda: wp.array[float],
-    relaxation: float,
+    seg_lambda: wp.array[float],
     sigmoid_ea_low: float,
-    direct_material: bool,
+    dt: float,
+    link_spin_impulse: wp.array[wp.vec3],
     # outputs
     body_deltas: wp.array[wp.spatial_vector],
 ):
@@ -251,6 +251,9 @@ def solve_tendon_slip(
     if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
         return
     if not tendon_link_active[link_idx]:
+        body = tendon_link_body[link_idx]
+        wp.atomic_add(body_deltas, body, wp.spatial_vector(wp.vec3(0.0), -link_spin_impulse[link_idx]))
+        link_spin_impulse[link_idx] = wp.vec3(0.0)
         return
 
     radius = tendon_link_radius[link_idx]
@@ -291,9 +294,7 @@ def solve_tendon_slip(
     force_r = wp.max(seg_material_tension[seg_right] + damping_tension_r, 0.0)
 
     force_sum = force_l + force_r
-    force_diff = wp.abs(force_l - force_r)
     allowed_diff = beta * force_sum
-    scale = wp.min(1.0, allowed_diff / wp.max(force_diff, 1.0e-8))
 
     # Stretch retains center-motion torque; add only friction-limited spin
     # about the roller center here.
@@ -307,7 +308,7 @@ def solve_tendon_slip(
         n = diff / dist
         r = x_r - center
         angular = wp.cross(r, n)
-        candidate = angular * seg_delta_lambda[seg_left]
+        candidate = angular * seg_lambda[seg_left]
         spin_delta = spin_delta + normal * wp.dot(candidate, normal)
 
     x_l = seg_attachment_l[seg_right]
@@ -318,14 +319,15 @@ def solve_tendon_slip(
         n = diff / dist
         r = x_l - center
         angular = -wp.cross(r, n)
-        candidate = angular * seg_delta_lambda[seg_right]
+        candidate = angular * seg_lambda[seg_right]
         spin_delta = spin_delta + normal * wp.dot(candidate, normal)
 
-    # The direct projection starts from full no-slip rolling motion. Its cone
-    # limiter already bounds the reaction; multiplying by beta again would
-    # under-apply the torque associated with that material transfer.
-    if direct_material:
-        spin_delta = spin_delta * scale
-    else:
-        spin_delta = spin_delta * scale * beta
+    # Project the accumulated reaction, not each iteration's impulse increment.
+    # The latter can add up to more than the available friction, or fail to
+    # retract a reaction when subsequent iterations reduce the cable tension.
+    # Lambda has impulse units; convert the capstan force bound with dt.
+    bound = radius * dt * allowed_diff
+    spin_total = normal * wp.clamp(wp.dot(spin_delta, normal), -bound, bound)
+    spin_delta = spin_total - link_spin_impulse[link_idx]
+    link_spin_impulse[link_idx] = spin_total
     wp.atomic_add(body_deltas, body, wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), spin_delta))

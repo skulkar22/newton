@@ -531,6 +531,7 @@ def solve_tendon_material_cooperative(
     sigmoid_transition_width: float,
     direct: TendonMaterialState,
     latch_failure: int,
+    link_material_transfer: wp.array[float],
 ):
     # Launch-compatible with the scalar kernel, including its ``latch_failure`` semantics: a
     # rejection taken on a discarded trial pose keeps that iteration's rest lengths and is

@@ -38,6 +38,8 @@
 
 ### Fixed
 
+- Correct cumulative tendon material slip and rolling reactions when neighboring contacts unload.
+
 - Resolve dynamic cable activation around overlapping same-winding rollers, and report invalid initial or accepted VBD routes through the direct material check.
 
 - Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.

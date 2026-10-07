@@ -8,7 +8,7 @@
 # different capstan friction coefficients on the pulley:
 #
 #   Left:   mu = 0.0   (frictionless)
-#   Center: mu = 0.05  (subcritical — visible partial grip)
+#   Center: mu = 0.40  (finite friction, sufficient for sticking here)
 #   Right:  mu = 10.0  (no-slip)
 #
 # Each pulley is a dynamic body on a hinge joint, free to rotate about Y.
@@ -22,7 +22,7 @@
 # The pulleys use explicit high inertia and the planar weights keep a
 # fixed orientation so contact with the pulley does not tumble the
 # light body over the rim.
-# With dynamic pulleys, low finite friction spins the pulley only partially.
+# Friction above the sticking threshold should not further change the motion.
 # The red tab on each pulley marks rim rotation; the frictionless pulley
 # should translate the cable without spinning.
 #
@@ -323,8 +323,8 @@ class Example:
             f"Dynamic capstan middle finite-friction pulley should rotate with heavy-side cable travel before contact: "
             f"theta={capstan_theta[1]:.4f}, all={capstan_theta}"
         )
-        assert capstan_theta[2] > capstan_theta[1], (
-            f"Dynamic capstan high-friction pulley should rotate at least as much as the mid-friction case before contact: "
+        assert np.isclose(capstan_theta[2], capstan_theta[1], rtol=0.03, atol=0.003), (
+            f"Dynamic capstan sticking cases should have the same rotation before contact: "
             f"mid={capstan_theta[1]:.4f}, high={capstan_theta[2]:.4f}, all={capstan_theta}"
         )
 

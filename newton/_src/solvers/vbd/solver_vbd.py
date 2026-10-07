@@ -2700,6 +2700,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 # Latch a direct-material rejection only on the accepted pose. In-iteration poses
                 # (iteration 0 is the raw inertial predictor) are discarded by the solver itself.
                 int(latch_failure),
+                self._tendon_link_material_transfer,
             ],
             device=self.device,
         )

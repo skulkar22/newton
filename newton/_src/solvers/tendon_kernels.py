@@ -75,8 +75,7 @@ def tendon_material_transfer_delta(
 
     Seed a monotone bracketing search with the frozen-secant estimate, then refine until
     the residual is below 1e-4 of the trial tensions. If the iteration budget or float
-    precision is exhausted, keep the lower bound: later sweeps can correct undertransfer,
-    but cannot undo overtransfer into the sticking cone.
+    precision is exhausted, keep the lower bound to avoid overshooting the capstan boundary.
     """
     max_delta = wp.min(
         wp.max(stretch_high, 0.0),
@@ -1203,6 +1202,7 @@ def _make_solve_tendon_material(direct_enabled: bool):
         sigmoid_transition_width: float,
         direct: TendonMaterialState,
         latch_failure: int,
+        link_material_transfer: wp.array[float],
     ):
         """Update free-span rest-length transfer for one tendon.
 
@@ -1354,6 +1354,23 @@ def _make_solve_tendon_material(direct_enabled: bool):
                 ):
                     return
             else:
+                # Form the full no-slip trial before relaxing any contact. Transport
+                # includes material entering/leaving the wrapped arc; it is not a
+                # friction force and must not be multiplied by a capstan coefficient.
+                # Scratch slip is relative to this trial and belongs to this call only.
+                for i_trial in range(1, num_links - 1):
+                    link = link_start + i_trial
+                    link_material_transfer[link] = 0.0
+                    if apply_rolling_transfer == 0 or tendon_link_type[link] != int(TendonLinkType.ROLLING):
+                        continue
+                    if not tendon_link_active[link]:
+                        continue
+                    left = tendon_link_cone_seg_l[link]
+                    right = tendon_link_cone_seg_r[link]
+                    if left >= 0 and right >= 0:
+                        seg_stretch[left] = seg_stretch[left] - seg_rolling_delta_r[left]
+                        seg_stretch[right] = seg_stretch[right] - seg_rolling_delta_l[right]
+
                 material_sweep_count = int(4)
                 if adaptive_cone_sweeps != 0:
                     material_sweep_count = wp.min(tendon_max_sweeps, 256)
@@ -1394,21 +1411,20 @@ def _make_solve_tendon_material(direct_enabled: bool):
                         if seg_left < 0 or seg_right < 0:
                             continue
 
-                        if material_sweep == 0 and is_rolling:
-                            # The common mode is material exchanged with the changing wrapped arc. Apply
-                            # it before relaxation so the capstan projection sees the conserved cable.
-                            common_rest_delta = 0.5 * (seg_rolling_delta_r[seg_left] + seg_rolling_delta_l[seg_right])
-                            seg_stretch[seg_left] = seg_stretch[seg_left] - common_rest_delta
-                            seg_stretch[seg_right] = seg_stretch[seg_right] - common_rest_delta
-
                         cap_ratio = tendon_link_cap_ratio[link_idx]
 
                         len_l = seg_length[seg_left]
                         len_r = seg_length[seg_right]
                         # Project the same unilateral Kelvin-Voigt tension used by
                         # solve_tendon_stretch, including damping at zero stretch.
-                        d_l_raw = seg_stretch[seg_left]
-                        d_r_raw = seg_stretch[seg_right]
+                        # Remove this contact's previous trial slip, keeping all neighbor
+                        # updates. Reproject the NET transfer, not just another positive
+                        # increment: a neighbor may have made earlier slip excessive.
+                        previous_transfer = link_material_transfer[link_idx]
+                        current_l = seg_stretch[seg_left]
+                        current_r = seg_stretch[seg_right]
+                        d_l_raw = current_l + previous_transfer
+                        d_r_raw = current_r - previous_transfer
 
                         # use the true per-segment compliance for the cone: the precise stretch state
                         # above removes the conditioning need for the old 1e-8 floor, and clamping here
@@ -1425,10 +1441,10 @@ def _make_solve_tendon_material(direct_enabled: bool):
                         damping_tension_r = (
                             seg_damping_tension[seg_right] if nonlinear_material or compliance_r > 0.0 else 0.0
                         )
-                        effective_stretch_l = wp.max(d_l_raw + comp_l * damping_tension_l, 0.0)
-                        effective_stretch_r = wp.max(d_r_raw + comp_r * damping_tension_r, 0.0)
-                        force_l = effective_stretch_l / comp_l
-                        force_r = effective_stretch_r / comp_r
+                        effective_stretch_l = d_l_raw + comp_l * damping_tension_l
+                        effective_stretch_r = d_r_raw + comp_r * damping_tension_r
+                        force_l = wp.max(effective_stretch_l / comp_l, 0.0)
+                        force_r = wp.max(effective_stretch_r / comp_r, 0.0)
                         if nonlinear_material:
                             force_l = (
                                 tendon_material_tension(
@@ -1488,42 +1504,6 @@ def _make_solve_tendon_material(direct_enabled: bool):
                                 )
                                 delta = wp.max(delta, 0.0)
                                 delta = wp.min(delta, max_delta)
-                            # rest_left += delta => d_l -= delta ; rest_right -= delta => d_r += delta
-                            seg_stretch[seg_left] = d_l_raw - delta
-                            seg_stretch[seg_right] = d_r_raw + delta
-                            if nonlinear_material:
-                                new_force_l = (
-                                    tendon_material_tension(
-                                        len_l,
-                                        len_l - d_l_raw + delta,
-                                        compliance_l,
-                                        sigmoid_ea_low,
-                                        sigmoid_ea_ratio,
-                                        sigmoid_transition_strain,
-                                        sigmoid_transition_width,
-                                    )
-                                    + damping_tension_l
-                                )
-                                new_force_r = (
-                                    tendon_material_tension(
-                                        len_r,
-                                        len_r - d_r_raw - delta,
-                                        compliance_r,
-                                        sigmoid_ea_low,
-                                        sigmoid_ea_ratio,
-                                        sigmoid_transition_strain,
-                                        sigmoid_transition_width,
-                                    )
-                                    + damping_tension_r
-                                )
-                                new_force_l = wp.max(new_force_l, 0.0)
-                                new_force_r = wp.max(new_force_r, 0.0)
-                                sweep_dtension = wp.max(
-                                    sweep_dtension,
-                                    wp.max(wp.abs(new_force_l - force_l), wp.abs(new_force_r - force_r)),
-                                )
-                            else:
-                                sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
                         elif force_r > force_l * cap_ratio:
                             if nonlinear_material:
                                 delta = tendon_material_transfer_delta(
@@ -1550,41 +1530,82 @@ def _make_solve_tendon_material(direct_enabled: bool):
                                 )
                                 delta = wp.max(delta, 0.0)
                                 delta = wp.min(delta, max_delta)
-                            seg_stretch[seg_left] = d_l_raw + delta
-                            seg_stretch[seg_right] = d_r_raw - delta
-                            if nonlinear_material:
-                                new_force_l = (
-                                    tendon_material_tension(
-                                        len_l,
-                                        len_l - d_l_raw - delta,
-                                        compliance_l,
-                                        sigmoid_ea_low,
-                                        sigmoid_ea_ratio,
-                                        sigmoid_transition_strain,
-                                        sigmoid_transition_width,
-                                    )
-                                    + damping_tension_l
+                            delta = -delta
+
+                        # The neighbor updates can make zero net transfer infeasible.
+                        # Constrain the pair together, preserving its total material.
+                        lower = min_rest - (len_l - d_l_raw)
+                        upper = len_r - d_r_raw - min_rest
+                        if lower <= upper:
+                            delta = wp.clamp(delta, lower, upper)
+                        else:
+                            delta = previous_transfer
+                        change = delta - previous_transfer
+                        link_material_transfer[link_idx] = delta
+                        # Apply the increment at stretch scale; subtracting large lengths
+                        # here would lose small corrections on short, stiff spans.
+                        seg_stretch[seg_left] = current_l - change
+                        seg_stretch[seg_right] = current_r + change
+                        if nonlinear_material and change != 0.0:
+                            old_l = wp.max(
+                                tendon_material_tension(
+                                    len_l,
+                                    len_l - current_l,
+                                    compliance_l,
+                                    sigmoid_ea_low,
+                                    sigmoid_ea_ratio,
+                                    sigmoid_transition_strain,
+                                    sigmoid_transition_width,
                                 )
-                                new_force_r = (
-                                    tendon_material_tension(
-                                        len_r,
-                                        len_r - d_r_raw + delta,
-                                        compliance_r,
-                                        sigmoid_ea_low,
-                                        sigmoid_ea_ratio,
-                                        sigmoid_transition_strain,
-                                        sigmoid_transition_width,
-                                    )
-                                    + damping_tension_r
+                                + damping_tension_l,
+                                0.0,
+                            )
+                            old_r = wp.max(
+                                tendon_material_tension(
+                                    len_r,
+                                    len_r - current_r,
+                                    compliance_r,
+                                    sigmoid_ea_low,
+                                    sigmoid_ea_ratio,
+                                    sigmoid_transition_strain,
+                                    sigmoid_transition_width,
                                 )
-                                new_force_l = wp.max(new_force_l, 0.0)
-                                new_force_r = wp.max(new_force_r, 0.0)
-                                sweep_dtension = wp.max(
-                                    sweep_dtension,
-                                    wp.max(wp.abs(new_force_l - force_l), wp.abs(new_force_r - force_r)),
+                                + damping_tension_r,
+                                0.0,
+                            )
+                            new_l = wp.max(
+                                tendon_material_tension(
+                                    len_l,
+                                    len_l - seg_stretch[seg_left],
+                                    compliance_l,
+                                    sigmoid_ea_low,
+                                    sigmoid_ea_ratio,
+                                    sigmoid_transition_strain,
+                                    sigmoid_transition_width,
                                 )
-                            else:
-                                sweep_dtension = wp.max(sweep_dtension, wp.max(delta / comp_l, delta / comp_r))
+                                + damping_tension_l,
+                                0.0,
+                            )
+                            new_r = wp.max(
+                                tendon_material_tension(
+                                    len_r,
+                                    len_r - seg_stretch[seg_right],
+                                    compliance_r,
+                                    sigmoid_ea_low,
+                                    sigmoid_ea_ratio,
+                                    sigmoid_transition_strain,
+                                    sigmoid_transition_width,
+                                )
+                                + damping_tension_r,
+                                0.0,
+                            )
+                            sweep_dtension = wp.max(
+                                sweep_dtension, wp.max(wp.abs(new_l - old_l), wp.abs(new_r - old_r))
+                            )
+                        elif not nonlinear_material:
+                            sweep_dtension = wp.max(
+                                sweep_dtension, wp.max(wp.abs(change) / comp_l, wp.abs(change) / comp_r)
+                            )
 
                     # Keep the normalization scale fixed so an unloading cable can settle as both the
                     # tension and its change approach zero. A per-sweep scale would shrink with the
@@ -1594,39 +1615,6 @@ def _make_solve_tendon_material(direct_enabled: bool):
                     rel_change = sweep_dtension / wp.max(settle_tension_reference, 1.0e-30)
                     if adaptive_cone_sweeps != 0 and rel_change < tendon_settle_tol:
                         converged = 1
-
-                # Apply the friction-limited differential transport once after material relaxation so
-                # cone sweeps cannot iteratively erode it.
-                if apply_rolling_transfer != 0:
-                    for i_roll in range(1, num_links - 1):
-                        link_idx = link_start + i_roll
-                        if tendon_link_type[link_idx] != int(TendonLinkType.ROLLING):
-                            continue
-                        if not tendon_link_active[link_idx]:
-                            continue
-
-                        seg_left = tendon_link_cone_seg_l[link_idx]
-                        seg_right = tendon_link_cone_seg_r[link_idx]
-                        if seg_left < 0 or seg_right < 0:
-                            continue
-
-                        cap_ratio = tendon_link_cap_ratio[link_idx]
-                        beta = (cap_ratio - 1.0) / (cap_ratio + 1.0)
-
-                        # Apply only the friction-limited differential mode after relaxation. The common
-                        # mode above is independent of friction and already accounts for wrapped material.
-                        rolling_delta_diff = 0.5 * (seg_rolling_delta_r[seg_left] - seg_rolling_delta_l[seg_right])
-                        len_al = seg_length[seg_left]
-                        len_ar = seg_length[seg_right]
-                        rest_l = len_al - seg_stretch[seg_left]
-                        rest_r = len_ar - seg_stretch[seg_right]
-                        rolling_transfer = rolling_delta_diff * beta
-                        # Bound the zero-sum transfer as a pair. Clamping either span independently would
-                        # discard the clipped amount and create cable material at the minimum rest length.
-                        rolling_transfer = wp.max(rolling_transfer, min_rest - rest_l)
-                        rolling_transfer = wp.min(rolling_transfer, rest_r - min_rest)
-                        seg_stretch[seg_left] = seg_stretch[seg_left] - rolling_transfer
-                        seg_stretch[seg_right] = seg_stretch[seg_right] + rolling_transfer
 
             # rebuild rest lengths from the telescoped stretch state (one cancellation per call,
             # paid once instead of every sweep -- this is what keeps the capstan accurate for stiff
