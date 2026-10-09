@@ -39,7 +39,16 @@ def _make_solver(model, *, iterations=8, direct=True, settle_iterations=4, **sol
 
 
 def _simulate_pulley(
-    *, dt=0.001, iterations=8, duration=0.18, velocity=0.2, preload=10.0, mu=1.0, solver_options=None, damping=0.0
+    *,
+    dt=0.001,
+    iterations=8,
+    duration=0.18,
+    velocity=0.2,
+    preload=10.0,
+    mu=1.0,
+    solver_options=None,
+    damping=0.0,
+    configure_solver=None,
 ):
     """Observe accepted poses and independent spring energy in the VBD path."""
     with wp.ScopedDevice("cpu"):
@@ -47,6 +56,8 @@ def _simulate_pulley(
         model.tendon_link_mu.fill_(mu)
         model.tendon_seg_damping.fill_(damping)
         solver = _make_solver(model, iterations=iterations, **(solver_options or {}))
+        if configure_solver is not None:
+            configure_solver(solver)
         state, next_state, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         body_velocity = state.body_qd.numpy().copy()

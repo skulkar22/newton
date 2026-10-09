@@ -783,11 +783,26 @@ class TestTendonSegmentALMExtended(unittest.TestCase):
     """Check physical references separately from the solver's reported tensions."""
 
     def test_nonlinear_damped_motion(self):
-        """Match a converged ordinary VBD reference through nonlinear motion and reversal."""
+        """Match a converged ordinary VBD reference through nonlinear motion and reversal.
+
+        The per-segment ALM row damps the free-span stretch rate with roller-axis spin removed. The
+        ordinary VBD row defaults to contact-point damping, a different damping law, so the reference
+        uses the ALM row's damping rate; the comparison then isolates the ALM row from the penalty row.
+        """
+
+        def alm_damping_rate(solver):
+            solver._tendon_material_state.legacy_alm_damping = True
+
         for nonlinear in (False, True):
             material = SIGMOID if nonlinear else {}
             reference = _simulate_pulley(
-                iterations=128, duration=0.05, velocity=2.0, preload=1.0, damping=10.0, solver_options=material
+                iterations=128,
+                duration=0.05,
+                velocity=2.0,
+                preload=1.0,
+                damping=10.0,
+                solver_options=material,
+                configure_solver=alm_damping_rate,
             )
             result = _simulate_pulley(
                 iterations=128,
