@@ -144,7 +144,7 @@ cooperative; this is not a whole-run kernel aggregate.
 
 ## Remaining limitations
 
-- This does not establish correctness or performance for every Tesla setup.
+- This does not establish correctness or performance for every application setup.
 - Existing direct-solver capacity and capstan-ratio bounds remain; see
   [direct material documentation](direct_tendon_material.md).
 - Unsupported fixed-roller wraps remain unsupported. The inherited activation

@@ -408,7 +408,7 @@ class SolverVBD(TendonStateMixin, SolverBase):
                 (a tension multiplier shared along the tendon plus an inertia-scaled penalty) instead of a
                 stiffness penalty. The material law is unchanged at convergence; the row's Hessian is bounded
                 by the tendon's inertial support, so very stiff cables settle with fewer substeps. Off by default
-                (legacy behaviour, bit-identical).
+                (the non-ALM path uses condensed material blocks).
             tendon_alm_penalty_scale: Penalty metric of the ALM row as a multiple of the tendon's inertial
                 support ``1 / (dt^2 * w)``. Small values leave the multiplier too slow to follow a stiff cable;
                 large values fall back towards penalty behaviour.
