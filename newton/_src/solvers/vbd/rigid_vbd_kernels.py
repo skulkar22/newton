@@ -7601,6 +7601,10 @@ def update_body_velocity(
     dt: float,
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
+    body_disp: wp.array[wp.vec3],
+    body_in_sparse_articulation: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    use_displacement: int,
     body_q_prev: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_qd_mirror: wp.array[wp.spatial_vector],
@@ -7645,8 +7649,12 @@ def update_body_velocity(
     x_com = x + wp.quat_rotate(q, com_local)
     x_com_prev = x_prev + wp.quat_rotate(q_prev, com_local)
 
-    # Linear velocity
+    # Linear velocity. Dynamic bodies of the sparse articulation solve use the predicted
+    # velocity plus their accumulated displacement from the inertial target, which avoids
+    # turning float32 rounding of absolute positions into unbalanced linear momentum.
     v = (x_com - x_com_prev) / dt
+    if use_displacement != 0 and body_in_sparse_articulation[tid] != 0 and body_inv_mass[tid] > 0.0:
+        v = wp.spatial_top(body_qd_mirror[tid]) + body_disp[tid] / dt
 
     # Angular velocity
     omega = quat_velocity(q, q_prev, dt)
