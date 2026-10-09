@@ -535,9 +535,13 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
+        q_starts = self.model.joint_q_start.numpy()
+        self.p2_q_start = int(q_starts[j_p2])
+        self.p6_q_start = int(q_starts[j_p6])
         dof_starts = self.model.joint_qd_start.numpy()
         self.slider_dof_start = int(dof_starts[j_slider])
         self.table_dof_start = int(dof_starts[j_table])
@@ -598,10 +602,10 @@ class Example:
             p2d = 0.0
             p6d = 0.0
 
-        self.control.joint_target_pos[self.p2_dof_start : self.p2_dof_start + 1].fill_(p2)
-        self.control.joint_target_vel[self.p2_dof_start : self.p2_dof_start + 1].fill_(p2d)
-        self.control.joint_target_pos[self.p6_dof_start : self.p6_dof_start + 1].fill_(p6)
-        self.control.joint_target_vel[self.p6_dof_start : self.p6_dof_start + 1].fill_(p6d)
+        self.control.joint_target_q[self.p2_q_start : self.p2_q_start + 1].fill_(p2)
+        self.control.joint_target_qd[self.p2_dof_start : self.p2_dof_start + 1].fill_(p2d)
+        self.control.joint_target_q[self.p6_q_start : self.p6_q_start + 1].fill_(p6)
+        self.control.joint_target_qd[self.p6_dof_start : self.p6_dof_start + 1].fill_(p6d)
 
     def simulate(self):
         for substep in range(self.sim_substeps):
@@ -611,7 +615,7 @@ class Example:
             self.state_0.clear_forces()
             if self.viewer is not None:
                 self.viewer.apply_forces(self.state_0)
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 

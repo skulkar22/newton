@@ -134,8 +134,13 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
+        q_starts = self.model.joint_q_start.numpy()
+        self.guide_q_start = int(q_starts[j_guide])
+        self.left_q_start = int(q_starts[j_left])
+        self.right_q_start = int(q_starts[j_right])
         dof_starts = self.model.joint_qd_start.numpy()
         self.guide_dof_start = int(dof_starts[j_guide])
         self.left_dof_start = int(dof_starts[j_left])
@@ -251,10 +256,10 @@ class Example:
         self.model.joint_target_kd[self.left_dof_start : self.left_dof_start + 1].fill_(left_kd)
         self.model.joint_target_ke[self.right_dof_start : self.right_dof_start + 1].fill_(right_ke)
         self.model.joint_target_kd[self.right_dof_start : self.right_dof_start + 1].fill_(right_kd)
-        self.control.joint_target_pos[self.left_dof_start : self.left_dof_start + 1].fill_(left_target)
-        self.control.joint_target_vel[self.left_dof_start : self.left_dof_start + 1].fill_(left_velocity)
-        self.control.joint_target_pos[self.right_dof_start : self.right_dof_start + 1].fill_(right_target)
-        self.control.joint_target_vel[self.right_dof_start : self.right_dof_start + 1].fill_(right_velocity)
+        self.control.joint_target_q[self.left_q_start : self.left_q_start + 1].fill_(left_target)
+        self.control.joint_target_qd[self.left_dof_start : self.left_dof_start + 1].fill_(left_velocity)
+        self.control.joint_target_q[self.right_q_start : self.right_q_start + 1].fill_(right_target)
+        self.control.joint_target_qd[self.right_dof_start : self.right_dof_start + 1].fill_(right_velocity)
 
     def simulate(self):
         for substep in range(self.sim_substeps):
@@ -264,7 +269,7 @@ class Example:
             self.state_0.clear_forces()
             if self.viewer is not None:
                 self.viewer.apply_forces(self.state_0)
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -321,7 +326,7 @@ class Example:
 
         guide_angles = np.array(self._guide_angle_history, dtype=np.float64)
         assert np.max(np.abs(guide_angles)) > 0.035, f"Passive cam did not rotate enough: {guide_angles[-5:]}"
-        assert abs(float(self.control.joint_target_pos.numpy()[self.guide_dof_start])) < 1.0e-6, (
+        assert abs(float(self.control.joint_target_q.numpy()[self.guide_q_start])) < 1.0e-6, (
             "Cam hinge should remain passive, with no prescribed target"
         )
         assert self._max_material_slip > 0.10, (

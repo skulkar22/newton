@@ -300,9 +300,9 @@ def run_vbd_motorized_model(model, drive_joint, target=2.0, num_frames=70, subst
     contacts = model.contacts()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
 
-    dof_start = int(model.joint_qd_start.numpy()[drive_joint])
+    q_start = int(model.joint_q_start.numpy()[drive_joint])
     for _ in range(num_frames):
-        control.joint_target_pos[dof_start : dof_start + 1].fill_(target)
+        control.joint_target_q[q_start : q_start + 1].fill_(target)
         for _ in range(substeps):
             state_0.clear_forces()
             model.collide(state_0, contacts)
@@ -1385,12 +1385,12 @@ def test_vbd_unloaded_motorized_pulley_preserves_rest(test, device):
         contacts = model.contacts()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
 
-        dof_start = int(model.joint_qd_start.numpy()[drive_joint])
+        q_start = int(model.joint_q_start.numpy()[drive_joint])
         initial_x = float(state_0.body_q.numpy()[slider_idx][0])
         initial_rest = solver.tendon_seg_rest_length.numpy().copy()
         dt = 1.0 / 60.0 / 10.0
         for _ in range(30):
-            control.joint_target_pos[dof_start : dof_start + 1].fill_(1.0)
+            control.joint_target_q[q_start : q_start + 1].fill_(1.0)
             state_0.clear_forces()
             model.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, dt)
@@ -1419,9 +1419,9 @@ def test_vbd_motorized_pulley_updates_rest_in_first_step(test, device):
         contacts = model.contacts()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
 
-        dof_start = int(model.joint_qd_start.numpy()[drive_joint])
+        q_start = int(model.joint_q_start.numpy()[drive_joint])
         initial_rest = solver.tendon_seg_rest_length.numpy().copy()
-        control.joint_target_pos[dof_start : dof_start + 1].fill_(1.0)
+        control.joint_target_q[q_start : q_start + 1].fill_(1.0)
 
         state_0.clear_forces()
         model.collide(state_0, contacts)

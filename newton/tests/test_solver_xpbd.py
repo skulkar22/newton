@@ -2121,7 +2121,6 @@ def test_xpbd_parent_f_includes_control_joint_f(test, device):
     for joint_kind, joint_force, expected_parent_f in cases:
         with test.subTest(joint_kind=joint_kind):
             builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis=newton.Axis.Z)
-            builder.request_state_attributes("body_parent_f")
             link = builder.add_link()
             builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
             if joint_kind == "prismatic":
@@ -2149,6 +2148,7 @@ def test_xpbd_parent_f_includes_control_joint_f(test, device):
                 joint_linear_relaxation=1.0,
                 joint_angular_relaxation=1.0,
             )
+            observables = solver.observables({newton.solvers.SolverObservableFlags.BODY_PARENT_F})
             state_in = model.state()
             state_out = model.state()
             control = model.control()
@@ -2158,8 +2158,8 @@ def test_xpbd_parent_f_includes_control_joint_f(test, device):
             joint_f[int(model.joint_qd_start.numpy()[joint])] = joint_force
             control.joint_f.assign(joint_f)
 
-            solver.step(state_in, state_out, control, None, 1.0 / 60.0)
-            parent_f = state_out.body_parent_f.numpy()[link]
+            solver.step(state_in, state_out, control, None, 1.0 / 60.0, observables=observables)
+            parent_f = observables.body_parent_f.numpy()[link]
 
             np.testing.assert_allclose(
                 parent_f,
@@ -2177,7 +2177,6 @@ def test_xpbd_parent_f_balances_fixed_body_tendon_load(test, device):
     expected_tension = (length - rest_length) / compliance
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis=newton.Axis.Z)
-    builder.request_state_attributes("body_parent_f")
 
     anchor = builder.add_body(
         xform=wp.transform(p=wp.vec3(length, 0.0, 0.0)),
@@ -2220,6 +2219,7 @@ def test_xpbd_parent_f_balances_fixed_body_tendon_load(test, device):
         joint_linear_relaxation=1.0,
         joint_angular_relaxation=1.0,
     )
+    observables = solver.observables({newton.solvers.SolverObservableFlags.BODY_PARENT_F})
     state_in = model.state()
     state_out = model.state()
     control = model.control()
@@ -2227,10 +2227,10 @@ def test_xpbd_parent_f_balances_fixed_body_tendon_load(test, device):
 
     dt = 1.0 / 60.0
     for _ in range(3):
-        solver.step(state_in, state_out, control, None, dt)
+        solver.step(state_in, state_out, control, None, dt, observables=observables)
         state_in, state_out = state_out, state_in
 
-    parent_f = state_in.body_parent_f.numpy()[body]
+    parent_f = observables.body_parent_f.numpy()[body]
     tendon_tension = float(-solver.tendon_seg_lambda.numpy()[0] / dt)
 
     np.testing.assert_allclose(
@@ -2638,7 +2638,7 @@ def test_xpbd_joint_reaction_f_stable_after_convergence(test, device):
         joint_angular_relaxation=1.0,
     )
     control = model.control()
-    contacts = model.contacts()
+    contacts = newton.CollisionPipeline(model).contacts()
 
     def run(iterations):
         state_in = model.state()
@@ -2736,7 +2736,7 @@ def test_xpbd_dynamic_pair_reaction_stable_after_convergence(test, device):
         angular_damping=0.0,
     )
     control = model.control()
-    contacts = model.contacts()
+    contacts = newton.CollisionPipeline(model).contacts()
 
     def run(iterations):
         state_in = model.state()
