@@ -644,13 +644,6 @@ class ModelBuilder:
         _SHAPE_COLOR_PALETTE[0][1] / 255.0,
         _SHAPE_COLOR_PALETTE[0][2] / 255.0,
     )
-    _ROD_BODY_FRAME_ORIGIN_DEPRECATION_MESSAGE = (
-        "Omitting body_frame_origin when creating rods is deprecated because the implicit default "
-        "will change from 'start' to 'com' in a future release. Pass body_frame_origin='start' to "
-        "preserve the existing start-node body frame, or body_frame_origin='com' to opt into "
-        "COM-centered capsule body frames."
-    )
-
     _BUILDER_ATTRIBUTE_SPECS: ClassVar[dict[str, Model.AttributeSpec]] = {
         "body_lock_inertia": Model.AttributeSpec(Model.AttributeFrequency.BODY),
         "joint_collision_filter_parent": Model.AttributeSpec(Model.AttributeFrequency.JOINT),
@@ -738,19 +731,11 @@ class ModelBuilder:
         finally:
             del frame
 
-    @classmethod
+    @staticmethod
     def _resolve_rod_body_frame_origin(
-        cls,
         method_name: str,
-        body_frame_origin: Literal["start", "com"] | None,
+        body_frame_origin: Literal["start", "com"],
     ) -> Literal["start", "com"]:
-        if body_frame_origin is None:
-            warnings.warn(
-                cls._ROD_BODY_FRAME_ORIGIN_DEPRECATION_MESSAGE,
-                DeprecationWarning,
-                stacklevel=cls._external_warning_stacklevel(),
-            )
-            return "start"
         if body_frame_origin not in ("start", "com"):
             raise ValueError(f"{method_name}: body_frame_origin must be 'start' or 'com', got {body_frame_origin!r}")
         return body_frame_origin
@@ -2250,6 +2235,7 @@ class ModelBuilder:
         Raises:
             ValueError: If the attribute key already exists with incompatible specification,
                 if the attribute uses a custom string frequency that hasn't been registered,
+                if the attribute uses a contact frequency (reserved for solver observables),
                 or if ``usd_attribute_name`` is ``"*"`` without a ``usd_value_transformer``.
 
         Example:
@@ -2275,6 +2261,14 @@ class ModelBuilder:
                 # with the default value 20.0
                 assert np.allclose(model.my_namespace.my_attribute.numpy(), [30.0, 20.0])
         """
+        if attribute.frequency in (
+            Model.AttributeFrequency.CONTACT,
+            Model.AttributeFrequency.CONTACT_RIGID,
+            Model.AttributeFrequency.CONTACT_SOFT,
+        ):
+            raise ValueError(
+                "Contact frequencies are only supported by SolverObservables, not builder custom attributes."
+            )
         key = attribute.key
 
         existing = self.custom_attributes.get(key)
@@ -9068,7 +9062,7 @@ class ModelBuilder:
         wrap_in_articulation: bool,
         junction_collision_filter: bool,
         color: Vec3 | None,
-        body_frame_origin: Literal["start", "com"] | None,
+        body_frame_origin: Literal["start", "com"],
     ) -> tuple[list[int], list[int]]:
         """Add a Rod object through the established chain or graph path."""
         radius = rod._resolve_radius()
@@ -9192,7 +9186,7 @@ class ModelBuilder:
         label: str | None,
         wrap_in_articulation: bool,
         color: Vec3 | None,
-        body_frame_origin: Literal["start", "com"] | None,
+        body_frame_origin: Literal["start", "com"],
     ) -> tuple[list[int], list[int]]:
         """Add an ordered point chain through the established graph path."""
         self._validate_rod_stiffness_inputs(
@@ -9339,7 +9333,7 @@ class ModelBuilder:
         label: str | None = None,
         wrap_in_articulation: bool = True,
         color: Vec3 | None = None,
-        body_frame_origin: Literal["start", "com"] | None = None,
+        body_frame_origin: Literal["start", "com"] = "com",
         rod: Rod | None = None,
         junction_collision_filter: bool = True,
     ) -> tuple[list[int], list[int]]:
@@ -9411,12 +9405,11 @@ class ModelBuilder:
             color: Optional display RGB color with values in ``[0, 1]`` applied to all generated
                 capsule shapes. If None, the rod uses the default rod color.
             body_frame_origin: Body-frame placement for each generated capsule. ``"start"`` preserves
-                the legacy convention where the body origin is at the segment start position
+                the convention where the body origin is at the segment start position
                 (``positions[i]`` for segment ``i``), and the COM/shape are offset by half the
                 segment length. ``"com"`` places the body origin at the segment midpoint so the
-                body origin and COM coincide. If None, preserves ``"start"`` for now with a
-                :class:`DeprecationWarning` because the implicit default will change to ``"com"``;
-                pass ``"start"`` or ``"com"`` explicitly.
+                body origin and COM coincide. Defaults to ``"com"``; ``"start"`` remains
+                a supported option.
             rod: Geometry, frame, topology, and constitutive-data source for
                 the prepared-object form. Mutually exclusive with ``positions``.
             junction_collision_filter: Whether to suppress self-collisions
@@ -9559,7 +9552,7 @@ class ModelBuilder:
         quaternions: list[Quat] | None = None,
         junction_collision_filter: bool = True,
         color: Vec3 | None = None,
-        body_frame_origin: Literal["start", "com"] | None = None,
+        body_frame_origin: Literal["start", "com"] = "com",
     ) -> tuple[list[int], list[int]]:
         """Adds a rod *graph* (supports junctions) from nodes + edges.
 
@@ -9624,12 +9617,11 @@ class ModelBuilder:
             color: Optional display RGB color with values in ``[0, 1]`` applied to all generated
                 capsule shapes. If None, the graph uses the default rod color.
             body_frame_origin: Body-frame placement for each generated capsule. ``"start"`` preserves
-                the legacy convention where the body origin is at the edge start node
+                the convention where the body origin is at the edge start node
                 (``node_positions[u]`` for edge ``(u, v)``), and the COM/shape are offset by half
                 the edge length. ``"com"`` places the body origin at the edge midpoint so the body
-                origin and COM coincide. If None, preserves ``"start"`` for now with a
-                :class:`DeprecationWarning` because the implicit default will change to ``"com"``;
-                pass ``"start"`` or ``"com"`` explicitly.
+                origin and COM coincide. Defaults to ``"com"``; ``"start"`` remains
+                a supported option.
 
         Returns:
             A pair ``(body_indices, joint_indices)`` where bodies correspond to
@@ -9689,7 +9681,7 @@ class ModelBuilder:
         quaternions: list[Quat] | None,
         junction_collision_filter: bool,
         color: Vec3 | None,
-        body_frame_origin: Literal["start", "com"] | None,
+        body_frame_origin: Literal["start", "com"],
         articulation_root_node: int | None = None,
         articulation_root_joint_factory: Callable[[int, Transform], int] | None = None,
     ) -> tuple[list[int], list[int]]:
@@ -9790,7 +9782,7 @@ class ModelBuilder:
             half_height = 0.5 * seg_length
 
             if use_com_origin:
-                # Opt-in convention: place body origin at the segment center so origin and COM coincide.
+                # Place the body origin at the segment center so origin and COM coincide.
                 center = p0 + seg_vec * 0.5
                 body_q = wp.transform(center, q)
                 com_offset = wp.vec3(0.0)
@@ -12045,8 +12037,12 @@ class ModelBuilder:
             return self.add_joint_fixed(parent, child, parent_xform=parent_xform, child_xform=child_xform, label=label)
 
     def request_contact_attributes(self, *attributes: str) -> None:
-        """
-        Request that specific contact attributes be allocated when creating a Contacts object from the finalized Model.
+        """Request optional contact attributes on the finalized model.
+
+        .. deprecated:: 1.7
+
+            Request :attr:`newton.solvers.SolverObservableFlags.CONTACT_F` from
+            the solver instead.
 
         Args:
             *attributes: Variable number of attribute names (strings).
@@ -12054,14 +12050,24 @@ class ModelBuilder:
         # Local import to avoid adding more module-level dependencies in this large file.
         from .contacts import Contacts  # noqa: PLC0415
 
+        warnings.warn(
+            "ModelBuilder.request_contact_attributes() is deprecated in Newton 1.7; "
+            "request SolverObservables from the solver instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         Contacts.validate_extended_attributes(attributes)
         self._requested_contact_attributes.update(attributes)
 
     def request_state_attributes(self, *attributes: str) -> None:
-        """
-        Request that specific state attributes be allocated when creating a State object from the finalized Model.
+        """Request optional solver-produced attributes on the finalized model.
 
-        See :ref:`extended_state_attributes` for details and usage.
+        .. deprecated:: 1.7
+
+            Request :class:`newton.solvers.SolverObservables` from the solver
+            instead.
+
+        See :doc:`Solver Observables </concepts/solver_observables>` for migration details.
 
         Args:
             *attributes: Variable number of attribute names (strings).
@@ -12069,6 +12075,12 @@ class ModelBuilder:
         # Local import to avoid adding more module-level dependencies in this large file.
         from .state import State  # noqa: PLC0415
 
+        warnings.warn(
+            "ModelBuilder.request_state_attributes() is deprecated in Newton 1.7; "
+            "request SolverObservables from the solver instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         State.validate_extended_attributes(attributes)
         self._requested_state_attributes.update(attributes)
 
@@ -13221,8 +13233,10 @@ class ModelBuilder:
             m = Model(device)
             m._sdf_texture_paired_samples = sdf_texture_paired_samples
             m._set_shape_collision_filter_packed(shape_collision_filter_packed)  # pyright: ignore[reportPrivateUsage]
-            m.request_contact_attributes(*self._requested_contact_attributes)
-            m.request_state_attributes(*self._requested_state_attributes)
+            # Preserve deprecated extended-attribute requests without emitting a
+            # second warning after the builder request already warned the caller.
+            m._requested_contact_attributes.update(self._requested_contact_attributes)
+            m._requested_state_attributes.update(self._requested_state_attributes)
             m.requires_grad = requires_grad
 
             m.world_count = self.world_count
