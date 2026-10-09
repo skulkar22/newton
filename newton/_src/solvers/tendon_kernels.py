@@ -852,7 +852,6 @@ def update_tendon_attachments(
 
     seed_al = wp.transform_point(pose_l, seg_attachment_l_local[seg])
     seed_ar = wp.transform_point(pose_r, seg_attachment_r_local[seg])
-    base_al = wp.transform_point(pose_l, seg_attachment_l_local_step[seg])
     base_ar_step_seg = seg
 
     # Route transitions move the persistent right endpoint between adjacent segment slots.
@@ -867,8 +866,6 @@ def update_tendon_attachments(
         elif not tendon_link_active[transition_link] and tendon_link_active_step[transition_link]:
             assert transition_link == link_l + 1 and link_r == transition_link + 1
             base_ar_step_seg = seg + 1
-
-    base_ar = wp.transform_point(pose_r, seg_attachment_r_local_step[base_ar_step_seg])
 
     new_al = center_l
     new_ar = center_r
@@ -921,25 +918,38 @@ def update_tendon_attachments(
         new_al = center_l
         new_ar = tangent_point_circle(center_l, center_r, radius_r, normal_r, orient_r)
 
+    new_al_local = wp.transform_point(wp.transform_inverse(pose_l), new_al)
+    new_ar_local = wp.transform_point(wp.transform_inverse(pose_r), new_ar)
+
     if apply_rolling_transfer != 0:
+        # Measure the contact advance in the link body frame, between the stored step-start
+        # point and the point this call stores. The next step starts from exactly that stored
+        # point, so the transfers telescope. Measuring in the world frame instead compares
+        # against transform(pose, local_step): the float32 world -> local -> world round trip
+        # moves the contact by a pose-dependent but step-to-step repeatable amount that no
+        # span books, and on a quasi-static roller it biases the inventory every step.
         if (
             type_l == int(TendonLinkType.ROLLING)
             and radius_l > 0.0
             and tendon_link_active[link_l] == tendon_link_active_step[link_l]
         ):
-            seg_rolling_delta_l[seg] = signed_arc_length(base_al, new_al, center_l, radius_l, normal_l, orient_l)
+            seg_rolling_delta_l[seg] = signed_arc_length(
+                seg_attachment_l_local_step[seg], new_al_local, offset_l, radius_l, axis_l, orient_l
+            )
 
         if (
             type_r == int(TendonLinkType.ROLLING)
             and radius_r > 0.0
             and tendon_link_active[link_r] == tendon_link_active_step[link_r]
         ):
-            seg_rolling_delta_r[seg] = -signed_arc_length(base_ar, new_ar, center_r, radius_r, normal_r, orient_r)
+            seg_rolling_delta_r[seg] = -signed_arc_length(
+                seg_attachment_r_local_step[base_ar_step_seg], new_ar_local, offset_r, radius_r, axis_r, orient_r
+            )
 
     seg_attachment_l[seg] = new_al
     seg_attachment_r[seg] = new_ar
-    seg_attachment_l_local[seg] = wp.transform_point(wp.transform_inverse(pose_l), new_al)
-    seg_attachment_r_local[seg] = wp.transform_point(wp.transform_inverse(pose_r), new_ar)
+    seg_attachment_l_local[seg] = new_al_local
+    seg_attachment_r_local[seg] = new_ar_local
     seg_length[seg] = wp.length(new_ar - new_al)
 
 
