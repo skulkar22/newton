@@ -1149,6 +1149,113 @@ def update_tendon_cone_rows(
     tendon_link_cap_ratio[link_idx] = wp.max(cap_ratio, 1.0)
 
 
+@wp.func
+def _physical_tendon_length_rate_from_twists(
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    link_l: int,
+    link_r: int,
+    x_l: wp.vec3,
+    x_r: wp.vec3,
+    velocity_l: wp.vec3,
+    velocity_r: wp.vec3,
+    omega_l: wp.vec3,
+    omega_r: wp.vec3,
+):
+    """Return free-span length rate from endpoint body twists."""
+    diff = x_r - x_l
+    length = wp.length(diff)
+    if length <= 1.0e-8:
+        return 0.0
+
+    direction = diff / length
+    body_l = tendon_link_body[link_l]
+    body_r = tendon_link_body[link_r]
+    pose_l = body_q[body_l]
+    pose_r = body_q[body_r]
+    world_com_l = wp.transform_point(pose_l, body_com[body_l])
+    world_com_r = wp.transform_point(pose_r, body_com[body_r])
+
+    linear_l = -direction
+    linear_r = direction
+    angular_l = -wp.cross(x_l - world_com_l, direction)
+    angular_r = wp.cross(x_r - world_com_r, direction)
+
+    return (
+        wp.dot(linear_l, velocity_l)
+        + wp.dot(linear_r, velocity_r)
+        + wp.dot(angular_l, omega_l)
+        + wp.dot(angular_r, omega_r)
+    )
+
+
+@wp.func
+def physical_tendon_length_rate(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    link_l: int,
+    link_r: int,
+    x_l: wp.vec3,
+    x_r: wp.vec3,
+):
+    """Return the free-span length rate used by the stretch constraint."""
+    body_l = tendon_link_body[link_l]
+    body_r = tendon_link_body[link_r]
+    return _physical_tendon_length_rate_from_twists(
+        body_q,
+        body_com,
+        tendon_link_body,
+        tendon_link_type,
+        tendon_link_offset,
+        tendon_link_axis,
+        link_l,
+        link_r,
+        x_l,
+        x_r,
+        wp.spatial_top(body_qd[body_l]),
+        wp.spatial_top(body_qd[body_r]),
+        wp.spatial_bottom(body_qd[body_l]),
+        wp.spatial_bottom(body_qd[body_r]),
+    )
+
+
+@wp.func
+def physical_tendon_length_rate_from_poses(
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    link_l: int,
+    link_r: int,
+    x_l_local: wp.vec3,
+    x_r_local: wp.vec3,
+    x_l: wp.vec3,
+    x_r: wp.vec3,
+):
+    """Return free-span length rate from the current and previous body poses."""
+    body_l = tendon_link_body[link_l]
+    body_r = tendon_link_body[link_r]
+    pose_l_prev = body_q_prev[body_l]
+    pose_r_prev = body_q_prev[body_r]
+    # Use the same physical contact points as the force Jacobian.
+    x_l_prev = wp.transform_point(pose_l_prev, x_l_local)
+    x_r_prev = wp.transform_point(pose_r_prev, x_r_local)
+    return (wp.length(x_r - x_l) - wp.length(x_r_prev - x_l_prev)) / dt
+
+
 def _make_solve_tendon_material(direct_enabled: bool):
     """Specialize material transfer without adding native workspace to the sweep kernel."""
 
@@ -1326,6 +1433,43 @@ def _make_solve_tendon_material(direct_enabled: bool):
                                 seg_attachment_l[seg],
                                 seg_attachment_r[seg],
                             )
+
+                        # Condensed rows use the full contact-point Jacobian.
+                        # Per-segment ALM retains its authored engagement law.
+                        if not direct.legacy_alm_damping:
+                            if damping_from_pose_delta != 0:
+                                seg_damping_tension[seg] = seg_active_damping[
+                                    seg
+                                ] * physical_tendon_length_rate_from_poses(
+                                    dt,
+                                    body_q,
+                                    body_q_prev,
+                                    body_com,
+                                    tendon_link_body,
+                                    tendon_link_type,
+                                    tendon_link_offset,
+                                    tendon_link_axis,
+                                    seg_active_link_l[seg],
+                                    seg_active_link_r[seg],
+                                    seg_attachment_l_local[seg],
+                                    seg_attachment_r_local[seg],
+                                    seg_attachment_l[seg],
+                                    seg_attachment_r[seg],
+                                )
+                            else:
+                                seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate(
+                                    body_q,
+                                    body_qd,
+                                    body_com,
+                                    tendon_link_body,
+                                    tendon_link_type,
+                                    tendon_link_offset,
+                                    tendon_link_axis,
+                                    seg_active_link_l[seg],
+                                    seg_active_link_r[seg],
+                                    seg_attachment_l[seg],
+                                    seg_attachment_r[seg],
+                                )
 
             if wp.static(direct_enabled):
                 if not transfer_tendon_material_direct(

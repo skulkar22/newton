@@ -13,6 +13,7 @@ import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+from itertools import combinations
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
@@ -9223,12 +9224,17 @@ class ModelBuilder:
                 if tendon_idx + 1 < len(self.tendon_start)
                 else len(self.tendon_link_body)
             )
-            for link_idx in range(link_start, link_end - 1):
-                tendon_edges.append((self.tendon_link_body[link_idx], self.tendon_link_body[link_idx + 1]))
-            # An inactive dynamic roller replaces its two authored spans with a direct bypass span.
-            for link_idx in range(link_start + 1, link_end - 1):
-                if (self.tendon_link_flags[link_idx] & int(TendonLinkFlags.DYNAMIC)) != 0:
-                    tendon_edges.append((self.tendon_link_body[link_idx - 1], self.tendon_link_body[link_idx + 1]))
+            # Material projection couples an entire sliding route, not just
+            # neighboring endpoints. Include every possible free-material
+            # block so colors remain valid as friction and routing change.
+            bodies = set()
+            for link_idx in range(link_start, link_end):
+                bodies.add(self.tendon_link_body[link_idx])
+                if link_idx == link_end - 1 or (
+                    link_idx > link_start and self.tendon_link_type[link_idx] == int(TendonLinkType.ATTACHMENT)
+                ):
+                    tendon_edges.extend(combinations(sorted(bodies), 2))
+                    bodies = {self.tendon_link_body[link_idx]}
 
         # Also color rigid bodies based on joint and tendon connectivity.
         self.body_color_groups = color_rigid_bodies(

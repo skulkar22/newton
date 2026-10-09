@@ -11,6 +11,7 @@ from ..tendon_kernels import (
     tendon_material_tension,
     tendon_segment_length_rate_from_poses,
 )
+from .tendon_modes import TendonMaterialMode, evaluate_condensed_tendon_force_hessians
 
 wp.set_module_options({"enable_backward": False})
 
@@ -85,6 +86,10 @@ class TendonForceElementAdjacencyInfo:
 
     body_adj_segments: wp.array[wp.int32]
     body_adj_segments_offsets: wp.array[wp.int32]
+    condensed: bool
+    modes: wp.array[TendonMaterialMode]
+    attachment_l: wp.array[wp.vec3]
+    attachment_r: wp.array[wp.vec3]
 
     def to(self, device):
         """Copy the adjacency to a device."""
@@ -94,6 +99,11 @@ class TendonForceElementAdjacencyInfo:
         adjacency = TendonForceElementAdjacencyInfo()
         adjacency.body_adj_segments = self.body_adj_segments.to(device)
         adjacency.body_adj_segments_offsets = self.body_adj_segments_offsets.to(device)
+        adjacency.condensed = self.condensed
+        if self.condensed:
+            adjacency.modes = self.modes.to(device)
+            adjacency.attachment_l = self.attachment_l.to(device)
+            adjacency.attachment_r = self.attachment_r.to(device)
         return adjacency
 
 
@@ -1322,6 +1332,21 @@ def evaluate_tendon_force_hessians(
     The capstan limiter is frozen when building the positive
     semidefinite local Hessian approximation; its derivative is not included.
     """
+    if adjacency.condensed and alm_enabled == 0:
+        return evaluate_condensed_tendon_force_hessians(
+            body,
+            body_q,
+            body_com,
+            adjacency.body_adj_segments,
+            adjacency.body_adj_segments_offsets,
+            adjacency.modes,
+            tendon_link_body,
+            adjacency.attachment_l,
+            adjacency.attachment_r,
+            seg_active,
+            seg_active_link_l,
+            seg_active_link_r,
+        )
     force = wp.vec3(0.0)
     torque = wp.vec3(0.0)
     h_ll = wp.mat33(0.0)

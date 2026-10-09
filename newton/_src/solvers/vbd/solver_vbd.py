@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import warnings
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,7 @@ from ...sim import (
     ModelBuilder,
     State,
     TendonLinkFlags,
+    TendonLinkType,
 )
 from ..flags import SolverNotifyFlags
 from ..solver import SolverBase
@@ -92,6 +94,7 @@ from .tendon_kernels import (
     update_duals_tendon,
     update_tendon_segment_diagnostics,
 )
+from .tendon_modes import TendonMaterialMode, prepare_tendon_material_modes
 from .tri_mesh_collision import (
     TriMeshCollisionDetector,
     TriMeshCollisionInfo,
@@ -537,6 +540,8 @@ class SolverVBD(TendonStateMixin, SolverBase):
         # Routed tendon geometry and material state are shared with XPBD; VBD
         # evaluates their force and Hessian contributions natively.
         self._init_tendon_state(model, allocate_xpbd_lambdas=True)
+        self._tendon_material_state.legacy_alm_damping = self.tendon_alm
+        self.tendon_material_modes = wp.zeros(model.tendon_segment_count, dtype=TendonMaterialMode, device=model.device)
         if self.tendon_alm_per_segment:
             self._tendon_material_state.segment_alm = True
             self._tendon_material_state.changed_routes = wp.zeros(model.tendon_count, dtype=int, device=self.device)
@@ -797,6 +802,10 @@ class SolverVBD(TendonStateMixin, SolverBase):
             # Adjacency and dimensions
             self.rigid_adjacency = self._compute_rigid_force_element_adjacency(model).to(self.device)
             self.tendon_adjacency = self._compute_tendon_force_element_adjacency(model).to(self.device)
+            self.tendon_adjacency.condensed = False
+            self.tendon_adjacency.modes = self.tendon_material_modes
+            self.tendon_adjacency.attachment_l = self.tendon_seg_attachment_l
+            self.tendon_adjacency.attachment_r = self.tendon_seg_attachment_r
             # Force accumulation arrays
             self.body_torques = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
             self.body_forces = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
@@ -1629,6 +1638,24 @@ class SolverVBD(TendonStateMixin, SolverBase):
                         )
                     body_segments[bypass_body].add(segment)
 
+            if not self.tendon_alm:
+                # A material mode can span several geometrically non-adjacent
+                # bodies. Updating those bodies simultaneously would be Jacobi,
+                # not the per-color descent assumed by the condensed curvature.
+                link_types = model.tendon_link_type.numpy()
+                starts = model.tendon_start.numpy()
+                for start, end in pairwise(starts):
+                    bodies = set()
+                    for link in range(start, end):
+                        bodies.add(int(link_bodies[link]))
+                        if link == end - 1 or (link > start and link_types[link] == int(TendonLinkType.ATTACHMENT)):
+                            colors = [body_colors[body] for body in bodies]
+                            if len(set(colors)) != len(colors):
+                                raise ValueError(
+                                    "model.body_color_groups does not separate material-coupled tendon bodies; "
+                                    "call ModelBuilder.color() after adding tendons"
+                                )
+                            bodies = {int(link_bodies[link])}
         offsets = np.zeros(model.body_count + 1, dtype=np.int32)
         for body, segments in enumerate(body_segments):
             offsets[body + 1] = offsets[body] + len(segments)
@@ -2705,6 +2732,33 @@ class SolverVBD(TendonStateMixin, SolverBase):
             device=self.device,
         )
 
+        if not self.tendon_alm:
+            wp.launch(
+                prepare_tendon_material_modes,
+                dim=model.tendon_count,
+                inputs=[
+                    model.tendon_start,
+                    self.tendon_link_cone_seg_l,
+                    self.tendon_link_cone_seg_r,
+                    self.tendon_link_cap_ratio,
+                    self.tendon_seg_rest_length,
+                    self.tendon_seg_length,
+                    self.tendon_seg_stretch,
+                    self.tendon_seg_active_compliance,
+                    self.tendon_seg_active_damping,
+                    self.tendon_seg_damping_tension,
+                    self.tendon_seg_active,
+                    dt,
+                    self.tendon_sigmoid_ea_low,
+                    self.tendon_sigmoid_ea_ratio,
+                    self.tendon_sigmoid_transition_strain,
+                    self.tendon_sigmoid_transition_width,
+                ],
+                outputs=[self.tendon_material_modes],
+                device=self.device,
+            )
+            self.tendon_adjacency.condensed = True
+
     def _finalize_tendon_routing(self, state_in: State, dt: float) -> None:
         """Accept material, then merge dynamic rollers crossed during this step."""
         if not self.tendon_alm_per_segment or not self._has_dynamic_tendon_links:
@@ -2941,18 +2995,20 @@ class SolverVBD(TendonStateMixin, SolverBase):
         self.body_hessian_al.zero_()
         self.body_hessian_ll.zero_()
 
-        self._update_tendon_routing(
-            state_in,
-            dt,
-            report_unsupported_wrap,
-            skip_material=self.tendon_material_direct and iteration < self._tendon_direct_settle_iterations(),
-        )
-
+        if self.tendon_alm:
+            self._update_tendon_routing(
+                state_in,
+                dt,
+                report_unsupported_wrap,
+                skip_material=self.tendon_material_direct and iteration < self._tendon_direct_settle_iterations(),
+            )
         body_color_groups = model.body_color_groups
 
         # Gauss-Seidel-style per-color updates
         for color in range(len(body_color_groups)):
             color_group = body_color_groups[color]
+            if not self.tendon_alm:
+                self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
             # Accumulate body-particle contact forces/hessians for bodies in this color
             if model.particle_count > 0 and contacts is not None:

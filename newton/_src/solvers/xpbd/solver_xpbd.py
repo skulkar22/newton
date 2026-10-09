@@ -31,10 +31,7 @@ from .kernels import (
     solve_tetrahedra,
     update_body_velocities,
 )
-from .tendon_kernels import (
-    solve_tendon_slip,
-    solve_tendon_stretch,
-)
+from .tendon_stretch_blocks import TendonStretchRow, prepare_stretch_rows, solve_stretch_blocks
 
 
 class SolverXPBD(TendonStateMixin, SolverBase):
@@ -204,6 +201,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
 
         # tendon state
         self._init_tendon_state(model)
+        self._tendon_stretch_rows = wp.empty(model.tendon_segment_count, dtype=TendonStretchRow, device=model.device)
         # Accumulate the friction reaction across XPBD iterations. VBD applies
         # constitutive forces directly and does not need this impulse state.
         self._tendon_link_spin_impulse = (
@@ -214,6 +212,61 @@ class SolverXPBD(TendonStateMixin, SolverBase):
             # reserve space for the particle hash grid
             with wp.ScopedDevice(model.device):
                 model.particle_grid.reserve(model.particle_count)
+
+    def _solve_tendon_stretch(
+        self,
+        body_q: wp.array[wp.transform],
+        body_qd: wp.array[wp.spatial_vector],
+        body_deltas: wp.array[wp.spatial_vector],
+        dt: float,
+    ) -> None:
+        """Solve shape-independent stretch blocks using the current capstan balance."""
+        model = self.model
+        wp.launch(
+            prepare_stretch_rows,
+            dim=model.tendon_segment_count,
+            inputs=[
+                body_q,
+                body_qd,
+                model.body_com,
+                model.tendon_link_body,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_stretch,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active_damping,
+                dt,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+            ],
+            outputs=[self._tendon_stretch_rows, self.tendon_seg_material_tension],
+            device=model.device,
+        )
+        wp.launch(
+            solve_stretch_blocks,
+            dim=model.tendon_count,
+            inputs=[
+                body_q,
+                self.body_inv_mass_effective,
+                self.body_inv_inertia_effective,
+                model.tendon_start,
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_link_cap_ratio,
+                self.tendon_seg_rest_length,
+                dt,
+                self.joint_linear_relaxation,
+                self.tendon_settle_tol,
+            ],
+            outputs=[self._tendon_stretch_rows, self.tendon_seg_lambda, self.tendon_seg_delta_lambda, body_deltas],
+            device=model.device,
+        )
 
     @override
     def notify_model_changed(self, flags: int) -> None:
@@ -863,79 +916,7 @@ class SolverXPBD(TendonStateMixin, SolverBase):
                         else:
                             body_deltas.zero_()
 
-                        # seg_lambda stores impulse, so physical compliance
-                        # scales the accumulated multiplier by 1 / dt.
-                        wp.launch(
-                            kernel=solve_tendon_stretch,
-                            dim=model.tendon_segment_count,
-                            inputs=[
-                                body_q,
-                                body_qd,
-                                model.body_com,
-                                self.body_inv_mass_effective,
-                                self.body_inv_inertia_effective,
-                                model.tendon_link_body,
-                                model.tendon_link_type,
-                                model.tendon_link_offset,
-                                model.tendon_link_axis,
-                                self.tendon_seg_rest_length,
-                                self.tendon_seg_attachment_l,
-                                self.tendon_seg_attachment_r,
-                                self.tendon_seg_attachment_l_local,
-                                self.tendon_seg_attachment_r_local,
-                                self.tendon_seg_active_compliance,
-                                self.tendon_seg_active_damping,
-                                self.tendon_seg_lambda,
-                                self.tendon_seg_delta_lambda,
-                                self.tendon_seg_active,
-                                self.tendon_seg_active_link_l,
-                                self.tendon_seg_active_link_r,
-                                1.0 / dt,
-                                self.joint_linear_relaxation,
-                                dt,
-                                self.tendon_sigmoid_ea_low,
-                                self.tendon_sigmoid_ea_ratio,
-                                self.tendon_sigmoid_transition_strain,
-                                self.tendon_sigmoid_transition_width,
-                            ],
-                            outputs=[self.tendon_seg_material_tension, body_deltas],
-                            device=model.device,
-                        )
-
-                        body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
-
-                        if requires_grad:
-                            body_deltas = wp.zeros_like(body_deltas)
-                        else:
-                            body_deltas.zero_()
-
-                        wp.launch(
-                            kernel=solve_tendon_slip,
-                            dim=model.tendon_link_count,
-                            inputs=[
-                                body_q,
-                                self.tendon_link_seg_left,
-                                model.tendon_link_body,
-                                model.tendon_link_type,
-                                model.tendon_link_radius,
-                                model.tendon_link_mu,
-                                self.tendon_link_active,
-                                model.tendon_link_offset,
-                                model.tendon_link_axis,
-                                self.tendon_seg_attachment_l,
-                                self.tendon_seg_attachment_r,
-                                self.tendon_seg_active_compliance,
-                                self.tendon_seg_material_tension,
-                                self.tendon_seg_damping_tension,
-                                self.tendon_seg_lambda,
-                                self.tendon_sigmoid_ea_low,
-                                dt,
-                                self._tendon_link_spin_impulse,
-                            ],
-                            outputs=[body_deltas],
-                            device=model.device,
-                        )
-
+                        self._solve_tendon_stretch(body_q, body_qd, body_deltas, dt)
                         body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
 
             self._contact_impulse = contact_impulse

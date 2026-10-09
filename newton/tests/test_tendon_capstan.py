@@ -2834,9 +2834,11 @@ def _pinhole_friction_metrics(mu, num_frames=80):
 def test_frictional_pinhole_mu_controls_slip_and_locking(test, device):
     """Pinhole friction should interpolate between free slip and locked cable transfer."""
     with wp.ScopedDevice(device):
-        low = _pinhole_friction_metrics(mu=0.0)
-        mid = _pinhole_friction_metrics(mu=0.1)
-        high = _pinhole_friction_metrics(mu=10.0)
+        # Compare before the rising weight reaches the guide; subsequent
+        # contact and reversal are not a friction-order test.
+        low = _pinhole_friction_metrics(mu=0.0, num_frames=40)
+        mid = _pinhole_friction_metrics(mu=0.1, num_frames=40)
+        high = _pinhole_friction_metrics(mu=10.0, num_frames=40)
 
         for label, metrics in [("low", low), ("mid", mid), ("high", high)]:
             body_q, _left_travel, right_travel = metrics

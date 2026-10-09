@@ -11,7 +11,13 @@ import warp as wp
 
 from ..sim.tendon import TendonLinkType
 from .tendon_alm_material import project_alm_material_cooperative
-from .tendon_kernels import oriented_wrap_arc_length, tendon_segment_length_rate, tendon_segment_length_rate_from_poses
+from .tendon_kernels import (
+    oriented_wrap_arc_length,
+    physical_tendon_length_rate,
+    physical_tendon_length_rate_from_poses,
+    tendon_segment_length_rate,
+    tendon_segment_length_rate_from_poses,
+)
 from .tendon_material_cooperative import solve_tendon_material_nonlinear_component as project_cooperative
 from .tendon_material_cooperative import warp_broadcast
 from .tendon_material_state import (
@@ -168,6 +174,40 @@ def prepare_material(
                             seg_attachment_l[seg],
                             seg_attachment_r[seg],
                         )
+                    # Condensed rows use the full contact-point Jacobian.
+                    # Per-segment ALM retains its authored engagement law.
+                    if not direct.legacy_alm_damping:
+                        if damping_from_pose_delta != 0:
+                            seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate_from_poses(
+                                dt,
+                                body_q,
+                                body_q_prev,
+                                body_com,
+                                tendon_link_body,
+                                tendon_link_type,
+                                tendon_link_offset,
+                                tendon_link_axis,
+                                seg_active_link_l[seg],
+                                seg_active_link_r[seg],
+                                seg_attachment_l_local[seg],
+                                seg_attachment_r_local[seg],
+                                seg_attachment_l[seg],
+                                seg_attachment_r[seg],
+                            )
+                        else:
+                            seg_damping_tension[seg] = seg_active_damping[seg] * physical_tendon_length_rate(
+                                body_q,
+                                body_qd,
+                                body_com,
+                                tendon_link_body,
+                                tendon_link_type,
+                                tendon_link_offset,
+                                tendon_link_axis,
+                                seg_active_link_l[seg],
+                                seg_active_link_r[seg],
+                                seg_attachment_l[seg],
+                                seg_attachment_r[seg],
+                            )
         return 1
     return 0
 

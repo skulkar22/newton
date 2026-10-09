@@ -15,6 +15,7 @@ from .tendon_material_nonlinear import TendonMaterialNonlinearState, solve_tendo
 class TendonMaterialState:
     enabled: bool
     segment_alm: bool
+    legacy_alm_damping: bool
     process_changed_routes: bool
     changed_routes: wp.array[int]
     alm: TendonALMMaterialState

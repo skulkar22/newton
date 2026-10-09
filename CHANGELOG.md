@@ -38,6 +38,8 @@
 
 ### Fixed
 
+- Solve circular tendon sliding blocks consistently in XPBD and non-ALM VBD; preserve the experimental per-segment ALM engagement law.
+
 - Correct cumulative tendon material slip and rolling reactions when neighboring contacts unload.
 
 - Resolve dynamic cable activation around overlapping same-winding rollers, and report invalid initial or accepted VBD routes through the direct material check.
