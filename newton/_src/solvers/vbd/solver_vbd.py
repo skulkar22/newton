@@ -5362,28 +5362,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         """Solve one rigid iteration with coupled sparse articulation updates."""
         model = self.model
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
-            self._solve_rigid_body_iteration_local(
-                state_in,
-                state_out,
-                control,
-                contacts,
-                dt,
-                report_unsupported_wrap=report_unsupported_wrap,
-                iteration=iteration,
-            )
+            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
             return
 
         layout = self.rigid_articulation_sparse_layout
         if layout is None or layout.articulation_count == 0:
-            self._solve_rigid_body_iteration_local(
-                state_in,
-                state_out,
-                control,
-                contacts,
-                dt,
-                report_unsupported_wrap=report_unsupported_wrap,
-                iteration=iteration,
-            )
+            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
             return
 
         assert self.rigid_articulation_sparse_values is not None
