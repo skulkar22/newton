@@ -1197,7 +1197,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # Routed tendon geometry and material state are shared with XPBD; VBD
         # evaluates their force and Hessian contributions natively.
         self._init_tendon_state(model, allocate_xpbd_lambdas=True)
-        self._tendon_material_state.legacy_alm_damping = self.tendon_alm
+        # Whether any tendon currently uses the ALM row. The per-tendon stiffness
+        # guard can leave every tendon on the penalty row; the solver then follows
+        # the tendon_alm=False path exactly. Resolved after the guard runs.
+        self._tendon_alm_rows = self.tendon_alm
+        self._tendon_alm_rows_resolved = not self.tendon_alm or self.tendon_alm_per_segment
+        self._tendon_material_state.legacy_alm_damping = self._tendon_alm_rows
         self.tendon_material_modes = wp.zeros(model.tendon_segment_count, dtype=TendonMaterialMode, device=model.device)
         if self.tendon_alm_per_segment:
             self._tendon_material_state.segment_alm = True
@@ -2743,7 +2748,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         )
                     body_segments[bypass_body].add(segment)
 
-            if not self.tendon_alm:
+            if not self.tendon_alm_per_segment:
                 # A material mode can span several geometrically non-adjacent
                 # bodies. Updating those bodies simultaneously would be Jacobi,
                 # not the per-color descent assumed by the condensed curvature.
@@ -2986,6 +2991,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._step_tendon_alm_state(dt)
+        self._resolve_tendon_alm_rows()
         self._initialize_particles(state_in, state_out, contacts, dt)
 
         rigid_due, soft_due = self._collision_detection_due((_Frequency.PRE_POST_INIT,))
@@ -4588,7 +4594,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             device=self.device,
         )
 
-        if not self.tendon_alm:
+        if not self._tendon_alm_rows:
             wp.launch(
                 prepare_tendon_material_modes,
                 dim=model.tendon_count,
@@ -4653,6 +4659,25 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._tendon_material_state.process_changed_routes = True
         self._update_tendon_routing(state_in, dt, True)
         self._tendon_material_state.process_changed_routes = False
+
+    def _resolve_tendon_alm_rows(self) -> None:
+        """Select the solver path once the stiffness guard has decided each tendon's row.
+
+        A guarded-off tendon keeps no multiplier and no ALM penalty. When no tendon uses the ALM
+        row, the solver runs the tendon_alm=False path, so guarded-off results match flag-off.
+        Undecided tendons (never movable yet) are re-checked on later steps.
+        """
+        if self._tendon_alm_rows_resolved or self.tendon_alm_mode is None:
+            return
+        if wp.get_device(self.device).is_capturing:
+            return
+        mode = self.tendon_alm_mode.numpy()
+        rows = bool(np.any(mode == 1))
+        self._tendon_alm_rows = rows
+        self._tendon_alm_rows_resolved = rows or not bool(np.any(mode < 0))
+        self._tendon_material_state.legacy_alm_damping = rows
+        if rows:
+            self.tendon_adjacency.condensed = False
 
     def _step_tendon_alm_state(self, dt: float) -> None:
         """Per-step compliant-ALM tendon maintenance from the step-start pose (``body_q_prev``)."""
@@ -4754,7 +4779,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.tendon_sigmoid_transition_width,
                 self.tendon_seg_alm_lambda,
                 self.tendon_seg_alm_k,
-                (2 if self.tendon_alm_per_segment else 1) if self.tendon_alm else 0,
+                (2 if self.tendon_alm_per_segment else 1) if self._tendon_alm_rows else 0,
             ],
             outputs=[
                 self.tendon_seg_attachment_l,
@@ -4962,7 +4987,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             body_color_groups = model.body_color_groups
         # A subset follows sparse assembly: preserve its Hessians and the
         # already accumulated reactions on bodies handled by the local solve.
-        if self.tendon_alm:
+        if self._tendon_alm_rows:
             self._update_tendon_routing(
                 state_in,
                 dt,
@@ -4973,7 +4998,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # Gauss-Seidel-style per-color updates
         for color in range(len(body_color_groups)):
             color_group = body_color_groups[color]
-            if not self.tendon_alm:
+            if not self._tendon_alm_rows:
                 self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
             self._accumulate_rigid_contact_forces(state_in, contacts, dt, color_group)
@@ -5059,7 +5084,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.tendon_sigmoid_transition_width,
                     self.tendon_seg_alm_lambda,
                     self.tendon_seg_alm_k,
-                    (2 if self.tendon_alm_per_segment else 1) if self.tendon_alm else 0,
+                    (2 if self.tendon_alm_per_segment else 1) if self._tendon_alm_rows else 0,
                     self.tendon_material_direct,
                     self.tendon_link_cone_seg_l,
                     self.tendon_link_cone_seg_r,
@@ -5202,7 +5227,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 device=self.device,
             )
 
-        if self.tendon_alm and model.tendon_segment_count > 0:
+        if self._tendon_alm_rows and model.tendon_segment_count > 0:
             # Dual ascent on the pose just produced by the colour sweeps, with the rest lengths
             # this iteration's material solve gave the force kernel.
             wp.launch(
