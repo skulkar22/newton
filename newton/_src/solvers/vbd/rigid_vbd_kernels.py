@@ -42,6 +42,7 @@ from newton._src.solvers.vbd.interval_arithmetic import (
 )
 
 from .joint_coordinates import JointCoordinateData, evaluate_coordinate
+from .tendon_kernels import TendonForceElementAdjacencyInfo, evaluate_tendon_force_hessians
 
 wp.set_module_options({"enable_backward": False})
 
@@ -226,6 +227,33 @@ def _contact_auto_tangent_rho(
 ):
     """Use tangent support, strengthened by pair structure up to the normal rho."""
     return wp.max(tangent_support, wp.min(normal_rho, structural_support))
+
+
+@wp.struct
+class RevoluteLimitALMState:
+    """Optional per-joint lower/upper force multipliers and numerical penalty."""
+
+    enabled: bool
+    multiplier: wp.array[wp.vec2]
+    penalty: wp.array[float]
+
+
+@wp.func
+def compliant_limit_row(g: float, g_prev: float, ke: float, kd: float, dt: float, rho: float, lam: float):
+    """Unilateral compliant ALM row; at convergence lambda equals the physical force.
+
+    Eliminating the compliant auxiliary coordinate gives a Hessian rho*K/(rho+K)
+    rather than K. Updating lambda to this traction enforces the physical law
+    without putting its potentially enormous stiffness in each body-local solve.
+    """
+    # Damping acts on penetration, not on travel through the inactive gap.
+    stiffness = ke + kd / dt
+    force = stiffness * g - kd / dt * wp.max(g_prev, 0.0)
+    traction = wp.max((rho * force + stiffness * lam) / (rho + stiffness), 0.0)
+    hessian = float(0.0)
+    if traction > 0.0:
+        hessian = rho * stiffness / (rho + stiffness)
+    return traction, hessian
 
 
 # ---------------------------------
@@ -3025,6 +3053,87 @@ def apply_linear_drive_limit_force(
 def _zero_force_hessian():
     """Zero (force, torque, H_ll, H_al, H_aa) tuple for early-exit paths."""
     return wp.vec3(0.0), wp.vec3(0.0), wp.mat33(0.0), wp.mat33(0.0), wp.mat33(0.0)
+
+
+@wp.kernel
+def update_revolute_limit_alm(
+    initialize: bool,
+    dt: float,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    body_inv_inertia: wp.array[wp.mat33],
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
+    joint_rest_angle: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    state: RevoluteLimitALMState,
+):
+    j = wp.tid()
+    if joint_type[j] != JointType.REVOLUTE or not joint_enabled[j]:
+        state.multiplier[j] = wp.vec2(0.0)
+        return
+    dof = joint_qd_start[j]
+    if joint_limit_ke[dof] <= 0.0:
+        state.multiplier[j] = wp.vec2(0.0)
+        return
+    p = joint_parent[j]
+    c = joint_child[j]
+    qp = wp.transform_get_rotation(joint_X_p[j])
+    qp_prev = qp
+    qp_rest = qp
+    if p >= 0:
+        qp = wp.transform_get_rotation(body_q[p] * joint_X_p[j])
+        qp_prev = wp.transform_get_rotation(body_q_prev[p] * joint_X_p[j])
+        qp_rest = wp.transform_get_rotation(body_q_rest[p] * joint_X_p[j])
+    qc = wp.transform_get_rotation(body_q[c] * joint_X_c[j])
+    qc_prev = wp.transform_get_rotation(body_q_prev[c] * joint_X_c[j])
+    qc_rest = wp.transform_get_rotation(body_q_rest[c] * joint_X_c[j])
+    a = wp.normalize(joint_axis[dof])
+    kappa, _jac = compute_kappa_and_jacobian(qp, qc, qp_rest, qc_rest)
+    kappa_prev, jac_prev = compute_kappa_and_jacobian(qp_prev, qc_prev, qp_rest, qc_rest)
+    theta = wp.dot(a, kappa) + joint_rest_angle[dof]
+    theta_prev = wp.dot(a, kappa_prev) + joint_rest_angle[dof]
+    if initialize:
+        # Inertial-scale numerical penalty; the constitutive stiffness is unchanged.
+        axis = wp.transpose(jac_prev) * a
+        ac = wp.quat_rotate_inv(wp.transform_get_rotation(body_q_prev[c]), axis)
+        w = wp.dot(ac, body_inv_inertia[c] * ac)
+        if p >= 0:
+            ap = wp.quat_rotate_inv(wp.transform_get_rotation(body_q_prev[p]), axis)
+            w = w + wp.dot(ap, body_inv_inertia[p] * ap)
+        state.penalty[j] = 4.0 / wp.max(w * dt * dt, 1.0e-12)
+        state.multiplier[j] = wp.vec2(0.0)
+    else:
+        lam = state.multiplier[j]
+        lower, _h_lower = compliant_limit_row(
+            joint_limit_lower[dof] - theta,
+            joint_limit_lower[dof] - theta_prev,
+            joint_limit_ke[dof],
+            0.5 * joint_limit_kd[dof],
+            dt,
+            state.penalty[j],
+            lam[0],
+        )
+        upper, _h_upper = compliant_limit_row(
+            theta - joint_limit_upper[dof],
+            theta_prev - joint_limit_upper[dof],
+            joint_limit_ke[dof],
+            0.5 * joint_limit_kd[dof],
+            dt,
+            state.penalty[j],
+            lam[1],
+        )
+        state.multiplier[j] = wp.vec2(lower, upper)
 
 
 @wp.func
@@ -6555,6 +6664,34 @@ def solve_rigid_body(
     external_hessian_al: wp.array[wp.mat33],
     external_hessian_aa: wp.array[wp.mat33],
     store_body_hessian: bool,
+    # Tendon data
+    tendon_adjacency: TendonForceElementAdjacencyInfo,
+    tendon_link_body: wp.array[int],
+    tendon_link_type: wp.array[int],
+    tendon_link_radius: wp.array[float],
+    tendon_link_mu: wp.array[float],
+    tendon_link_offset: wp.array[wp.vec3],
+    tendon_link_axis: wp.array[wp.vec3],
+    tendon_link_seg_left: wp.array[int],
+    tendon_seg_rest_length: wp.array[float],
+    tendon_seg_attachment_l_local: wp.array[wp.vec3],
+    tendon_seg_attachment_r_local: wp.array[wp.vec3],
+    tendon_seg_active_compliance: wp.array[float],
+    tendon_seg_active_damping: wp.array[float],
+    tendon_seg_active: wp.array[int],
+    tendon_seg_active_link_l: wp.array[int],
+    tendon_seg_active_link_r: wp.array[int],
+    tendon_sigmoid_ea_low: float,
+    tendon_sigmoid_ea_ratio: float,
+    tendon_sigmoid_transition_strain: float,
+    tendon_sigmoid_transition_width: float,
+    tendon_seg_alm_lambda: wp.array[float],
+    tendon_seg_alm_k: wp.array[float],
+    tendon_alm_enabled: int,
+    tendon_material_direct: bool,
+    tendon_link_cone_seg_l: wp.array[int],
+    tendon_link_cone_seg_r: wp.array[int],
+    tendon_link_cap_ratio: wp.array[float],
     # Output
     body_q_new: wp.array[wp.transform],
 ):
@@ -6675,6 +6812,46 @@ def solve_rigid_body(
         ext_h_ll[2, 1],
         ext_h_ll[2, 2] + inertial_coeff,
     )
+
+    tendon_force, tendon_torque, tendon_h_ll, tendon_h_al, tendon_h_aa = evaluate_tendon_force_hessians(
+        body_index,
+        dt,
+        body_q,
+        body_q_prev,
+        body_com,
+        tendon_adjacency,
+        tendon_link_body,
+        tendon_link_type,
+        tendon_link_radius,
+        tendon_link_mu,
+        tendon_link_offset,
+        tendon_link_axis,
+        tendon_link_seg_left,
+        tendon_seg_rest_length,
+        tendon_seg_attachment_l_local,
+        tendon_seg_attachment_r_local,
+        tendon_seg_active_compliance,
+        tendon_seg_active_damping,
+        tendon_seg_active,
+        tendon_seg_active_link_l,
+        tendon_seg_active_link_r,
+        tendon_sigmoid_ea_low,
+        tendon_sigmoid_ea_ratio,
+        tendon_sigmoid_transition_strain,
+        tendon_sigmoid_transition_width,
+        tendon_seg_alm_lambda,
+        tendon_seg_alm_k,
+        tendon_alm_enabled,
+        tendon_material_direct,
+        tendon_link_cone_seg_l,
+        tendon_link_cone_seg_r,
+        tendon_link_cap_ratio,
+    )
+    f_force = f_force + tendon_force
+    f_torque = f_torque + tendon_torque
+    h_ll = h_ll + tendon_h_ll
+    h_al = h_al + tendon_h_al
+    h_aa = h_aa + tendon_h_aa
 
     # Accumulate joint forces (constraints)
     num_adj_joints = get_body_num_adjacent_joints(adjacency, body_index)

@@ -746,6 +746,103 @@ add_basic_example_test(
     test_options={"num-frames": 480},
 )
 
+add_basic_example_test(
+    name="cable.example_tendon_pulley",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+add_basic_example_test(
+    name="cable.example_tendon_pinhole",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+add_basic_example_test(
+    name="cable.example_tendon_pinhole_friction",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+add_basic_example_test(
+    name="cable.example_tendon_pinhole_routing",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 240},
+)
+add_basic_example_test(
+    name="cable.example_tendon_mujoco_wrap",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 220},
+)
+add_basic_example_test(
+    name="cable.example_tendon_mujoco_switch",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 220},
+)
+add_basic_example_test(
+    name="cable.example_tendon_mujoco_switch_matrix",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 220},
+)
+add_basic_example_test(
+    name="cable.example_tendon_rolling_pulley",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 180},
+)
+add_basic_example_test(
+    name="cable.example_tendon_equilibrium",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+add_basic_example_test(
+    name="cable.example_tendon_compound_pulley",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 220},
+)
+add_basic_example_test(
+    name="cable.example_tendon_gear_pulley",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 180},
+)
+add_basic_example_test(
+    name="cable.example_tendon_cable_machine",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+add_basic_example_test(
+    name="cable.example_tendon_3d_routing",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 70},
+)
+add_basic_example_test(
+    name="cable.example_tendon_xy_table",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 600},
+)
+add_basic_example_test(
+    name="cable.example_tendon_capstan_friction",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+add_basic_example_test(
+    name="cable.example_tendon_capstan_kinematic",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 100},
+)
+
 
 class TestClothExamples(unittest.TestCase):
     pass

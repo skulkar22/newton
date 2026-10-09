@@ -64,6 +64,7 @@ Newton Physics
    :caption: Further Reading
 
    FAQ <faq>
+   Cable Joints Formulation <cable_joints_formulation>
    Migration Guide <migration>
    Isaac Lab <lab/isaac-lab>
 

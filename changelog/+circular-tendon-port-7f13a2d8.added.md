@@ -1,0 +1,1 @@
+Add experimental circular tendon material, routing, and per-segment ALM support to current local VBD and XPBD, with remapped builder copies and explicit errors for unsupported sparse coupling and tendon history reset.

@@ -314,6 +314,10 @@ class CheckOutput:
     def __enter__(self):
         # wp.force_load()
 
+        # Drain any device printf still buffered on the GPU before redirecting stdout. CUDA
+        # copies its printf buffer to the host only at a synchronization, so output from an
+        # earlier (check_output=False) test would otherwise land in this test's capture.
+        wp.synchronize()
         self.capture = StdOutCapture()
         self.capture.begin()
 

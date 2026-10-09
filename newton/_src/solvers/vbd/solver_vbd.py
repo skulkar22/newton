@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Mapping
+from itertools import pairwise
 from math import isfinite
 from typing import Any
 
@@ -28,6 +29,8 @@ from ...sim import (
     ModelFlags,
     State,
     StateFlags,
+    TendonLinkFlags,
+    TendonLinkType,
 )
 from ...sim.collide import _count_soft_particle_rigid_contact_pairs
 from ...sim.joint_mimic import has_supported_joint_mimics
@@ -36,6 +39,10 @@ from ...utils.mesh import build_vertex_adjacency_with_warp
 from ..coupled.interface import CouplingInterface
 from ..observables import SolverObservableFlags, SolverObservables
 from ..solver import SolverBase
+from ..tendon_alm_material import TendonALMMaterialState
+from ..tendon_kernels import solve_tendon_material_direct, update_tendon_attachments
+from ..tendon_material_cooperative_kernels import solve_tendon_material_cooperative
+from ..tendon_state import TendonStateMixin
 from ..xpbd import kernels as xpbd_kernels
 from ..xpbd.kernels import apply_joint_forces
 from . import particle_vbd_kernels, rigid_sparse_articulation_kernels, rigid_vbd_kernels, vbd_coupling_kernels
@@ -115,6 +122,15 @@ from .rigid_vbd_kernels import (
     update_duals_joint,
     update_rod_dahl_state,
 )
+from .tendon_kernels import (
+    TendonForceElementAdjacencyInfo,
+    deactivate_negative_tendon_wraps,
+    snapshot_tendon_segment_length_reference,
+    step_tendon_alm_state,
+    update_duals_tendon,
+    update_tendon_segment_diagnostics,
+)
+from .tendon_modes import TendonMaterialMode, prepare_tendon_material_modes
 from .vbd_coupling_kernels import (
     _harvest_vbd_body_particle_contact_forces_on_proxy_bodies_kernel,
     _harvest_vbd_proxy_particle_body_contact_forces_kernel,
@@ -182,7 +198,7 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
     return gamma if use_compliant_alm else alpha * gamma
 
 
-class SolverVBD(SolverBase, CouplingInterface):
+class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     """An implicit solver using Vertex Block Descent (VBD) for particles and Augmented VBD (AVBD) for rigid bodies.
 
     .. experimental::
@@ -292,6 +308,14 @@ class SolverVBD(SolverBase, CouplingInterface):
           with ``integrate_with_external_rigid_solver=True``.
 
         See :ref:`Body-particle attachments` for authoring and cross-solver behavior.
+    Tendon limitations:
+        - Tendons require local rigid VBD and cannot use an external rigid solver.
+        - Reconstruct the solver for a fresh tendon episode; :meth:`reset` does not
+          yet support tendon material, routing, and multiplier history.
+        - Static routes and isolated dynamic ROLLING links are supported. Zero
+          segment compliance is approximated as ``1.0e-8`` m/N.
+        - Call :meth:`newton.ModelBuilder.color` after adding tendons so that
+          segment endpoints receive different rigid-body colors.
 
     Buffer sizing:
         Body-body contact state is pre-allocated from ``model.rigid_contact_max`` when a
@@ -458,6 +482,24 @@ class SolverVBD(SolverBase, CouplingInterface):
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
         collision_frequency_type: Mapping[SolverBase.CollisionSlot, SolverBase.CollisionFrequencyType] | None = None,
+        rigid_joint_limit_alm: bool = False,
+        rigid_tendon_relaxation: float = 0.7,  # Compatibility parameter; ignored
+        tendon_max_sweeps: int = 256,
+        tendon_settle_tol: float = 1.0e-3,
+        rigid_enable_dahl_friction: bool | None = None,  # Deprecated: auto-detected from model attributes
+        tendon_activation_tol: float = 2.0e-3,
+        tendon_route_hysteresis: float = 1.0e-4,
+        tendon_route_min_span_ratio: float = 2.0,
+        tendon_sigmoid_ea_low: float = 0.0,
+        tendon_sigmoid_ea_ratio: float = 1.0,
+        tendon_sigmoid_transition_strain: float = 0.0,
+        tendon_sigmoid_transition_width: float = 1.0,
+        tendon_alm: bool = False,
+        tendon_alm_per_segment: bool = False,
+        tendon_alm_penalty_scale: float = 5.0,
+        tendon_alm_min_stiffness_ratio: float = 50.0,
+        tendon_material_direct: bool = False,
+        tendon_material_direct_settle_iterations: int = 4,
     ):
         """
         Args:
@@ -741,6 +783,68 @@ class SolverVBD(SolverBase, CouplingInterface):
                 active may not be ``NONE`` (``RIGID`` with ``rigid_soft_enable_dat``,
                 ``SOFT_SELF_CONTACT`` with ``particle_enable_self_contact``); :meth:`step`
                 raises otherwise.
+            rigid_joint_limit_alm: Compatibility argument; only False is supported. The separate
+                legacy revolute-limit experiment has not been ported over current main joint ALM.
+            rigid_tendon_relaxation: Compatibility parameter retained for existing callers. Native VBD tendon
+                force elements do not use XPBD relaxation.
+            tendon_max_sweeps: Maximum capstan material-relaxation sweeps per VBD iteration.
+            tendon_settle_tol: Relative tension-change tolerance for stopping capstan material relaxation.
+            rigid_enable_dahl_friction: Deprecated and ignored. Dahl friction is auto-detected
+                from ``model.vbd.dahl_eps_max`` / ``model.vbd.dahl_tau``.
+            tendon_activation_tol: Relative radius gap that inactive dynamic rollers must cross before
+                activation; the solver takes the larger of it and ``tendon_route_hysteresis`` [m]. Active
+                rollers still deactivate at their surface.
+            tendon_route_hysteresis: Absolute floor [m] under ``tendon_activation_tol`` for the dynamic routing
+                hysteresis band.
+            tendon_route_min_span_ratio: Shortest bypass span, in candidate radii, that the dynamic routing test
+                is evaluated on. Candidates with a shorter span keep their previous state.
+            tendon_sigmoid_ea_low: Experimental low-strain axial stiffness for the solver-wide sigmoid tendon law.
+                A non-positive value disables the experimental law.
+            tendon_sigmoid_ea_ratio: Experimental high/low axial-stiffness ratio.
+            tendon_sigmoid_transition_strain: Experimental sigmoid transition strain.
+            tendon_sigmoid_transition_width: Experimental sigmoid transition width.
+            tendon_alm: Experimental. Solve routed-tendon stretch as a compliant augmented-Lagrangian row
+                (a tension multiplier shared along the tendon plus an inertia-scaled penalty) instead of a
+                stiffness penalty. The material law is unchanged at convergence; the row's Hessian is bounded
+                by the tendon's inertial support, so very stiff cables settle with fewer substeps. Off by default
+                (the non-ALM path uses condensed material blocks).
+            tendon_alm_penalty_scale: Penalty metric of the ALM row as a multiple of the tendon's inertial
+                support ``1 / (dt^2 * w)``. Small values leave the multiplier too slow to follow a stiff cable;
+                large values fall back towards penalty behaviour.
+            tendon_alm_per_segment: Experimental. Retain a multiplier per segment and use the same ALM
+                tension in the direct material projection and roller reactions. Requires ``tendon_alm``
+                and ``tendon_material_direct``. Nonlinear/damped rows use an experimental nonlinear
+                projection certified against the actual ALM forces. Positive damping is limited to
+                the taut extension created during the step, giving continuous slack engagement.
+                Check projection failures with :meth:`check_tendon_material`. Route changes reset
+                the affected tendon's multipliers.
+            tendon_alm_min_stiffness_ratio: A tendon whose material stiffness is below this multiple of its
+                inertial support keeps the legacy penalty row. The ratio is the penalty row's conditioning number
+                (how much heavier the cable's stretch term is than the body's inertia term in the local solve);
+                the ALM row is only worth its cost where that number is large. Decided once per tendon, at the
+                first step, and kept. 0 applies the ALM row to every tendon. The multiplier decays per step by
+                ``rigid_avbd_gamma``, like the joint multipliers.
+            tendon_material_direct: Use the experimental direct finite-friction material solve instead of
+                material sweeps. Supports linear compliance or the experimental sigmoid law,
+                at most 32 authored spans between attachments, and capstan ratios no greater than 4.
+                CUDA projects sigmoid components cooperatively; CPU uses scalar exact blocks.
+                Call :meth:`check_tendon_material` outside
+                CUDA graph capture to detect unsupported or infeasible runtime states. There is no fallback
+                to material sweeps; discard a failed step and reconstruct the solver after correcting its inputs.
+            tendon_material_direct_settle_iterations: Opening iterations of a step whose pose the direct
+                material solve does not act on. The direct solve is exact for the geometry it is handed, so
+                it must not act on the opening poses: iteration 0 is the raw inertial predictor, which
+                violates every penalty joint by ``F*dt^2/m`` and ``tau*dt^2/I``, and the iterations that
+                undo it are still far from the pose the step accepts. Those iterations keep the rest lengths
+                of the last solved pose; the route geometry still refreshes every iteration and the accepted
+                end-of-step pose always solves the material. Measured on the planar two-cable rig that
+                motivated the default (20 substeps x 32 iterations): the driven span's peak tension falls
+                158 / 39.4 / 22.4 / 20.0 / 11.4 N and the worst inner-segment peak 139.7 / 112.2 / 123.5 /
+                11.4 N as this count goes 0 to 4, and solving only the accepted pose is worse again
+                (2.4 kN). The count is capped at ``iterations - 1`` so a short iteration budget keeps one
+                in-loop update. A scene whose penalty joints settle in more iterations needs a larger value;
+                gating on measured route motion instead was tried and is worse (see
+                ``docs/direct_tendon_material.md``). Ignored by material sweeps.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -1030,6 +1134,43 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
 
+        if model.tendon_count and integrate_with_external_rigid_solver:
+            raise ValueError("Tendons require VBD to integrate their rigid bodies.")
+        if rigid_joint_limit_alm:
+            raise ValueError("The legacy revolute-limit ALM experiment is not ported; use current main joint ALM.")
+        if model.tendon_count and rigid_articulation_solve != "local":
+            raise ValueError(
+                "Tendons currently require rigid_articulation_solve=local; sparse tendon coupling is unvalidated."
+            )
+        self.tendon_max_sweeps = tendon_max_sweeps
+        self.tendon_settle_tol = tendon_settle_tol
+        self.tendon_activation_tol = tendon_activation_tol
+        self.tendon_route_hysteresis = tendon_route_hysteresis
+        self.tendon_route_min_span_ratio = tendon_route_min_span_ratio
+        self.tendon_sigmoid_ea_low = tendon_sigmoid_ea_low
+        self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
+        self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
+        self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
+        if tendon_alm_penalty_scale < 0.0:
+            raise ValueError(f"tendon_alm_penalty_scale must be non-negative, got {tendon_alm_penalty_scale}")
+        if tendon_alm_min_stiffness_ratio < 0.0:
+            raise ValueError(
+                f"tendon_alm_min_stiffness_ratio must be non-negative, got {tendon_alm_min_stiffness_ratio}"
+            )
+        self.tendon_alm = bool(tendon_alm)
+        self.tendon_alm_per_segment = bool(tendon_alm_per_segment)
+        if self.tendon_alm_per_segment:
+            if not tendon_alm or not tendon_material_direct:
+                raise ValueError("tendon_alm_per_segment requires tendon_alm and tendon_material_direct")
+        self.tendon_alm_penalty_scale = float(tendon_alm_penalty_scale)
+        self.tendon_alm_min_stiffness_ratio = float(tendon_alm_min_stiffness_ratio)
+        self.tendon_material_direct = tendon_material_direct
+        if tendon_material_direct_settle_iterations < 0:
+            raise ValueError(
+                "tendon_material_direct_settle_iterations must be non-negative, "
+                f"got {tendon_material_direct_settle_iterations}"
+            )
+        self.tendon_material_direct_settle_iterations = int(tendon_material_direct_settle_iterations)
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -1052,6 +1193,36 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_external_vertex_contact_filtering_map,
             particle_external_edge_contact_filtering_map,
         )
+
+        # Routed tendon geometry and material state are shared with XPBD; VBD
+        # evaluates their force and Hessian contributions natively.
+        self._init_tendon_state(model, allocate_xpbd_lambdas=True)
+        self._tendon_material_state.legacy_alm_damping = self.tendon_alm
+        self.tendon_material_modes = wp.zeros(model.tendon_segment_count, dtype=TendonMaterialMode, device=model.device)
+        if self.tendon_alm_per_segment:
+            self._tendon_material_state.segment_alm = True
+            self._tendon_material_state.changed_routes = wp.zeros(model.tendon_count, dtype=int, device=self.device)
+            self._tendon_material_state.alm = TendonALMMaterialState()
+            alm = self._tendon_material_state.alm
+            for name in ("reference", "extension", "offset", "force"):
+                setattr(alm, name, wp.zeros(model.tendon_segment_count, dtype=float, device=model.device))
+            alm.iterations = wp.zeros(model.tendon_segment_count, dtype=int, device=model.device)
+            alm.length = self.tendon_seg_length
+            alm.physical_compliance = self.tendon_seg_active_compliance
+            alm.damping = self.tendon_seg_active_damping
+            alm.damping_force = self.tendon_seg_damping_tension
+            alm.multiplier = self.tendon_seg_alm_lambda
+            alm.penalty = self.tendon_seg_alm_k
+            # Share the nonlinear force law and certificate with the scalar CPU
+            # reference, but evaluate segment coefficients concurrently on CUDA.
+            if self.device.is_cuda:
+                self._tendon_material_kernel = solve_tendon_material_cooperative
+                self._tendon_material_lanes = 32
+                self._tendon_material_block_dim = 32
+            else:
+                self._tendon_material_kernel = solve_tendon_material_direct
+                self._tendon_material_lanes = 1
+                self._tendon_material_block_dim = 256
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -1380,6 +1551,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.body_particle_attachment_indices,
             ) = self._compute_body_particle_attachment_adjacency(model)
 
+            self.tendon_adjacency = self._compute_tendon_force_element_adjacency(model).to(self.device)
+            self.tendon_adjacency.condensed = False
+            self.tendon_adjacency.modes = self.tendon_material_modes
+            self.tendon_adjacency.attachment_l = self.tendon_seg_attachment_l
+            self.tendon_adjacency.attachment_r = self.tendon_seg_attachment_r
             # Force accumulation arrays
             self.body_torques = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
             self.body_forces = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
@@ -2526,6 +2702,77 @@ class SolverVBD(SolverBase, CouplingInterface):
             wp.array(indices, dtype=wp.int32, device=self.device),
         )
 
+    def _compute_tendon_force_element_adjacency(self, model: Model) -> TendonForceElementAdjacencyInfo:
+        """Build CSR adjacency for authored and possible dynamic bypass segments."""
+        adjacency = TendonForceElementAdjacencyInfo()
+        body_segments = [set() for _ in range(model.body_count)]
+        body_colors = np.full(model.body_count, -1, dtype=np.int32)
+        for color, group in enumerate(model.body_color_groups):
+            body_colors[group.numpy()] = color
+
+        if model.tendon_segment_count > 0:
+            link_bodies = model.tendon_link_body.numpy()
+            link_flags = model.tendon_link_flags.numpy()
+            segment_left_links = self.tendon_seg_link_l.numpy()
+            link_left_segments = self.tendon_link_seg_left.numpy()
+            for segment, left_link in enumerate(segment_left_links):
+                body_l = int(link_bodies[left_link])
+                body_r = int(link_bodies[left_link + 1])
+                if body_l != body_r and len(model.body_color_groups) > 0 and body_colors[body_l] == body_colors[body_r]:
+                    raise ValueError(
+                        "model.body_color_groups does not separate tendon segment endpoints; "
+                        "call ModelBuilder.color() after adding tendons"
+                    )
+                body_segments[body_l].add(segment)
+                body_segments[body_r].add(segment)
+
+                right_link = left_link + 1
+                # Deactivation reuses the left authored segment for the bypass to the following link.
+                if (link_flags[right_link] & int(TendonLinkFlags.DYNAMIC)) != 0 and link_left_segments[
+                    right_link
+                ] == segment:
+                    bypass_body = int(link_bodies[right_link + 1])
+                    if (
+                        bypass_body != body_l
+                        and len(model.body_color_groups) > 0
+                        and body_colors[bypass_body] == body_colors[body_l]
+                    ):
+                        raise ValueError(
+                            "model.body_color_groups does not separate dynamic tendon bypass endpoints; "
+                            "call ModelBuilder.color() after adding tendons"
+                        )
+                    body_segments[bypass_body].add(segment)
+
+            if not self.tendon_alm:
+                # A material mode can span several geometrically non-adjacent
+                # bodies. Updating those bodies simultaneously would be Jacobi,
+                # not the per-color descent assumed by the condensed curvature.
+                link_types = model.tendon_link_type.numpy()
+                starts = model.tendon_start.numpy()
+                for start, end in pairwise(starts):
+                    bodies = set()
+                    for link in range(start, end):
+                        bodies.add(int(link_bodies[link]))
+                        if link == end - 1 or (link > start and link_types[link] == int(TendonLinkType.ATTACHMENT)):
+                            colors = [body_colors[body] for body in bodies]
+                            if len(set(colors)) != len(colors):
+                                raise ValueError(
+                                    "model.body_color_groups does not separate material-coupled tendon bodies; "
+                                    "call ModelBuilder.color() after adding tendons"
+                                )
+                            bodies = {int(link_bodies[link])}
+        offsets = np.zeros(model.body_count + 1, dtype=np.int32)
+        for body, segments in enumerate(body_segments):
+            offsets[body + 1] = offsets[body] + len(segments)
+
+        flat_segments = np.asarray(
+            [segment for segments in body_segments for segment in sorted(segments)], dtype=np.int32
+        )
+        with wp.ScopedDevice("cpu"):
+            adjacency.body_adj_segments = wp.array(flat_segments, dtype=wp.int32)
+            adjacency.body_adj_segments_offsets = wp.array(offsets, dtype=wp.int32)
+        return adjacency
+
     # =====================================================
     # Main Solver Methods
     # =====================================================
@@ -2695,6 +2942,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         contacts = self._resolve_step_contacts(contacts)
         self.validate_observables(observables, contacts)
         self._apply_module_options()
+        if self.tendon_material_direct != self._tendon_material_state.enabled:
+            raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
+        if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
+            raise ValueError("tendon_material_direct does not support differentiable simulation")
+        self._validate_direct_tendon_law()
+
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
@@ -2715,7 +2968,24 @@ class SolverVBD(SolverBase, CouplingInterface):
         if control is None:
             control = self.model.control(clone_variables=False)
 
+        # Must run BEFORE _initialize_rigid_bodies: the dynamic routing activation
+        # decision has to see the accepted pose, but the inertial predictor inside
+        # _initialize_rigid_bodies overwrites state_in.body_q in place.
+        if self.tendon_seg_lambda is not None and state_in.body_q is not None:
+            self._snapshot_tendon_step_state()
+            self._update_tendon_link_active(self.model, state_in.body_q)
+            self._prepare_tendon_route(self.model, state_in.body_q, 1.0e-8)
+            self.tendon_seg_material_tension.zero_()
+            if self.iterations == 0 or self.integrate_with_external_rigid_solver:
+                self.tendon_seg_lambda.zero_()
+                if self.tendon_alm:
+                    self.tendon_seg_alm_lambda.zero_()
+                    self.tendon_seg_alm_k.zero_()
+                    self.tendon_alm_lambda.zero_()
+                    self.tendon_alm_k.zero_()
+
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
+        self._step_tendon_alm_state(dt)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
         rigid_due, soft_due = self._collision_detection_due((_Frequency.PRE_POST_INIT,))
@@ -2729,7 +2999,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._mid_step_detection(
                 state_in, state_out, contacts, dt, rigid_due=rigid_due, soft_due=soft_due, preserve_history=True
             )
-            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration(
+                state_in, state_out, control, contacts, dt, report_unsupported_wrap=False, iteration=iter_num
+            )
             self._solve_particle_iteration(state_in, state_out, contacts, dt)
 
         # Opt-in contact force export: evaluate at the final iterate while the pose history the
@@ -2737,9 +3009,27 @@ class SolverVBD(SolverBase, CouplingInterface):
         if observables is not None and observables.is_requested(SolverObservableFlags.CONTACT_F):
             self._export_contact_forces(state_in, state_out, contacts, dt, observables.contact_f)
 
+        update_tendon_diagnostics = (
+            self.iterations > 0
+            and self.tendon_seg_lambda is not None
+            and state_in.body_q is not None
+            and not self.integrate_with_external_rigid_solver
+        )
+        if update_tendon_diagnostics:
+            # The final body update changes tendon geometry after the last
+            # in-iteration material solve. Accept its route state before
+            # reporting tension or carrying rest lengths into the next step.
+            # This accepted state is also where the unsupported-wrap
+            # diagnostic is meaningful (mid-iteration predictor overshoot is
+            # not), so report it here.
+            self._finalize_tendon_routing(state_in, dt)
+            self._snapshot_tendon_segment_length_reference(state_in.body_q, dt)
+
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
         self._finalize_rigid_bodies(state_in, state_out, dt)
+        if update_tendon_diagnostics:
+            self._update_tendon_segment_diagnostics(state_out, dt)
         self._finalize_particles(state_out, dt)
 
     @override
@@ -2832,6 +3122,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                 for REVOLUTE, PRISMATIC, and D6 joint coordinates;
                 ``None`` requests all flags.
         """
+        if self.model.tendon_count:
+            raise NotImplementedError(
+                "Tendon history reset is not supported; reconstruct the solver for a fresh episode."
+            )
         if state is None:
             raise ValueError("'state' argument is required.")
         model = self.model
@@ -4154,6 +4448,324 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         wp.copy(state_out.particle_q, state_in.particle_q)
 
+    def _tendon_direct_settle_iterations(self) -> int:
+        """Opening iterations whose pose the direct material solve does not act on.
+
+        Always leave the last iteration to the material solve, so a short iteration budget keeps
+        its in-loop update.
+        """
+        return min(self.tendon_material_direct_settle_iterations, max(self.iterations - 1, 0))
+
+    def _update_tendon_routing(
+        self,
+        state_in: State,
+        dt: float,
+        report_unsupported_wrap: bool,
+        skip_material: bool = False,
+        latch_failure: bool | None = None,
+    ) -> None:
+        """Update VBD routed-tendon geometry and rolling rest transfer for this iteration.
+
+        ``skip_material`` refreshes the route geometry and re-bases the rest lengths on the
+        step-start route (deactivation merge, activation split) but transfers no material.
+        """
+        model = self.model
+        if model.tendon_segment_count == 0 or state_in.body_q is None:
+            return
+
+        wp.launch(
+            kernel=update_tendon_attachments,
+            dim=model.tendon_segment_count,
+            inputs=[
+                state_in.body_q,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_flags,
+                model.tendon_link_radius,
+                model.tendon_link_orientation,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_link_active,
+                self.tendon_link_active_step,
+                self.tendon_seg_attachment_l_local_step,
+                self.tendon_seg_attachment_r_local_step,
+                1,
+            ],
+            outputs=[
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_attachment_l_local,
+                self.tendon_seg_attachment_r_local,
+                self.tendon_seg_rolling_delta_l,
+                self.tendon_seg_rolling_delta_r,
+                self.tendon_seg_length,
+            ],
+            device=self.device,
+        )
+
+        self._update_tendon_cone_rows(
+            model, state_in.body_q, report_unsupported_wrap, latch_unsupported_wrap=report_unsupported_wrap
+        )
+
+        # Direct mode only. The opening iterations run on poses the solver has not settled
+        # yet: iteration 0 is the raw inertial predictor, which on toy4 swings each copy's
+        # penalty-pinned base by 39-51 deg and its routing links by tens of millimetres. The
+        # direct solve computes an exact allocation for whatever geometry it is given, so
+        # those poses yield kilonewton-scale ones; material sweeps are bounded per pass and
+        # never reach them. Transfer no material on those iterations: with both transfer
+        # flags off the kernel only re-bases the rest lengths on the step-start route and
+        # splits a newly activated roller, so the force kernel reads rest lengths for the
+        # spans it evaluates. Skipping the kernel outright left a dynamic candidate that
+        # changed state at step start with the previous route's rest lengths: its merged span
+        # (or 1 um split span) carried a phantom stretch of half a span for the whole hold.
+        # The accepted pose at the end of the step always solves the material.
+        apply_transfer = int(not skip_material)
+        if latch_failure is None:
+            latch_failure = report_unsupported_wrap
+        if self.tendon_alm_per_segment:
+            self._tendon_material_state.alm.dt = dt
+
+        wp.launch(
+            kernel=self._tendon_material_kernel,
+            dim=model.tendon_count * self._tendon_material_lanes,
+            block_dim=self._tendon_material_block_dim,
+            inputs=[
+                state_in.body_q,
+                state_in.body_qd,
+                self.body_q_prev,
+                model.body_com,
+                model.tendon_start,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_radius,
+                model.tendon_link_orientation,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_rest_length_step,
+                self.tendon_seg_route_rest_length,
+                self.tendon_seg_stretch,
+                self.tendon_seg_damping_tension,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active_damping,
+                self.tendon_link_active,
+                self.tendon_link_active_step,
+                self.tendon_link_route_rest_length,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_length,
+                self.tendon_seg_attachment_l_local,
+                self.tendon_seg_attachment_r_local,
+                self.tendon_seg_rolling_delta_l,
+                self.tendon_seg_rolling_delta_r,
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_link_cap_ratio,
+                self.tendon_cone_sweep_count,
+                1,
+                dt,
+                apply_transfer,
+                apply_transfer,
+                1,
+                self.tendon_max_sweeps,
+                self.tendon_settle_tol,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+                self._tendon_material_state,
+                # Latch a direct-material rejection only on the accepted pose. In-iteration poses
+                # (iteration 0 is the raw inertial predictor) are discarded by the solver itself.
+                int(latch_failure),
+                self._tendon_link_material_transfer,
+            ],
+            device=self.device,
+        )
+
+        if not self.tendon_alm:
+            wp.launch(
+                prepare_tendon_material_modes,
+                dim=model.tendon_count,
+                inputs=[
+                    model.tendon_start,
+                    self.tendon_link_cone_seg_l,
+                    self.tendon_link_cone_seg_r,
+                    self.tendon_link_cap_ratio,
+                    self.tendon_seg_rest_length,
+                    self.tendon_seg_length,
+                    self.tendon_seg_stretch,
+                    self.tendon_seg_active_compliance,
+                    self.tendon_seg_active_damping,
+                    self.tendon_seg_damping_tension,
+                    self.tendon_seg_active,
+                    dt,
+                    self.tendon_sigmoid_ea_low,
+                    self.tendon_sigmoid_ea_ratio,
+                    self.tendon_sigmoid_transition_strain,
+                    self.tendon_sigmoid_transition_width,
+                ],
+                outputs=[self.tendon_material_modes],
+                device=self.device,
+            )
+            self.tendon_adjacency.condensed = True
+
+    def _finalize_tendon_routing(self, state_in: State, dt: float) -> None:
+        """Accept material, then merge dynamic rollers crossed during this step."""
+        if not self.tendon_alm_per_segment or not self._has_dynamic_tendon_links:
+            self._update_tendon_routing(state_in, dt, True)
+            return
+        model = self.model
+        self._update_tendon_routing(state_in, dt, False, latch_failure=True)
+        # Rebase on the just-accepted geometry/material before changing topology.
+        # Reusing the step-start ledger would apply its rolling transfer twice.
+        self._snapshot_tendon_step_state()
+        wp.launch(
+            deactivate_negative_tendon_wraps,
+            dim=model.tendon_count,
+            inputs=[
+                state_in.body_q,
+                model.tendon_start,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_flags,
+                model.tendon_link_radius,
+                model.tendon_link_orientation,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_link_active,
+                self.tendon_seg_alm_lambda,
+                self.tendon_seg_alm_k,
+                self._tendon_material_state.changed_routes,
+            ],
+            device=self.device,
+        )
+        self._prepare_tendon_route(model, state_in.body_q, 1.0e-8)
+        self._tendon_material_state.process_changed_routes = True
+        self._update_tendon_routing(state_in, dt, True)
+        self._tendon_material_state.process_changed_routes = False
+
+    def _step_tendon_alm_state(self, dt: float) -> None:
+        """Per-step compliant-ALM tendon maintenance from the step-start pose (``body_q_prev``)."""
+        model = self.model
+        if not self.tendon_alm or model.tendon_segment_count == 0 or self.integrate_with_external_rigid_solver:
+            return
+        wp.launch(
+            kernel=step_tendon_alm_state,
+            dim=model.tendon_count,
+            inputs=[
+                dt,
+                self.body_q_prev,
+                model.body_com,
+                self.body_inv_mass_effective,
+                self.body_inv_inertia_effective,
+                model.tendon_start,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_radius,
+                model.tendon_link_mu,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_link_seg_left,
+                self.tendon_seg_attachment_l_local_step,
+                self.tendon_seg_attachment_r_local_step,
+                self.tendon_seg_route_rest_length,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+                self.tendon_alm_penalty_scale,
+                self.tendon_alm_min_stiffness_ratio,
+                self.rigid_avbd_gamma,
+                self.tendon_alm_mode,  # input/output
+                self.tendon_alm_lambda,  # input/output
+                self.tendon_alm_k,  # input/output
+                self.tendon_seg_alm_lambda,  # input/output
+                self.tendon_seg_alm_k,  # input/output
+                self.tendon_seg_alm_link_l,  # input/output
+                self.tendon_seg_alm_link_r,  # input/output
+                int(self.tendon_alm_per_segment),
+            ],
+            device=self.device,
+        )
+
+    def _snapshot_tendon_segment_length_reference(self, body_q: wp.array[wp.transform], dt: float) -> None:
+        """Preserve previous-pose segment lengths through rigid finalization."""
+        model = self.model
+        # Native VBD does not accumulate XPBD delta lambdas, so this existing
+        # per-segment scratch can hold the damping reference until finalization.
+        wp.launch(
+            kernel=snapshot_tendon_segment_length_reference,
+            dim=model.tendon_segment_count,
+            inputs=[
+                dt,
+                body_q,
+                self.body_q_prev,
+                model.body_com,
+                model.tendon_link_body,
+                model.tendon_link_type,
+                model.tendon_link_offset,
+                model.tendon_link_axis,
+                self.tendon_seg_attachment_l_local,
+                self.tendon_seg_attachment_r_local,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+            ],
+            outputs=[self.tendon_seg_delta_lambda],
+            device=self.device,
+        )
+
+    def _update_tendon_segment_diagnostics(self, state_out: State, dt: float) -> None:
+        """Update tendon geometry and damping from the accepted rigid pose."""
+        model = self.model
+        wp.launch(
+            kernel=update_tendon_segment_diagnostics,
+            dim=model.tendon_segment_count,
+            inputs=[
+                dt,
+                state_out.body_q,
+                model.tendon_link_body,
+                self.tendon_seg_attachment_l_local,
+                self.tendon_seg_attachment_r_local,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active_damping,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_seg_delta_lambda,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+                self.tendon_seg_alm_lambda,
+                self.tendon_seg_alm_k,
+                (2 if self.tendon_alm_per_segment else 1) if self.tendon_alm else 0,
+            ],
+            outputs=[
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_material_tension,
+                self.tendon_seg_damping_tension,
+                self.tendon_seg_lambda,
+            ],
+            device=self.device,
+        )
+
     def _solve_rigid_body_iteration(
         self,
         state_in: State,
@@ -4161,11 +4773,21 @@ class SolverVBD(SolverBase, CouplingInterface):
         control: Control,
         contacts: Contacts | None,
         dt: float,
+        report_unsupported_wrap: bool = False,
+        iteration: int = 0,
     ):
         if self.rigid_articulation_solve == "block_sparse_joints":
             self._solve_rigid_body_iteration_block_sparse_joints(state_in, state_out, control, contacts, dt)
         else:
-            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration_local(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                report_unsupported_wrap=report_unsupported_wrap,
+                iteration=iteration,
+            )
         if self._mimic_solver is not None:
             self._mimic_solver.solve(
                 state_in.body_q,
@@ -4318,6 +4940,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         contacts: Contacts | None,
         dt: float,
         body_color_groups: list[wp.array[wp.int32]] | None = None,
+        report_unsupported_wrap: bool = False,
+        iteration: int = 0,
     ):
         """Solve one rigid-body VBD iteration using per-body diagonal systems.
 
@@ -4338,10 +4962,19 @@ class SolverVBD(SolverBase, CouplingInterface):
             body_color_groups = model.body_color_groups
         # A subset follows sparse assembly: preserve its Hessians and the
         # already accumulated reactions on bodies handled by the local solve.
+        if self.tendon_alm:
+            self._update_tendon_routing(
+                state_in,
+                dt,
+                report_unsupported_wrap,
+                skip_material=self.tendon_material_direct and iteration < self._tendon_direct_settle_iterations(),
+            )
 
         # Gauss-Seidel-style per-color updates
         for color in range(len(body_color_groups)):
             color_group = body_color_groups[color]
+            if not self.tendon_alm:
+                self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
             self._accumulate_rigid_contact_forces(state_in, contacts, dt, color_group)
             wp.launch(
@@ -4404,6 +5037,33 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_hessian_al,
                     self.body_hessian_aa,
                     self._has_joint_mimics,
+                    self.tendon_adjacency,
+                    model.tendon_link_body,
+                    model.tendon_link_type,
+                    model.tendon_link_radius,
+                    model.tendon_link_mu,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    self.tendon_link_seg_left,
+                    self.tendon_seg_rest_length,
+                    self.tendon_seg_attachment_l_local,
+                    self.tendon_seg_attachment_r_local,
+                    self.tendon_seg_active_compliance,
+                    self.tendon_seg_active_damping,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                    self.tendon_sigmoid_ea_low,
+                    self.tendon_sigmoid_ea_ratio,
+                    self.tendon_sigmoid_transition_strain,
+                    self.tendon_sigmoid_transition_width,
+                    self.tendon_seg_alm_lambda,
+                    self.tendon_seg_alm_k,
+                    (2 if self.tendon_alm_per_segment else 1) if self.tendon_alm else 0,
+                    self.tendon_material_direct,
+                    self.tendon_link_cone_seg_l,
+                    self.tendon_link_cone_seg_r,
+                    self.tendon_link_cap_ratio,
                 ],
                 outputs=[
                     state_in.body_q,
@@ -4542,6 +5202,43 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+        if self.tendon_alm and model.tendon_segment_count > 0:
+            # Dual ascent on the pose just produced by the colour sweeps, with the rest lengths
+            # this iteration's material solve gave the force kernel.
+            wp.launch(
+                kernel=update_duals_tendon,
+                dim=model.tendon_count,
+                inputs=[
+                    dt,
+                    state_in.body_q,
+                    self.body_q_prev,
+                    model.body_com,
+                    model.tendon_start,
+                    model.tendon_link_body,
+                    model.tendon_link_type,
+                    model.tendon_link_offset,
+                    model.tendon_link_axis,
+                    self.tendon_seg_attachment_l_local,
+                    self.tendon_seg_attachment_r_local,
+                    self.tendon_seg_rest_length,
+                    self.tendon_seg_active_compliance,
+                    self.tendon_seg_active_damping,
+                    self.tendon_seg_active,
+                    self.tendon_seg_active_link_l,
+                    self.tendon_seg_active_link_r,
+                    self.tendon_sigmoid_ea_low,
+                    self.tendon_sigmoid_ea_ratio,
+                    self.tendon_sigmoid_transition_strain,
+                    self.tendon_sigmoid_transition_width,
+                    self.tendon_alm_lambda,  # input/output
+                    self.tendon_alm_k,  # input
+                    self.tendon_seg_alm_lambda,  # input/output
+                    self.tendon_seg_alm_k,  # input
+                    int(self.tendon_alm_per_segment),
+                ],
+                device=self.device,
+            )
+
     def _export_contact_forces(
         self, state_in: State, state_out: State, contacts: Contacts, dt: float, contact_f: wp.array[wp.spatial_vector]
     ) -> None:
@@ -4665,12 +5362,28 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Solve one rigid iteration with coupled sparse articulation updates."""
         model = self.model
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
-            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration_local(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                report_unsupported_wrap=report_unsupported_wrap,
+                iteration=iteration,
+            )
             return
 
         layout = self.rigid_articulation_sparse_layout
         if layout is None or layout.articulation_count == 0:
-            self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration_local(
+                state_in,
+                state_out,
+                control,
+                contacts,
+                dt,
+                report_unsupported_wrap=report_unsupported_wrap,
+                iteration=iteration,
+            )
             return
 
         assert self.rigid_articulation_sparse_values is not None

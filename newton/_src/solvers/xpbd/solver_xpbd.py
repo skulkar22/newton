@@ -11,6 +11,8 @@ from ...sim.joint_mimic import has_supported_joint_mimics
 from ..coupled.interface import CouplingInterface
 from ..observables import SolverObservableFlags, SolverObservables
 from ..solver import SolverBase
+from ..tendon_kernels import update_tendon_attachments
+from ..tendon_state import TendonStateMixin
 from . import kernels, restitution_kernels
 from .kernels import (
     accumulate_weighted_contact_impulse,
@@ -22,6 +24,7 @@ from .kernels import (
     bending_constraint,
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
+    convert_joint_impulse_to_reaction_f,
     copy_kinematic_body_state_kernel,
     solve_body_contact_positions,
     solve_body_joints,
@@ -41,6 +44,7 @@ from .restitution_kernels import (
     select_manifold_contacts,
     solve_manifold_restitution,
 )
+from .tendon_stretch_blocks import TendonStretchRow, prepare_stretch_rows, solve_stretch_blocks
 
 _COMPUTE_BODY_VELOCITY_DEPRECATION_MSG = (
     "SolverXPBD.compute_body_velocity_from_position_delta is deprecated in Newton 1.6 and will be removed in 1.7 "
@@ -49,7 +53,7 @@ _COMPUTE_BODY_VELOCITY_DEPRECATION_MSG = (
 )
 
 
-class SolverXPBD(SolverBase, CouplingInterface):
+class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
     """An implicit integrator using eXtended Position-Based Dynamics (XPBD) for rigid and soft body simulation.
 
     References:
@@ -105,6 +109,22 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 
+    The experimental constructor option ``tendon_material_direct=True`` replaces
+    material sweeps with a finite-friction direct solve and matching rolling
+    reaction. It supports linear compliance >= 1e-25 m/N or the experimental
+    sigmoid law, at most 32 authored spans between attachments, and capstan
+    ratios up to 4. CUDA uses a cooperative warp for sigmoid projection; CPU
+    uses the scalar exact-block implementation. Geometry-dependent cap ratios
+    and numerical feasibility are checked at runtime. Differentiable simulation
+    is not supported in this mode. See ``docs/direct_tendon_material.md``.
+    ``tendon_max_sweeps`` and ``tendon_settle_tol`` do not control direct solves.
+    Select the mode at construction; reconstruct the solver to change it.
+
+    Call :meth:`check_tendon_material` after each step or graph replay, outside
+    capture and before consuming results. A failure prints an error and remains
+    latched; queued body solves are not rolled back, so the affected step/frame/
+    batch must be discarded. There is no fallback to material sweeps.
+
     Example
     -------
 
@@ -143,6 +163,16 @@ class SolverXPBD(SolverBase, CouplingInterface):
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
         deterministic: wp.DeterministicMode | None = None,
+        tendon_max_sweeps: int = 256,
+        tendon_settle_tol: float = 1.0e-3,
+        tendon_activation_tol: float = 2.0e-3,
+        tendon_route_hysteresis: float = 1.0e-4,
+        tendon_route_min_span_ratio: float = 2.0,
+        tendon_sigmoid_ea_low: float = 0.0,
+        tendon_sigmoid_ea_ratio: float = 1.0,
+        tendon_sigmoid_transition_strain: float = 0.0,
+        tendon_sigmoid_transition_width: float = 1.0,
+        tendon_material_direct: bool = False,
     ):
         """Initialize the XPBD solver.
 
@@ -187,6 +217,27 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._restitution_module_options = module_options
 
         self.iterations = iterations
+        self.tendon_material_direct = tendon_material_direct
+        # Routed-cable capstan cone relaxation: up to tendon_max_sweeps Gauss-Seidel passes, stopping
+        # early once the relaxation has settled -- the max per-sweep tension change relative to the
+        # first sweep's peak tension falls below tendon_settle_tol. Already-converged cables stop almost
+        # immediately; stiff/transient ones run up to the cap.
+        self.tendon_max_sweeps = tendon_max_sweeps
+        self.tendon_settle_tol = tendon_settle_tol
+        # Dynamic routing hysteresis: inactive rollers activate only after entering the larger
+        # of this fraction of their radius and tendon_route_hysteresis [m]; active rollers still
+        # deactivate at their surface. Candidates whose bypass span is shorter than
+        # tendon_route_min_span_ratio candidate radii keep their previous state, because the
+        # test is undefined there.
+        self.tendon_activation_tol = tendon_activation_tol
+        self.tendon_route_hysteresis = tendon_route_hysteresis
+        self.tendon_route_min_span_ratio = tendon_route_min_span_ratio
+        # Experimental solver-wide nonlinear tendon material. A non-positive
+        # low-strain EA keeps the established per-segment compliance path.
+        self.tendon_sigmoid_ea_low = tendon_sigmoid_ea_low
+        self.tendon_sigmoid_ea_ratio = tendon_sigmoid_ea_ratio
+        self.tendon_sigmoid_transition_strain = tendon_sigmoid_transition_strain
+        self.tendon_sigmoid_transition_width = tendon_sigmoid_transition_width
 
         self.soft_body_relaxation = soft_body_relaxation
         self.soft_contact_relaxation = soft_contact_relaxation
@@ -214,10 +265,32 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._has_joint_mimics = has_supported_joint_mimics(model, "SolverXPBD")
 
         self._init_kinematic_state()
+        self.joint_reaction_f = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+        """Per-joint reaction wrench [N, N*m], shape (joint_count,).
+
+        The wrench is transmitted from the joint parent to the child, expressed
+        in world frame at the child body's center of mass. It is refreshed by
+        :meth:`step` from the accumulated XPBD joint impulse.
+        """
+        self._joint_lambdas = wp.zeros((2, model.joint_count), dtype=wp.spatial_vector, device=model.device)
 
         # helper variables to track constraint resolution vars
         self._particle_delta_counter = 0
         self._body_delta_counter = 0
+        self._joint_position_delta_residual = wp.zeros(model.body_count, dtype=wp.vec3, device=model.device)
+        self._joint_orientation_delta_residual = wp.zeros(model.body_count, dtype=wp.quat, device=model.device)
+        self._joint_orientation_delta_residual_reference = wp.zeros(
+            model.body_count, dtype=wp.quat, device=model.device
+        )
+
+        # tendon state
+        self._init_tendon_state(model)
+        self._tendon_stretch_rows = wp.empty(model.tendon_segment_count, dtype=TendonStretchRow, device=model.device)
+        # Accumulate the friction reaction across XPBD iterations. VBD applies
+        # constitutive forces directly and does not need this impulse state.
+        self._tendon_link_spin_impulse = (
+            wp.zeros(model.tendon_link_count, dtype=wp.vec3, device=model.device) if model.tendon_count > 0 else None
+        )
 
         if model.particle_count > 1 and model.particle_grid is not None:
             # reserve space for the particle hash grid
@@ -240,6 +313,61 @@ class SolverXPBD(SolverBase, CouplingInterface):
     def compute_body_velocity_from_position_delta(self, value: bool) -> None:
         warnings.warn(_COMPUTE_BODY_VELOCITY_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
         self._compute_body_velocity_from_position_delta = value
+
+    def _solve_tendon_stretch(
+        self,
+        body_q: wp.array[wp.transform],
+        body_qd: wp.array[wp.spatial_vector],
+        body_deltas: wp.array[wp.spatial_vector],
+        dt: float,
+    ) -> None:
+        """Solve shape-independent stretch blocks using the current capstan balance."""
+        model = self.model
+        wp.launch(
+            prepare_stretch_rows,
+            dim=model.tendon_segment_count,
+            inputs=[
+                body_q,
+                body_qd,
+                model.body_com,
+                model.tendon_link_body,
+                self.tendon_seg_active,
+                self.tendon_seg_active_link_l,
+                self.tendon_seg_active_link_r,
+                self.tendon_seg_attachment_l,
+                self.tendon_seg_attachment_r,
+                self.tendon_seg_rest_length,
+                self.tendon_seg_stretch,
+                self.tendon_seg_active_compliance,
+                self.tendon_seg_active_damping,
+                dt,
+                self.tendon_sigmoid_ea_low,
+                self.tendon_sigmoid_ea_ratio,
+                self.tendon_sigmoid_transition_strain,
+                self.tendon_sigmoid_transition_width,
+            ],
+            outputs=[self._tendon_stretch_rows, self.tendon_seg_material_tension],
+            device=model.device,
+        )
+        wp.launch(
+            solve_stretch_blocks,
+            dim=model.tendon_count,
+            inputs=[
+                body_q,
+                self.body_inv_mass_effective,
+                self.body_inv_inertia_effective,
+                model.tendon_start,
+                self.tendon_link_cone_seg_l,
+                self.tendon_link_cone_seg_r,
+                self.tendon_link_cap_ratio,
+                self.tendon_seg_rest_length,
+                dt,
+                self.joint_linear_relaxation,
+                self.tendon_settle_tol,
+            ],
+            outputs=[self._tendon_stretch_rows, self.tendon_seg_lambda, self.tendon_seg_delta_lambda, body_deltas],
+            device=model.device,
+        )
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -351,6 +479,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         body_deltas: wp.array,
         dt: float,
         rigid_contact_inv_weight: wp.array = None,
+        compensate_roundoff: bool = False,
     ):
         with wp.ScopedTimer("apply_body_deltas", False):
             if state_in.requires_grad:
@@ -372,6 +501,16 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     new_body_qd = state_out.body_qd
                 self._body_delta_counter = 1 - self._body_delta_counter
 
+            position_delta_residual = None
+            orientation_delta_residual = None
+            orientation_delta_residual_reference = None
+            if compensate_roundoff and not state_in.requires_grad:
+                # Tape needs immutable primals, while this numerical workspace is updated in place.
+                # Keep differentiable XPBD on its established uncompensated update path for now.
+                position_delta_residual = self._joint_position_delta_residual
+                orientation_delta_residual = self._joint_orientation_delta_residual
+                orientation_delta_residual_reference = self._joint_orientation_delta_residual_reference
+
             wp.launch(
                 kernel=apply_body_deltas,
                 dim=model.body_count,
@@ -385,10 +524,16 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     body_deltas,
                     rigid_contact_inv_weight,
                     dt,
+                    position_delta_residual,
+                    orientation_delta_residual,
+                    orientation_delta_residual_reference,
                 ],
                 outputs=[
                     new_body_q,
                     new_body_qd,
+                    position_delta_residual,
+                    orientation_delta_residual,
+                    orientation_delta_residual_reference,
                 ],
                 device=model.device,
             )
@@ -426,6 +571,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._apply_module_options()
         self.validate_observables(observables, contacts)
         requires_grad = state_in.requires_grad
+        if self.tendon_material_direct != self._tendon_material_state.enabled:
+            raise ValueError("Reconstruct SolverXPBD to change tendon_material_direct")
+        if self.tendon_material_direct and (requires_grad or state_out.requires_grad):
+            raise ValueError("tendon_material_direct does not support differentiable simulation")
+        self._validate_direct_tendon_law()
         self._particle_delta_counter = 0
         self._body_delta_counter = 0
 
@@ -442,6 +592,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
             if observables is not None and observables.is_requested(SolverObservableFlags.CONTACT_F)
             else None
         )
+
+        if model.joint_count and not state_in.requires_grad:
+            self._joint_position_delta_residual.zero_()
+            self._joint_orientation_delta_residual.zero_()
+            self._joint_orientation_delta_residual_reference.zero_()
 
         particle_q = None
         particle_qd = None
@@ -507,11 +662,17 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     contacts.rigid_contact_max, dtype=wp.spatial_vector, device=model.device
                 )
 
-        # Optional per-joint accumulated child-side spatial impulse, used to
-        # populate ``body_parent_f`` after the iteration loop.
+        # Per-joint accumulated child-side spatial impulse, used to populate
+        # ``self.joint_reaction_f`` and optionally ``state_out.body_parent_f``
+        # after the iteration loop.
         joint_impulse = None
-        if body_parent_f is not None and model.joint_count > 0:
+        joint_lambdas = None
+        if model.joint_count > 0:
             joint_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+            # In-place lambda updates cannot preserve the primal values needed
+            # by earlier launches during a differentiable backward pass.
+            if not requires_grad:
+                joint_lambdas = self._joint_lambdas
 
         if control is None:
             control = model.control(clone_variables=False)
@@ -548,11 +709,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 if model.joint_count:
                     # Avoid accumulating joint_f into the persistent state body_f buffer.
                     body_f_tmp = wp.clone(state_in.body_f)
-                    # ``joint_impulse`` (may be ``None`` when ``body_parent_f``
-                    # was not requested) accumulates both the joint_f wrench
+                    # ``joint_impulse`` accumulates both the joint_f wrench
                     # contribution recorded here and the constraint-correction
                     # contribution added by :func:`solve_body_joints` inside
-                    # the iteration loop.  Together they recover the total
+                    # the iteration loop. Together they recover the total
                     # wrench transmitted to the child body, matching the
                     # :attr:`State.body_parent_f` convention.
                     wp.launch(
@@ -595,6 +755,20 @@ class SolverXPBD(SolverBase, CouplingInterface):
             edge_constraint_lambdas = None
             if model.edge_count:
                 edge_constraint_lambdas = wp.empty_like(model.edge_rest_angle)
+
+            # Tendon constraints are split into route update, stretch, and
+            # rolling slip/friction stages.  Stretch carries cable load; the
+            # slip stage applies capstan-limited spin-axis coupling.
+            if model.tendon_segment_count > 0 and body_q is not None:
+                self._snapshot_tendon_step_state()
+                # Activation must see the accepted pose: ``body_q`` aliases
+                # state_out.body_q, which integrate_bodies has already filled with
+                # the inertial predictor. state_in.body_q is left untouched there.
+                self._update_tendon_link_active(model, state_in.body_q)
+                self._prepare_tendon_route(model, state_in.body_q)
+                self.tendon_seg_lambda.zero_()
+                self._tendon_link_spin_impulse.zero_()
+                self.tendon_seg_material_tension.zero_()
 
             for i in range(self.iterations):
                 with wp.ScopedTimer(f"iteration_{i}", False):
@@ -862,13 +1036,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 control.joint_target_qd,
                                 model.joint_target_ke,
                                 model.joint_target_kd,
+                                i,
                                 self.joint_linear_compliance,
                                 self.joint_angular_compliance,
                                 self.joint_angular_relaxation,
                                 self.joint_linear_relaxation,
                                 dt,
                             ],
-                            outputs=[body_deltas, joint_impulse],
+                            outputs=[body_deltas, joint_impulse, joint_lambdas],
                             device=model.device,
                         )
 
@@ -900,6 +1075,111 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 device=model.device,
                             )
 
+                        body_q, body_qd = self._apply_body_deltas(
+                            model, state_in, state_out, body_deltas, dt, compensate_roundoff=True
+                        )
+
+                    # solve tendon segment distance constraints
+                    if model.tendon_segment_count > 0 and body_q is not None:
+                        wp.launch(
+                            kernel=update_tendon_attachments,
+                            dim=model.tendon_segment_count,
+                            inputs=[
+                                body_q,
+                                model.tendon_link_body,
+                                model.tendon_link_type,
+                                model.tendon_link_flags,
+                                model.tendon_link_radius,
+                                model.tendon_link_orientation,
+                                model.tendon_link_offset,
+                                model.tendon_link_axis,
+                                self.tendon_seg_active,
+                                self.tendon_seg_active_link_l,
+                                self.tendon_seg_active_link_r,
+                                self.tendon_link_active,
+                                self.tendon_link_active_step,
+                                self.tendon_seg_attachment_l_local_step,
+                                self.tendon_seg_attachment_r_local_step,
+                                1,
+                            ],
+                            outputs=[
+                                self.tendon_seg_attachment_l,
+                                self.tendon_seg_attachment_r,
+                                self.tendon_seg_attachment_l_local,
+                                self.tendon_seg_attachment_r_local,
+                                self.tendon_seg_rolling_delta_l,
+                                self.tendon_seg_rolling_delta_r,
+                                self.tendon_seg_length,
+                            ],
+                            device=model.device,
+                        )
+
+                        self._update_tendon_cone_rows(model, body_q, i == 0)
+
+                        wp.launch(
+                            kernel=self._tendon_material_kernel,
+                            dim=model.tendon_count * self._tendon_material_lanes,
+                            block_dim=self._tendon_material_block_dim,
+                            inputs=[
+                                body_q,
+                                body_qd,
+                                body_q,
+                                model.body_com,
+                                model.tendon_start,
+                                model.tendon_link_body,
+                                model.tendon_link_type,
+                                model.tendon_link_radius,
+                                model.tendon_link_orientation,
+                                model.tendon_link_offset,
+                                model.tendon_link_axis,
+                                self.tendon_seg_rest_length,
+                                self.tendon_seg_rest_length_step,
+                                self.tendon_seg_route_rest_length,
+                                self.tendon_seg_stretch,
+                                self.tendon_seg_damping_tension,
+                                self.tendon_seg_active,
+                                self.tendon_seg_active_link_l,
+                                self.tendon_seg_active_link_r,
+                                self.tendon_seg_active_compliance,
+                                self.tendon_seg_active_damping,
+                                self.tendon_link_active,
+                                self.tendon_link_active_step,
+                                self.tendon_link_route_rest_length,
+                                self.tendon_seg_attachment_l,
+                                self.tendon_seg_attachment_r,
+                                self.tendon_seg_length,
+                                self.tendon_seg_attachment_l_local,
+                                self.tendon_seg_attachment_r_local,
+                                self.tendon_seg_rolling_delta_l,
+                                self.tendon_seg_rolling_delta_r,
+                                self.tendon_link_cone_seg_l,
+                                self.tendon_link_cone_seg_r,
+                                self.tendon_link_cap_ratio,
+                                self.tendon_cone_sweep_count,
+                                0,
+                                dt,
+                                1,
+                                1,
+                                1,
+                                self.tendon_max_sweeps,
+                                self.tendon_settle_tol,
+                                self.tendon_sigmoid_ea_low,
+                                self.tendon_sigmoid_ea_ratio,
+                                self.tendon_sigmoid_transition_strain,
+                                self.tendon_sigmoid_transition_width,
+                                self._tendon_material_state,
+                                1,
+                                self._tendon_link_material_transfer,
+                            ],
+                            device=model.device,
+                        )
+
+                        if requires_grad:
+                            body_deltas = wp.zeros_like(body_deltas)
+                        else:
+                            body_deltas.zero_()
+
+                        self._solve_tendon_stretch(body_q, body_qd, body_deltas, dt)
                         body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
 
             self._contact_impulse = contact_impulse
@@ -922,6 +1202,24 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     )
                 if contacts is not None and contacts.force is not None and contacts.force.ptr != contact_f.ptr:
                     contacts.force.assign(contact_f)
+
+            # Populate the per-joint reaction force diagnostic and optional
+            # ``state_out.body_parent_f`` (incoming joint wrench per body)
+            # from the accumulated child-side impulse.
+            if joint_impulse is not None:
+                wp.launch(
+                    kernel=convert_joint_impulse_to_reaction_f,
+                    dim=model.joint_count,
+                    inputs=[
+                        joint_impulse,
+                        model.joint_enabled,
+                        model.joint_type,
+                        model.joint_child,
+                        dt,
+                    ],
+                    outputs=[self.joint_reaction_f],
+                    device=model.device,
+                )
 
             # Populate optional ``body_parent_f`` (incoming joint
             # wrench per body) from the per-joint accumulated child-side
