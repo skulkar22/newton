@@ -423,7 +423,7 @@ or recapturing a CUDA graph. Other VBD joint types currently ignore this propert
      - |yes| :sup:`6`
      - |yes| :sup:`5`
      - |no|
-   * - Body-particle attachments
+   * - Particle-body attachments
      - |no|
      - |no|
      - |no|
@@ -436,18 +436,18 @@ or recapturing a CUDA graph. Other VBD joint types currently ignore this propert
 | :sup:`5` XPBD uses mass-weighted mimic corrections. VBD uses its assembled body Hessians and retains the mimic reaction forces within the timestep, so drives, friction, and contacts participate in the coupled solve. Both perform one mimic solve per solver iteration.
 | :sup:`6` MuJoCo lowers each joint-owned relationship to joint equality constraints. Multi-axis D6 relationships produce one equality constraint per axis.
 | :sup:`7` VBD interprets ``joint_target_kd`` and ``joint_limit_kd`` as absolute damping coefficients in physical units.
-| :sup:`8` See :ref:`Body-particle attachments` for authoring and semantics. Attachments spanning two
+| :sup:`8` See :ref:`Particle-body attachments` for authoring and semantics. Attachments spanning two
   solvers are coupled by :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` instead.
 | :sup:`9` VBD supports revolute-joint armature with the experimental ``block_sparse_joints`` articulation solve.
 
-.. _Body-particle attachments:
+.. _Particle-body attachments:
 
-Body-Particle Attachments
+Particle-Body Attachments
 -------------------------
 
-A body-particle attachment ties one cloth or solid particle to a point in a
+A particle-body attachment ties one cloth or solid particle to a point in a
 rigid body's local frame. Author attachments with
-:meth:`newton.ModelBuilder.add_attachment_body_particle`. They are stored on the
+:meth:`newton.ModelBuilder.add_attachment_particle_body`. They are stored on the
 :class:`~newton.Model` and do not require a coupled solver.
 
 :class:`~newton.solvers.SolverVBD` applies an attachment whenever it integrates

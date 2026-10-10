@@ -1467,7 +1467,7 @@ def test_sparse_body_particle_attachment_reactions(test, device):
     particles = []
     for body, y in [(parent, 0.0), (standalone, 2.0)]:
         particle = builder.add_particle(pos=wp.vec3(0.0, y, 0.0), vel=wp.vec3(1.0, 0.0, 0.0), mass=1.0)
-        builder.add_attachment_body_particle(body, particle, stiffness=2.0e4, damping=100.0)
+        builder.add_attachment_particle_body(particle, body, stiffness=2.0e4, damping=100.0)
         particles.append(particle)
     builder.color()
     model = builder.finalize(device=device)
