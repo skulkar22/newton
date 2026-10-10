@@ -2258,9 +2258,9 @@ def test_dynamic_route_hysteresis_band_absorbs_pose_jitter(test, device):
 
 def _oriented_wrap_angle_at_link(solver, model, state, link_idx):
     """Oriented wrap angle of a rolling link that carries one span on each side."""
-    body_q = state.body_q.numpy()
-    center = body_q[model.tendon_link_body.numpy()[link_idx]][:3] + model.tendon_link_offset.numpy()[link_idx]
-    normal = model.tendon_link_axis.numpy()[link_idx]
+    pose = wp.transform(*state.body_q.numpy()[model.tendon_link_body.numpy()[link_idx]])
+    center = np.array(wp.transform_point(pose, wp.vec3(*model.tendon_link_offset.numpy()[link_idx])))
+    normal = np.array(wp.transform_vector(pose, wp.vec3(*model.tendon_link_axis.numpy()[link_idx])))
     radial_in = solver.tendon_seg_attachment_r.numpy()[link_idx - 1] - center
     radial_out = solver.tendon_seg_attachment_l.numpy()[link_idx] - center
     radial_in -= np.dot(radial_in, normal) * normal

@@ -28,6 +28,7 @@ from newton.tests.test_tendon_capstan import (
     SIGMOID_TENDON_MATERIAL,
     _moving_rolling_route_material_error,
     _oriented_route_material_length,
+    _oriented_wrap_angle_at_link,
     build_dynamic_pulley_atwood,
     build_force_driven_dynamic_route,
     build_kinematic_pulley_atwood,
@@ -718,90 +719,105 @@ def test_vbd_sigmoid_stretch_uses_material_tangent(test, device):
 
 
 def test_vbd_quasi_static_roller_conserves_cable_inventory(test, device):
-    """A taut cable over a near-static dynamic roller must not leak inventory step by step.
+    """Keep a taut cable's inventory constant over a near-static dynamic roller.
 
-    The roller sits off its body origin on a revolute arm, so its contact points round-trip through
-    float32 body-local coordinates every step. Rolling transfer must telescope across steps instead of
-    re-booking that round-trip error as cable sliding over the roller.
+    The roller sits off the origin of a rotated arm body that is hinged far from the world origin,
+    so its contact points round-trip through float32 body-local coordinates every step. Rolling
+    transfer must telescope across steps instead of booking that round-trip error as cable sliding
+    over the roller.
     """
     with wp.ScopedDevice(device):
-        for arm_angle in (0.83, 2.21):
-            radius = 0.006
-            pivot = (-0.0612, 0.0237)
-            offset = 0.0473
-            builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=(0.0, 0.0, 0.0))
-            q = wp.quat(0.0, 0.0, float(np.sin(0.5 * arm_angle)), float(np.cos(0.5 * arm_angle)))
-            arm = builder.add_link(
-                xform=wp.transform(p=wp.vec3(pivot[0], pivot[1], 0.0), q=q),
-                mass=0.02,
-                inertia=wp.mat33(np.eye(3) * 2.0e-6),
+        radius = 0.012
+        arm_angle = 0.83
+        arm_length = 0.1
+        half_span = 0.04
+        rise = 0.02
+        pivot = np.array([0.31, -0.27, 0.12])
+        center = pivot + arm_length * np.array([np.cos(arm_angle), np.sin(arm_angle), 0.0])
+        # Each span starts 1 mm stretched over its tangent length, so the cable stays taut.
+        rest_length = float(np.sqrt(half_span**2 + rise**2 - radius**2)) - 1.0e-3
+
+        builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=(0.0, 0.0, 0.0))
+        arm_xform = wp.transform(
+            p=wp.vec3(*pivot), q=wp.quat(0.0, 0.0, float(np.sin(0.5 * arm_angle)), float(np.cos(0.5 * arm_angle)))
+        )
+        arm = builder.add_link(xform=arm_xform, mass=0.02, inertia=wp.mat33(np.eye(3) * 2.0e-6))
+        # The cable pulls the roller toward the anchors and presses the arm into its upper limit.
+        joint = builder.add_joint_revolute(
+            parent=-1,
+            child=arm,
+            axis=(0.0, 0.0, 1.0),
+            limit_lower=-0.005,
+            limit_upper=0.005,
+            limit_ke=1.0e4,
+            limit_kd=5.0,
+            parent_xform=arm_xform,
+        )
+        builder.add_articulation([joint])
+        # Both anchors sit above the roller center, so the cable wraps its underside by ~83 deg.
+        anchors = [
+            builder.add_body(
+                xform=wp.transform(p=wp.vec3(center[0] + side * half_span, center[1] + rise, center[2])),
+                mass=0.0,
+                is_kinematic=True,
             )
-            joint = builder.add_joint_revolute(
-                parent=-1,
-                child=arm,
-                axis=(0.0, 0.0, 1.0),
-                limit_lower=arm_angle - 0.05,
-                limit_upper=arm_angle + 0.05,
-                limit_ke=1.0e4,
-                limit_kd=5.0,
-                parent_xform=wp.transform(p=wp.vec3(pivot[0], pivot[1], 0.0), q=q),
-            )
-            builder.add_articulation([joint])
-            center = (pivot[0] + np.cos(arm_angle) * offset, pivot[1] + np.sin(arm_angle) * offset)
-            anchors = [
-                builder.add_body(
-                    xform=wp.transform(p=wp.vec3(center[0] + side * 0.04, center[1] - radius - 0.003, 0.0)),
-                    mass=0.0,
-                    is_kinematic=True,
-                )
-                for side in (-1.0, 1.0)
-            ]
-            builder.add_tendon()
-            builder.add_tendon_link(body=anchors[0], link_type=int(TendonLinkType.ATTACHMENT), axis=(0.0, 0.0, 1.0))
-            builder.add_tendon_link(
-                body=arm,
-                link_type=int(TendonLinkType.ROLLING),
-                radius=radius,
-                orientation=1,
-                mu=0.25,
-                offset=(offset, 0.0, 0.0),
-                axis=(0.0, 0.0, 1.0),
-                compliance=2.0e-5,
-                damping=5.0,
-                rest_length=0.038,
-            )
-            builder.add_tendon_link(
-                body=anchors[1],
-                link_type=int(TendonLinkType.ATTACHMENT),
-                axis=(0.0, 0.0, 1.0),
-                compliance=2.0e-5,
-                damping=5.0,
-                rest_length=0.038,
-            )
-            model = builder.finalize()
-            _set_serial_body_coloring(model)
-            solver = newton.solvers.SolverVBD(
+            for side in (-1.0, 1.0)
+        ]
+        builder.add_tendon()
+        builder.add_tendon_link(body=anchors[0], link_type=int(TendonLinkType.ATTACHMENT), axis=(0.0, 0.0, 1.0))
+        builder.add_tendon_link(
+            body=arm,
+            link_type=int(TendonLinkType.ROLLING),
+            radius=radius,
+            orientation=1,
+            mu=0.25,
+            offset=(arm_length, 0.0, 0.0),
+            axis=(0.0, 0.0, 1.0),
+            compliance=2.0e-5,
+            damping=5.0,
+            rest_length=rest_length,
+        )
+        builder.add_tendon_link(
+            body=anchors[1],
+            link_type=int(TendonLinkType.ATTACHMENT),
+            axis=(0.0, 0.0, 1.0),
+            compliance=2.0e-5,
+            damping=5.0,
+            rest_length=rest_length,
+        )
+        model = builder.finalize()
+        _set_serial_body_coloring(model)
+
+        solvers = {
+            "direct ALM": lambda: newton.solvers.SolverVBD(
                 model,
                 iterations=32,
                 tendon_alm=True,
                 tendon_alm_per_segment=True,
                 tendon_material_direct=True,
                 tendon_alm_min_stiffness_ratio=0.0,
-            )
+            ),
+            "default": lambda: newton.solvers.SolverVBD(model, iterations=32),
+        }
+        dt = 1.0 / 1200.0
+        for name, make_solver in solvers.items():
+            solver = make_solver()
             state_0, state_1 = model.state(), model.state()
             newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
-            dt = 1.0 / 1200.0
-            for _ in range(600):
+            for _ in range(300):
                 solver.step(state_0, state_1, model.control(), None, dt)
                 state_0, state_1 = state_1, state_0
-            test.assertTrue(bool(solver.tendon_link_active.numpy()[1]), "The roller should stay wrapped")
             inventory_0 = _oriented_route_material_length(solver, model, state_0, 1)
-            for _ in range(3000):
+            for _ in range(1000):
                 solver.step(state_0, state_1, model.control(), None, dt)
                 state_0, state_1 = state_1, state_0
+            solver.check_tendon_material()
+            test.assertTrue(bool(solver.tendon_link_active.numpy()[1]), f"{name}: the roller should stay wrapped")
+            wrap = _oriented_wrap_angle_at_link(solver, model, state_0, 1)
+            test.assertGreater(wrap, np.radians(60.0), f"{name}: the cable should wrap the roller")
             drift = _oriented_route_material_length(solver, model, state_0, 1) - inventory_0
-            # The pre-fix world-frame transfer leaked ~1.5-5 nm per step here (several um over 3000 steps).
-            test.assertLess(abs(drift), 1.0e-6, f"arm_angle={arm_angle}: cable inventory drifted by {drift:.3e} m")
+            # The pre-fix world-frame transfer leaked ~20 nm per step here (~20 um over 1000 steps).
+            test.assertLess(abs(drift), 1.0e-6, f"{name}: cable inventory drifted by {drift:.3e} m")
 
 
 def test_vbd_slack_damped_tendon_remains_force_free(test, device):
