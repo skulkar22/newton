@@ -10252,7 +10252,7 @@ class ModelBuilder:
         label: str | None = None,
         wrap_in_articulation: bool = True,
         color: Vec3 | None = None,
-        body_frame_origin: Literal["start", "com"] | None = None,
+        body_frame_origin: Literal["start", "com"] = "com",
     ) -> tuple[list[int], list[int]]:
         """Adds a rod/cable along a Catmull-Rom spline through the given control points.
 
@@ -10297,9 +10297,9 @@ class ModelBuilder:
             num_segments: Number of capsule segments (>= 2). Exactly one of ``num_segments``
                 and ``segment_length`` must be provided.
             segment_length: Target segment length [m]. The segment count is rounded so segments
-                have equal length close to this value. Useful together with
-                :func:`newton.utils.create_cable_stiffness_from_elastic_moduli`, which expects
-                the segment length.
+                have equal length close to this value. Useful when deriving per-joint stiffness
+                from elastic moduli (for example ``stretch = E * A / L``), which depends on the
+                segment length.
             radius: Capsule radius [m].
             cfg: Shape configuration for the capsules. If ``None``, :attr:`default_shape_cfg`
                 is used. Segment mass follows from ``cfg.density``.
@@ -10338,7 +10338,7 @@ class ModelBuilder:
             color: Optional display RGB color in ``[0, 1]`` applied to all generated capsule
                 shapes; see :meth:`add_rod`.
             body_frame_origin: Body-frame placement for each generated capsule (``"start"`` or
-                ``"com"``); see :meth:`add_rod`.
+                ``"com"``, default ``"com"`` as in :meth:`add_rod`); see :meth:`add_rod`.
 
         Returns:
             A pair ``(body_indices, joint_indices)``, as returned by :meth:`add_rod`. For an
@@ -10362,10 +10362,9 @@ class ModelBuilder:
             straight_rest_shape=straight_rest_shape,
         )
 
+        rod = Rod(shape.rest_points, quaternions=shape.rest_quaternions, closed=closed, radius=radius)
         return self.add_rod(
-            positions=shape.rest_points,
-            quaternions=shape.rest_quaternions,
-            radius=radius,
+            rod=rod,
             cfg=cfg,
             stretch_stiffness=stretch_stiffness,
             stretch_damping=stretch_damping,
@@ -10375,7 +10374,6 @@ class ModelBuilder:
             bend_damping=bend_damping,
             twist_stiffness=twist_stiffness,
             twist_damping=twist_damping,
-            closed=closed,
             label=label,
             wrap_in_articulation=wrap_in_articulation,
             color=color,

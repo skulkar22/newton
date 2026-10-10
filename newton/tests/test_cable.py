@@ -7236,9 +7236,12 @@ def _rmf_closed_loop_holonomy_impl(test: unittest.TestCase, device):
 def _rmf_twist_distribution_impl(test: unittest.TestCase, device):
     """Verify uniform twist distribution: frame k of a straight cable is rolled by k * twist_total / N."""
     num_segments = 20
-    points = newton.utils.cable_straight_points(
-        start=wp.vec3(0.0, 0.0, 0.0), direction=wp.vec3(1.0, 0.0, 0.0), length=2.0, num_segments=num_segments
-    )
+    points = [
+        wp.vec3(*p)
+        for p in newton.Rod.create_straight(
+            wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), 2.0, segment_count=num_segments
+        ).points
+    ]
     twist_total = np.pi
     quats = _rotation_minimizing_cable_quaternions(points, twist_total=twist_total)
 
@@ -7380,10 +7383,9 @@ def _cable_spline_shape_straight_rest_impl(test: unittest.TestCase, device):
 
 def _cable_body_transforms_impl(test: unittest.TestCase, device):
     """Verify _cable_body_transforms places body origins at segment midpoints or start points."""
-    points = newton.utils.cable_straight_points(
-        start=wp.vec3(0.0, 0.0, 0.0), direction=wp.vec3(1.0, 0.0, 0.0), length=1.0, num_segments=4
-    )
-    quats = newton.utils.rod_parallel_transport_quaternions(points)
+    rod = newton.Rod.create_straight(wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), 1.0, segment_count=4)
+    points = [wp.vec3(*p) for p in rod.points]
+    quats = [wp.quat(*q) for q in rod.quaternions]
 
     xforms_com = _cable_body_transforms(points, quats, body_frame_origin="com")
     xforms_start = _cable_body_transforms(points, quats, body_frame_origin="start")

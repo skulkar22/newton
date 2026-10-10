@@ -151,9 +151,9 @@ class Example:
         # Rope material: per-joint stiffness derived from Young's modulus and geometry.
         youngs_modulus = 5.0e6
         segment_length = 0.04
-        stretch_stiffness, bend_stiffness = newton.utils.rod_stiffness_from_elastic_moduli(
-            youngs_modulus, self.cable_radius, segment_length
-        )
+        # stretch = E * A / L and bend = E * I / L for a solid circular section of radius r.
+        stretch_stiffness = youngs_modulus * math.pi * self.cable_radius**2 / segment_length
+        bend_stiffness = youngs_modulus * 0.25 * math.pi * self.cable_radius**4 / segment_length
 
         # Each knot starts a few centimeters above the ground and keeps enough clearance
         # between crossing strands for the chosen capsule radius.
