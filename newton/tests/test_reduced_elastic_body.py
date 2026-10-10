@@ -2985,6 +2985,25 @@ def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
         newton.solvers.SolverVBD(model, iterations=1, integrate_with_external_rigid_solver=True)
 
 
+def test_vbd_elastic_body_rejects_block_sparse_joints(test, device):
+    """The block-sparse articulation solve does not support reduced elastic bodies."""
+    basis = newton.ModalBasis(
+        sample_points=[[0.0, 0.0, 0.0]],
+        sample_phi=[[[1.0, 0.0, 0.0]]],
+        sample_mass=[1.0],
+        mode_stiffness=[0.0],
+        mode_damping=[0.0],
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis)
+    builder.add_joint_fixed(parent=-1, child=body)
+    builder.color()
+    model = builder.finalize(device=device)
+
+    with test.assertRaisesRegex(NotImplementedError, "block_sparse_joints"):
+        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
+
+
 def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
     """An indefinite block degrades to a Jacobi step instead of writing NaN."""
     width = 7
@@ -4357,6 +4376,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_elastic_body_rejects_external_rigid_solver",
         test_vbd_elastic_body_rejects_external_rigid_solver,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_body_rejects_block_sparse_joints",
+        test_vbd_elastic_body_rejects_block_sparse_joints,
         devices=[device],
     )
     add_function_test(

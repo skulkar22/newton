@@ -1172,6 +1172,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 f"got {rigid_articulation_diagonal_regularization}"
             )
         self.rigid_articulation_solve = rigid_articulation_solve
+        if int(model.elastic_body_count) > 0 and self.rigid_articulation_solve == "block_sparse_joints":
+            # The block-sparse articulation factorization treats joint endpoints as rigid and its
+            # displacement-form position update bypasses the reduced elastic block solve.
+            raise NotImplementedError(
+                "SolverVBD cannot simulate reduced elastic bodies with "
+                "rigid_articulation_solve='block_sparse_joints'. Use rigid_articulation_solve='local' "
+                "or remove the elastic bodies from the model."
+            )
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
 
