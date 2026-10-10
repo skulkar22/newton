@@ -730,6 +730,13 @@ add_example_test(
     use_viewer=True,
     test_options={"num-frames": 20},
 )
+add_example_test(
+    TestCableExamples,
+    name="cable.example_cable_spline",
+    devices=test_devices,
+    use_viewer=True,
+    test_options={"num-frames": 60},
+)
 
 
 add_basic_example_test(

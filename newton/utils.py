@@ -72,20 +72,24 @@ __all__ += [
 # cable compatibility
 # ==================================================================================
 from ._src.utils.cable import (  # noqa: E402
-    CableStiffness as _CableStiffness,
-)
-from ._src.utils.cable import (  # noqa: E402
+    CableSplineShape,
+    cable_spline_shape,
     create_cable_stiffness_from_elastic_moduli,
     create_parallel_transport_cable_quaternions,
     create_straight_cable_points,
     create_straight_cable_points_and_quaternions,
+)
+from ._src.utils.cable import (  # noqa: E402
+    CableStiffness as _CableStiffness,
 )
 
 if TYPE_CHECKING:
     CableStiffness = _CableStiffness
 
 __all__ += [
+    "CableSplineShape",
     "CableStiffness",
+    "cable_spline_shape",
     "create_cable_stiffness_from_elastic_moduli",
     "create_parallel_transport_cable_quaternions",
     "create_straight_cable_points",
