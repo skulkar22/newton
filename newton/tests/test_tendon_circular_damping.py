@@ -15,7 +15,11 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
 def test_damped_tendon_matches_unilateral_force_law(test, device):
-    """Match implicit signed spring-plus-damper force, including its inactive branch."""
+    """Match the implicit unilateral spring-plus-damper force on taut and slack spans.
+
+    XPBD uses the signed Kelvin-Voigt row, so fast extension transmits damping tension before
+    geometric tautness. VBD keeps a geometrically slack span force-free.
+    """
     with wp.ScopedDevice(device):
         builder = newton.ModelBuilder(up_axis=Axis.Z, gravity=(0.0, 0.0, 0.0))
         anchor = builder.add_body(mass=0.0, is_kinematic=True)
@@ -37,7 +41,8 @@ def test_damped_tendon_matches_unilateral_force_law(test, device):
         model = builder.finalize()
         dt = 1.0 / 120.0
         for solver_name in ("xpbd", "vbd"):
-            for velocity in (-3.0, 0.0, 3.0, 30.0):
+            # 120 m/s ends the step taut (free length 1.25 m > rest 1.0 m) and exercises the active branch.
+            for velocity in (-3.0, 0.0, 3.0, 30.0, 120.0):
                 with test.subTest(solver=solver_name, velocity=velocity):
                     if solver_name == "xpbd":
                         solver = newton.solvers.SolverXPBD(model, iterations=20, joint_linear_relaxation=1.0)

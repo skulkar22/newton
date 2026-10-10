@@ -1762,8 +1762,9 @@ def test_vbd_xy_table_tracks_reference_prefix(test, device):
 VBD_EXAMPLE_ASSERTION_CASES = (
     ("vbd_tendon_pulley_example_assertions", PulleyExample, 100, True, set()),
     ("vbd_tendon_pinhole_example_assertions", PinholeExample, 100, True, set()),
-    # 150 frames: the light weight reaches the pulley crown at frame ~154 with XPBD and VBD alike.
-    ("vbd_tendon_rolling_pulley_example_assertions", RollingPulleyExample, 150, True, set()),
+    # Known failure, inherited and shared with XPBD (test_examples runs the same 180 frames): the light
+    # weight reaches the pulley crown at frame ~154. Recorded explicitly rather than shortening the run.
+    ("vbd_tendon_rolling_pulley_example_assertions", RollingPulleyExample, 180, True, {"cuda:0"}),
     ("vbd_tendon_equilibrium_example_assertions", EquilibriumExample, 100, True, set()),
     ("vbd_tendon_gear_pulley_example_assertions", GearPulleyExample, 180, True, set()),
     ("vbd_tendon_cable_machine_example_assertions", CableMachineExample, 100, True, set()),

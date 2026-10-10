@@ -1202,6 +1202,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # the tendon_alm=False path exactly. Resolved after the guard runs.
         self._tendon_alm_rows = self.tendon_alm
         self._tendon_alm_rows_resolved = not self.tendon_alm or self.tendon_alm_per_segment
+        self._tendon_alm_capture_warned = False
+        self._tendon_movable = None
+        if not self._tendon_alm_rows_resolved:
+            # A tendon with no dynamic link body never gets a movable row, so its guard stays
+            # undecided; it must not keep the per-step readback alive.
+            starts = model.tendon_start.numpy()
+            dynamic = model.body_inv_mass.numpy()[model.tendon_link_body.numpy()] > 0.0
+            self._tendon_movable = np.array(
+                [bool(np.any(dynamic[starts[t] : starts[t + 1]])) for t in range(model.tendon_count)], dtype=bool
+            )
         self._tendon_material_state.legacy_alm_damping = self._tendon_alm_rows
         self.tendon_material_modes = wp.zeros(model.tendon_segment_count, dtype=TendonMaterialMode, device=model.device)
         if self.tendon_alm_per_segment:
@@ -4665,16 +4675,28 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         A guarded-off tendon keeps no multiplier and no ALM penalty. When no tendon uses the ALM
         row, the solver runs the tendon_alm=False path, so guarded-off results match flag-off.
-        Undecided tendons (never movable yet) are re-checked on later steps.
+        Undecided movable tendons are re-checked on later steps. A CUDA graph captured before the
+        decision keeps the path selected at capture time, so run one uncaptured step first.
         """
         if self._tendon_alm_rows_resolved or self.tendon_alm_mode is None:
             return
-        if wp.get_device(self.device).is_capturing:
+        if self.device.is_capturing:
+            if not self._tendon_alm_capture_warned:
+                warnings.warn(
+                    "SolverVBD is being captured before the tendon ALM stiffness guard has decided each "
+                    "tendon's row; the captured graph keeps the current solver path. Run one uncaptured "
+                    "step() before capturing.",
+                    stacklevel=3,
+                )
+                self._tendon_alm_capture_warned = True
             return
         mode = self.tendon_alm_mode.numpy()
         rows = bool(np.any(mode == 1))
         self._tendon_alm_rows = rows
-        self._tendon_alm_rows_resolved = rows or not bool(np.any(mode < 0))
+        undecided = mode < 0
+        if self._tendon_movable is not None:
+            undecided &= self._tendon_movable
+        self._tendon_alm_rows_resolved = rows or not bool(np.any(undecided))
         self._tendon_material_state.legacy_alm_damping = rows
         if rows:
             self.tendon_adjacency.condensed = False
