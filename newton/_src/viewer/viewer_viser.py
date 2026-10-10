@@ -1819,6 +1819,7 @@ class ViewerViser(ViewerBase):
         metallic: float | None = None,
         dynamic: bool = False,
         opacity: float | None = None,
+        colors: wp.array[wp.vec3] | None = None,
     ):
         """
         Log a mesh to viser for visualization.
@@ -1840,6 +1841,7 @@ class ViewerViser(ViewerBase):
                 is metal.
             dynamic: Whether mesh topology may change between frames.
             opacity: Optional display opacity in [0, 1].
+            colors: Optional per-vertex colors, overriding ``color`` for each vertex.
         """
         name = self._qualify(name)
 
@@ -1854,6 +1856,9 @@ class ViewerViser(ViewerBase):
         # Convert to numpy arrays
         points_np = to_numpy(points).astype(np.float32)
         indices_np = to_numpy(indices).astype(np.uint32)
+        colors_np = to_numpy(colors).astype(np.float32) if colors is not None else None
+        if colors_np is not None and colors_np.shape != points_np.shape:
+            raise ValueError(f"colors must have shape {points_np.shape}, got {colors_np.shape}")
         uvs_np = to_numpy(uvs).astype(np.float32) if uvs is not None else None
         texture_image = prepare_viewer_texture(texture)
 
@@ -1872,7 +1877,7 @@ class ViewerViser(ViewerBase):
             indices_np = indices_np.reshape(-1, 3)
 
         trimesh_mesh = None
-        if texture_image is not None and uvs_np is not None:
+        if texture_image is not None and uvs_np is not None and colors_np is None:
             trimesh_mesh = self._build_trimesh_mesh(points_np, indices_np, uvs_np, texture_image, opacity=opacity)
             if trimesh_mesh is None:
                 warnings.warn(
@@ -1891,6 +1896,7 @@ class ViewerViser(ViewerBase):
             "color": mesh_color,
             "side": mesh_side,
             "opacity": opacity,
+            "colors": colors_np,
         }
         existing_mesh = self._meshes.get(name)
         self._meshes[name] = mesh_data
@@ -1905,6 +1911,8 @@ class ViewerViser(ViewerBase):
             and existing_mesh.get("color") == mesh_color
             and existing_mesh.get("side") == mesh_side
             and existing_mesh.get("opacity") == opacity
+            and existing_mesh.get("colors") is None
+            and colors_np is None
         )
         if can_update:
             try:
@@ -1938,7 +1946,7 @@ class ViewerViser(ViewerBase):
                 "name": name,
                 "vertices": points_np,
                 "faces": indices_np,
-                "color": mesh_color,
+                "color": colors_np if colors_np is not None else mesh_color,
                 "wireframe": self._wireframe,
                 "side": mesh_side,
             }

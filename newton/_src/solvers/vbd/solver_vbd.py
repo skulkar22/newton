@@ -70,6 +70,17 @@ from .particle_vbd_kernels import (
     solve_elasticity,
     update_velocity,
 )
+from .reduced_elastic_kernels import (
+    _NUM_ELASTIC_CONTACT_THREADS_PER_BODY,
+    accumulate_elastic_frame_coupling,
+    assemble_elastic_contacts,
+    assemble_elastic_joints,
+    copy_body_frame_to_elastic_joint,
+    copy_elastic_body_transforms_back,
+    copy_elastic_joint_frame_to_body,
+    create_solve_elastic_body_tiled,
+    integrate_elastic_modes_implicit,
+)
 from .rigid_sparse_articulation import build_rigid_articulation_sparse_layout
 from .rigid_sparse_articulation_kernels import (
     SPARSE_ARTICULATION_CTA_THREADS,
@@ -235,7 +246,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
       with ``rigid_compliant_alm=False``.
 
     Joint limitations:
-        - Supported joint types: BALL, FIXED, FREE, REVOLUTE, PRISMATIC, D6, ROD.
+        - Supported joint types: BALL, FIXED, FREE, REVOLUTE, PRISMATIC, D6, ROD, ELASTIC.
           DISTANCE joints are not supported.
         - :attr:`~newton.Model.joint_enabled` is supported for all joint types and
           is read live. After changing enable flags, call
@@ -481,6 +492,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
+        rigid_joint_adaptive_stiffness: bool | None = None,
+        elastic_body_relaxation: float = 1.0,
+        elastic_solver_metrics: bool = False,
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
@@ -769,6 +783,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contact manifolds between collision updates.
             rigid_articulation_diagonal_regularization: Non-negative value added to each
                 translational and angular diagonal Hessian entry before sparse factorization.
+            rigid_joint_adaptive_stiffness: Compatibility control for the reduced-elastic development branch.
+                Passing ``False`` disables legacy joint penalty ramping, equivalent to setting both linear and
+                angular beta values to zero. ``None`` and ``True`` leave the beta controls unchanged.
+            elastic_body_relaxation: Under-relaxation factor for reduced elastic body block updates. This scales the
+                coupled frame-and-mode update after inertia, joint, and contact terms are assembled. Must be finite and
+                in the range ``[0, 1]``.
+            elastic_solver_metrics: Whether to compute reduced elastic block residual and update metrics. Disabled by
+                default to avoid extra dense matrix-vector products in every block solve.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -899,6 +921,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError(f"rigid_avbd_beta must be >= 0, got {rigid_avbd_beta}")
         rigid_avbd_linear_beta = rigid_avbd_linear_beta if rigid_avbd_linear_beta is not None else rigid_avbd_beta
         rigid_avbd_angular_beta = rigid_avbd_angular_beta if rigid_avbd_angular_beta is not None else rigid_avbd_beta
+        if rigid_joint_adaptive_stiffness is False:
+            rigid_avbd_linear_beta = 0.0
+            rigid_avbd_angular_beta = 0.0
         if (
             rigid_contact_stick_motion_eps is not None
             or rigid_contact_stick_freeze_translation_eps is not None
@@ -1125,6 +1150,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.iterations = iterations
         self.friction_epsilon = friction_epsilon
         self.rigid_soft_contact_use_log_barrier = bool(rigid_soft_contact_use_log_barrier)
+        if not np.isfinite(elastic_body_relaxation) or not 0.0 <= elastic_body_relaxation <= 1.0:
+            raise ValueError(
+                f"elastic_body_relaxation must be finite and in the range [0, 1], got {elastic_body_relaxation}"
+            )
+        self.elastic_body_relaxation = float(elastic_body_relaxation)
+        self.elastic_solver_metrics = bool(elastic_solver_metrics)
+        self.rigid_joint_adaptive_stiffness = rigid_joint_adaptive_stiffness
         self._joint_mode_deprecation_warned = False
         if rigid_articulation_solve not in ("local", "block_sparse_joints"):
             raise ValueError(
@@ -1330,6 +1362,43 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # Initialize rigid penetration-free (DAT) truncation state
         self._init_rigid_penetration_free(model, rigid_soft_dat_use_interval_arithmetic)
 
+        # Joint coordinates at which reduced elastic contact frames are evaluated; step() and the
+        # mid-step detection passes update it to the current iterate.
+        self._contact_frame_joint_q = model.joint_q
+        self.elastic_contact_count_zero = wp.zeros(1, dtype=int, device=self.device)
+        elastic_body_count = int(model.elastic_body_count)
+        if elastic_body_count > 0 and self.integrate_with_external_rigid_solver:
+            raise NotImplementedError(
+                "SolverVBD cannot simulate reduced elastic bodies with "
+                "integrate_with_external_rigid_solver=True. Either integrate rigid bodies with "
+                "SolverVBD (integrate_with_external_rigid_solver=False) or remove the elastic "
+                "bodies from the model."
+            )
+        self.elastic_body_block_width = int(model.elastic_max_mode_count) + 6
+        if elastic_body_count > 0:
+            self._validate_elastic_body_block_width(self.elastic_body_block_width)
+        self.elastic_body_block_grad = wp.empty(
+            (elastic_body_count, self.elastic_body_block_width), dtype=float, device=self.device
+        )
+        self.elastic_body_block_delta = wp.empty(
+            (elastic_body_count, self.elastic_body_block_width), dtype=float, device=self.device
+        )
+        self.elastic_body_block_matrix = wp.empty(
+            (elastic_body_count, self.elastic_body_block_width, self.elastic_body_block_width),
+            dtype=float,
+            device=self.device,
+        )
+        self.elastic_implicit_mass_coupling, self.elastic_reduced_inv_mass = self._build_elastic_mass_solve_data(model)
+        self._solve_elastic_body_tiled = (
+            create_solve_elastic_body_tiled(self.elastic_body_block_width) if elastic_body_count > 0 else None
+        )
+        metric_count = model.elastic_body_count if self.elastic_solver_metrics else 0
+        self.elastic_body_block_initial_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
+        self.elastic_body_block_solve_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
+        self.elastic_body_block_applied_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
+        self.elastic_body_block_update_norm = wp.zeros(metric_count, dtype=float, device=self.device)
+        self.elastic_body_block_update_max = wp.zeros(metric_count, dtype=float, device=self.device)
+
         # Controls whether the next step() refreshes contact state derived from
         # the Contacts buffer or reuses the current rigid/body-particle contact state.
         # Defaults to True and is reset to True when consumed by step().
@@ -1352,6 +1421,99 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+    def _validate_elastic_body_block_width(self, block_width: int):
+        """Reject a block width whose tiles cannot fit in the device shared memory budget.
+
+        The tiled solve holds the assembled block and its Cholesky factor as ``block_width``
+        squared tiles plus three vectors. Without this check an oversized
+        :attr:`Model.elastic_max_mode_count` surfaces as an opaque allocation failure when the
+        kernel is first launched.
+        """
+        shared_memory_limit = int(getattr(self.device, "max_shared_memory_per_block", 0))
+        if shared_memory_limit <= 0:
+            return
+
+        required_bytes = (2 * block_width * block_width + 3 * block_width) * 4
+        if required_bytes > shared_memory_limit:
+            largest_width = int((np.sqrt(9.0 + 2.0 * shared_memory_limit) - 3.0) / 4.0)
+            max_mode_count = max(largest_width - 6, 0)
+            raise ValueError(
+                f"Reduced elastic block width {block_width} (6 frame DOFs + "
+                f"elastic_max_mode_count={block_width - 6}) needs about {required_bytes} bytes of "
+                f"shared memory per body, but device '{self.device}' provides "
+                f"{shared_memory_limit}. Reduce the largest modal basis to at most "
+                f"{max_mode_count} modes."
+            )
+
+    def _build_elastic_mass_solve_data(self, model: Model) -> tuple[wp.array, wp.array]:
+        """Build coupled-mass flags and generalized inverse-mass blocks."""
+        elastic_body_count = int(model.elastic_body_count)
+        if elastic_body_count == 0:
+            return (
+                wp.empty(0, dtype=bool, device=self.device),
+                wp.empty(
+                    (0, self.elastic_body_block_width, self.elastic_body_block_width), dtype=float, device=self.device
+                ),
+            )
+
+        elastic_body = model.elastic_body.numpy()
+        mode_start = model.elastic_mode_start.numpy()
+        mode_count = model.elastic_mode_count.numpy()
+        mode_mass = model.elastic_mode_mass.numpy()
+        coupling_linear = model.elastic_mode_coupling_linear.numpy()
+        coupling_angular = model.elastic_mode_coupling_angular.numpy()
+        body_mass = model.body_mass.numpy()
+        body_inertia = model.body_inertia.numpy()
+        body_com = model.body_com.numpy()
+        body_inv_mass = self.body_inv_mass_effective.numpy()
+        body_inv_inertia = self.body_inv_inertia_effective.numpy()
+
+        flags = np.zeros(elastic_body_count, dtype=bool)
+        inverse_mass = np.zeros(
+            (elastic_body_count, self.elastic_body_block_width, self.elastic_body_block_width), dtype=np.float32
+        )
+        for elastic_index, body in enumerate(elastic_body):
+            count = int(mode_count[elastic_index])
+            if count == 0:
+                continue
+            start = int(mode_start[elastic_index])
+            frame_dynamic = float(body_inv_mass[body]) > 0.0
+            if frame_dynamic:
+                inverse_mass[elastic_index, :3, :3] = float(body_inv_mass[body]) * np.eye(3, dtype=np.float32)
+                inverse_mass[elastic_index, 3:6, 3:6] = np.asarray(body_inv_inertia[body], dtype=np.float32)
+            for mode in range(count):
+                mass = float(mode_mass[start + mode])
+                if mass > 0.0:
+                    inverse_mass[elastic_index, 6 + mode, 6 + mode] = 1.0 / mass
+
+            if not frame_dynamic:
+                continue
+
+            frame_mass = np.zeros((6, 6), dtype=np.float64)
+            frame_mass[:3, :3] = float(body_mass[body]) * np.eye(3)
+            frame_mass[3:, 3:] = np.asarray(body_inertia[body], dtype=np.float64)
+            cross_mass = np.zeros((6, count), dtype=np.float64)
+            for mode in range(count):
+                linear = np.asarray(coupling_linear[start + mode], dtype=np.float64)
+                angular = np.asarray(coupling_angular[start + mode], dtype=np.float64)
+                cross_mass[:3, mode] = linear
+                cross_mass[3:, mode] = -(angular + np.cross(body_com[body], linear))
+            modal_mass = np.diag(np.asarray(mode_mass[start : start + count], dtype=np.float64))
+            reduced_mass = np.block([[frame_mass, cross_mass], [cross_mass.T, modal_mass]])
+            diagonal_scale = max(float(np.max(np.abs(np.diag(reduced_mass)))), 1.0)
+            is_spd = float(np.linalg.eigvalsh(reduced_mass)[0]) > 1.0e-8 * diagonal_scale
+            flags[elastic_index] = is_spd
+            if is_spd:
+                active_width = 6 + count
+                inverse_mass[elastic_index, :active_width, :active_width] = np.linalg.inv(reduced_mass).astype(
+                    np.float32
+                )
+
+        return (
+            wp.array(flags, dtype=bool, device=self.device),
+            wp.array(inverse_mass, dtype=float, device=self.device),
+        )
 
     def _init_particle_system(
         self,
@@ -1535,6 +1697,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.rigid_joint_alpha = rigid_avbd_alpha
         elif rigid_compliant_alm:
             self.rigid_joint_alpha = 0.0
+        elif model.elastic_body_count > 0:
+            # Reduced elastic joint projections historically use the raw attachment
+            # residual. Treating the current deformed endpoint as C0 suppresses 95%
+            # of the first coupled frame/modal update on the legacy path.
+            self.rigid_joint_alpha = 0.0
         else:
             self.rigid_joint_alpha = 0.95
         self.rigid_linear_beta = rigid_avbd_linear_beta
@@ -1643,6 +1810,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.joint_penalty_kd,
                 self.joint_is_hard,
             ) = self._init_joint_penalty_k()
+            # Compatibility alias retained by the reduced-elastic development API.
+            self.joint_penalty_k_max = self.joint_material_k
             self._init_structural_k()
 
             # Body-body contact state (pre-allocated in __init__ when possible, resized on first step otherwise).
@@ -1792,6 +1961,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
+            if self.model.elastic_body_count > 0:
+                self.elastic_implicit_mass_coupling, self.elastic_reduced_inv_mass = (
+                    self._build_elastic_mass_solve_data(self.model)
+                )
         if (
             flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
             and self._integrates_rigid_bodies
@@ -1927,6 +2100,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 body_q_prev,
                 contacts,
                 dt,
+                joint_q=state_out.joint_q,
+                joint_q_prev=state.joint_q,
             )
             wp.launch(
                 _harvest_vbd_proxy_wrenches_kernel,
@@ -2272,6 +2447,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
           - PRISMATIC: 3 scalars (2-DOF perpendicular linear + isotropic angular + linear drive/limit)
           - D6:   2 + lin_count + ang_count scalars (projected linear + projected angular + per-DOF drive/limit)
           - FREE:  0 scalars (not a constraint)
+          - ELASTIC: 0 scalars (state owner, not a constraint)
 
         Drive and limit for each free DOF share one AVBD slot (mutually exclusive at runtime).
 
@@ -2306,7 +2482,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 elif jt[j] == JointType.D6:
                     dim_np[j] = 2 + int(jdof_dim[j, 0]) + int(jdof_dim[j, 1])
                 else:
-                    if jt[j] != JointType.FREE:
+                    if jt[j] != JointType.FREE and jt[j] != JointType.ELASTIC:
                         raise NotImplementedError(
                             f"SolverVBD rigid joints: JointType.{JointType(jt[j]).name} is not implemented yet "
                             "(only ROD, BALL, FIXED, REVOLUTE, PRISMATIC, and D6 are supported)."
@@ -2956,6 +3132,33 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             # in existing CUDA graphs, silently ignoring the mode change on replay.
             self.joint_is_hard.assign(is_hard_np)
 
+    def elastic_mode_solve_metrics(self) -> dict[str, np.ndarray]:
+        """Return the latest reduced elastic block solve metrics.
+
+        Metrics are written per elastic body during :meth:`step` and cover every row of the
+        coupled ``(6 + mode_count)`` block that the solve updates: the six floating-frame rows
+        when the frame is solved, plus the active modal rows. Padded modal rows are excluded.
+        ``initial_residual_norm`` measures the block gradient before the block update.
+        ``solve_residual_norm`` measures the linear residual after the unrelaxed dense block
+        solve, ``g + H delta``. ``applied_residual_norm`` uses the relaxed update that was
+        actually applied. ``update_norm`` and ``update_max`` measure the applied increment.
+
+        Note:
+            The frame and modal rows carry different units, so the norms mix ``[N]``, ``[N·m]``
+            and modal-force components. They are meaningful as a ratio against
+            ``initial_residual_norm``, not as absolute quantities.
+
+            Metrics are empty unless the solver was constructed with
+            ``elastic_solver_metrics=True``.
+        """
+        return {
+            "initial_residual_norm": self.elastic_body_block_initial_residual_norm.numpy().copy(),
+            "solve_residual_norm": self.elastic_body_block_solve_residual_norm.numpy().copy(),
+            "applied_residual_norm": self.elastic_body_block_applied_residual_norm.numpy().copy(),
+            "update_norm": self.elastic_body_block_update_norm.numpy().copy(),
+            "update_max": self.elastic_body_block_update_max.numpy().copy(),
+        }
+
     @override
     def step(
         self,
@@ -3025,6 +3228,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if control is None:
             control = self.model.control(clone_variables=False)
 
+        self._initialize_elastic_bodies(state_in, state_out, control, dt)
+        self._contact_frame_joint_q = state_in.joint_q
         # Must run BEFORE _initialize_rigid_bodies: the dynamic routing activation
         # decision has to see the accepted pose, but the inertial predictor inside
         # _initialize_rigid_bodies overwrites state_in.body_q in place.
@@ -3096,9 +3301,152 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
         self._finalize_rigid_bodies(state_in, state_out, dt)
+        self._finalize_elastic_bodies(state_out)
         if update_tendon_diagnostics:
             self._update_tendon_segment_diagnostics(state_out, dt)
         self._finalize_particles(state_out, dt)
+
+    def _initialize_elastic_bodies(self, state_in: State, state_out: State, control: Control, dt: float):
+        """Synchronize reduced elastic owner joints and integrate modal coordinates."""
+        model = self.model
+        if model.elastic_body_count == 0:
+            return
+
+        if self.elastic_solver_metrics:
+            self.elastic_body_block_initial_residual_norm.zero_()
+            self.elastic_body_block_solve_residual_norm.zero_()
+            self.elastic_body_block_applied_residual_norm.zero_()
+            self.elastic_body_block_update_norm.zero_()
+            self.elastic_body_block_update_max.zero_()
+
+        wp.copy(state_out.joint_q, state_in.joint_q)
+        wp.copy(state_out.joint_qd, state_in.joint_qd)
+
+        wp.launch(
+            kernel=copy_elastic_joint_frame_to_body,
+            dim=model.elastic_body_count,
+            inputs=[
+                model.elastic_body,
+                model.elastic_joint,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+                state_in.joint_qd,
+            ],
+            outputs=[
+                state_in.body_q,
+                state_in.body_qd,
+            ],
+            device=self.device,
+        )
+
+        wp.launch(
+            kernel=integrate_elastic_modes_implicit,
+            dim=model.elastic_body_count,
+            inputs=[
+                dt,
+                model.elastic_joint,
+                model.elastic_mode_start,
+                model.elastic_mode_count,
+                model.elastic_mode_mass,
+                model.elastic_mode_stiffness,
+                model.elastic_mode_damping,
+                model.joint_q_start,
+                model.joint_qd_start,
+                control.joint_f,
+                state_in.joint_q,
+                state_in.joint_qd,
+            ],
+            outputs=[
+                state_out.joint_q,
+                state_out.joint_qd,
+            ],
+            device=self.device,
+        )
+
+    def _finalize_elastic_bodies(self, state_out: State):
+        """Write solved floating-frame body poses back to reduced elastic owner joints."""
+        model = self.model
+        if model.elastic_body_count == 0:
+            return
+
+        wp.launch(
+            kernel=copy_body_frame_to_elastic_joint,
+            dim=model.elastic_body_count,
+            inputs=[
+                model.elastic_body,
+                model.elastic_joint,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_out.body_q,
+                state_out.body_qd,
+            ],
+            outputs=[
+                state_out.joint_q,
+                state_out.joint_qd,
+            ],
+            device=self.device,
+        )
+
+    def _launch_elastic_body_solve(
+        self,
+        body_ids: wp.array,
+        solve_frame: bool,
+        state_in: State,
+        state_out: State,
+        relaxation: float,
+        dt: float,
+    ):
+        model = self.model
+        common_inputs = [
+            dt,
+            solve_frame,
+            body_ids,
+            model.body_elastic_index,
+            model.elastic_joint,
+            model.elastic_mode_count,
+        ]
+        body_q_current = state_in.body_q if solve_frame else state_out.body_q
+        trailing_inputs = [
+            self.body_inv_mass_effective,
+            model.body_com,
+            body_q_current,
+            model.joint_q_start,
+            model.joint_qd_start,
+            state_in.joint_q,
+            self.elastic_body_block_grad,
+            self.elastic_body_block_delta,
+            self.elastic_body_block_matrix,
+        ]
+        metric_inputs = [
+            self.elastic_body_block_initial_residual_norm,
+            self.elastic_body_block_solve_residual_norm,
+            self.elastic_body_block_applied_residual_norm,
+            self.elastic_body_block_update_norm,
+            self.elastic_body_block_update_max,
+            relaxation,
+        ]
+        outputs = [
+            state_out.body_q,
+            state_out.joint_q,
+            state_out.joint_qd,
+        ]
+
+        wp.launch_tiled(
+            kernel=self._solve_elastic_body_tiled,
+            dim=[body_ids.size],
+            inputs=common_inputs + trailing_inputs + metric_inputs,
+            outputs=outputs,
+            block_dim=32,
+            device=self.device,
+        )
+
+    def _elastic_solve_inputs(self, contacts: Contacts | None) -> tuple[int, wp.array, float]:
+        """Resolve elastic contact launch bounds and the body-block relaxation."""
+        model = self.model
+        if contacts is None or model.elastic_shape_vertex_total_count == 0 or contacts.rigid_contact_max <= 0:
+            return 0, self.elastic_contact_count_zero, self.elastic_body_relaxation
+        return contacts.rigid_contact_max, contacts.rigid_contact_count, self.elastic_body_relaxation
 
     @override
     def reset(
@@ -3786,6 +4134,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         contacts.rigid_contact_shape1,
                         model.shape_body,
                         self.body_inv_mass_effective,
+                        model.body_elastic_index,
                         self.body_body_contact_buffer_pre_alloc,
                     ],
                     outputs=[
@@ -4023,6 +4372,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.body_structural_k,
                 int(BodyFlags.PROXY),
                 body_q,
+                contacts.rigid_contact_elastic_sample0,
+                contacts.rigid_contact_elastic_sample1,
+                model.body_elastic_index,
+                model.elastic_joint,
+                model.elastic_mode_count,
+                self._contact_frame_joint_q,
+                model.joint_q_start,
+                model.elastic_shape_vertex_local,
+                model.elastic_shape_vertex_phi,
+                self.elastic_reduced_inv_mass,
+                model.elastic_max_mode_count,
                 self.rigid_contact_hard,
                 self.rigid_compliant_alm,
                 lambda_retention,
@@ -4211,6 +4571,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         state_in.body_q,
                         self.body_q_prev,
                         model.body_q,
+                        model.body_elastic_index,
+                        model.elastic_joint,
+                        model.elastic_mode_count,
+                        state_in.joint_q,
+                        model.joint_q_start,
+                        model.joint_parent_elastic_endpoint,
+                        model.joint_child_elastic_endpoint,
+                        model.elastic_endpoint_phi,
+                        model.elastic_endpoint_psi,
+                        model.elastic_max_mode_count,
                         self.joint_constraint_start,
                         self.joint_constraint_dim,
                         self.joint_is_hard,
@@ -4910,9 +5280,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         contacts: Contacts | None,
         dt: float,
         body_group: wp.array[wp.int32],
+        state_out: State | None = None,
     ):
-        """Accumulate contact and body-particle attachment terms for a body group."""
+        """Accumulate contact and body-particle attachment terms for a body group.
+
+        ``state_out.joint_q`` carries the current reduced elastic modal coordinates (the
+        previous ones are in ``state_in.joint_q``); without it contacts use ``state_in``.
+        """
         model = self.model
+        joint_q = state_in.joint_q
+        if state_out is not None and state_out.joint_q is not None:
+            joint_q = state_out.joint_q
         if model.attachment_particle_body_count > 0:
             wp.launch(
                 kernel=accumulate_body_particle_attachments_per_body,
@@ -5023,7 +5401,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     contacts.rigid_contact_normal,
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
+                    contacts.rigid_contact_elastic_sample0,
+                    contacts.rigid_contact_elastic_sample1,
                     model.shape_body,
+                    model.body_elastic_index,
+                    model.elastic_joint,
+                    model.elastic_mode_count,
+                    joint_q,
+                    state_in.joint_q,
+                    model.joint_q_start,
+                    model.elastic_shape_vertex_local,
+                    model.elastic_shape_vertex_phi,
+                    model.elastic_max_mode_count,
                     self.body_body_contact_buffer_pre_alloc,
                     self.body_body_contact_counts,
                     self.body_body_contact_indices,
@@ -5065,7 +5454,35 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.body_hessian_ll.zero_()
             if self._mimic_solver is not None:
                 self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
+            if model.elastic_body_count > 0:
+                wp.launch(
+                    kernel=accumulate_elastic_frame_coupling,
+                    dim=model.elastic_body_count,
+                    inputs=[
+                        dt,
+                        model.elastic_body,
+                        model.elastic_joint,
+                        model.elastic_mode_start,
+                        model.elastic_mode_count,
+                        model.elastic_mode_coupling_linear,
+                        model.elastic_mode_coupling_angular,
+                        state_in.body_q,
+                        self.body_q_prev,
+                        model.body_com,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        state_out.joint_q,
+                        state_in.joint_q,
+                        state_in.joint_qd,
+                    ],
+                    outputs=[
+                        self.body_forces,
+                        self.body_torques,
+                    ],
+                    device=self.device,
+                )
             body_color_groups = model.body_color_groups
+        rigid_contact_max, rigid_contact_count, elastic_body_relaxation = self._elastic_solve_inputs(contacts)
         # A subset follows sparse assembly: preserve its Hessians and the
         # already accumulated reactions on bodies handled by the local solve.
         if self._tendon_alm_rows:
@@ -5082,7 +5499,159 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if not self._tendon_alm_rows:
                 self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
-            self._accumulate_rigid_contact_forces(state_in, contacts, dt, color_group)
+            self._accumulate_rigid_contact_forces(state_in, contacts, dt, color_group, state_out)
+
+            if model.elastic_body_count > 0:
+                wp.launch(
+                    kernel=assemble_elastic_joints,
+                    dim=color_group.size,
+                    inputs=[
+                        dt,
+                        True,
+                        color_group,
+                        model.elastic_joint,
+                        model.elastic_mode_start,
+                        model.elastic_mode_count,
+                        model.elastic_mode_mass,
+                        model.elastic_mode_stiffness,
+                        model.elastic_mode_damping,
+                        model.elastic_mode_coupling_linear,
+                        model.elastic_mode_coupling_angular,
+                        model.elastic_mode_coupling_centrifugal,
+                        model.elastic_mode_coupling_coriolis,
+                        self.elastic_implicit_mass_coupling,
+                        self.rigid_adjacency,
+                        model.elastic_endpoint_phi,
+                        model.elastic_endpoint_psi,
+                        model.elastic_max_mode_count,
+                        model.body_elastic_index,
+                        state_in.body_q,
+                        self.body_q_prev,
+                        model.body_q,
+                        model.body_mass,
+                        self.body_inv_mass_effective,
+                        model.body_inertia,
+                        self.body_inertia_q,
+                        model.body_com,
+                        model.body_world,
+                        model.gravity,
+                        self.body_forces,
+                        self.body_torques,
+                        self.body_hessian_ll,
+                        self.body_hessian_al,
+                        self.body_hessian_aa,
+                        model.joint_type,
+                        model.joint_enabled,
+                        model.joint_parent,
+                        model.joint_child,
+                        model.joint_X_p,
+                        model.joint_X_c,
+                        model.joint_axis,
+                        self.joint_rod_rest_kb_local,
+                        self.joint_rod_rest_twist,
+                        model.joint_qd_start,
+                        model.joint_target_q_start,
+                        self.joint_constraint_start,
+                        self.joint_penalty_k,
+                        self.joint_rho,
+                        self.joint_material_k,
+                        self.joint_penalty_kd,
+                        self.joint_sigma_start,
+                        self.joint_C_fric,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        control.joint_target_q,
+                        control.joint_target_qd,
+                        model.joint_limit_lower,
+                        model.joint_limit_upper,
+                        model.joint_limit_ke,
+                        model.joint_limit_kd,
+                        self.joint_drive_limit_support,
+                        self.joint_drive_lambda,
+                        self.joint_limit_lambda,
+                        self.joint_lambda_lin,
+                        self.joint_lambda_ang,
+                        self.joint_C0_lin,
+                        self.joint_C0_ang,
+                        self.joint_is_hard,
+                        self.rigid_joint_alpha,
+                        self.rigid_compliant_alm,
+                        model.joint_dof_dim,
+                        self._joint_coordinates.data,
+                        model.joint_parent_elastic_endpoint,
+                        model.joint_child_elastic_endpoint,
+                        model.joint_q_start,
+                        control.joint_f,
+                        state_in.joint_q,
+                        state_in.joint_qd,
+                        state_out.joint_q,
+                    ],
+                    outputs=[
+                        self.elastic_body_block_grad,
+                        self.elastic_body_block_delta,
+                        self.elastic_body_block_matrix,
+                    ],
+                    device=self.device,
+                )
+
+                if rigid_contact_max > 0:
+                    wp.launch(
+                        kernel=assemble_elastic_contacts,
+                        dim=color_group.size * _NUM_ELASTIC_CONTACT_THREADS_PER_BODY,
+                        inputs=[
+                            dt,
+                            True,
+                            color_group,
+                            model.elastic_joint,
+                            model.elastic_mode_count,
+                            model.elastic_max_mode_count,
+                            model.body_elastic_index,
+                            self.body_inv_mass_effective,
+                            state_in.body_q,
+                            self.body_q_prev,
+                            model.body_com,
+                            model.shape_body,
+                            rigid_contact_max,
+                            rigid_contact_count,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                            contacts.rigid_contact_point0,
+                            contacts.rigid_contact_point1,
+                            contacts.rigid_contact_offset0,
+                            contacts.rigid_contact_offset1,
+                            contacts.rigid_contact_normal,
+                            contacts.rigid_contact_margin0,
+                            contacts.rigid_contact_margin1,
+                            contacts.rigid_contact_elastic_sample0,
+                            contacts.rigid_contact_elastic_sample1,
+                            self.body_body_contact_penalty_k,
+                            self.body_body_contact_normal_rho,
+                            self.body_body_contact_material_ke,
+                            self.body_body_contact_material_kd,
+                            self.body_body_contact_material_mu,
+                            self.body_body_contact_tangent_rho,
+                            self.body_body_contact_lambda,
+                            self.body_body_contact_C0,
+                            self.rigid_contact_alpha,
+                            self.rigid_contact_hard,
+                            self.rigid_compliant_alm,
+                            self.friction_epsilon,
+                            self.body_body_contact_buffer_pre_alloc,
+                            self.body_body_contact_counts,
+                            self.body_body_contact_indices,
+                            model.joint_q_start,
+                            model.elastic_shape_vertex_local,
+                            model.elastic_shape_vertex_phi,
+                            state_in.joint_q,
+                            state_out.joint_q,
+                        ],
+                        outputs=[
+                            self.elastic_body_block_grad,
+                            self.elastic_body_block_matrix,
+                        ],
+                        device=self.device,
+                    )
+
             wp.launch(
                 kernel=solve_rigid_body,
                 inputs=[
@@ -5103,6 +5672,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.joint_child,
                     model.joint_X_p,
                     model.joint_X_c,
+                    model.body_elastic_index,
+                    model.elastic_joint,
+                    model.elastic_mode_count,
+                    state_out.joint_q,
+                    state_in.joint_q,
+                    model.joint_q_start,
+                    model.joint_parent_elastic_endpoint,
+                    model.joint_child_elastic_endpoint,
+                    model.elastic_endpoint_phi,
+                    model.elastic_endpoint_psi,
+                    model.elastic_max_mode_count,
                     model.joint_axis,
                     self.joint_rod_rest_kb_local,
                     self.joint_rod_rest_twist,
@@ -5177,6 +5757,25 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 dim=color_group.size,
                 device=self.device,
             )
+            if model.elastic_body_count > 0:
+                self._launch_elastic_body_solve(
+                    color_group,
+                    True,
+                    state_in,
+                    state_out,
+                    elastic_body_relaxation,
+                    dt,
+                )
+
+            if model.elastic_body_count > 0:
+                wp.launch(
+                    kernel=copy_elastic_body_transforms_back,
+                    inputs=[color_group, model.body_elastic_index, state_out.body_q],
+                    outputs=[state_in.body_q],
+                    dim=color_group.size,
+                    device=self.device,
+                )
+
             # Truncate this color's pose updates before the next color accumulates
             # forces against them; the last color also feeds the dual updates.
             self._rigid_penetration_free_truncation(state_in, contacts)
@@ -5207,9 +5806,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     contacts.rigid_contact_normal,
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
+                    contacts.rigid_contact_elastic_sample0,
+                    contacts.rigid_contact_elastic_sample1,
                     model.shape_body,
                     state_in.body_q,
                     self.body_q_prev,
+                    model.body_elastic_index,
+                    model.elastic_joint,
+                    model.elastic_mode_count,
+                    state_out.joint_q,
+                    state_in.joint_q,
+                    model.joint_q_start,
+                    model.elastic_shape_vertex_local,
+                    model.elastic_shape_vertex_phi,
+                    model.elastic_max_mode_count,
                     dt,
                     self.body_body_contact_material_mu,
                     self.body_body_contact_C0,
@@ -5257,7 +5867,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if not self._integrates_rigid_bodies:
             return
 
-        if model.joint_count > 0:
+        if model.joint_count > 0 and (self.rigid_compliant_alm or self.rigid_joint_adaptive_stiffness is not False):
             wp.launch(
                 kernel=update_duals_joint,
                 dim=model.joint_count,
@@ -5268,6 +5878,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.joint_child,
                     model.joint_X_p,
                     model.joint_X_c,
+                    model.body_elastic_index,
+                    model.elastic_joint,
+                    model.elastic_mode_count,
+                    state_out.joint_q,
+                    state_in.joint_q,
+                    model.joint_q_start,
+                    model.joint_parent_elastic_endpoint,
+                    model.joint_child_elastic_endpoint,
+                    model.elastic_endpoint_phi,
+                    model.elastic_endpoint_psi,
+                    model.elastic_max_mode_count,
                     model.joint_axis,
                     self.joint_rod_rest_kb_local,
                     self.joint_rod_rest_twist,
@@ -5355,7 +5976,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         """
         # Clear unowned rigid rows and soft rows when no particles are present as well as padding.
         contact_f.zero_()
-        self._export_body_body_contact_forces(state_in, contacts, dt, contact_f)
+        self._export_body_body_contact_forces(state_in, contacts, dt, contact_f, state_out)
         if contacts.soft_contact_max > 0 and self.model.particle_count > 0:
             # Slicing creates a view, not a device allocation, including during graph capture.
             self._export_body_particle_contact_forces(
@@ -5363,13 +5984,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
 
     def _export_body_body_contact_forces(
-        self, state_in: State, contacts: Contacts, dt: float, contact_f: wp.array[wp.spatial_vector]
+        self,
+        state_in: State,
+        contacts: Contacts,
+        dt: float,
+        contact_f: wp.array[wp.spatial_vector],
+        state_out: State | None = None,
     ) -> None:
         """Evaluate one wrench per body-body contact record when this solver integrates the bodies."""
         if not self._integrates_rigid_bodies:
             return
 
         model = self.model
+        joint_q = state_in.joint_q
+        if state_out is not None and state_out.joint_q is not None:
+            joint_q = state_out.joint_q
         rigid_contact_max = contacts.rigid_contact_max
         if rigid_contact_max == 0:
             return
@@ -5392,10 +6021,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contacts.rigid_contact_normal,
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
+                contacts.rigid_contact_elastic_sample0,
+                contacts.rigid_contact_elastic_sample1,
                 model.shape_body,
                 state_in.body_q,
                 self.body_q_prev,
                 model.body_com,
+                model.body_elastic_index,
+                model.elastic_joint,
+                model.elastic_mode_count,
+                joint_q,
+                state_in.joint_q,
+                model.joint_q_start,
+                model.elastic_shape_vertex_local,
+                model.elastic_shape_vertex_phi,
+                model.elastic_max_mode_count,
                 self.body_body_contact_penalty_k,
                 self.body_body_contact_normal_rho,
                 self.body_body_contact_material_ke,
@@ -5491,7 +6131,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         if self._mimic_solver is not None:
             self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
-        self._accumulate_rigid_contact_forces(state_in, contacts, dt, layout.articulation_bodies)
+        self._accumulate_rigid_contact_forces(state_in, contacts, dt, layout.articulation_bodies, state_out)
         if self.rigid_articulation_diagonal_regularization > 0.0:
             wp.launch(
                 kernel=regularize_articulation_body_hessian,
@@ -5883,6 +6523,22 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             data.body_articulation_local = self.rigid_articulation_sparse_layout.body_articulation_local
         data.alpha = self.rigid_joint_alpha
         data.compliant_alm = int(self.rigid_compliant_alm)
+        # Reduced elastic endpoints are evaluated at the reported state's modal coordinates; no previous
+        # coordinates are available here, so endpoint motion does not contribute to joint damping.
+        data.joint_q = state.joint_q
+        data.joint_q_prev = state.joint_q
+        data.elastic_max_mode_count = int(model.elastic_max_mode_count)
+        for name in (
+            "body_elastic_index",
+            "elastic_joint",
+            "elastic_mode_count",
+            "joint_q_start",
+            "joint_parent_elastic_endpoint",
+            "joint_child_elastic_endpoint",
+            "elastic_endpoint_phi",
+            "elastic_endpoint_psi",
+        ):
+            setattr(data, name, getattr(model, name))
         for name in (
             "joint_enabled",
             "joint_target_q_start",
@@ -5958,6 +6614,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         body_q_prev: wp.array[wp.transform],
         contacts: Contacts | None,
         dt: float,
+        *,
+        joint_q: wp.array[float] | None = None,
+        joint_q_prev: wp.array[float] | None = None,
     ) -> tuple[
         wp.array[wp.int32],
         wp.array[wp.int32],
@@ -5981,6 +6640,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contact geometry/material references. If None, the function
                 returns default zero/sentinel outputs.
             dt: Time step size [s].
+            joint_q: Current joint coordinates. Required for deformation-aware points on reduced elastic bodies;
+                defaults to the model coordinates when omitted.
+            joint_q_prev: Previous joint coordinates used for contact velocity on reduced elastic bodies;
+                defaults to ``joint_q`` when omitted.
 
         Note:
             Call after collision generation and ``step()`` with the same
@@ -6042,6 +6705,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         # Type narrowing: remaining path requires a valid Contacts instance.
         assert contacts is not None
+        if joint_q is None:
+            joint_q = self.model.joint_q
+        if joint_q_prev is None:
+            joint_q_prev = joint_q
 
         output_capacity = self._rigid_contact_body0.shape[0]
         if output_capacity < max_contacts:
@@ -6067,10 +6734,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contacts.rigid_contact_normal,
                 contacts.rigid_contact_margin0,
                 contacts.rigid_contact_margin1,
+                contacts.rigid_contact_elastic_sample0,
+                contacts.rigid_contact_elastic_sample1,
                 self.model.shape_body,
                 body_q,
                 body_q_prev,
                 self.model.body_com,
+                self.model.body_elastic_index,
+                self.model.elastic_joint,
+                self.model.elastic_mode_count,
+                joint_q,
+                joint_q_prev,
+                self.model.joint_q_start,
+                self.model.elastic_shape_vertex_local,
+                self.model.elastic_shape_vertex_phi,
+                self.model.elastic_max_mode_count,
                 self.body_body_contact_penalty_k,
                 self.body_body_contact_normal_rho,
                 self.body_body_contact_material_ke,
@@ -6241,6 +6919,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             view.body_qd = state_in.body_qd
         view.particle_q = state_in.particle_q
         view.particle_qd = state_in.particle_qd
+        view.joint_q = state_out.joint_q
+        view.joint_qd = state_out.joint_qd
         return view
 
     def _resolve_self_contact_schedule(self) -> tuple[SolverBase.CollisionFrequencyType, int]:
@@ -6315,6 +6995,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
         if rigid_due:
             self._refresh_rigid_contact_state(contacts, refresh=True, restore_history=preserve_history)
+            self._contact_frame_joint_q = collision_state.joint_q
             self._step_body_body_contact_frame(contacts, collision_state.body_q, dt, 1.0, 1.0)
             self._refresh_body_particle_contact_state(contacts, refresh=True)
 

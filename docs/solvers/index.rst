@@ -278,8 +278,17 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |no|
      - |yes|
      - |no|
+   * - ELASTIC
+     - |no|
+     - |no|
+     - |no|
+     - |no|
+     - |yes| :sup:`5`
+     - |no|
 
 | :sup:`1` DISTANCE joints are treated as FREE (no distance constraint enforcement).
+| :sup:`5` ELASTIC joints own a floating frame plus reduced modal coordinates.
+  VBD solves the frame and modes as one dense block.
 
 **Joint properties**
 

@@ -58,6 +58,18 @@ class JointForceData:
     joint_is_hard: wp.array[int]
     alpha: float
     compliant_alm: int
+    # Reduced elastic joint endpoints (deformed attachment frames).
+    body_elastic_index: wp.array[wp.int32]
+    elastic_joint: wp.array[wp.int32]
+    elastic_mode_count: wp.array[wp.int32]
+    joint_q: wp.array[float]
+    joint_q_prev: wp.array[float]
+    joint_q_start: wp.array[int]
+    joint_parent_elastic_endpoint: wp.array[wp.int32]
+    joint_child_elastic_endpoint: wp.array[wp.int32]
+    elastic_endpoint_phi: wp.array[wp.vec3]
+    elastic_endpoint_psi: wp.array[wp.vec3]
+    elastic_max_mode_count: int
 
 
 @wp.func
@@ -242,6 +254,17 @@ def evaluate_joint_forces(
         c.child,
         c.X_p,
         c.X_c,
+        data.body_elastic_index,
+        data.elastic_joint,
+        data.elastic_mode_count,
+        data.joint_q,
+        data.joint_q_prev,
+        data.joint_q_start,
+        data.joint_parent_elastic_endpoint,
+        data.joint_child_elastic_endpoint,
+        data.elastic_endpoint_phi,
+        data.elastic_endpoint_psi,
+        data.elastic_max_mode_count,
         c.axis,
         data.joint_rod_rest_kb_local,
         data.joint_rod_rest_twist,
