@@ -55,13 +55,10 @@ def test_damped_tendon_matches_unilateral_force_law(test, device):
                     solver.step(state_0, state_1, model.control(), None, dt)
 
                     # x = x_free - dt^2*T/m, T = max((x-rest)/C + d*(x-x0)/dt, 0).
-                    # XPBD's signed row lets fast extension transmit damping tension
-                    # before geometric tautness. VBD keeps a slack span force-free
-                    # (see test_vbd_slack_damped_tendon_remains_force_free).
+                    # For sufficiently fast extension this Kelvin-Voigt law
+                    # transmits damping tension even before geometric tautness.
                     free_length = 0.25 + dt * velocity
                     trial_tension = (free_length - 1.0) / 1.0e-3 + 100.0 * velocity
-                    if solver_name == "vbd" and free_length <= 1.0:
-                        trial_tension = 0.0
                     tension = max(trial_tension, 0.0) / (1.0 + dt * dt / 1.0e-3 + dt * 100.0)
                     expected_velocity = velocity - dt * tension
                     test.assertAlmostEqual(float(state_1.body_qd.numpy()[body][0]), expected_velocity, delta=1.0e-4)

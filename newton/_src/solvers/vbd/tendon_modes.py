@@ -50,16 +50,16 @@ def prepare_tendon_material_modes(
         mode.first = seg
         mode.last = seg
         mode.next = -1
-        # A geometrically slack span transmits no force: neither the spring nor
-        # the damper acts until the span is taut, as in the uncondensed row.
-        if active[seg] != 0 and length[seg] > rest[seg]:
+        if active[seg] != 0:
             comp = wp.max(compliance[seg], _MIN_TENDON_COMPLIANCE)
             material = stretch[seg] / comp
             tangent = 1.0 / comp
             if ea_low > 0.0:
                 material = tendon_material_tension(length[seg], rest[seg], comp, ea_low, ea_ratio, transition, width)
                 tangent = tendon_material_tangent(length[seg], rest[seg], comp, ea_low, ea_ratio, transition, width)
-            # Unilateral Kelvin-Voigt force of a taut span.
+            # Match the material projection's unilateral Kelvin-Voigt force.
+            # Damping can support positive tension at nonpositive elastic
+            # stretch; testing stretch alone would discard that force.
             mode.tension = wp.max(material + damping_tension[seg], 0.0)
             if mode.tension > 0.0:
                 mode.stiffness = tangent + damping[seg] / dt
