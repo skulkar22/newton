@@ -166,6 +166,7 @@ class Example:
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
+            rigid_compliant_alm=False,
             iterations=16,
             rigid_joint_linear_k_start=1.0e5,
             rigid_joint_angular_k_start=1.0e3,

@@ -150,7 +150,7 @@ class Example:
         self.max_frame_move = dict.fromkeys(self.beams, 0.0)
         self.max_com_drift = dict.fromkeys(self.beams, 0.0)
 
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=24)
+        self.solver = newton.solvers.SolverVBD(self.model, rigid_compliant_alm=False, iterations=24)
 
         self.viewer.set_model(self.model)
         self.viewer.show_elastic_strain = True

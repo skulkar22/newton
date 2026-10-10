@@ -96,7 +96,7 @@ class FastVBDRigidBaseline:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=10)
+        self.solver = newton.solvers.SolverVBD(self.model, rigid_compliant_alm=False, iterations=10)
         for _ in range(WARMUP_FRAMES):
             self.solver.step(self.state_0, self.state_1, self.control, None, 1.0 / 240.0)
             self.state_0, self.state_1 = self.state_1, self.state_0

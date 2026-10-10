@@ -181,7 +181,7 @@ class Example:
 
         self.max_abs_q = dict.fromkeys(self.beams, 0.0)
 
-        self.solver = newton.solvers.SolverVBD(self.model, iterations=32)
+        self.solver = newton.solvers.SolverVBD(self.model, rigid_compliant_alm=False, iterations=32)
 
         self.viewer.set_model(self.model)
         self.viewer.show_elastic_strain = True

@@ -492,6 +492,7 @@ class Example:
         self.contacts = self.model.contacts()
         self.solver = newton.solvers.SolverVBD(
             self.model,
+            rigid_compliant_alm=False,
             iterations=self.solver_iterations,
             elastic_solver_metrics=True,
             rigid_contact_k_start=5.0e3,
