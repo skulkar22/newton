@@ -348,11 +348,15 @@ def create_compute_gjk_mpr_contacts(
         # Special treatment for minkowski objects
         if type_a == GeoType.SPHERE or type_a == GeoType.CAPSULE:
             radius_eff_a = shape_a_data.scale[0]
-            shape_a_data.scale[0] = small_radius
+            radius = wp.min(shape_a_data.scale[0], small_radius)
+            radius_eff_a -= radius
+            shape_a_data.scale[0] = radius
 
         if type_b == GeoType.SPHERE or type_b == GeoType.CAPSULE:
             radius_eff_b = shape_b_data.scale[0]
-            shape_b_data.scale[0] = small_radius
+            radius = wp.min(shape_b_data.scale[0], small_radius)
+            radius_eff_b -= radius
+            shape_b_data.scale[0] = radius
 
         # Pre-pack ContactData template with static information
         contact_template = ContactData()

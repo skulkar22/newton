@@ -49,8 +49,56 @@ CYLINDER_FLAT_MODE_COS = float(math.cos(math.radians(CYLINDER_FLAT_MODE_DEG)))
 def closest_segment_point(a: wp.vec3, b: wp.vec3, pt: wp.vec3) -> wp.vec3:
     """Returns the closest point on the a-b line segment to a point pt."""
     ab = b - a
-    t = wp.dot(pt - a, ab) / (wp.dot(ab, ab) + 1e-6)
+    length_sq = wp.dot(ab, ab)
+    if length_sq == 0.0:
+        return a
+    t = wp.dot(pt - a, ab) / length_sq
     return a + wp.clamp(t, 0.0, 1.0) * ab
+
+
+@wp.func
+def _collide_capsule_cylinder_barrel(
+    capsule_pos: wp.vec3,
+    capsule_axis: wp.vec3,
+    capsule_radius: float,
+    capsule_half_length: float,
+    cylinder_pos: wp.vec3,
+    cylinder_axis: wp.vec3,
+    cylinder_radius: float,
+    cylinder_half_height: float,
+) -> tuple[bool, float, wp.vec3, wp.vec3]:
+    """Solve a capsule core's exterior closest point on a finite cylinder barrel.
+
+    Return an unhandled result for parallel cores, cap/rim witnesses, or core
+    intersection. Those cases retain the general convex query and its manifold.
+    Axes are normalized. The handled witness attains the infinite-cylinder
+    distance bound inside the finite barrel, so it is also a global closest pair.
+    """
+    relative = capsule_pos - cylinder_pos
+    radial_center = relative - cylinder_axis * wp.dot(relative, cylinder_axis)
+    radial_axis = capsule_axis - cylinder_axis * wp.dot(capsule_axis, cylinder_axis)
+    radial_axis_sq = wp.dot(radial_axis, radial_axis)
+    # This dimensionless guard preserves the parallel side-contact manifold.
+    if radial_axis_sq <= 1.0e-12:
+        return False, float(MAXVAL), wp.vec3(0.0), wp.vec3(0.0)
+    along = wp.clamp(
+        -wp.dot(radial_center, radial_axis) / radial_axis_sq,
+        -capsule_half_length,
+        capsule_half_length,
+    )
+    closest = relative + along * capsule_axis
+    axial = wp.dot(closest, cylinder_axis)
+    radial = closest - axial * cylinder_axis
+    radial_distance = wp.length(radial)
+    if radial_distance < cylinder_radius or wp.abs(axial) >= cylinder_half_height:
+        return False, float(MAXVAL), wp.vec3(0.0), wp.vec3(0.0)
+    if radial_distance <= 0.0:
+        return False, float(MAXVAL), wp.vec3(0.0), wp.vec3(0.0)
+    normal = -radial / radial_distance
+    separation = radial_distance - cylinder_radius - capsule_radius
+    capsule_surface = capsule_pos + along * capsule_axis + capsule_radius * normal
+    cylinder_surface = cylinder_pos + axial * cylinder_axis - cylinder_radius * normal
+    return True, separation, 0.5 * (capsule_surface + cylinder_surface), normal
 
 
 @wp.func
