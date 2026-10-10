@@ -1116,6 +1116,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Per-body COM displacement from the inertial target, accumulated by the sparse
         # articulation solve (see ``_init_body_displacement``).
         self._body_disp = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
+        self._body_disp_ang = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
         body_in_sparse = np.zeros(model.body_count, dtype=np.int32)
         if self.rigid_articulation_sparse_layout is not None:
             body_in_sparse[self.rigid_articulation_sparse_layout.articulation_bodies.numpy()] = 1
@@ -4783,6 +4784,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_hessian_al,
                     self.body_hessian_aa,
                     self._body_disp,
+                    self._body_disp_ang,
                     self._use_body_displacement,
                 ],
                 outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
@@ -4825,6 +4827,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.rigid_articulation_sparse_rhs,
                     self.rigid_articulation_sparse_delta,
                     self._body_disp,
+                    self._body_disp_ang,
                     self._use_body_displacement,
                 ],
                 outputs=[state_in.body_q],
@@ -4879,6 +4882,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._rigid_articulation_sparse_delta_scalar,
                     self.body_inertia_q,
                     self._body_disp,
+                    self._body_disp_ang,
                     self._use_body_displacement,
                 ],
                 outputs=[state_in.body_q],
@@ -5409,7 +5413,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             kernel=init_body_displacement,
             dim=model.body_count,
             inputs=[state_in.body_q, self.body_inertia_q, model.body_com],
-            outputs=[self._body_disp],
+            outputs=[self._body_disp, self._body_disp_ang],
             device=self.device,
         )
 
@@ -5432,6 +5436,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 state_in.body_q,
                 model.body_com,
                 self._body_disp,
+                self._body_disp_ang,
                 self._body_in_sparse_articulation,
                 self.body_inv_mass_effective,
                 self._use_body_displacement,

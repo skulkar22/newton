@@ -23,6 +23,8 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     compute_kappa_and_jacobian,
     compute_kappa_dot,
     evaluate_rod_joint_force_hessian,
+    quat_from_rotation_vector,
+    rotation_vector_from_quat,
 )
 
 wp.set_module_options({"enable_backward": False})
@@ -777,6 +779,7 @@ def _body_diagonal_contribution(
     body_hessian_al: wp.array[wp.mat33],
     body_hessian_aa: wp.array[wp.mat33],
     body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
 ):
     body = articulation_bodies[local_body]
@@ -816,6 +819,10 @@ def _body_diagonal_contribution(
         tau_world = wp.quat_rotate(rot_current, I_body * (theta_body * dt_inv_sqr)) + body_torques[body]
         R = wp.quat_to_matrix(rot_current)
         I_world = R * I_body * wp.transpose(R)
+        if use_displacement != 0:
+            # With rot_current = exp(phi) * rot_star, the inertial torque is -I_world * phi / dt^2;
+            # phi is accumulated exactly instead of recovered from two rounded quaternions.
+            tau_world = -(I_world * body_disp_ang[body]) * dt_inv_sqr + body_torques[body]
 
         H_ll = body_hessian_ll[body]
         H_ll[0, 0] = H_ll[0, 0] + inertial_coeff
@@ -844,6 +851,7 @@ def _apply_sparse_delta_value_to_body(
     dx_in: vec6f,
     body_inertia_q: wp.array[wp.transform],
     body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
     body_q_new: wp.array[wp.transform],
 ):
@@ -872,9 +880,13 @@ def _apply_sparse_delta_value_to_body(
             disp = body_disp[body] + wp.vec3(dx[0], dx[1], dx[2])
             body_disp[body] = disp
             q_star = body_inertia_q[body]
-            com_star = wp.transform_get_translation(q_star) + wp.quat_rotate(
-                wp.transform_get_rotation(q_star), body_com_local
-            )
+            rot_star = wp.transform_get_rotation(q_star)
+            # Same for rotation: compose the update with the accumulated near-identity rotation
+            # and rebuild the absolute rotation from the inertial target.
+            accumulated = wp.normalize(wp.mul(dq, quat_from_rotation_vector(body_disp_ang[body])))
+            body_disp_ang[body] = rotation_vector_from_quat(accumulated)
+            rot_new = wp.normalize(wp.mul(accumulated, rot_star))
+            com_star = wp.transform_get_translation(q_star) + wp.quat_rotate(rot_star, body_com_local)
             com_new = com_star + disp
         pos_new = com_new - wp.quat_rotate(rot_new, body_com_local)
         body_q_new[body] = wp.transform(pos_new, rot_new)
@@ -1210,6 +1222,7 @@ def assemble_articulation_body_diagonal_scalar(
     body_hessian_al: wp.array[wp.mat33],
     body_hessian_aa: wp.array[wp.mat33],
     body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
     values_scalar: wp.array[float],
     rhs_scalar: wp.array[float],
@@ -1231,6 +1244,7 @@ def assemble_articulation_body_diagonal_scalar(
         body_hessian_al,
         body_hessian_aa,
         body_disp,
+        body_disp_ang,
         use_displacement,
     )
     diag_slot = articulation_diag_slots[local_body]
@@ -2136,6 +2150,7 @@ def apply_articulation_sparse_delta_scalar(
     delta_scalar: wp.array[float],
     body_inertia_q: wp.array[wp.transform],
     body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
     body_q_new: wp.array[wp.transform],
 ):
@@ -2150,6 +2165,7 @@ def apply_articulation_sparse_delta_scalar(
         _scalar_vec_load(delta_scalar, local_body),
         body_inertia_q,
         body_disp,
+        body_disp_ang,
         use_displacement,
         body_q_new,
     )
@@ -2230,6 +2246,7 @@ def solve_articulation_sparse_serial_scalar(
     rhs: wp.array[vec6f],
     delta: wp.array[vec6f],
     body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
     body_q_new: wp.array[wp.transform],
 ):
@@ -2256,6 +2273,7 @@ def solve_articulation_sparse_serial_scalar(
             body_hessian_al,
             body_hessian_aa,
             body_disp,
+            body_disp_ang,
             use_displacement,
         )
         rhs[local_body] = rhs_value
@@ -2401,6 +2419,7 @@ def solve_articulation_sparse_serial_scalar(
             delta[local_body],
             body_inertia_q,
             body_disp,
+            body_disp_ang,
             use_displacement,
             body_q_new,
         )
@@ -2412,6 +2431,7 @@ def init_body_displacement(
     body_inertia_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
 ):
     """Displacement of the iteration start pose from the inertial target (exact for nearby float32 values)."""
     tid = wp.tid()
@@ -2421,3 +2441,9 @@ def init_body_displacement(
     com = wp.transform_get_translation(q) + wp.quat_rotate(wp.transform_get_rotation(q), c)
     com_star = wp.transform_get_translation(q_star) + wp.quat_rotate(wp.transform_get_rotation(q_star), c)
     body_disp[tid] = com - com_star
+    rot = wp.transform_get_rotation(q)
+    rot_star = wp.transform_get_rotation(q_star)
+    phi = wp.vec3(0.0)
+    if rot[0] != rot_star[0] or rot[1] != rot_star[1] or rot[2] != rot_star[2] or rot[3] != rot_star[3]:
+        phi = rotation_vector_from_quat(wp.mul(rot, wp.quat_inverse(rot_star)))
+    body_disp_ang[tid] = phi
