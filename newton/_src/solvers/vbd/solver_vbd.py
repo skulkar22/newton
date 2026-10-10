@@ -76,6 +76,7 @@ from .rigid_sparse_articulation_kernels import (
     apply_articulation_sparse_delta_scalar,
     assemble_articulation_body_diagonal_scalar,
     assemble_articulation_joints_scalar,
+    init_body_displacement,
     mat66f,
     predict_articulation_armature,
     regularize_articulation_body_hessian,
@@ -1312,7 +1313,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_articulation_sparse_rhs_scalar = self._rigid_articulation_sparse_rhs_scalar
                     self.rigid_articulation_sparse_delta_scalar = self._rigid_articulation_sparse_delta_scalar
 
+        # Per-body COM displacement from the inertial target, accumulated by the sparse
+        # articulation solve (see ``_init_body_displacement``).
+        self._body_disp = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
+        self._body_disp_ang = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
+        body_in_sparse = np.zeros(model.body_count, dtype=np.int32)
+        if self.rigid_articulation_sparse_layout is not None:
+            body_in_sparse[self.rigid_articulation_sparse_layout.articulation_bodies.numpy()] = 1
+        self._body_in_sparse_articulation = wp.array(body_in_sparse, dtype=wp.int32, device=self.device)
+
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
+        self._update_displacement_mode()
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
 
@@ -1766,6 +1777,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._mimic_solver = (
                 JointMimicSolver(self.model, self._joint_coordinates.data) if self._has_joint_mimics else None
             )
+            self._update_displacement_mode()
         refresh_structural_k = (
             bool(
                 flags
@@ -3030,6 +3042,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.tendon_alm_k.zero_()
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
+        self._init_body_displacement(state_in)
         self._step_tendon_alm_state(dt)
         self._resolve_tendon_alm_rows()
         self._initialize_particles(state_in, state_out, contacts, dt)
@@ -5571,6 +5584,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.body_hessian_ll,
                     self.body_hessian_al,
                     self.body_hessian_aa,
+                    self._body_disp,
+                    self._body_disp_ang,
+                    self._use_body_displacement,
                 ],
                 outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
                 device=self.device,
@@ -5611,6 +5627,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_articulation_sparse_values,
                     self.rigid_articulation_sparse_rhs,
                     self.rigid_articulation_sparse_delta,
+                    self._body_disp,
+                    self._body_disp_ang,
+                    self._use_body_displacement,
                 ],
                 outputs=[state_in.body_q],
                 device=self.device,
@@ -5662,6 +5681,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.body_com,
                     self.rigid_articulation_relaxation,
                     self._rigid_articulation_sparse_delta_scalar,
+                    self.body_inertia_q,
+                    self._body_disp,
+                    self._body_disp_ang,
+                    self._use_body_displacement,
                 ],
                 outputs=[state_in.body_q],
                 device=self.device,
@@ -6093,6 +6116,31 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             device=self.device,
         )
 
+    def _update_displacement_mode(self):
+        """Enable the displacement-form sparse update unless another solver writes body poses.
+
+        The joint mimic solve moves body poses directly between sparse updates, so models
+        with mimics keep the absolute-position update. After a change, recapture any CUDA graph.
+        """
+        self._use_body_displacement = int(
+            self.rigid_articulation_solve == "block_sparse_joints"
+            and self.rigid_articulation_sparse_layout is not None
+            and not self._has_joint_mimics
+        )
+
+    def _init_body_displacement(self, state_in: State):
+        """Start each step's displacement at the iteration start pose minus the inertial target."""
+        model = self.model
+        if model.body_count == 0 or not self._integrates_rigid_bodies:
+            return
+        wp.launch(
+            kernel=init_body_displacement,
+            dim=model.body_count,
+            inputs=[state_in.body_q, self.body_inertia_q, model.body_com],
+            outputs=[self._body_disp, self._body_disp_ang],
+            device=self.device,
+        )
+
     def _finalize_rigid_bodies(self, state_in: State, state_out: State, dt: float):
         """Finalize rigid body velocities and Dahl friction state after VBD iterations (post-iteration phase).
 
@@ -6111,6 +6159,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 dt,
                 state_in.body_q,
                 model.body_com,
+                self._body_disp,
+                self._body_disp_ang,
+                self._body_in_sparse_articulation,
+                self.body_inv_mass_effective,
+                self._use_body_displacement,
             ],
             outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
             dim=model.body_count,
