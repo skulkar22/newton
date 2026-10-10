@@ -7,6 +7,10 @@ This experimental adaptation extracts shape-independent mechanics from
 ``cf643a3c20d12454c463fd4bfa098d4773f9f878`` on experimental base ``1a775c10``.
 No elliptical or convex routing implementation is included.
 
+The circular mechanics and the sweep correction are Viktor Reutskyy's work. The
+adapted commit ``f471c8b032487fc4b83128488075cd128674ae55`` was recorded under an
+integration tool identity; this section and its git note record the original author.
+
 XPBD now solves coupled sliding spans together, including repeated-body mass
 cross terms, and retracts accumulated impulses consistently. Non-ALM VBD
 projects material before each body color and condenses frictionless spans into

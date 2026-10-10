@@ -1,0 +1,6 @@
+# Integration commits recorded under a tool identity or a short name belong to the integrator.
+# Commits adapted from other authors are credited in their documentation and git notes
+# (for example, f471c8b0: Viktor Reutskyy, see docs/tendon_circular_integration.rst).
+Shubhankar Kulkarni <shubhankark@nvidia.com> shubhankark <shubhankark@nvidia.com>
+Shubhankar Kulkarni <shubhankark@nvidia.com> Codex <codex@local.invalid>
+Shubhankar Kulkarni <shubhankark@nvidia.com> Codex <codex@openai.com>
