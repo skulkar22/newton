@@ -372,6 +372,7 @@ def _record_reduction_overflow(
     overflow[0] = wp.where(insert_failures[0] > 0 or buffer_overflows[0] > 0, 1, 0)
 
 
+@wp.func
 def write_elastic_contact(
     contact_data: ContactData,
     writer_data: ContactWriterData,
