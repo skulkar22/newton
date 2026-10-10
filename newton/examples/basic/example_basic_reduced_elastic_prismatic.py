@@ -171,7 +171,7 @@ class Example:
         self.elastic_qd_start = int(self.model.joint_qd_start.numpy()[self.elastic_joint])
         self.base_qd_start = int(self.model.joint_qd_start.numpy()[self.j_base])
         self.slide_qd_start = int(self.model.joint_qd_start.numpy()[self.j_slide])
-        self._target_pos = self.control.joint_target_pos.numpy()
+        self._target_pos = self.control.joint_target_q.numpy()
         self._joint_f = self.control.joint_f.numpy()
         self.initial_volume_ratio = elastic_shape_volume_ratio(self.model, self.state_0)
         self.max_volume_ratio_error = abs(self.initial_volume_ratio - 1.0)
@@ -206,7 +206,7 @@ class Example:
         self._last_rotation_target = self.rotation_amplitude * math.sin(rotate_phase)
         self._target_pos[self.slide_qd_start] = self._last_slide_target
         self._target_pos[self.base_qd_start] = self._last_rotation_target
-        self.control.joint_target_pos.assign(self._target_pos)
+        self.control.joint_target_q.assign(self._target_pos)
 
         joint_q = self.state_0.joint_q.numpy()
         joint_qd = self.state_0.joint_qd.numpy()

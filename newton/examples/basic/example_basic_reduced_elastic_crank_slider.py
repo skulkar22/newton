@@ -195,7 +195,7 @@ class Example:
         self.elastic_q_start = int(self.model.joint_q_start.numpy()[self.elastic_joint])
         self.elastic_qd_start = int(self.model.joint_qd_start.numpy()[self.elastic_joint])
         self.drive_qd_start = int(self.model.joint_qd_start.numpy()[self.j_crank_ground])
-        self._target_pos = self.control.joint_target_pos.numpy()
+        self._target_pos = self.control.joint_target_q.numpy()
         self._joint_f = self.control.joint_f.numpy()
         self.max_volume_ratio_error = abs(elastic_shape_volume_ratio(self.model, self.state_0) - 1.0)
 
@@ -236,7 +236,7 @@ class Example:
     def _set_controls(self, t: float):
         target_theta = self.theta0 + 0.55 * math.sin(1.25 * t)
         self._target_pos[self.drive_qd_start] = target_theta
-        self.control.joint_target_pos.assign(self._target_pos)
+        self.control.joint_target_q.assign(self._target_pos)
 
         joint_q = self.state_0.joint_q.numpy()
         joint_qd = self.state_0.joint_qd.numpy()
