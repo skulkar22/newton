@@ -5531,7 +5531,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_rate_ref = wp.zeros(n, dtype=wp.transform, device=self.device)
         # Prototype ablation switches (default on): BDF2 rates inside the solve, gyroscopic term.
         self._bdf2_use_rates = int(os.environ.get("NEWTON_VBD_BDF2_RATES", "1") != "0")
-        self._bdf2_use_gyro = int(os.environ.get("NEWTON_VBD_BDF2_GYRO", "1") != "0")
+        # 0 off, 1 explicit (extrapolated), 2 implicit (Newton step on the Euler equation)
+        self._bdf2_use_gyro = int(os.environ.get("NEWTON_VBD_BDF2_GYRO", "1"))
 
     def _update_displacement_mode(self):
         """Enable the displacement-form sparse update unless another solver writes body poses.

@@ -7653,8 +7653,10 @@ def bdf2_predict_rigid_bodies(
     x~ = x_n + (x_n - x_{n-1}) / 3 + h v_pred, with v_pred = 4/3 v_n - 1/3 v_{n-1} + h a.
     The previous step's motion (x_n - x_{n-1}) is carried exactly as a small increment
     (inc_lin / inc_ang) instead of being formed by differencing rounded absolute poses.
-    Rotation: q~ = exp(inc_ang / 3 + h w_pred) q_n. The gyroscopic torque -w x I w is
-    evaluated at the extrapolated rate w* = 2 w_n - w_{n-1} (second-order IMEX).
+    Rotation: q~ = exp(inc_ang / 3 + h w_pred) q_n. Gyroscopic torque -w x I w (``use_gyroscopic``):
+    1 = explicit at the extrapolated rate w* = 2 w_n - w_{n-1} (second-order IMEX); 2 = implicit, BDF2-consistent:
+    one Newton step in the body frame on I (w - w_lin) + h w x I w = 0, where w_lin is the gyroscope-free
+    BDF2 prediction (stable for fast spins; the explicit form adds energy to tumbling bodies).
 
     Worlds flagged in ``pose_rebaseline_mask`` (construction, reset) have no history yet. They start
     from the history of constant external acceleration a (gravity, applied force/torque):
@@ -7704,7 +7706,7 @@ def bdf2_predict_rigid_bodies(
         pred_ang[tid] = wp.vec3(0.0)
         return
     torque = wp.spatial_bottom(f)
-    if use_gyroscopic != 0:
+    if use_gyroscopic == 1:
         w_star = wp.quat_rotate_inv(rot_n, 2.0 * wp.spatial_bottom(qd_n) - wp.spatial_bottom(qd_m))
         torque = torque - wp.quat_rotate(rot_n, wp.cross(w_star, body_inertia[tid] * w_star))
     v_pred = (
@@ -7713,6 +7715,13 @@ def bdf2_predict_rigid_bodies(
         + h * (gravity[body_world[tid]] + wp.spatial_top(f) * inv_m)
     )
     w_pred = (4.0 / 3.0) * wp.spatial_bottom(qd_n) - (1.0 / 3.0) * wp.spatial_bottom(qd_m) + h * (inv_I_world * torque)
+    if use_gyroscopic == 2:
+        I_b = body_inertia[tid]
+        w_b = wp.quat_rotate_inv(rot_n, w_pred)
+        Iw = I_b * w_b
+        residual = h * wp.cross(w_b, Iw)
+        jacobian = I_b + h * (wp.skew(w_b) * I_b - wp.skew(Iw))
+        w_pred = wp.quat_rotate(rot_n, w_b - wp.inverse(jacobian) * residual)
     off_lin = d_lin * (1.0 / 3.0) + h * v_pred
     off_ang = d_ang * (1.0 / 3.0) + h * w_pred
     pred_lin[tid] = off_lin
