@@ -93,7 +93,6 @@ from .rigid_vbd_kernels import (
     apply_body_truncation_ts,
     apply_rigid_soft_truncation,
     bdf2_predict_rigid_bodies,
-    bdf2_save_history,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
@@ -2719,10 +2718,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         if control is None:
             control = self.model.control(clone_variables=False)
 
-        # BDF2 prototype: after one backward-Euler step has recorded history, rigid phases
-        # solve with h = 2/3 dt about the BDF2 inertial target (see bdf2_predict_rigid_bodies).
-        self._bdf2_step = int(self._bdf2_enabled and self._bdf2_history_ready)
+        # BDF2 prototype: rigid phases solve with h = 2/3 dt about the BDF2 inertial target
+        # (see bdf2_predict_rigid_bodies). Worlds without history start from a synthetic one,
+        # so every step and every world uses the same h (CUDA-graph and per-world-reset safe).
+        self._bdf2_step = int(self._bdf2_enabled)
         rigid_dt = dt * (2.0 / 3.0) if self._bdf2_step else dt
+        self._bdf2_full_dt = dt
 
         self._initialize_rigid_bodies(state_in, control, contacts, rigid_dt, update_rigid)
         self._init_body_displacement(state_in)
@@ -2750,8 +2751,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._snapshot_rigid_contact_history(contacts)
         self._finalize_rigid_bodies(state_in, state_out, rigid_dt)
         self._finalize_particles(state_out, dt)
-        if self._bdf2_enabled:
-            self._bdf2_history_ready = True
 
     @override
     def reset(
@@ -2847,8 +2846,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise ValueError("'state' argument is required.")
         model = self.model
         world_mask = self._normalize_reset_world_mask(world_mask)
-        # BDF2 prototype: history is global; any reset restarts with one backward-Euler step.
-        self._bdf2_history_ready = False
+        # BDF2 prototype: reset() flags the selected worlds in _rigid_pose_rebaseline_mask, which
+        # also restarts their BDF2 history (see bdf2_predict_rigid_bodies).
 
         flags_value = int(StateFlags.ALL if flags is None else flags)
 
@@ -3798,7 +3797,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                         state_in.body_q,
                         state_in.body_qd,
                         dt,
-                        self._bdf2_step,
+                        self._bdf2_full_dt,
+                        model.body_world,
+                        self._rigid_pose_rebaseline_mask,
                         self._bdf2_inc_lin,
                         self._bdf2_inc_ang,
                         self._bdf2_arm_rate,
@@ -3821,28 +3822,23 @@ class SolverVBD(SolverBase, CouplingInterface):
                     device=self.device,
                 )
 
-            # BDF2 prototype: record the step-start state on the first (backward-Euler) step,
-            # then predict the BDF2 target on later steps instead of the forward Euler step.
-            if self._bdf2_enabled and not self._bdf2_step:
-                wp.launch(
-                    bdf2_save_history,
-                    dim=model.body_count,
-                    inputs=[state_in.body_qd],
-                    outputs=[self._bdf2_hist_qd],
-                    device=self.device,
-                )
             if self._bdf2_step:
                 wp.launch(
                     bdf2_predict_rigid_bodies,
                     dim=model.body_count,
                     inputs=[
                         dt,
+                        self._bdf2_full_dt,
                         model.gravity,
                         model.body_world,
+                        self._rigid_pose_rebaseline_mask,
                         body_f_for_integration,
                         model.body_com,
+                        model.body_inertia,
                         self.body_inv_mass_effective,
                         self.body_inv_inertia_effective,
+                        self._bdf2_use_gyro,
+                        self._bdf2_use_rates,
                         state_in.body_q,
                         state_in.body_qd,
                         self._bdf2_hist_qd,
@@ -3851,7 +3847,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._bdf2_pred_lin,
                         self._bdf2_pred_ang,
                     ],
-                    outputs=[self.body_inertia_q],
+                    outputs=[self.body_q_prev, self.body_inertia_q, self._bdf2_rate_ref],
                     device=self.device,
                 )
                 if self.rigid_articulation_sparse_layout is not None:
@@ -4348,7 +4344,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 inputs=[
                     dt,
                     body_group,
-                    self.body_q_prev,
+                    self._rate_reference_q,
                     state_in.body_q,
                     model.body_com,
                     self.body_inv_mass_effective,
@@ -4430,7 +4426,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     dt,
                     color_group,
                     state_in.body_q,
-                    self.body_q_prev,
+                    self._rate_reference_q,
                     model.body_q,
                     model.body_mass,
                     self.body_inv_mass_effective,
@@ -4523,7 +4519,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     contacts.rigid_contact_margin1,
                     model.shape_body,
                     state_in.body_q,
-                    self.body_q_prev,
+                    self._rate_reference_q,
                     dt,
                     self.body_body_contact_material_mu,
                     self.body_body_contact_C0,
@@ -4589,7 +4585,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.joint_target_q_start,
                     self.joint_constraint_start,
                     state_in.body_q,
-                    self.body_q_prev,
+                    self._rate_reference_q,
                     model.body_q,
                     model.joint_dof_dim,
                     self.joint_C0_lin,
@@ -4670,7 +4666,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 contacts.rigid_contact_margin1,
                 model.shape_body,
                 state_in.body_q,
-                self.body_q_prev,
+                self._rate_reference_q,
                 model.body_com,
                 self.body_body_contact_penalty_k,
                 self.body_body_contact_normal_rho,
@@ -4803,7 +4799,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             layout.articulation_block_cols,
             layout.body_articulation_local,
             state_in.body_q,
-            self.body_q_prev,
+            self._rate_reference_q,
             model.body_q,
             self.body_inertia_q,
             model.body_com,
@@ -5483,6 +5479,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
+    @property
+    def _rate_reference_q(self):
+        """Pose that in-solve rates difference against: x_n (BDF1) or x_n + (x_n - x_{n-1}) / 3 (BDF2)."""
+        return self._bdf2_rate_ref if self._bdf2_step else self.body_q_prev
+
     def _setup_time_integration(self, rigid_time_integration: str):
         """Select the rigid time integrator (BDF2 is an experimental prototype).
 
@@ -5515,6 +5516,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_arm_delta = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
         self._bdf2_arm_offset = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
         self._bdf2_arm_rate = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
+        # x_n + (x_n - x_{n-1}) / 3: (x - reference) / h is the BDF2 velocity used by in-solve rates.
+        self._bdf2_rate_ref = wp.zeros(n, dtype=wp.transform, device=self.device)
+        # Prototype ablation switches (default on): BDF2 rates inside the solve, gyroscopic term.
+        self._bdf2_use_rates = int(os.environ.get("NEWTON_VBD_BDF2_RATES", "1") != "0")
+        self._bdf2_use_gyro = int(os.environ.get("NEWTON_VBD_BDF2_GYRO", "1") != "0")
 
     def _update_displacement_mode(self):
         """Enable the displacement-form sparse update unless another solver writes body poses.
@@ -5570,6 +5576,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._bdf2_inc_ang if self._bdf2_enabled else self._body_disp,
                 self._bdf2_pred_lin if self._bdf2_enabled else self._body_disp,
                 self._bdf2_pred_ang if self._bdf2_enabled else self._body_disp,
+                self._bdf2_rate_ref if self._bdf2_enabled else self.body_q_prev,
             ],
             outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
             dim=model.body_count,

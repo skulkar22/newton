@@ -20,6 +20,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _measure_rod_bend_twist_z,
     _rod_bend_twist_jacobian_z_from_measure,
     _structural_row_has_stiffness,
+    _world_selected,
     compute_kappa_and_jacobian,
     compute_kappa_dot,
     evaluate_rod_joint_force_hessian,
@@ -920,19 +921,21 @@ def predict_articulation_armature_bdf2(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     h: float,
-    bdf2_step: int,
+    dt: float,
+    body_world: wp.array[wp.int32],
+    pose_rebaseline_mask: wp.array[wp.bool],
     inc_lin: wp.array[wp.vec3],
     inc_ang: wp.array[wp.vec3],
     hist_rate: wp.array[float],
     targets: wp.array[float],
     deltas: wp.array[float],
 ):
-    """Rotor target for the BDF2 prototype.
+    """Rotor target for the BDF2 prototype: q_n + (q_n - q_{n-1}) / 3 + h (4/3 rate_n - 1/3 rate_{n-1}).
 
-    bdf2_step == 0: backward-Euler target q + h * rate (first step), recording history.
-    bdf2_step == 1: q_n + (q_n - q_{n-1}) / 3 + h (4/3 rate_n - 1/3 rate_{n-1}). The previous increment
-    q_n - q_{n-1} is projected from the bodies' exact step increments, not differenced from rounded angles.
-    ``deltas`` receives target - q_n, built from small terms only.
+    The previous increment q_n - q_{n-1} is projected from the bodies' exact step increments
+    (exact to second order for a hinge: the child and parent increments differ only along the
+    axis), not differenced from rounded angles. Worlds without history (``pose_rebaseline_mask``)
+    start with rate_{n-1} = rate_n and q_n - q_{n-1} = dt rate_n. ``deltas`` receives target - q_n.
     """
     joint = joints[wp.tid()]
     if coordinates.joint_type[joint] != JointType.REVOLUTE:
@@ -946,9 +949,11 @@ def predict_articulation_armature_bdf2(
         rate += wp.dot(gp, body_qd[parent])
         prev += wp.dot(gp, wp.spatial_vector(inc_lin[parent], inc_ang[parent]))
     dof = coordinates.qd_start[joint]
-    delta = h * rate
-    if bdf2_step != 0:
-        delta = prev / 3.0 + h * ((4.0 / 3.0) * rate - (1.0 / 3.0) * hist_rate[dof])
+    rate_m = hist_rate[dof]
+    if _world_selected(body_world[child], pose_rebaseline_mask):
+        prev = dt * rate
+        rate_m = rate
+    delta = prev / 3.0 + h * ((4.0 / 3.0) * rate - (1.0 / 3.0) * rate_m)
     hist_rate[dof] = rate
     targets[dof] = q + delta
     deltas[dof] = delta

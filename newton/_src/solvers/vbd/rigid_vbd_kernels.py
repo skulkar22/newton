@@ -7621,24 +7621,19 @@ def rotation_vector_from_quat(q: wp.quat) -> wp.vec3:
 
 
 @wp.kernel
-def bdf2_save_history(
-    body_qd: wp.array[wp.spatial_vector],
-    hist_qd: wp.array[wp.spatial_vector],
-):
-    """Store the step-start velocity as v_{n-1} for the next BDF2 step (first, backward-Euler step)."""
-    tid = wp.tid()
-    hist_qd[tid] = body_qd[tid]
-
-
-@wp.kernel
 def bdf2_predict_rigid_bodies(
     h: float,
+    dt: float,
     gravity: wp.array[wp.vec3],
     body_world: wp.array[wp.int32],
+    pose_rebaseline_mask: wp.array[wp.bool],
     body_f: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
+    body_inertia: wp.array[wp.mat33],
     body_inv_mass: wp.array[float],
     body_inv_inertia: wp.array[wp.mat33],
+    use_gyroscopic: int,
+    use_rate_reference: int,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     hist_qd: wp.array[wp.spatial_vector],
@@ -7646,45 +7641,76 @@ def bdf2_predict_rigid_bodies(
     inc_ang: wp.array[wp.vec3],
     pred_lin: wp.array[wp.vec3],
     pred_ang: wp.array[wp.vec3],
+    body_q_prev: wp.array[wp.transform],
     body_inertia_q: wp.array[wp.transform],
+    rate_reference: wp.array[wp.transform],
 ):
-    """BDF2 inertial target (prototype).
+    """BDF2 inertial target and rate reference (prototype).
 
     With h = 2/3 dt, BDF2 is a backward-Euler-type solve of step h about the target
-    x~ = x_n + (x_n - x_{n-1}) / 3 + h v_pred, with v_pred = 4/3 v_n - 1/3 v_{n-1} + h a_ext.
+    x~ = x_n + (x_n - x_{n-1}) / 3 + h v_pred, with v_pred = 4/3 v_n - 1/3 v_{n-1} + h a.
     The previous step's motion (x_n - x_{n-1}) is carried exactly as a small increment
     (inc_lin / inc_ang) instead of being formed by differencing rounded absolute poses.
-    Rotation: q~ = exp(inc_ang / 3 + h w_pred) q_n. Gyroscopic terms are not included.
+    Rotation: q~ = exp(inc_ang / 3 + h w_pred) q_n. The gyroscopic torque -w x I w is
+    evaluated at the extrapolated rate w* = 2 w_n - w_{n-1} (second-order IMEX).
+
+    Worlds flagged in ``pose_rebaseline_mask`` (construction, reset) have no history yet. They start
+    from the history of constant external acceleration a (gravity, applied force/torque):
+    v_{n-1} = v_n - dt a and x_n - x_{n-1} = dt v_n - dt^2 a / 2. That makes the first step a
+    consistent BDF2 step (v_pred = v_n + dt a, x~ = x_n + dt v_n + dt^2 a / 2) with the same h as every
+    other step, so the step size never changes per world.
+
+    ``rate_reference`` receives x_n + (x_n - x_{n-1}) / 3, so (x - rate_reference) / h is the
+    BDF2 velocity used by damping, drive, friction and contact rates inside the solve.
     """
     tid = wp.tid()
     q_n = body_q[tid]
     qd_n = body_qd[tid]
     qd_m = hist_qd[tid]
-    hist_qd[tid] = qd_n
+    d_lin = inc_lin[tid]
+    d_ang = inc_ang[tid]
     inv_m = body_inv_mass[tid]
+    f = body_f[tid]
+    c = body_com[tid]
+    rot_n = wp.transform_get_rotation(q_n)
+    com_n = wp.transform_get_translation(q_n) + wp.quat_rotate(rot_n, c)
+    R = wp.quat_to_matrix(rot_n)
+    inv_I_world = R * body_inv_inertia[tid] * wp.transpose(R)
+    if _world_selected(body_world[tid], pose_rebaseline_mask):
+        body_q_prev[tid] = q_n
+        a_lin = wp.vec3(0.0)
+        a_ang = wp.vec3(0.0)
+        if inv_m > 0.0:
+            a_lin = gravity[body_world[tid]] + wp.spatial_top(f) * inv_m
+            a_ang = inv_I_world * wp.spatial_bottom(f)
+        qd_m = wp.spatial_vector(wp.spatial_top(qd_n) - dt * a_lin, wp.spatial_bottom(qd_n) - dt * a_ang)
+        d_lin = dt * wp.spatial_top(qd_n) - (0.5 * dt * dt) * a_lin
+        d_ang = dt * wp.spatial_bottom(qd_n) - (0.5 * dt * dt) * a_ang
+    hist_qd[tid] = qd_n
+
+    reference = q_n
+    if use_rate_reference != 0:
+        rot_r = wp.normalize(wp.mul(quat_from_rotation_vector(d_ang * (1.0 / 3.0)), rot_n))
+        reference = wp.transform(com_n + d_lin * (1.0 / 3.0) - wp.quat_rotate(rot_r, c), rot_r)
+    rate_reference[tid] = reference
+
     if inv_m == 0.0:
         body_inertia_q[tid] = q_n
         pred_lin[tid] = wp.vec3(0.0)
         pred_ang[tid] = wp.vec3(0.0)
         return
-    c = body_com[tid]
-    rot_n = wp.transform_get_rotation(q_n)
-    com_n = wp.transform_get_translation(q_n) + wp.quat_rotate(rot_n, c)
-    f = body_f[tid]
-    R = wp.quat_to_matrix(rot_n)
-    inv_I_world = R * body_inv_inertia[tid] * wp.transpose(R)
+    torque = wp.spatial_bottom(f)
+    if use_gyroscopic != 0:
+        w_star = wp.quat_rotate_inv(rot_n, 2.0 * wp.spatial_bottom(qd_n) - wp.spatial_bottom(qd_m))
+        torque = torque - wp.quat_rotate(rot_n, wp.cross(w_star, body_inertia[tid] * w_star))
     v_pred = (
         (4.0 / 3.0) * wp.spatial_top(qd_n)
         - (1.0 / 3.0) * wp.spatial_top(qd_m)
         + h * (gravity[body_world[tid]] + wp.spatial_top(f) * inv_m)
     )
-    w_pred = (
-        (4.0 / 3.0) * wp.spatial_bottom(qd_n)
-        - (1.0 / 3.0) * wp.spatial_bottom(qd_m)
-        + h * (inv_I_world * wp.spatial_bottom(f))
-    )
-    off_lin = inc_lin[tid] * (1.0 / 3.0) + h * v_pred
-    off_ang = inc_ang[tid] * (1.0 / 3.0) + h * w_pred
+    w_pred = (4.0 / 3.0) * wp.spatial_bottom(qd_n) - (1.0 / 3.0) * wp.spatial_bottom(qd_m) + h * (inv_I_world * torque)
+    off_lin = d_lin * (1.0 / 3.0) + h * v_pred
+    off_ang = d_ang * (1.0 / 3.0) + h * w_pred
     pred_lin[tid] = off_lin
     pred_ang[tid] = off_ang
     rot_t = wp.normalize(wp.mul(quat_from_rotation_vector(off_ang), rot_n))
@@ -7710,6 +7736,7 @@ def update_body_velocity(
     bdf2_inc_ang: wp.array[wp.vec3],
     bdf2_pred_lin: wp.array[wp.vec3],
     bdf2_pred_ang: wp.array[wp.vec3],
+    bdf2_rate_reference: wp.array[wp.transform],
     body_q_prev: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_qd_mirror: wp.array[wp.spatial_vector],
@@ -7761,7 +7788,18 @@ def update_body_velocity(
     # turning float32 rounding of absolute positions into unbalanced linear momentum.
     v = (x_com - x_com_prev) / dt
     omega = quat_velocity(q, q_prev, dt)
-    if use_displacement != 0 and body_in_sparse_articulation[tid] != 0 and body_inv_mass[tid] > 0.0:
+    sparse_dynamic = use_displacement != 0 and body_in_sparse_articulation[tid] != 0 and body_inv_mass[tid] > 0.0
+    if bdf2_step != 0 and not sparse_dynamic:
+        # BDF2 (prototype) for bodies outside the sparse solve: v = (x - x_ref) / h, with
+        # x_ref = x_n + (x_n - x_{n-1}) / 3 from bdf2_predict_rigid_bodies.
+        reference = bdf2_rate_reference[tid]
+        q_ref = wp.transform_get_rotation(reference)
+        v = (x_com - (wp.transform_get_translation(reference) + wp.quat_rotate(q_ref, com_local))) / dt
+        omega = quat_velocity(q, q_ref, dt)
+        if bdf2_enabled != 0:
+            bdf2_inc_lin[tid] = x_com - x_com_prev
+            bdf2_inc_ang[tid] = rotation_vector_from_quat(wp.mul(q, wp.quat_inverse(q_prev)))
+    if sparse_dynamic:
         v = wp.spatial_top(body_qd_mirror[tid]) + body_disp[tid] / dt
         # The step's rotation is the predicted rotation exp(omega_pred * dt) followed by the
         # accumulated solver rotation exp(phi). Both are near identity, so composing them keeps
