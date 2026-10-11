@@ -77,6 +77,7 @@ from .rigid_sparse_articulation_kernels import (
     solve_articulation_sparse_block32_scalar,
     solve_articulation_sparse_serial_scalar,
     vec6f,
+    warm_start_body_displacement,
 )
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
@@ -3847,7 +3848,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._bdf2_pred_lin,
                         self._bdf2_pred_ang,
                     ],
-                    outputs=[self.body_q_prev, self.body_inertia_q, self._bdf2_rate_ref],
+                    outputs=[
+                        self.body_q_prev,
+                        self.body_inertia_q,
+                        self._bdf2_rate_ref,
+                        self._body_disp,
+                        self._body_disp_ang,
+                    ],
                     device=self.device,
                 )
                 if self.rigid_articulation_sparse_layout is not None:
@@ -5539,6 +5546,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         model = self.model
         if model.body_count == 0 or not self._integrates_rigid_bodies:
             return
+        warm = self._warm_start_enabled()
+        if warm:
+            wp.copy(self._warm_prev_disp, self._body_disp)
+            wp.copy(self._warm_prev_disp_ang, self._body_disp_ang)
         wp.launch(
             kernel=init_body_displacement,
             dim=model.body_count,
@@ -5546,6 +5557,35 @@ class SolverVBD(SolverBase, CouplingInterface):
             outputs=[self._body_disp, self._body_disp_ang],
             device=self.device,
         )
+        if warm:
+            wp.launch(
+                kernel=warm_start_body_displacement,
+                dim=model.body_count,
+                inputs=[
+                    self._body_in_sparse_articulation,
+                    self.body_inv_mass_effective,
+                    self.body_inertia_q,
+                    model.body_com,
+                    self._warm_prev_disp,
+                    self._warm_prev_disp_ang,
+                    1.0,
+                ],
+                outputs=[self._body_disp, self._body_disp_ang, state_in.body_q],
+                device=self.device,
+            )
+
+    def _warm_start_enabled(self) -> bool:
+        """Prototype: warm-start the displacement (default on with BDF2; NEWTON_VBD_WARM_START overrides)."""
+        if not getattr(self, "_use_body_displacement", 0):
+            return False
+        if not hasattr(self, "_warm_prev_disp"):
+            import os  # noqa: PLC0415
+
+            default = "1" if getattr(self, "_bdf2_enabled", False) else "0"
+            self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", default) != "0"
+            self._warm_prev_disp = wp.zeros_like(self._body_disp)
+            self._warm_prev_disp_ang = wp.zeros_like(self._body_disp_ang)
+        return self._warm_start
 
     def _finalize_rigid_bodies(self, state_in: State, state_out: State, dt: float):
         """Finalize rigid body velocities and Dahl friction state after VBD iterations (post-iteration phase).

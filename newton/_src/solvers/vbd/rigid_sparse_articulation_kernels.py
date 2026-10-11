@@ -2549,3 +2549,37 @@ def init_body_displacement(
     if rot[0] != rot_star[0] or rot[1] != rot_star[1] or rot[2] != rot_star[2] or rot[3] != rot_star[3]:
         phi = rotation_vector_from_quat(wp.mul(rot, wp.quat_inverse(rot_star)))
     body_disp_ang[tid] = phi
+
+
+@wp.kernel
+def warm_start_body_displacement(
+    body_in_sparse_articulation: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    body_inertia_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    previous_disp: wp.array[wp.vec3],
+    previous_disp_ang: wp.array[wp.vec3],
+    gamma: float,
+    body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+):
+    """Start the iterations at the inertial target plus the previous step's converged displacement.
+
+    The displacement (solver correction relative to the inertial target) changes slowly between steps,
+    e.g. the sag held up by joints and drives, so starting from it saves the iterations that would
+    otherwise re-derive it every step. The displacement is set exactly; the pose is composed from it.
+    """
+    tid = wp.tid()
+    if body_in_sparse_articulation[tid] == 0 or body_inv_mass[tid] == 0.0:
+        return
+    d = gamma * previous_disp[tid]
+    phi = gamma * previous_disp_ang[tid]
+    q_star = body_inertia_q[tid]
+    c = body_com[tid]
+    rot_star = wp.transform_get_rotation(q_star)
+    com_star = wp.transform_get_translation(q_star) + wp.quat_rotate(rot_star, c)
+    rot = wp.normalize(wp.mul(quat_from_rotation_vector(phi), rot_star))
+    body_q[tid] = wp.transform(com_star + d - wp.quat_rotate(rot, c), rot)
+    body_disp[tid] = d
+    body_disp_ang[tid] = phi

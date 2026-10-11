@@ -7644,6 +7644,8 @@ def bdf2_predict_rigid_bodies(
     body_q_prev: wp.array[wp.transform],
     body_inertia_q: wp.array[wp.transform],
     rate_reference: wp.array[wp.transform],
+    body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
 ):
     """BDF2 inertial target and rate reference (prototype).
 
@@ -7678,6 +7680,8 @@ def bdf2_predict_rigid_bodies(
     inv_I_world = R * body_inv_inertia[tid] * wp.transpose(R)
     if _world_selected(body_world[tid], pose_rebaseline_mask):
         body_q_prev[tid] = q_n
+        body_disp[tid] = wp.vec3(0.0)  # no warm start across a reset
+        body_disp_ang[tid] = wp.vec3(0.0)
         a_lin = wp.vec3(0.0)
         a_ang = wp.vec3(0.0)
         if inv_m > 0.0:
