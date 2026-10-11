@@ -26,6 +26,18 @@ solver = newton.solvers.SolverVBD(
 
 The env var `NEWTON_VBD_TIME_INTEGRATION=bdf1|bdf2` overrides the argument. It exists so harnesses can switch without code edits, and is a prototype convenience only.
 
+Prototype switches for studies (defaults shown; all CUDA-graph safe because they are read once at construction):
+
+- `NEWTON_VBD_BDF2_RATES=1`: BDF2 velocity in every in-solve rate (`0` reproduces the first prototype's 1.5x over-damping).
+- `NEWTON_VBD_BDF2_GYRO=1`: gyroscopic term, explicit at the extrapolated rate (`0` off, `2` implicit Newton step; tested less accurate).
+- `NEWTON_VBD_WARM_START`: displacement warm start, `1` by default with BDF2 and `0` with BDF1.
+
+Recommended for whole-body humanoids (from the G1 study):
+- Use the block-sparse articulation solve; BDF2 requires it.
+- Set `rigid_articulation_relaxation=1.0`.
+- Use the warm start, which is on by default with BDF2.
+- Feed time-varying PD targets sampled at the **end** of the step (t + dt). An implicit step balances forces there, and start-of-step targets add a one-step lag to both integrators.
+
 **Guards:** BDF2 raises `ValueError` unless `block_sparse_joints` is used, the model has no joint mimics (the displacement path must be active) and there are no particles.
 
 ## How it maps to the code
@@ -39,10 +51,11 @@ With ĥ = (2/3)·dt, BDF2 is the same VBD minimisation as BDF1, but uses ĥ inst
 | Piece | Where |
 |---|---|
 | Option, guards, buffers | `solver_vbd.py`: `rigid_time_integration` arg, `_setup_time_integration()` |
-| Per-step switch | `step()`: `_bdf2_step = enabled and history_ready`; `rigid_dt = 2/3·dt` on BDF2 steps. That `rigid_dt` is passed to init, iterations, contact export and finalize. Particles still get `dt`. |
-| History reset | `reset()` sets `_bdf2_history_ready = False`. The first step after construction or reset is BDF1. |
-| Save v_{n−1} on the BDF1 step | `rigid_vbd_kernels.py`: `bdf2_save_history` |
-| BDF2 inertial target | `rigid_vbd_kernels.py`: `bdf2_predict_rigid_bodies`. Writes `body_inertia_q`, `v_pred`/`ω_pred`, and the prediction offsets `pred_lin`/`pred_ang`. |
+| Per-step switch | `step()`: `_bdf2_step = enabled` (constant, no Python branch per step); `rigid_dt = 2/3·dt`. That `rigid_dt` is passed to init, iterations, contact export and finalize. Particles still get `dt`. |
+| Start-up and reset | Worlds flagged in `_rigid_pose_rebaseline_mask` (construction, `reset(world_mask)`) start from a constant-external-acceleration history inside `bdf2_predict_rigid_bodies`: `v_{n−1} = v_n − dt·a`, `x_n − x_{n−1} = dt·v_n − dt²a/2`. Every step uses the same h, so a CUDA graph captured on the first step is exact and resets are per world. |
+| BDF2 inertial target | `rigid_vbd_kernels.py`: `bdf2_predict_rigid_bodies`. Writes `body_inertia_q`, `v_pred`/`ω_pred` (with the gyroscopic torque at `2ω_n − ω_{n−1}`), the prediction offsets `pred_lin`/`pred_ang`, the **rate reference pose** `x_n + (x_n − x_{n−1})/3`, and rebaselines `body_q_prev` for fresh worlds. |
+| In-solve rates | `solver_vbd.py`: `_rate_reference_q` (rate reference on BDF2 steps, `body_q_prev` otherwise) is passed wherever a rate or slip is formed: joint assembly, `update_duals_joint`, body-body contact accumulation and duals, contact-force export, `solve_rigid_body`. Pose uses (coordinate unwrap, friction anchor, C0) keep `body_q_prev`. |
+| Warm start | `rigid_sparse_articulation_kernels.py`: `warm_start_body_displacement`; `solver_vbd.py`: `_init_body_displacement`. Buffers are allocated at construction. |
 | Velocity + exact increments | `rigid_vbd_kernels.py`: `update_body_velocity`. On a BDF2 step `ω = ω_pred + φ/ĥ`. It stores `inc = pred_offset + solver_displacement` (BDF1 step: `inc = v·dt`). |
 | Rotor (armature) target | `rigid_sparse_articulation_kernels.py`: `predict_articulation_armature_bdf2`. Writes the target and `delta = target − q_n` from small terms. |
 | Rotor residual offset | `rigid_sparse_articulation_kernels.py`: `bdf2_armature_offset`. Computes `q(x̃) − target = J·pred_offset − delta`. |
@@ -58,12 +71,11 @@ Absolute positions and quaternions are float32. Their rounding (~1e-7 relative) 
 
 ## Known limitations (prototype)
 
-- Gyroscopic terms are left out of `ω_pred`.
-- Joint damping, friction and drive damping inside the iterations still use `(x − x_n)/ĥ`. That is first-order consistent, not exact BDF2.
-- The rotor increment `J·Δθ` is exact for planar hinge chains and first-order accurate for general 3-D rotation.
-- The history flag is global, so a partial-world `reset()` restarts every world with one BDF1 step.
-- The BDF1/BDF2 choice per step is a Python flag. Capture CUDA graphs only after one eager step.
-- Behaviour changes where BDF1 damping was helping: actuated and contact-rich cases (Doctor Legs, G1 tracking) need retuning. See the report.
+- Fixed time step: the BDF2 coefficients assume a constant dt; a step-size change needs the variable-step formula.
+- Joint mimics and particles are not supported with BDF2 (the constructor refuses them).
+- The rotor increment `J·Δθ` is exact to second order for hinges (child and parent increments differ only along the axis).
+- In-solve rates still difference absolute poses against the rate reference (same float32 precision as BDF1 has today).
+- A float32 rotation floor limits fast spins at very small steps for both integrators.
 
 ## How to check a change
 
