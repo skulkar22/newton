@@ -921,30 +921,61 @@ def predict_articulation_armature_bdf2(
     body_qd: wp.array[wp.spatial_vector],
     h: float,
     bdf2_step: int,
-    hist_q: wp.array[float],
+    inc_lin: wp.array[wp.vec3],
+    inc_ang: wp.array[wp.vec3],
     hist_rate: wp.array[float],
     targets: wp.array[float],
+    deltas: wp.array[float],
 ):
     """Rotor target for the BDF2 prototype.
 
     bdf2_step == 0: backward-Euler target q + h * rate (first step), recording history.
-    bdf2_step == 1: 4/3 q_n - 1/3 q_{n-1} + h (4/3 rate_n - 1/3 rate_{n-1}), recording history.
+    bdf2_step == 1: q_n + (q_n - q_{n-1}) / 3 + h (4/3 rate_n - 1/3 rate_{n-1}). The previous increment
+    q_n - q_{n-1} is projected from the bodies' exact step increments, not differenced from rounded angles.
+    ``deltas`` receives target - q_n, built from small terms only.
     """
     joint = joints[wp.tid()]
     if coordinates.joint_type[joint] != JointType.REVOLUTE:
         return
     q, gp, gc = evaluate_coordinate(coordinates, joint, 0, body_q)
-    rate = wp.dot(gc, body_qd[coordinates.child[joint]])
+    child = coordinates.child[joint]
     parent = coordinates.parent[joint]
+    rate = wp.dot(gc, body_qd[child])
+    prev = wp.dot(gc, wp.spatial_vector(inc_lin[child], inc_ang[child]))
     if parent >= 0:
         rate += wp.dot(gp, body_qd[parent])
+        prev += wp.dot(gp, wp.spatial_vector(inc_lin[parent], inc_ang[parent]))
     dof = coordinates.qd_start[joint]
-    target = q + h * rate
+    delta = h * rate
     if bdf2_step != 0:
-        target = (4.0 / 3.0) * q - (1.0 / 3.0) * hist_q[dof] + h * ((4.0 / 3.0) * rate - (1.0 / 3.0) * hist_rate[dof])
-    hist_q[dof] = q
+        delta = prev / 3.0 + h * ((4.0 / 3.0) * rate - (1.0 / 3.0) * hist_rate[dof])
     hist_rate[dof] = rate
-    targets[dof] = target
+    targets[dof] = q + delta
+    deltas[dof] = delta
+
+
+@wp.kernel
+def bdf2_armature_offset(
+    coordinates: JointCoordinateData,
+    joints: wp.array[int],
+    body_q: wp.array[wp.transform],
+    pred_lin: wp.array[wp.vec3],
+    pred_ang: wp.array[wp.vec3],
+    deltas: wp.array[float],
+    offsets: wp.array[float],
+):
+    """Rotor residual at the inertial target, q(x~) - target = J * pred_offset - (target - q_n), from small terms."""
+    joint = joints[wp.tid()]
+    if coordinates.joint_type[joint] != JointType.REVOLUTE:
+        return
+    _q, gp, gc = evaluate_coordinate(coordinates, joint, 0, body_q)
+    child = coordinates.child[joint]
+    parent = coordinates.parent[joint]
+    moved = wp.dot(gc, wp.spatial_vector(pred_lin[child], pred_ang[child]))
+    if parent >= 0:
+        moved += wp.dot(gp, wp.spatial_vector(pred_lin[parent], pred_ang[parent]))
+    dof = coordinates.qd_start[joint]
+    offsets[dof] = moved - deltas[dof]
 
 
 @wp.kernel
@@ -1328,6 +1359,10 @@ def _assemble_articulation_joint_scalar(
     joint_target_kd: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
+    armature_body_disp: wp.array[wp.vec3],
+    armature_body_disp_ang: wp.array[wp.vec3],
+    joint_armature_offset: wp.array[float],
+    armature_incremental: int,
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -1655,7 +1690,19 @@ def _assemble_articulation_joint_scalar(
         if armature > 0.0:
             q, gp, gc = evaluate_coordinate(joint_coordinates, joint, 0, body_q)
             armature_hessian = armature / (dt * dt)
-            armature_force = armature_hessian * (q - joint_armature_target[qd_start])
+            residual = q - joint_armature_target[qd_start]
+            if armature_incremental != 0:
+                # BDF2 prototype: q(x) - target = J * disp + (q(x~) - target), all small terms, so the
+                # residual keeps float32 relative precision instead of differencing rounded angles.
+                child = joint_child[joint]
+                parent = joint_parent[joint]
+                residual = wp.dot(gc, wp.spatial_vector(armature_body_disp[child], armature_body_disp_ang[child]))
+                residual += joint_armature_offset[qd_start]
+                if parent >= 0:
+                    residual += wp.dot(
+                        gp, wp.spatial_vector(armature_body_disp[parent], armature_body_disp_ang[parent])
+                    )
+            armature_force = armature_hessian * residual
             _assemble_coordinate_row_scalar(
                 values_scalar,
                 rhs_scalar,
@@ -1919,6 +1966,10 @@ def assemble_articulation_joints_scalar(
     joint_target_kd: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
+    armature_body_disp: wp.array[wp.vec3],
+    armature_body_disp_ang: wp.array[wp.vec3],
+    joint_armature_offset: wp.array[float],
+    armature_incremental: int,
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -1977,6 +2028,10 @@ def assemble_articulation_joints_scalar(
         joint_target_kd,
         joint_armature,
         joint_armature_target,
+        armature_body_disp,
+        armature_body_disp_ang,
+        joint_armature_offset,
+        armature_incremental,
         joint_target_q,
         joint_target_vel,
         joint_limit_lower,
@@ -2244,6 +2299,10 @@ def solve_articulation_sparse_serial_scalar(
     joint_target_kd: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
+    armature_body_disp: wp.array[wp.vec3],
+    armature_body_disp_ang: wp.array[wp.vec3],
+    joint_armature_offset: wp.array[float],
+    armature_incremental: int,
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -2353,6 +2412,10 @@ def solve_articulation_sparse_serial_scalar(
             joint_target_kd,
             joint_armature,
             joint_armature_target,
+            armature_body_disp,
+            armature_body_disp_ang,
+            joint_armature_offset,
+            armature_incremental,
             joint_target_q,
             joint_target_vel,
             joint_limit_lower,

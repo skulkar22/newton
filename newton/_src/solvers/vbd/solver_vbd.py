@@ -67,6 +67,7 @@ from .rigid_sparse_articulation_kernels import (
     apply_articulation_sparse_delta_scalar,
     assemble_articulation_body_diagonal_scalar,
     assemble_articulation_joints_scalar,
+    bdf2_armature_offset,
     init_body_displacement,
     mat66f,
     predict_articulation_armature,
@@ -3793,10 +3794,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                         state_in.body_qd,
                         dt,
                         self._bdf2_step,
-                        self._bdf2_arm_q,
+                        self._bdf2_inc_lin,
+                        self._bdf2_inc_ang,
                         self._bdf2_arm_rate,
                     ],
-                    outputs=[self._rigid_articulation_armature_target],
+                    outputs=[self._rigid_articulation_armature_target, self._bdf2_arm_delta],
                     device=self.device,
                 )
             elif self.rigid_articulation_sparse_layout is not None:
@@ -3820,8 +3822,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 wp.launch(
                     bdf2_save_history,
                     dim=model.body_count,
-                    inputs=[state_in.body_q, state_in.body_qd],
-                    outputs=[self._bdf2_hist_q, self._bdf2_hist_qd],
+                    inputs=[state_in.body_qd],
+                    outputs=[self._bdf2_hist_qd],
                     device=self.device,
                 )
             if self._bdf2_step:
@@ -3838,12 +3840,30 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_inv_inertia_effective,
                         state_in.body_q,
                         state_in.body_qd,
-                        self._bdf2_hist_q,
                         self._bdf2_hist_qd,
+                        self._bdf2_inc_lin,
+                        self._bdf2_inc_ang,
+                        self._bdf2_pred_lin,
+                        self._bdf2_pred_ang,
                     ],
                     outputs=[self.body_inertia_q],
                     device=self.device,
                 )
+                if self.rigid_articulation_sparse_layout is not None:
+                    wp.launch(
+                        bdf2_armature_offset,
+                        dim=self.rigid_articulation_sparse_layout.articulation_joint_count,
+                        inputs=[
+                            self._joint_coordinates.data,
+                            self.rigid_articulation_sparse_layout.articulation_joints,
+                            state_in.body_q,
+                            self._bdf2_pred_lin,
+                            self._bdf2_pred_ang,
+                            self._bdf2_arm_delta,
+                        ],
+                        outputs=[self._bdf2_arm_offset],
+                        device=self.device,
+                    )
             else:
                 # Forward integrate rigid bodies (body_q modified in-place for dynamic bodies only).
                 wp.launch(
@@ -4808,6 +4828,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             model.joint_target_kd,
             model.joint_armature,
             self._rigid_articulation_armature_target,
+            self._body_disp,
+            self._body_disp_ang,
+            self._bdf2_arm_offset if self._bdf2_enabled else self._rigid_articulation_armature_target,
+            self._bdf2_step,
             control.joint_target_q,
             control.joint_target_qd,
             model.joint_limit_lower,
@@ -5475,9 +5499,16 @@ class SolverVBD(SolverBase, CouplingInterface):
                 "rigid_time_integration='bdf2' (prototype) requires rigid_articulation_solve='block_sparse_joints', "
                 "no joint mimics and no particles."
             )
-        self._bdf2_hist_q = wp.zeros(self.model.body_count, dtype=wp.transform, device=self.device)
-        self._bdf2_hist_qd = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
-        self._bdf2_arm_q = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
+        n = self.model.body_count
+        self._bdf2_hist_qd = wp.zeros(n, dtype=wp.spatial_vector, device=self.device)
+        # Exact previous-step increments (x_n - x_{n-1}, rotation vector) and this step's prediction offsets.
+        self._bdf2_inc_lin = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        self._bdf2_inc_ang = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        self._bdf2_pred_lin = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        self._bdf2_pred_ang = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        # Rotor target - q_n and the rotor residual at the inertial target, both from small terms.
+        self._bdf2_arm_delta = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
+        self._bdf2_arm_offset = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
         self._bdf2_arm_rate = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
 
     def _update_displacement_mode(self):
@@ -5529,6 +5560,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.body_inv_mass_effective,
                 self._use_body_displacement,
                 self._bdf2_step,
+                int(self._bdf2_enabled),
+                self._bdf2_inc_lin if self._bdf2_enabled else self._body_disp,
+                self._bdf2_inc_ang if self._bdf2_enabled else self._body_disp,
+                self._bdf2_pred_lin if self._bdf2_enabled else self._body_disp,
+                self._bdf2_pred_ang if self._bdf2_enabled else self._body_disp,
             ],
             outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
             dim=model.body_count,
