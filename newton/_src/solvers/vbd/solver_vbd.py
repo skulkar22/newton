@@ -723,6 +723,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 contact manifolds between collision updates.
             rigid_articulation_diagonal_regularization: Non-negative value added to each
                 translational and angular diagonal Hessian entry before sparse factorization.
+            rigid_time_integration: Rigid time integrator. ``"bdf1"`` (default) is backward Euler.
+                ``"bdf2"`` is an experimental second-order prototype that requires
+                ``rigid_articulation_solve="block_sparse_joints"``, no joint mimics and no
+                particles; the first step after construction or :meth:`reset` is a BDF1 step.
+                The ``NEWTON_VBD_TIME_INTEGRATION`` environment variable overrides this value.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
