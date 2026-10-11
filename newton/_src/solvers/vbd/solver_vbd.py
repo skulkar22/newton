@@ -5499,6 +5499,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         import os  # noqa: PLC0415
 
         mode = os.environ.get("NEWTON_VBD_TIME_INTEGRATION", rigid_time_integration)
+        # Displacement warm start (prototype): allocated here so no step allocates (CUDA-graph safe).
+        self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", "1" if mode == "bdf2" else "0") != "0"
+        self._warm_prev_disp = wp.zeros_like(self._body_disp)
+        self._warm_prev_disp_ang = wp.zeros_like(self._body_disp_ang)
         if mode not in ("bdf1", "bdf2"):
             raise ValueError(f"rigid_time_integration must be 'bdf1' or 'bdf2', got {mode!r}")
         self.rigid_time_integration = mode
@@ -5576,16 +5580,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
     def _warm_start_enabled(self) -> bool:
         """Prototype: warm-start the displacement (default on with BDF2; NEWTON_VBD_WARM_START overrides)."""
-        if not getattr(self, "_use_body_displacement", 0):
-            return False
-        if not hasattr(self, "_warm_prev_disp"):
-            import os  # noqa: PLC0415
-
-            default = "1" if getattr(self, "_bdf2_enabled", False) else "0"
-            self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", default) != "0"
-            self._warm_prev_disp = wp.zeros_like(self._body_disp)
-            self._warm_prev_disp_ang = wp.zeros_like(self._body_disp_ang)
-        return self._warm_start
+        return bool(self._warm_start and self._use_body_displacement)
 
     def _finalize_rigid_bodies(self, state_in: State, state_out: State, dt: float):
         """Finalize rigid body velocities and Dahl friction state after VBD iterations (post-iteration phase).
