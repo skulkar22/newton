@@ -914,6 +914,40 @@ def predict_articulation_armature(
 
 
 @wp.kernel
+def predict_articulation_armature_bdf2(
+    coordinates: JointCoordinateData,
+    joints: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    h: float,
+    bdf2_step: int,
+    hist_q: wp.array[float],
+    hist_rate: wp.array[float],
+    targets: wp.array[float],
+):
+    """Rotor target for the BDF2 prototype.
+
+    bdf2_step == 0: backward-Euler target q + h * rate (first step), recording history.
+    bdf2_step == 1: 4/3 q_n - 1/3 q_{n-1} + h (4/3 rate_n - 1/3 rate_{n-1}), recording history.
+    """
+    joint = joints[wp.tid()]
+    if coordinates.joint_type[joint] != JointType.REVOLUTE:
+        return
+    q, gp, gc = evaluate_coordinate(coordinates, joint, 0, body_q)
+    rate = wp.dot(gc, body_qd[coordinates.child[joint]])
+    parent = coordinates.parent[joint]
+    if parent >= 0:
+        rate += wp.dot(gp, body_qd[parent])
+    dof = coordinates.qd_start[joint]
+    target = q + h * rate
+    if bdf2_step != 0:
+        target = (4.0 / 3.0) * q - (1.0 / 3.0) * hist_q[dof] + h * ((4.0 / 3.0) * rate - (1.0 / 3.0) * hist_rate[dof])
+    hist_q[dof] = q
+    hist_rate[dof] = rate
+    targets[dof] = target
+
+
+@wp.kernel
 def save_articulation_body_hessians(
     bodies: wp.array[wp.int32],
     diag_slots: wp.array[wp.int32],

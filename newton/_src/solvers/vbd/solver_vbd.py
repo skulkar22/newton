@@ -70,6 +70,7 @@ from .rigid_sparse_articulation_kernels import (
     init_body_displacement,
     mat66f,
     predict_articulation_armature,
+    predict_articulation_armature_bdf2,
     regularize_articulation_body_hessian,
     save_articulation_body_hessians,
     solve_articulation_sparse_block32_scalar,
@@ -90,6 +91,8 @@ from .rigid_vbd_kernels import (
     accumulate_body_particle_contacts_per_body,
     apply_body_truncation_ts,
     apply_rigid_soft_truncation,
+    bdf2_predict_rigid_bodies,
+    bdf2_save_history,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
@@ -455,6 +458,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
+        rigid_time_integration: str = "bdf1",
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
@@ -1124,6 +1128,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
         self._update_displacement_mode()
+        self._setup_time_integration(rigid_time_integration)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
 
@@ -2708,7 +2713,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         if control is None:
             control = self.model.control(clone_variables=False)
 
-        self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
+        # BDF2 prototype: after one backward-Euler step has recorded history, rigid phases
+        # solve with h = 2/3 dt about the BDF2 inertial target (see bdf2_predict_rigid_bodies).
+        self._bdf2_step = int(self._bdf2_enabled and self._bdf2_history_ready)
+        rigid_dt = dt * (2.0 / 3.0) if self._bdf2_step else dt
+
+        self._initialize_rigid_bodies(state_in, control, contacts, rigid_dt, update_rigid)
         self._init_body_displacement(state_in)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
@@ -2721,19 +2731,21 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_due = self.collision_pipeline is not None and self._rigid_collision_is_due(iter_num)
             soft_due = self.particle_enable_self_contact and self._self_contact_is_due(iter_num)
             self._mid_step_detection(
-                state_in, state_out, contacts, dt, rigid_due=rigid_due, soft_due=soft_due, preserve_history=True
+                state_in, state_out, contacts, rigid_dt, rigid_due=rigid_due, soft_due=soft_due, preserve_history=True
             )
-            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, rigid_dt)
             self._solve_particle_iteration(state_in, state_out, contacts, dt)
 
         # Opt-in contact force export: evaluate at the final iterate while the pose history the
         # iterations used is still intact (finalization advances it below).
-        self._export_contact_forces(state_in, state_out, contacts, dt)
+        self._export_contact_forces(state_in, state_out, contacts, rigid_dt)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
-        self._finalize_rigid_bodies(state_in, state_out, dt)
+        self._finalize_rigid_bodies(state_in, state_out, rigid_dt)
         self._finalize_particles(state_out, dt)
+        if self._bdf2_enabled:
+            self._bdf2_history_ready = True
 
     @override
     def reset(
@@ -2829,6 +2841,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise ValueError("'state' argument is required.")
         model = self.model
         world_mask = self._normalize_reset_world_mask(world_mask)
+        # BDF2 prototype: history is global; any reset restarts with one backward-Euler step.
+        self._bdf2_history_ready = False
 
         flags_value = int(StateFlags.ALL if flags is None else flags)
 
@@ -3768,7 +3782,24 @@ class SolverVBD(SolverBase, CouplingInterface):
 
             # Rotor inertia must not inherit feedforward/external torques from
             # the body's force-shifted inertial target.
-            if self.rigid_articulation_sparse_layout is not None:
+            if self.rigid_articulation_sparse_layout is not None and self._bdf2_enabled:
+                wp.launch(
+                    predict_articulation_armature_bdf2,
+                    dim=self.rigid_articulation_sparse_layout.articulation_joint_count,
+                    inputs=[
+                        self._joint_coordinates.data,
+                        self.rigid_articulation_sparse_layout.articulation_joints,
+                        state_in.body_q,
+                        state_in.body_qd,
+                        dt,
+                        self._bdf2_step,
+                        self._bdf2_arm_q,
+                        self._bdf2_arm_rate,
+                    ],
+                    outputs=[self._rigid_articulation_armature_target],
+                    device=self.device,
+                )
+            elif self.rigid_articulation_sparse_layout is not None:
                 wp.launch(
                     predict_articulation_armature,
                     dim=self.rigid_articulation_sparse_layout.articulation_joint_count,
@@ -3783,29 +3814,60 @@ class SolverVBD(SolverBase, CouplingInterface):
                     device=self.device,
                 )
 
-            # Forward integrate rigid bodies (body_q modified in-place for dynamic bodies only).
-            wp.launch(
-                kernel=forward_step_rigid_bodies,
-                inputs=[
-                    dt,
-                    model.gravity,
-                    model.body_world,
-                    self._rigid_pose_rebaseline_mask,
-                    body_f_for_integration,
-                    model.body_com,
-                    model.body_inertia,
-                    self.body_inv_mass_effective,
-                    self.body_inv_inertia_effective,
-                    state_in.body_q,  # input/output
-                    state_in.body_qd,  # input/output
-                ],
-                outputs=[
-                    self.body_q_prev,  # rebaselined for flagged worlds (first step / reset)
-                    self.body_inertia_q,
-                ],
-                dim=model.body_count,
-                device=self.device,
-            )
+            # BDF2 prototype: record the step-start state on the first (backward-Euler) step,
+            # then predict the BDF2 target on later steps instead of the forward Euler step.
+            if self._bdf2_enabled and not self._bdf2_step:
+                wp.launch(
+                    bdf2_save_history,
+                    dim=model.body_count,
+                    inputs=[state_in.body_q, state_in.body_qd],
+                    outputs=[self._bdf2_hist_q, self._bdf2_hist_qd],
+                    device=self.device,
+                )
+            if self._bdf2_step:
+                wp.launch(
+                    bdf2_predict_rigid_bodies,
+                    dim=model.body_count,
+                    inputs=[
+                        dt,
+                        model.gravity,
+                        model.body_world,
+                        body_f_for_integration,
+                        model.body_com,
+                        self.body_inv_mass_effective,
+                        self.body_inv_inertia_effective,
+                        state_in.body_q,
+                        state_in.body_qd,
+                        self._bdf2_hist_q,
+                        self._bdf2_hist_qd,
+                    ],
+                    outputs=[self.body_inertia_q],
+                    device=self.device,
+                )
+            else:
+                # Forward integrate rigid bodies (body_q modified in-place for dynamic bodies only).
+                wp.launch(
+                    kernel=forward_step_rigid_bodies,
+                    inputs=[
+                        dt,
+                        model.gravity,
+                        model.body_world,
+                        self._rigid_pose_rebaseline_mask,
+                        body_f_for_integration,
+                        model.body_com,
+                        model.body_inertia,
+                        self.body_inv_mass_effective,
+                        self.body_inv_inertia_effective,
+                        state_in.body_q,  # input/output
+                        state_in.body_qd,  # input/output
+                    ],
+                    outputs=[
+                        self.body_q_prev,  # rebaselined for flagged worlds (first step / reset)
+                        self.body_inertia_q,
+                    ],
+                    dim=model.body_count,
+                    device=self.device,
+                )
 
             # Truncate the forward step against the division planes before any
             # solve iterations run on the predicted poses.
@@ -5392,6 +5454,32 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
+    def _setup_time_integration(self, rigid_time_integration: str):
+        """Select the rigid time integrator (BDF2 is an experimental prototype).
+
+        ``NEWTON_VBD_TIME_INTEGRATION`` overrides the argument (prototype convenience only).
+        """
+        import os  # noqa: PLC0415
+
+        mode = os.environ.get("NEWTON_VBD_TIME_INTEGRATION", rigid_time_integration)
+        if mode not in ("bdf1", "bdf2"):
+            raise ValueError(f"rigid_time_integration must be 'bdf1' or 'bdf2', got {mode!r}")
+        self.rigid_time_integration = mode
+        self._bdf2_enabled = mode == "bdf2"
+        self._bdf2_history_ready = False
+        self._bdf2_step = 0
+        if not self._bdf2_enabled:
+            return
+        if not self._integrates_rigid_bodies or not self._use_body_displacement or self.model.particle_count > 0:
+            raise ValueError(
+                "rigid_time_integration='bdf2' (prototype) requires rigid_articulation_solve='block_sparse_joints', "
+                "no joint mimics and no particles."
+            )
+        self._bdf2_hist_q = wp.zeros(self.model.body_count, dtype=wp.transform, device=self.device)
+        self._bdf2_hist_qd = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
+        self._bdf2_arm_q = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
+        self._bdf2_arm_rate = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
+
     def _update_displacement_mode(self):
         """Enable the displacement-form sparse update unless another solver writes body poses.
 
@@ -5440,6 +5528,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._body_in_sparse_articulation,
                 self.body_inv_mass_effective,
                 self._use_body_displacement,
+                self._bdf2_step,
             ],
             outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
             dim=model.body_count,

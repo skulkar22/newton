@@ -7621,6 +7621,81 @@ def rotation_vector_from_quat(q: wp.quat) -> wp.vec3:
 
 
 @wp.kernel
+def bdf2_save_history(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    hist_q: wp.array[wp.transform],
+    hist_qd: wp.array[wp.spatial_vector],
+):
+    """Store the step-start pose and velocity as the previous state for the next BDF2 step."""
+    tid = wp.tid()
+    hist_q[tid] = body_q[tid]
+    hist_qd[tid] = body_qd[tid]
+
+
+@wp.kernel
+def bdf2_predict_rigid_bodies(
+    h: float,
+    gravity: wp.array[wp.vec3],
+    body_world: wp.array[wp.int32],
+    body_f: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[float],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    hist_q: wp.array[wp.transform],
+    hist_qd: wp.array[wp.spatial_vector],
+    body_inertia_q: wp.array[wp.transform],
+):
+    """BDF2 inertial target (prototype).
+
+    With h = 2/3 dt, BDF2 is a backward-Euler-type solve of step h about the target
+    x~ = 4/3 x_n - 1/3 x_{n-1} + h v_pred, with v_pred = 4/3 v_n - 1/3 v_{n-1} + h a_ext.
+    Rotation uses the tangent space at q_n: q~ = exp(-1/3 log(q_{n-1} q_n^-1) + h w_pred) q_n.
+    Writes the target into body_q (iteration start) and body_inertia_q, the predicted
+    velocity into body_qd, and stores (q_n, v_n) as the next step's history.
+    Gyroscopic terms are not included (prototype limitation).
+    """
+    tid = wp.tid()
+    q_n = body_q[tid]
+    qd_n = body_qd[tid]
+    q_m = hist_q[tid]
+    qd_m = hist_qd[tid]
+    hist_q[tid] = q_n
+    hist_qd[tid] = qd_n
+    inv_m = body_inv_mass[tid]
+    if inv_m == 0.0:
+        body_inertia_q[tid] = q_n
+        return
+    c = body_com[tid]
+    rot_n = wp.transform_get_rotation(q_n)
+    rot_m = wp.transform_get_rotation(q_m)
+    com_n = wp.transform_get_translation(q_n) + wp.quat_rotate(rot_n, c)
+    com_m = wp.transform_get_translation(q_m) + wp.quat_rotate(rot_m, c)
+    f = body_f[tid]
+    R = wp.quat_to_matrix(rot_n)
+    inv_I_world = R * body_inv_inertia[tid] * wp.transpose(R)
+    v_pred = (
+        (4.0 / 3.0) * wp.spatial_top(qd_n)
+        - (1.0 / 3.0) * wp.spatial_top(qd_m)
+        + h * (gravity[body_world[tid]] + wp.spatial_top(f) * inv_m)
+    )
+    w_pred = (
+        (4.0 / 3.0) * wp.spatial_bottom(qd_n)
+        - (1.0 / 3.0) * wp.spatial_bottom(qd_m)
+        + h * (inv_I_world * wp.spatial_bottom(f))
+    )
+    com_t = (4.0 / 3.0) * com_n - (1.0 / 3.0) * com_m + h * v_pred
+    r = rotation_vector_from_quat(wp.mul(rot_m, wp.quat_inverse(rot_n)))
+    rot_t = wp.normalize(wp.mul(quat_from_rotation_vector(-(1.0 / 3.0) * r + h * w_pred), rot_n))
+    q_t = wp.transform(com_t - wp.quat_rotate(rot_t, c), rot_t)
+    body_q[tid] = q_t
+    body_inertia_q[tid] = q_t
+    body_qd[tid] = wp.spatial_vector(v_pred, w_pred)
+
+
+@wp.kernel
 def update_body_velocity(
     dt: float,
     body_q: wp.array[wp.transform],
@@ -7630,6 +7705,7 @@ def update_body_velocity(
     body_in_sparse_articulation: wp.array[wp.int32],
     body_inv_mass: wp.array[float],
     use_displacement: int,
+    bdf2_step: int,
     body_q_prev: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_qd_mirror: wp.array[wp.spatial_vector],
@@ -7691,6 +7767,9 @@ def update_body_velocity(
             quat_from_rotation_vector(body_disp_ang[tid]), quat_from_rotation_vector(omega_pred * dt)
         )
         omega = rotation_vector_from_quat(step_rotation) / dt
+        if bdf2_step != 0:
+            # BDF2 (prototype): omega_{n+1} = omega_pred + phi / h in the tangent space at q_n.
+            omega = omega_pred + body_disp_ang[tid] / dt
 
     body_qd[tid] = wp.spatial_vector(v, omega)
 
