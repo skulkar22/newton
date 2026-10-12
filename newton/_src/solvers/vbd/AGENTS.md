@@ -36,6 +36,7 @@ Prototype switches for studies (defaults shown; all CUDA-graph safe because they
 - `NEWTON_VBD_EXT_FORCE_GUESS=0|1` (`rigid_external_force_guess`, default off): with `EXT_FORCE=solve` and articulations, one unrelaxed block-sparse solve `H d0 = f_ext` (or `f_n − f_{n−1}` on warm-started bodies) before the iterations (`ext_force_guess_rhs`, `override_articulation_rhs_scalar`, the `rhs_override` input of the serial kernel). It removes the lag of `solve` mode at relaxation < 1 without the over-response of `target` mode.
 - `NEWTON_VBD_WARM_GAMMA=1.0`: fraction of the previous displacement used by the warm start (0 = start at the inertial target).
 - `NEWTON_VBD_RHO_ARMATURE=0|1` (`rigid_axis_support_armature`; default on for BDF2, off for BDF1): add `armature/h²` to the support (ALM rho) of revolute drive/limit rows (`add_armature_to_axis_support`). A limit between a very light link and a heavy one (G1 waist_roll → torso) otherwise gets its rho from the light link alone and does not hold: torso falling onto a 0.52 rad limit through a 0.047 kg link overshoots 2.4–3.0 rad at 4 ms (0.54 rad even at 0.8 ms, BDF1 too); with the armature term 0.007–0.010 rad.
+- `NEWTON_VBD_LIMIT_RHO_FLOOR=0|1` (`rigid_limit_rho_floor`; default on for BDF2, off for BDF1): floor the support (ALM rho) of every limit row (revolute, prismatic, D6) at `9·(K + D/h)`, the floor drive and structural rows already have (`floor_limit_axis_support`). Covers models without armature: light-link chain at 4 ms / 7 it, torso falling onto +0.52 rad, overshoot 2.4–3.0 rad without it, ≤ 0.006 rad with it for armature 0, 1e-4 and 1e-2, both integrators, gravity-only and held by a PD.
 - `NEWTON_VBD_BDF2_KINEMATIC_RATE=1`: BDF2 rate reference of kinematic bodies `x_n − (ĥ/dt)(x_n − x_{n−1})` (`bdf2_kinematic_rate_reference`), so a user-animated kinematic body has velocity +V in the solve and in `body_qd` (the first prototype gave −V/2 and dragged a box resting on a moving platform backwards).
 - `NEWTON_VBD_BDF2_THETA_POSE_LIN/ANG=1e-6`: F6 tolerances. With theta `event`/`contact`, a dynamic body whose pose differs from the solver's last final pose (an external write without `reset()`) makes its world take BDF1 steps (`bdf2_theta_detect_pose_writes`).
 - `NEWTON_VBD_BDF2_EXACT_ROT=1`: compose the BDF2 rotational prediction (`exp(ĥω_pred)·exp(Δ_n/3)`), step increment (`exp(φ)·exp(pred)`) and sparse velocity read-back (`exp(φ)·exp(ĥω_pred)`) from small rotation vectors (`rigid_bdf2_exact_rotation`); `0` adds the vectors (first prototype, first-order for large rotations about different axes).
@@ -109,10 +110,16 @@ Check with `stability-runs/gpu_legacy_all.sh` (chain and fixed-base G1, BDF1 and
 | `rigid_bdf2_rotor_residual` | `NEWTON_VBD_BDF2_EXACT_ROTOR` | `composed` | `linear` |
 | `rigid_bdf2_theta_policy` | `NEWTON_VBD_BDF2_THETA` | `event` | `off` |
 | `rigid_axis_support_armature` | `NEWTON_VBD_RHO_ARMATURE` | on (BDF1: off) | off |
+| `rigid_limit_rho_floor` | `NEWTON_VBD_LIMIT_RHO_FLOOR` | on (BDF1: off) | off |
 | `rigid_bdf2_kinematic_rate` | `NEWTON_VBD_BDF2_KINEMATIC_RATE` | on | off |
 | `rigid_external_force_guess` | `NEWTON_VBD_EXT_FORCE_GUESS` | off | off |
 
 Setting the pinned column reproduces 8afa14fc BDF2 bit for bit. All switches are read at construction; per-step state is on the device, so a CUDA graph captured at construction replays exactly.
+
+### Open follow-ups (not in this branch)
+
+- The same under-weighted rho exists in joint dry-friction rows (bounded by the friction limit), in the tendon ALM row on `dev/rigid-vbd-integration` (`tendon_alm=True`: rho from the lightest attachment, one-sided, retained multiplier, so slack-to-taut behaves like a limit hit), and in contact rows on free light bodies (10 kg box on a free 0.05 kg plate at 4 ms sinks 5.2 mm vs 0.5 mm static; articulated links are protected by the structural term). Contact logic was out of scope here.
+- Friction stick measured from the anchor pose, `eval_joint_forces` with the solver's rate reference and step, contact-row support from the subtree mass, theta = 0 for unconverged bodies, per-body theta (Stage B).
 
 ## The one rule that matters: never difference rounded absolute poses
 

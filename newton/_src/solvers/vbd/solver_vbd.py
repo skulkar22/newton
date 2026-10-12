@@ -114,6 +114,7 @@ from .rigid_vbd_kernels import (
     compute_rigid_contact_forces,
     compute_rod_dahl_parameters,
     ext_force_guess_rhs,
+    floor_limit_axis_support,
     forward_step_rigid_bodies,
     init_body_body_contact_materials,
     init_body_body_contacts_alm,
@@ -491,6 +492,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_bdf2_kinematic_rate: bool = True,
         rigid_warm_start_gamma: float = 1.0,
         rigid_axis_support_armature: bool | None = None,
+        rigid_limit_rho_floor: bool | None = None,
         rigid_external_force_mode: str | None = None,
         rigid_external_force_guess: bool = False,
         deterministic: wp.DeterministicMode | None = None,
@@ -814,6 +816,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 limit rows. Without it, a limit between a very light link and a heavy one gets a rho from the light
                 link's inertia only and cannot hold (G1 waist pitch at 2-4 ms). ``None`` (default) enables it for
                 BDF2 and leaves BDF1 unchanged. ``NEWTON_VBD_RHO_ARMATURE`` (``0``/``1``) overrides it.
+            rigid_limit_rho_floor: Floor the support (ALM rho) of every joint limit row (revolute, prismatic,
+                D6) at ``9 (K + D/h)``, as drive and structural rows already are. Without it the limit rho is the row
+                support, which is tiny next to a very light link or without armature, and the limit acts only through
+                its slowly growing multiplier. ``None`` (default) enables it for BDF2 and leaves BDF1 unchanged.
+                ``NEWTON_VBD_LIMIT_RHO_FLOOR`` (``0``/``1``) overrides it.
             rigid_external_force_mode: Where ``State.body_f`` and the mapped ``Control.joint_f``
                 enter the rigid step (experimental). ``None`` (default) selects ``"target"`` for
                 BDF1 and ``"solve"`` for BDF2. ``"target"`` shifts each body's inertial target by
@@ -1247,6 +1254,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_bdf2_kinematic_rate,
             rigid_warm_start_gamma,
             rigid_axis_support_armature,
+            rigid_limit_rho_floor,
         )
         self._setup_external_force_mode(rigid_external_force_mode, rigid_external_force_guess)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
@@ -4144,6 +4152,26 @@ class SolverVBD(SolverBase, CouplingInterface):
                     ],
                     device=self.device,
                 )
+                if self._limit_rho_floor:
+                    wp.launch(
+                        kernel=floor_limit_axis_support,
+                        dim=model.joint_count,
+                        inputs=[
+                            self._step_size,
+                            model.joint_type,
+                            model.joint_enabled,
+                            model.joint_child,
+                            model.joint_qd_start,
+                            model.joint_dof_dim,
+                            model.joint_limit_lower,
+                            model.joint_limit_upper,
+                            model.joint_limit_ke,
+                            model.joint_limit_kd,
+                            1.0 / (dt * dt),
+                        ],
+                        outputs=[self.joint_drive_limit_support],
+                        device=self.device,
+                    )
                 if self._rho_armature:
                     wp.launch(
                         kernel=add_armature_to_axis_support,
@@ -5747,6 +5775,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_bdf2_kinematic_rate: bool = True,
         rigid_warm_start_gamma: float = 1.0,
         rigid_axis_support_armature: bool | None = None,
+        rigid_limit_rho_floor: bool | None = None,
     ):
         """Select the rigid time integrator (BDF2 is an experimental prototype).
 
@@ -5777,6 +5806,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Armature in the revolute drive/limit row support (ALM rho); opt-in for both integrators.
         rho_default = (mode == "bdf2") if rigid_axis_support_armature is None else bool(rigid_axis_support_armature)
         self._rho_armature = os.environ.get("NEWTON_VBD_RHO_ARMATURE", "1" if rho_default else "0") != "0"
+        floor_default = (mode == "bdf2") if rigid_limit_rho_floor is None else bool(rigid_limit_rho_floor)
+        self._limit_rho_floor = os.environ.get("NEWTON_VBD_LIMIT_RHO_FLOOR", "1" if floor_default else "0") != "0"
         # BDF2 rate reference of kinematic bodies (user-animated): BDF1-consistent velocity instead of -V/2.
         self._bdf2_kinematic_rate = (
             os.environ.get("NEWTON_VBD_BDF2_KINEMATIC_RATE", "1" if rigid_bdf2_kinematic_rate else "0") != "0"

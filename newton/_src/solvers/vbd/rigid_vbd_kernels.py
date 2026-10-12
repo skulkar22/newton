@@ -9249,6 +9249,46 @@ def add_armature_to_axis_support(
 
 
 @wp.kernel
+def floor_limit_axis_support(
+    step_size: RigidStepSize,
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    inv_dt_sq: float,
+    joint_drive_limit_support: wp.array[float],
+):
+    """``rigid_limit_rho_floor`` / ``NEWTON_VBD_LIMIT_RHO_FLOOR``: floor the support (ALM rho) of every limit row at
+    9 (K + D/h), the floor drive and structural rows already get (``_bilateral_auto_rho``).
+
+    The limit rho is the row support; between a very light link and a heavy one (or with no armature) it is far
+    below the limit stiffness, and the limit then acts only through its slowly growing multiplier (overshoot,
+    wind-up, rebound). Applies to revolute, prismatic and D6 limits. The axis support is shared with a drive on the
+    same DOF, whose own rho is max(support, 9 K_drive), so that drive converges faster too.
+    """
+    j = wp.tid()
+    if not joint_enabled[j] or joint_child[j] < 0:
+        return
+    jt = joint_type[j]
+    if jt != JointType.REVOLUTE and jt != JointType.PRISMATIC and jt != JointType.D6:
+        return
+    inv_dt = wp.sqrt(rigid_step_inv_h2(step_size, joint_child[j], inv_dt_sq))
+    start = joint_qd_start[j]
+    for axis in range(joint_dof_dim[j, 0] + joint_dof_dim[j, 1]):
+        dof = start + axis
+        support = joint_drive_limit_support[dof]
+        ke = joint_limit_ke[dof]
+        if support > 0.0 and _limit_row_exists(ke, joint_limit_lower[dof], joint_limit_upper[dof]):
+            floor = _COMPLIANT_ALM_BILATERAL_MIN_RHO_OVER_K * (ke + wp.max(joint_limit_kd[dof], 0.0) * inv_dt)
+            joint_drive_limit_support[dof] = wp.max(support, floor)
+
+
+@wp.kernel
 def bdf2_kinematic_rate_reference(
     step_size: RigidStepSize,
     h: float,
