@@ -9,6 +9,7 @@ from newton._src.math import quat_velocity
 from newton._src.sim import JointType
 from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData, evaluate_coordinate
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
+    RigidStepSize,
     _drive_row_applies_force,
     _eval_joint_axis_drive_limit,
     _eval_joint_axis_friction,
@@ -25,6 +26,8 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     compute_kappa_dot,
     evaluate_rod_joint_force_hessian,
     quat_from_rotation_vector,
+    rigid_step_bdf2,
+    rigid_step_h,
     rotation_vector_from_quat,
 )
 
@@ -765,6 +768,7 @@ def _assemble_coordinate_row_scalar(
 
 @wp.func
 def _body_diagonal_contribution(
+    step_size: RigidStepSize,
     dt: float,
     local_body: int,
     articulation_bodies: wp.array[wp.int32],
@@ -784,6 +788,7 @@ def _body_diagonal_contribution(
     use_displacement: int,
 ):
     body = articulation_bodies[local_body]
+    dt = rigid_step_h(step_size, body, dt)
     q_current = body_q[body]
 
     diag = mat66f(0.0)
@@ -949,6 +954,7 @@ def predict_articulation_armature(
 
 @wp.kernel
 def predict_articulation_armature_bdf2(
+    step_size: RigidStepSize,
     coordinates: JointCoordinateData,
     joints: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -985,6 +991,13 @@ def predict_articulation_armature_bdf2(
         rate += wp.dot(gp, body_qd[parent])
         prev += wp.dot(gp, wp.spatial_vector(inc_lin[parent], inc_ang[parent]))
     dof = coordinates.qd_start[joint]
+    if rigid_step_bdf2(step_size, child, 1) == 0:
+        # Theta selection (prototype): BDF1 step for this world, as predict_articulation_armature (dt is the
+        # full step), keeping the rate history for the next BDF2 step.
+        hist_rate[dof] = rate
+        targets[dof] = q + dt * rate
+        deltas[dof] = dt * rate
+        return
     rate_m = hist_rate[dof]
     if _world_selected(body_world[child], pose_rebaseline_mask):
         prev = dt * rate
@@ -1313,6 +1326,7 @@ def _evaluate_sparse_drive_limit(
 
 @wp.kernel
 def assemble_articulation_body_diagonal_scalar(
+    step_size: RigidStepSize,
     dt: float,
     articulation_bodies: wp.array[wp.int32],
     articulation_diag_slots: wp.array[wp.int32],
@@ -1335,6 +1349,7 @@ def assemble_articulation_body_diagonal_scalar(
 ):
     local_body = wp.tid()
     diag, rhs_value = _body_diagonal_contribution(
+        step_size,
         dt,
         local_body,
         articulation_bodies,
@@ -1362,6 +1377,7 @@ def assemble_articulation_body_diagonal_scalar(
 
 @wp.func
 def _assemble_articulation_joint_scalar(
+    step_size: RigidStepSize,
     joint_cursor: int,
     dt: float,
     articulation_joints: wp.array[wp.int32],
@@ -1429,6 +1445,9 @@ def _assemble_articulation_joint_scalar(
     joint = articulation_joints[joint_cursor]
     if not joint_enabled[joint]:
         return
+    # Theta selection (prototype): the joint takes its child's step and integrator (one per world).
+    dt = rigid_step_h(step_size, joint_child[joint], dt)
+    armature_incremental = rigid_step_bdf2(step_size, joint_child[joint], armature_incremental)
 
     jt = joint_type[joint]
     if (
@@ -1987,6 +2006,7 @@ def _assemble_articulation_joint_scalar(
 
 @wp.kernel
 def assemble_articulation_joints_scalar(
+    step_size: RigidStepSize,
     dt: float,
     articulation_joints: wp.array[wp.int32],
     articulation_joint_body_start: wp.array[wp.int32],
@@ -2051,6 +2071,7 @@ def assemble_articulation_joints_scalar(
     rhs_scalar: wp.array[float],
 ):
     _assemble_articulation_joint_scalar(
+        step_size,
         wp.tid(),
         dt,
         articulation_joints,
@@ -2326,6 +2347,7 @@ def apply_articulation_sparse_delta_scalar(
 
 @wp.kernel
 def solve_articulation_sparse_serial_scalar(
+    step_size: RigidStepSize,
     dt: float,
     articulation_joints: wp.array[wp.int32],
     articulation_joint_body_start: wp.array[wp.int32],
@@ -2418,6 +2440,7 @@ def solve_articulation_sparse_serial_scalar(
 
     for local_body in range(body_start, body_end):
         diag, rhs_value = _body_diagonal_contribution(
+            step_size,
             dt,
             local_body,
             articulation_bodies,
@@ -2441,6 +2464,7 @@ def solve_articulation_sparse_serial_scalar(
 
     for joint_cursor in range(joint_start, joint_end):
         _assemble_articulation_joint_scalar(
+            step_size,
             joint_cursor,
             dt,
             articulation_joints,
@@ -2618,6 +2642,7 @@ def init_body_displacement(
 
 @wp.kernel
 def warm_start_body_displacement(
+    step_size: RigidStepSize,
     body_in_sparse_articulation: wp.array[wp.int32],
     body_inv_mass: wp.array[float],
     body_inertia_q: wp.array[wp.transform],
@@ -2638,6 +2663,8 @@ def warm_start_body_displacement(
     tid = wp.tid()
     if body_in_sparse_articulation[tid] == 0 or body_inv_mass[tid] == 0.0:
         return
+    if rigid_step_bdf2(step_size, tid, 1) == 0:
+        return  # theta selection: a BDF1 step starts cold, as the BDF1 solve does by default
     d = gamma * previous_disp[tid]
     phi = gamma * previous_disp_ang[tid]
     q_star = body_inertia_q[tid]

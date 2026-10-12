@@ -84,6 +84,7 @@ from .rigid_vbd_kernels import (
     JointFrictionData,
     RigidContactHistory,
     RigidForceElementAdjacencyInfo,
+    RigidStepSize,
     _count_body_particle_attachments_per_body,
     _count_num_adjacent_joints,
     _fill_adjacent_joints,
@@ -94,7 +95,13 @@ from .rigid_vbd_kernels import (
     add_external_wrench_to_solve,
     apply_body_truncation_ts,
     apply_rigid_soft_truncation,
+    bdf2_compose_inertial_rotation,
     bdf2_predict_rigid_bodies,
+    bdf2_theta_count_contacts,
+    bdf2_theta_detect_bodies,
+    bdf2_theta_detect_dofs,
+    bdf2_theta_expand_bodies,
+    bdf2_theta_select_worlds,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
@@ -113,11 +120,14 @@ from .rigid_vbd_kernels import (
     snapshot_body_body_contact_history,
     solve_rigid_body,
     step_body_body_contact_C0_lambda,
+    step_body_body_contact_C0_lambda_theta,
     step_joint_C0_lambda_rho,
     update_body_velocity,
     update_duals_body_body_contacts,
+    update_duals_body_body_contacts_theta,
     update_duals_body_particle_contacts,
     update_duals_joint,
+    update_duals_joint_theta,
     update_rod_dahl_state,
 )
 from .vbd_coupling_kernels import (
@@ -190,6 +200,7 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
 # BDF2 prototype: synthetic start-up history (rigid_bdf2_startup) -> kernel code.
 _BDF2_STARTUP_MODES = {"free_fall": 0, "constant_velocity": 1, "gravity": 2}
 # BDF2 prototype: rotor (armature) residual evaluation (rigid_bdf2_rotor_residual / NEWTON_VBD_BDF2_EXACT_ROTOR).
+_BDF2_THETA_POLICIES = {"off": 0, "fresh": 1, "event": 2, "contact": 3, "bdf1": 4, "bdf2": 5}
 _BDF2_ROTOR_RESIDUAL_MODES = {"linear": 0, "0": 0, "composed": 1, "1": 1, "absolute": 2, "2": 2}
 
 
@@ -467,10 +478,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_time_integration: str = "bdf1",
-        rigid_bdf2_startup: str = "constant_velocity",
+        rigid_bdf2_startup: str = "gravity",
         rigid_bdf2_exact_rotation: bool = True,
         rigid_bdf2_rotor_residual: str = "composed",
-        rigid_external_force_mode: str = "target",
+        rigid_bdf2_theta_policy: str = "event",
+        rigid_external_force_mode: str | None = None,
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
@@ -742,12 +754,15 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ``rigid_bdf2_startup``.
                 The ``NEWTON_VBD_TIME_INTEGRATION`` environment variable overrides this value.
             rigid_bdf2_startup: Synthetic BDF2 history for worlds without one (construction,
-                :meth:`reset`); only used with ``rigid_time_integration="bdf2"``.
-                ``"constant_velocity"`` (default) assumes the bodies and rotors moved at their
-                current velocity: ``v_{n-1} = v_n`` and ``x_n - x_{n-1} = dt v_n``, so a held body
-                stays at rest and no external force enters the history. ``"gravity"`` adds the
-                gravity acceleration to the body history (exact free fall, held bodies get a
-                ``dt g / 4`` start-up velocity). ``"free_fall"`` is the first prototype's history
+                :meth:`reset`); only used with ``rigid_time_integration="bdf2"`` when the theta
+                selection does not bootstrap fresh worlds with BDF1 steps.
+                ``"gravity"`` (default) uses a constant-gravity history for the bodies
+                (``v_{n-1} = v_n - dt g``, ``x_n - x_{n-1} = dt v_n - dt^2 g / 2``) and constant
+                velocity for the rotors; no external force enters the history. Free fall is exact
+                and the DevTech pendulum keeps its accuracy; a held body gets a ``dt g / 4``
+                start-up velocity. ``"constant_velocity"`` assumes the bodies moved at their current
+                velocity (a held body stays at rest, but any force present at the start leaves a
+                permanent ``-dt a / 2`` velocity lag; 2-3x worse pendulum error). ``"free_fall"`` is the first prototype's history
                 built from each body's unconstrained acceleration including ``joint_f`` and
                 ``body_f`` (kept for ablation only: it injects ``dt tau / (4 I_link)`` of spurious
                 joint rate when explicit torques are on). The ``NEWTON_VBD_BDF2_STARTUP``
@@ -767,13 +782,26 @@ class SolverVBD(SolverBase, CouplingInterface):
                 small terms. ``"absolute"`` differences the absolute coordinate as BDF1 does. The
                 ``NEWTON_VBD_BDF2_EXACT_ROTOR`` environment variable (``linear``/``composed``/
                 ``absolute`` or ``0``/``1``/``2``) overrides this value.
+            rigid_bdf2_theta_policy: BDF2 only. Per-world BDF1/BDF2 selection before each solve
+                (the world-level fallback of the theta blend). ``"off"``: every step is BDF2 (first
+                prototype). ``"fresh"``: worlds flagged by construction or :meth:`reset` take BDF1 steps
+                first, so the BDF2 history is made of real increments (the textbook starter;
+                replaces ``rigid_bdf2_startup``). ``"event"``: also on pre-solve events (a contact
+                predicted to activate or release, a joint limit engaging or releasing, a jump of
+                ``joint_f`` or ``body_f``, a velocity jump); the default. ``"contact"``: like ``"event"`` and
+                BDF1 while any contact is predicted active in the world. Each event holds BDF1 for
+                ``NEWTON_VBD_BDF2_THETA_HOLD`` (2) steps. ``"bdf1"`` / ``"bdf2"`` force the
+                selection (verification). The ``NEWTON_VBD_BDF2_THETA`` environment variable
+                overrides this value.
             rigid_external_force_mode: Where ``State.body_f`` and the mapped ``Control.joint_f``
-                enter the rigid step (experimental). ``"target"`` (default) shifts each body's
-                inertial target by ``h^2 M^-1 f``, as before. ``"solve"`` keeps the inertial target
+                enter the rigid step (experimental). ``None`` (default) selects ``"target"`` for
+                BDF1 and ``"solve"`` for BDF2. ``"target"`` shifts each body's inertial target by
+                ``h^2 M^-1 f`` (the BDF1 behaviour). ``"solve"`` keeps the inertial target
                 kinematic plus gravity and adds the wrench inside the solve as a constant
                 generalized force; the minimizer is the same, but the iteration starts from the
                 force-free prediction, which matters when an explicit torque acts on a light link
-                held by stiff joints. Both integrators support it. The ``NEWTON_VBD_EXT_FORCE``
+                held by stiff joints (with BDF1 at relaxation 0.65 it also removes a steady-state
+                error of the force-shifted start). Both integrators support it. The ``NEWTON_VBD_EXT_FORCE``
                 environment variable overrides this value.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
@@ -1182,7 +1210,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
         self._update_displacement_mode()
         self._setup_time_integration(
-            rigid_time_integration, rigid_bdf2_startup, rigid_bdf2_exact_rotation, rigid_bdf2_rotor_residual
+            rigid_time_integration,
+            rigid_bdf2_startup,
+            rigid_bdf2_exact_rotation,
+            rigid_bdf2_rotor_residual,
+            rigid_bdf2_theta_policy,
         )
         self._setup_external_force_mode(rigid_external_force_mode)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
@@ -3696,9 +3728,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             return
         model = self.model
         wp.launch(
-            kernel=step_body_body_contact_C0_lambda,
+            kernel=step_body_body_contact_C0_lambda_theta if self._theta_active else step_body_body_contact_C0_lambda,
             dim=contacts.rigid_contact_max,
             inputs=[
+                *([self._step_size] if self._theta_active else []),
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
@@ -3785,6 +3818,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Rigid-only initialization
         # ---------------------------
         if self._integrates_rigid_bodies:
+            if self._bdf2_step:
+                self._select_bdf2_theta(state_in, control, contacts, self._bdf2_full_dt, dt)
             self._refresh_rigid_contact_state(contacts, refresh)
             self._joint_coordinates.begin_step(
                 state_in,
@@ -3848,6 +3883,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     predict_articulation_armature_bdf2,
                     dim=self.rigid_articulation_sparse_layout.articulation_joint_count,
                     inputs=[
+                        self._step_size,
                         self._joint_coordinates.data,
                         self.rigid_articulation_sparse_layout.articulation_joints,
                         state_in.body_q,
@@ -3883,6 +3919,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     bdf2_predict_rigid_bodies,
                     dim=model.body_count,
                     inputs=[
+                        self._step_size,
                         dt,
                         self._bdf2_full_dt,
                         model.gravity,
@@ -3896,7 +3933,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_inv_inertia_effective,
                         self._bdf2_use_gyro,
                         self._bdf2_use_rates,
-                        self._bdf2_exact_rot,
                         state_in.body_q,
                         state_in.body_qd,
                         self._bdf2_hist_qd,
@@ -3911,9 +3947,27 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._bdf2_rate_ref,
                         self._body_disp,
                         self._body_disp_ang,
+                        self._bdf2_step_d_ang,
+                        self._bdf2_step_rot_n,
                     ],
                     device=self.device,
                 )
+                if self._bdf2_exact_rot:
+                    wp.launch(
+                        bdf2_compose_inertial_rotation,
+                        dim=model.body_count,
+                        inputs=[
+                            self._step_size,
+                            dt,
+                            self.body_inv_mass_effective,
+                            model.body_com,
+                            state_in.body_qd,
+                            self._bdf2_step_d_ang,
+                            self._bdf2_step_rot_n,
+                        ],
+                        outputs=[self._bdf2_pred_ang, state_in.body_q, self.body_inertia_q],
+                        device=self.device,
+                    )
                 if self.rigid_articulation_sparse_layout is not None:
                     wp.launch(
                         bdf2_armature_offset,
@@ -3968,6 +4022,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     kernel=step_joint_C0_lambda_rho,
                     dim=model.joint_count,
                     inputs=[
+                        self._step_size,
                         model.joint_type,
                         model.joint_enabled,
                         model.joint_parent,
@@ -4406,6 +4461,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=accumulate_body_body_contacts_per_body,
                 dim=dim,
                 inputs=[
+                    self._step_size,
                     dt,
                     body_group,
                     self._rate_reference_q,
@@ -4488,6 +4544,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             wp.launch(
                 kernel=solve_rigid_body,
                 inputs=[
+                    self._step_size,
                     dt,
                     color_group,
                     state_in.body_q,
@@ -4568,9 +4625,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         model = self.model
         if self._integrates_rigid_bodies and contacts is not None and contacts.rigid_contact_max > 0:
             wp.launch(
-                kernel=update_duals_body_body_contacts,
+                kernel=update_duals_body_body_contacts_theta if self._theta_active else update_duals_body_body_contacts,
                 dim=contacts.rigid_contact_max,
                 inputs=[
+                    *([self._step_size] if self._theta_active else []),
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
@@ -4634,9 +4692,10 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         if model.joint_count > 0:
             wp.launch(
-                kernel=update_duals_joint,
+                kernel=update_duals_joint_theta if self._theta_active else update_duals_joint,
                 dim=model.joint_count,
                 inputs=[
+                    *([self._step_size] if self._theta_active else []),
                     model.joint_type,
                     model.joint_enabled,
                     model.joint_parent,
@@ -4717,6 +4776,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             kernel=compute_body_body_contact_forces,
             dim=rigid_contact_max,
             inputs=[
+                self._step_size,
                 float(dt),
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
@@ -4858,6 +4918,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._rigid_articulation_sparse_delta_scalar.zero_()
 
         joint_inputs = [
+            self._step_size,
             dt,
             layout.articulation_joints,
             layout.articulation_joint_body_start,
@@ -4925,6 +4986,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=assemble_articulation_body_diagonal_scalar,
                 dim=layout.articulation_body_count,
                 inputs=[
+                    self._step_size,
                     dt,
                     layout.articulation_bodies,
                     layout.articulation_diag_slots,
@@ -5556,9 +5618,10 @@ class SolverVBD(SolverBase, CouplingInterface):
     def _setup_time_integration(
         self,
         rigid_time_integration: str,
-        rigid_bdf2_startup: str = "constant_velocity",
+        rigid_bdf2_startup: str = "gravity",
         rigid_bdf2_exact_rotation: bool = True,
         rigid_bdf2_rotor_residual: str = "composed",
+        rigid_bdf2_theta_policy: str = "event",
     ):
         """Select the rigid time integrator (BDF2 is an experimental prototype).
 
@@ -5592,6 +5655,18 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_enabled = mode == "bdf2"
         self._bdf2_history_ready = False
         self._bdf2_step = 0
+        # Per-body step of the theta selection; per_body = 0 keeps every kernel on its scalar step.
+        self._step_size = RigidStepSize()
+        self._step_size.per_body = 0
+        dummy_f = wp.zeros(1, dtype=float, device=self.device)
+        self._step_size.h = dummy_f
+        self._step_size.inv_h2 = dummy_f
+        self._step_size.bdf2 = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._theta_active = False
+        theta = os.environ.get("NEWTON_VBD_BDF2_THETA", rigid_bdf2_theta_policy)
+        if theta not in _BDF2_THETA_POLICIES:
+            raise ValueError(f"rigid_bdf2_theta_policy must be one of {sorted(_BDF2_THETA_POLICIES)}, got {theta!r}")
+        self.rigid_bdf2_theta_policy = theta
         if not self._bdf2_enabled:
             return
         if not self._integrates_rigid_bodies or not self._use_body_displacement or self.model.particle_count > 0:
@@ -5606,6 +5681,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_inc_ang = wp.zeros(n, dtype=wp.vec3, device=self.device)
         self._bdf2_pred_lin = wp.zeros(n, dtype=wp.vec3, device=self.device)
         self._bdf2_pred_ang = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        # History increment used by the prediction and q_n's rotation (for bdf2_compose_inertial_rotation).
+        self._bdf2_step_d_ang = wp.zeros(n, dtype=wp.vec3, device=self.device)
+        self._bdf2_step_rot_n = wp.zeros(n, dtype=wp.quat, device=self.device)
         # Rotor target - q_n and the rotor residual at the inertial target, both from small terms.
         self._bdf2_arm_delta = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
         self._bdf2_arm_offset = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
@@ -5616,11 +5694,159 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_use_rates = int(os.environ.get("NEWTON_VBD_BDF2_RATES", "1") != "0")
         # 0 off, 1 explicit (extrapolated), 2 implicit (Newton step on the Euler equation)
         self._bdf2_use_gyro = int(os.environ.get("NEWTON_VBD_BDF2_GYRO", "1"))
+        self._setup_bdf2_theta(_BDF2_THETA_POLICIES[theta])
 
-    def _setup_external_force_mode(self, rigid_external_force_mode: str):
+    def _setup_bdf2_theta(self, policy: int):
+        """Allocate the per-world BDF1/BDF2 selection (prototype); all per-step state lives on the device."""
+        import os  # noqa: PLC0415
+
+        self._theta_policy = policy
+        self._theta_active = policy != 0
+        if not self._theta_active:
+            return
+        model = self.model
+        dev = self.device
+        n = model.body_count
+        slots = int(model.world_count) + 1
+        self._step_size = RigidStepSize()
+        self._step_size.per_body = 1
+        self._step_size.h = wp.zeros(n, dtype=float, device=dev)
+        self._step_size.inv_h2 = wp.zeros(n, dtype=float, device=dev)
+        self._step_size.bdf2 = wp.zeros(n, dtype=wp.int32, device=dev)
+        self._theta_world_bdf2 = wp.zeros(slots, dtype=wp.int32, device=dev)
+        self._theta_world_hold = wp.zeros(slots, dtype=wp.int32, device=dev)
+        self._theta_world_event = wp.zeros(slots, dtype=wp.int32, device=dev)
+        self._theta_world_contacts = wp.zeros(slots, dtype=wp.int32, device=dev)
+        self._theta_world_contacts_prev = wp.zeros(slots, dtype=wp.int32, device=dev)
+        self._theta_qd_m2 = wp.zeros(n, dtype=wp.spatial_vector, device=dev)
+        self._theta_body_f_prev = wp.zeros(n, dtype=wp.spatial_vector, device=dev)
+        n_dof = model.joint_dof_count
+        self._theta_joint_f_prev = wp.zeros(max(n_dof, 1), dtype=float, device=dev)
+        self._theta_limit_prev = wp.zeros(max(n_dof, 1), dtype=wp.int32, device=dev)
+        self._theta_zero_joint_f = wp.zeros(max(n_dof, 1), dtype=float, device=dev)
+        dof_world = np.zeros(max(n_dof, 1), dtype=np.int32)
+        dof_coord = np.full(max(n_dof, 1), -1, dtype=np.int32)
+        if n_dof > 0:
+            qs = model.joint_q_start.numpy()
+            ds = model.joint_qd_start.numpy()
+            jt = model.joint_type.numpy()
+            jw = model.joint_world.numpy()
+            for j in range(model.joint_count):
+                dof_world[ds[j] : ds[j + 1]] = jw[j]
+                if jt[j] in (int(JointType.REVOLUTE), int(JointType.PRISMATIC)):
+                    dof_coord[ds[j]] = qs[j]
+        self._theta_dof_world = wp.array(dof_world, dtype=wp.int32, device=dev)
+        self._theta_dof_coord = wp.array(dof_coord, dtype=wp.int32, device=dev)
+        self._theta_hold_steps = int(os.environ.get("NEWTON_VBD_BDF2_THETA_HOLD", "2"))
+        self._theta_force_abs = float(os.environ.get("NEWTON_VBD_BDF2_THETA_FORCE_ABS", "1.0"))
+        self._theta_force_rel = float(os.environ.get("NEWTON_VBD_BDF2_THETA_FORCE_REL", "0.5"))
+        self._theta_vel_lin = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_LIN", "0.05"))
+        self._theta_vel_ang = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_ANG", "0.5"))
+        self._theta_vel_rel = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_REL", "0.2"))
+
+    def _select_bdf2_theta(self, state_in: State, control: Control, contacts: Contacts | None, dt: float, h: float):
+        """Pre-solve BDF1/BDF2 selection per world (device-side; Python constants only)."""
+        if not self._theta_active:
+            return
+        model = self.model
+        dev = self.device
+        events = self._theta_policy in (2, 3)
+        n_dof = model.joint_dof_count
+        if events and n_dof > 0:
+            joint_f = (
+                control.joint_f if control is not None and control.joint_f is not None else self._theta_zero_joint_f
+            )
+            wp.launch(
+                bdf2_theta_detect_dofs,
+                dim=n_dof,
+                inputs=[
+                    self._theta_dof_world,
+                    self._theta_dof_coord,
+                    joint_f,
+                    state_in.joint_q,
+                    model.joint_limit_lower,
+                    model.joint_limit_upper,
+                    self._theta_force_abs,
+                    self._theta_force_rel,
+                    1,
+                    int(state_in.joint_q is not None),
+                ],
+                outputs=[self._theta_joint_f_prev, self._theta_limit_prev, self._theta_world_event],
+                device=dev,
+            )
+        if model.body_count > 0:
+            wp.launch(
+                bdf2_theta_detect_bodies,
+                dim=model.body_count,
+                inputs=[
+                    model.body_world,
+                    self.body_inv_mass_effective,
+                    state_in.body_qd,
+                    self._bdf2_hist_qd,
+                    state_in.body_f,
+                    self._theta_vel_lin,
+                    self._theta_vel_ang,
+                    self._theta_vel_rel,
+                    self._theta_force_abs,
+                    self._theta_force_rel,
+                    int(events),
+                    int(events),
+                ],
+                outputs=[self._theta_qd_m2, self._theta_body_f_prev, self._theta_world_event],
+                device=dev,
+            )
+        if events and contacts is not None and contacts.rigid_contact_max > 0:
+            wp.launch(
+                bdf2_theta_count_contacts,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_margin0,
+                    contacts.rigid_contact_margin1,
+                    model.shape_body,
+                    model.body_world,
+                    state_in.body_q,
+                    state_in.body_qd,
+                    model.body_com,
+                    dt,
+                ],
+                outputs=[self._theta_world_contacts],
+                device=dev,
+            )
+        wp.launch(
+            bdf2_theta_select_worlds,
+            dim=self._theta_world_bdf2.shape[0],
+            inputs=[
+                self._theta_policy,
+                self._theta_hold_steps,
+                self._rigid_pose_rebaseline_mask,
+                self._theta_world_contacts,
+                self._theta_world_contacts_prev,
+                self._theta_world_event,
+                self._theta_world_hold,
+            ],
+            outputs=[self._theta_world_bdf2],
+            device=dev,
+        )
+        wp.launch(
+            bdf2_theta_expand_bodies,
+            dim=model.body_count,
+            inputs=[model.body_world, self._theta_world_bdf2, dt, h, 1.0 / (dt * dt), 1.0 / (h * h)],
+            outputs=[self._step_size.bdf2, self._step_size.h, self._step_size.inv_h2],
+            device=dev,
+        )
+
+    def _setup_external_force_mode(self, rigid_external_force_mode: str | None):
         """Select where external wrenches enter the rigid step (``NEWTON_VBD_EXT_FORCE`` overrides)."""
         import os  # noqa: PLC0415
 
+        if rigid_external_force_mode is None:
+            rigid_external_force_mode = "solve" if self._bdf2_enabled else "target"
         mode = os.environ.get("NEWTON_VBD_EXT_FORCE", rigid_external_force_mode)
         if mode not in ("target", "solve"):
             raise ValueError(f"rigid_external_force_mode must be 'target' or 'solve', got {mode!r}")
@@ -5676,6 +5902,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=warm_start_body_displacement,
                 dim=model.body_count,
                 inputs=[
+                    self._step_size,
                     self._body_in_sparse_articulation,
                     self.body_inv_mass_effective,
                     self.body_inertia_q,
@@ -5707,6 +5934,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         wp.launch(
             kernel=update_body_velocity,
             inputs=[
+                self._step_size,
                 dt,
                 state_in.body_q,
                 model.body_com,

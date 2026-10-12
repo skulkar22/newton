@@ -249,6 +249,270 @@ def _world_selected(world: int, mask: wp.array[wp.bool]):
     return mask[mask_index]
 
 
+# -----------------------------
+# BDF2 prototype: per-world BDF1/BDF2 selection (theta) and the per-body step it implies
+# -----------------------------
+@wp.struct
+class RigidStepSize:
+    """Per-body rigid step for the BDF2 theta selection (prototype).
+
+    ``per_body == 0``: every kernel uses its scalar step and BDF2 flag (the solver-wide integrator).
+    Otherwise ``h[body]`` is the body's solve step (``dt`` on a BDF1 step, ``2/3 dt`` on a BDF2 step, both the
+    host-rounded values the scalar path would pass), ``inv_h2[body]`` the matching host-rounded ``1 / h^2`` and
+    ``bdf2[body]`` 1 on a BDF2 step. All bodies of a world share one value, so every joint and contact row has a
+    single step (the per-world fallback of the theta blend).
+    """
+
+    per_body: int
+    h: wp.array[float]
+    inv_h2: wp.array[float]
+    bdf2: wp.array[wp.int32]
+
+
+@wp.func
+def rigid_step_h(step: RigidStepSize, body: int, dt: float) -> float:
+    if step.per_body != 0 and body >= 0:
+        return step.h[body]
+    return dt
+
+
+@wp.func
+def rigid_step_inv_h2(step: RigidStepSize, body: int, inv_h2: float) -> float:
+    if step.per_body != 0 and body >= 0:
+        return step.inv_h2[body]
+    return inv_h2
+
+
+@wp.func
+def rigid_step_bdf2(step: RigidStepSize, body: int, bdf2_step: int) -> int:
+    if step.per_body != 0 and body >= 0:
+        return step.bdf2[body]
+    return bdf2_step
+
+
+@wp.func
+def rigid_step_contact_body(s0: int, s1: int, shape_body: wp.array[wp.int32]) -> int:
+    """Body whose step a contact row uses: shape 0's body, else shape 1's (both share a world)."""
+    b = int(-1)
+    if s0 >= 0:
+        b = shape_body[s0]
+    if b < 0 and s1 >= 0:
+        b = shape_body[s1]
+    return b
+
+
+@wp.func
+def _world_slot(world: int, slot_count: int) -> int:
+    if world < 0:
+        return slot_count - 1
+    return world
+
+
+@wp.kernel
+def bdf2_theta_detect_dofs(
+    dof_world: wp.array[wp.int32],
+    dof_coord: wp.array[wp.int32],
+    joint_f: wp.array[float],
+    joint_q: wp.array[float],
+    limit_lower: wp.array[float],
+    limit_upper: wp.array[float],
+    force_abs_tol: float,
+    force_rel_tol: float,
+    use_force: int,
+    use_limits: int,
+    joint_f_prev: wp.array[float],
+    limit_state_prev: wp.array[wp.int32],
+    world_event: wp.array[wp.int32],
+):
+    """Pre-solve detectors per DOF: explicit torque jump and joint-limit engagement or release."""
+    d = wp.tid()
+    slot = _world_slot(dof_world[d], world_event.shape[0])
+    if use_force != 0:
+        f = joint_f[d]
+        fp = joint_f_prev[d]
+        if wp.abs(f - fp) > force_abs_tol + force_rel_tol * wp.abs(fp):
+            wp.atomic_max(world_event, slot, 1)
+        joint_f_prev[d] = f
+    c = dof_coord[d]
+    if use_limits != 0 and c >= 0:
+        lo = limit_lower[d]
+        hi = limit_upper[d]
+        state = int(0)
+        if lo < hi:
+            q = joint_q[c]
+            if q <= lo:
+                state = -1
+            elif q >= hi:
+                state = 1
+        if state != limit_state_prev[d]:
+            wp.atomic_max(world_event, slot, 1)
+        limit_state_prev[d] = state
+
+
+@wp.kernel
+def bdf2_theta_detect_bodies(
+    body_world: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    body_qd: wp.array[wp.spatial_vector],
+    hist_qd: wp.array[wp.spatial_vector],
+    body_f: wp.array[wp.spatial_vector],
+    lin_tol: float,
+    ang_tol: float,
+    rel_tol: float,
+    force_abs_tol: float,
+    force_rel_tol: float,
+    use_velocity: int,
+    use_force: int,
+    qd_m2: wp.array[wp.spatial_vector],
+    body_f_prev: wp.array[wp.spatial_vector],
+    world_event: wp.array[wp.int32],
+):
+    """Pre-solve detectors per body: velocity jump (second difference v_n - 2 v_{n-1} + v_{n-2}) and body_f jump."""
+    b = wp.tid()
+    if body_inv_mass[b] == 0.0:
+        return
+    slot = _world_slot(body_world[b], world_event.shape[0])
+    v = body_qd[b]
+    vm = hist_qd[b]
+    if use_velocity != 0:
+        d2 = v - 2.0 * vm + qd_m2[b]
+        lin = wp.length(wp.spatial_top(d2))
+        ang = wp.length(wp.spatial_bottom(d2))
+        if lin > lin_tol + rel_tol * wp.length(wp.spatial_top(v)) or ang > ang_tol + rel_tol * wp.length(
+            wp.spatial_bottom(v)
+        ):
+            wp.atomic_max(world_event, slot, 1)
+    qd_m2[b] = vm
+    if use_force != 0:
+        f = body_f[b]
+        fp = body_f_prev[b]
+        df = f - fp
+        if wp.length(wp.spatial_top(df)) > force_abs_tol + force_rel_tol * wp.length(wp.spatial_top(fp)) or wp.length(
+            wp.spatial_bottom(df)
+        ) > force_abs_tol + force_rel_tol * wp.length(wp.spatial_bottom(fp)):
+            wp.atomic_max(world_event, slot, 1)
+        body_f_prev[b] = f
+
+
+@wp.kernel
+def bdf2_theta_count_contacts(
+    rigid_contact_count: wp.array[int],
+    rigid_contact_shape0: wp.array[int],
+    rigid_contact_shape1: wp.array[int],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[float],
+    rigid_contact_margin1: wp.array[float],
+    shape_body: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: float,
+    world_contacts: wp.array[wp.int32],
+):
+    """Count, per world, the contacts predicted active this step: separation + dt * approach rate < 0."""
+    i = wp.tid()
+    if i >= rigid_contact_count[0]:
+        return
+    s0 = rigid_contact_shape0[i]
+    s1 = rigid_contact_shape1[i]
+    b0 = shape_body[s0] if s0 >= 0 else -1
+    b1 = shape_body[s1] if s1 >= 0 else -1
+    n = rigid_contact_normal[i]
+    p0 = rigid_contact_point0[i]
+    p1 = rigid_contact_point1[i]
+    cp0 = p0
+    cp1 = p1
+    v0 = wp.vec3(0.0)
+    v1 = wp.vec3(0.0)
+    if b0 >= 0:
+        X = body_q[b0]
+        cp0 = wp.transform_point(X, p0)
+        r = cp0 - wp.transform_point(X, body_com[b0])
+        v0 = wp.spatial_top(body_qd[b0]) + wp.cross(wp.spatial_bottom(body_qd[b0]), r)
+    if b1 >= 0:
+        X = body_q[b1]
+        cp1 = wp.transform_point(X, p1)
+        r = cp1 - wp.transform_point(X, body_com[b1])
+        v1 = wp.spatial_top(body_qd[b1]) + wp.cross(wp.spatial_bottom(body_qd[b1]), r)
+    sep = contact_surface_separation(cp0, cp1, n, rigid_contact_margin0[i], rigid_contact_margin1[i])
+    if sep + dt * wp.dot(n, v1 - v0) < 0.0:
+        b = b0
+        if b < 0:
+            b = b1
+        if b >= 0:
+            wp.atomic_add(world_contacts, _world_slot(body_world[b], world_contacts.shape[0]), 1)
+
+
+@wp.kernel
+def bdf2_theta_select_worlds(
+    policy: int,
+    hold_steps: int,
+    rebaseline_mask: wp.array[wp.bool],
+    world_contacts: wp.array[wp.int32],
+    world_contacts_prev: wp.array[wp.int32],
+    world_event: wp.array[wp.int32],
+    world_hold: wp.array[wp.int32],
+    world_bdf2: wp.array[wp.int32],
+):
+    """Per world: BDF1 (0) or BDF2 (1) for this step. Policies: 1 fresh, 2 event, 3 contact, 4 always BDF1,
+    5 always BDF2 (through the per-body path). An event holds BDF1 for ``hold_steps`` steps (event step included),
+    so the next BDF2 step has a history made of real BDF1 increments."""
+    w = wp.tid()
+    event = int(0)
+    if rebaseline_mask[w]:
+        event = 1
+    if policy == 2 or policy == 3:
+        if world_event[w] != 0:
+            event = 1
+        if world_contacts[w] != world_contacts_prev[w]:
+            event = 1
+    if policy == 3 and world_contacts[w] > 0:
+        event = 1
+    hold = world_hold[w]
+    if event != 0:
+        hold = hold_steps
+    bdf2 = int(1)
+    if hold > 0:
+        bdf2 = 0
+        hold = hold - 1
+    if policy == 4:
+        bdf2 = 0
+    if policy == 5:
+        bdf2 = 1
+        hold = 0
+    world_hold[w] = hold
+    world_bdf2[w] = bdf2
+    world_contacts_prev[w] = world_contacts[w]
+    world_contacts[w] = 0
+    world_event[w] = 0
+
+
+@wp.kernel
+def bdf2_theta_expand_bodies(
+    body_world: wp.array[wp.int32],
+    world_bdf2: wp.array[wp.int32],
+    h_bdf1: float,
+    h_bdf2: float,
+    inv_h2_bdf1: float,
+    inv_h2_bdf2: float,
+    body_bdf2: wp.array[wp.int32],
+    body_h: wp.array[float],
+    body_inv_h2: wp.array[float],
+):
+    b = wp.tid()
+    flag = world_bdf2[_world_slot(body_world[b], world_bdf2.shape[0])]
+    body_bdf2[b] = flag
+    if flag != 0:
+        body_h[b] = h_bdf2
+        body_inv_h2[b] = inv_h2_bdf2
+    else:
+        body_h[b] = h_bdf1
+        body_inv_h2[b] = inv_h2_bdf1
+
+
 @wp.func
 def _reset_world_selected(
     world: int,
@@ -4602,6 +4866,7 @@ def _joint_coordinate_support(
 
 @wp.kernel
 def step_joint_C0_lambda_rho(
+    step_size: RigidStepSize,
     joint_type: wp.array[int],
     joint_enabled: wp.array[bool],
     joint_parent: wp.array[int],
@@ -4662,6 +4927,7 @@ def step_joint_C0_lambda_rho(
     c_start = int(joint_constraint_start[j])
     c_dim = int(joint_constraint_dim[j])
     child = joint_child[j]
+    inv_dt_sq = rigid_step_inv_h2(step_size, child, inv_dt_sq)
     parent = joint_parent[j]
 
     # 1. Penalty-k decay runs unconditionally (even for disabled joints).
@@ -5160,6 +5426,135 @@ def snapshot_body_body_contact_history(
     prev_normal[i] = rigid_contact_normal[i]
 
 
+@wp.func
+def _step_body_body_contact_C0_lambda_impl(
+    step_size: RigidStepSize,
+    tid_in: int,
+    rigid_contact_count: wp.array[int],
+    rigid_contact_shape0: wp.array[int],
+    rigid_contact_shape1: wp.array[int],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[float],
+    rigid_contact_margin1: wp.array[float],
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    body_inv_mass: wp.array[float],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_com: wp.array[wp.vec3],
+    body_structural_k: wp.array[float],
+    proxy_flag: int,
+    body_q: wp.array[wp.transform],
+    legacy_hard_contacts: int,
+    contact_compliant_alm: int,
+    lambda_retention: float,
+    inv_dt_sq: float,
+    penalty_decay: float,
+    contact_material_ke: wp.array[float],
+    k_start: float,
+    # In/out
+    contact_normal_rho: wp.array[float],
+    contact_penalty_k: wp.array[float],
+    contact_C0: wp.array[wp.vec3],
+    contact_lambda: wp.array[wp.vec3],
+    contact_tangent_rho: wp.array[float],
+):
+    i = tid_in
+    if i >= rigid_contact_count[0]:
+        return
+    inv_dt_sq = rigid_step_inv_h2(
+        step_size, rigid_step_contact_body(rigid_contact_shape0[i], rigid_contact_shape1[i], shape_body), inv_dt_sq
+    )
+
+    contact_normal_rho[i] = 0.0
+    contact_tangent_rho[i] = 0.0
+
+    ke = contact_material_ke[i]
+    s0 = rigid_contact_shape0[i]
+    s1 = rigid_contact_shape1[i]
+    k_min = _contact_penalty_floor(ke, k_start)
+    contact_penalty_k[i] = wp.clamp(penalty_decay * contact_penalty_k[i], k_min, ke)
+
+    # Snapshot the fresh residual before validating warm-start support; the
+    # dual uses it to release truly separated rows.
+    n = rigid_contact_normal[i]
+    if legacy_hard_contacts == 1 or contact_compliant_alm == 1:
+        b0 = shape_body[s0] if s0 >= 0 else -1
+        b1 = shape_body[s1] if s1 >= 0 else -1
+        p0 = rigid_contact_point0[i]
+        p1 = rigid_contact_point1[i]
+        anchor0_local = p0 + rigid_contact_offset0[i]
+        anchor1_local = p1 + rigid_contact_offset1[i]
+        cp0 = wp.transform_point(body_q[b0], p0) if b0 >= 0 else p0
+        cp1 = wp.transform_point(body_q[b1], p1) if b1 >= 0 else p1
+        C0_n = -contact_surface_separation(cp0, cp1, n, rigid_contact_margin0[i], rigid_contact_margin1[i])
+        a0 = wp.transform_point(body_q[b0], anchor0_local) if b0 >= 0 else anchor0_local
+        a1 = wp.transform_point(body_q[b1], anchor1_local) if b1 >= 0 else anchor1_local
+        d_surf = a1 - a0
+        C0_t = -(d_surf - n * wp.dot(n, d_surf))
+        contact_C0[i] = n * C0_n + C0_t
+
+        if contact_compliant_alm == 1:
+            # Resolve rho before using it to validate retained history.
+            normal_support = _contact_conditioning_scale(
+                s0,
+                s1,
+                p0,
+                p1,
+                n,
+                shape_body,
+                body_q,
+                body_com,
+                body_inv_mass,
+                body_inv_inertia,
+                body_structural_k,
+                inv_dt_sq,
+            )
+            contact_normal_rho[i] = _contact_auto_normal_rho(normal_support, ke)
+            tangent_support = _contact_tangent_conditioning_scale(
+                s0,
+                s1,
+                anchor0_local,
+                anchor1_local,
+                n,
+                shape_body,
+                body_q,
+                body_com,
+                body_inv_mass,
+                body_inv_inertia,
+                inv_dt_sq,
+            )
+            structural_support = _contact_pair_structural_scale(
+                b0,
+                b1,
+                body_flags,
+                body_inv_mass,
+                body_structural_k,
+                proxy_flag,
+            )
+            contact_tangent_rho[i] = _contact_auto_tangent_rho(
+                tangent_support,
+                contact_normal_rho[i],
+                structural_support,
+            )
+
+    lam = contact_lambda[i]
+    if contact_compliant_alm == 0:
+        # Preserve legacy full-vector retention.
+        contact_lambda[i] = lam * lambda_retention
+        return
+
+    has_compressive_warmstart = wp.dot(lam, n) > 0.0
+    live = ke > 0.0 and contact_normal_rho[i] > 0.0
+    if has_compressive_warmstart and live and lambda_retention > 0.0:
+        contact_lambda[i] = lam * lambda_retention
+    else:
+        contact_lambda[i] = wp.vec3(0.0)
+
+
 @wp.kernel
 def step_body_body_contact_C0_lambda(
     rigid_contact_count: wp.array[int],
@@ -5290,6 +5685,78 @@ def step_body_body_contact_C0_lambda(
         contact_lambda[i] = lam * lambda_retention
     else:
         contact_lambda[i] = wp.vec3(0.0)
+
+
+@wp.kernel
+def step_body_body_contact_C0_lambda_theta(
+    step_size: RigidStepSize,
+    rigid_contact_count: wp.array[int],
+    rigid_contact_shape0: wp.array[int],
+    rigid_contact_shape1: wp.array[int],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[float],
+    rigid_contact_margin1: wp.array[float],
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    body_inv_mass: wp.array[float],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_com: wp.array[wp.vec3],
+    body_structural_k: wp.array[float],
+    proxy_flag: int,
+    body_q: wp.array[wp.transform],
+    legacy_hard_contacts: int,
+    contact_compliant_alm: int,
+    lambda_retention: float,
+    inv_dt_sq: float,
+    penalty_decay: float,
+    contact_material_ke: wp.array[float],
+    k_start: float,
+    # In/out
+    contact_normal_rho: wp.array[float],
+    contact_penalty_k: wp.array[float],
+    contact_C0: wp.array[wp.vec3],
+    contact_lambda: wp.array[wp.vec3],
+    contact_tangent_rho: wp.array[float],
+):
+    """step_body_body_contact_C0_lambda with the per-body step of the BDF2 theta selection (prototype)."""
+    _step_body_body_contact_C0_lambda_impl(
+        step_size,
+        wp.tid(),
+        rigid_contact_count,
+        rigid_contact_shape0,
+        rigid_contact_shape1,
+        rigid_contact_point0,
+        rigid_contact_point1,
+        rigid_contact_offset0,
+        rigid_contact_offset1,
+        rigid_contact_normal,
+        rigid_contact_margin0,
+        rigid_contact_margin1,
+        shape_body,
+        body_flags,
+        body_inv_mass,
+        body_inv_inertia,
+        body_com,
+        body_structural_k,
+        proxy_flag,
+        body_q,
+        legacy_hard_contacts,
+        contact_compliant_alm,
+        lambda_retention,
+        inv_dt_sq,
+        penalty_decay,
+        contact_material_ke,
+        k_start,
+        contact_normal_rho,
+        contact_penalty_k,
+        contact_C0,
+        contact_lambda,
+        contact_tangent_rho,
+    )
 
 
 @wp.kernel
@@ -5555,6 +6022,7 @@ def create_accumulate_body_body_contacts_per_body():
 
     @wp.kernel(module="unique")
     def accumulate_body_body_contacts_per_body(
+        step_size: RigidStepSize,
         dt: float,
         color_group: wp.array[wp.int32],
         body_q_prev: wp.array[wp.transform],
@@ -5608,6 +6076,7 @@ def create_accumulate_body_body_contacts_per_body():
         body_id = color_group[body_idx_in_group]
         if body_inv_mass[body_id] <= 0.0:
             return
+        dt = rigid_step_h(step_size, body_id, dt)
 
         num_contacts = body_contact_counts[body_id]
         if num_contacts > body_contact_buffer_pre_alloc:
@@ -6001,6 +6470,7 @@ compute_rigid_contact_forces = create_compute_rigid_contact_forces()
 
 @wp.kernel
 def compute_body_body_contact_forces(
+    step_size: RigidStepSize,
     dt: float,
     # Contact data
     rigid_contact_count: wp.array[int],
@@ -6048,6 +6518,11 @@ def compute_body_body_contact_forces(
     if contact_idx >= rigid_contact_count[0]:
         contact_force[contact_idx] = wp.spatial_vector()
         return
+    dt = rigid_step_h(
+        step_size,
+        rigid_step_contact_body(rigid_contact_shape0[contact_idx], rigid_contact_shape1[contact_idx], shape_body),
+        dt,
+    )
 
     _b0, _b1, _point0_world, _point1_world, force_0, torque_0, _force_1 = _evaluate_body_body_contact_slot(
         contact_idx,
@@ -6492,6 +6967,7 @@ def compute_body_particle_contact_forces(
 
 @wp.kernel
 def solve_rigid_body(
+    step_size: RigidStepSize,
     dt: float,
     body_ids_in_color: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
@@ -6599,6 +7075,7 @@ def solve_rigid_body(
     """
     tid = wp.tid()
     body_index = body_ids_in_color[tid]
+    dt = rigid_step_h(step_size, body_index, dt)
 
     q_current = body_q[body_index]
 
@@ -6792,6 +7269,600 @@ def solve_rigid_body(
     pos_new = com_new - wp.quat_rotate(rot_new, body_com_local)
 
     body_q_new[body_index] = wp.transform(pos_new, rot_new)
+
+
+@wp.func
+def _update_duals_joint_impl(
+    step_size: RigidStepSize,
+    tid_in: int,
+    # Inputs
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_rod_rest_kb_local: wp.array[wp.vec3],
+    joint_rod_rest_twist: wp.array[float],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_constraint_start: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    joint_dof_dim: wp.array2d[int],
+    joint_C0_lin: wp.array[wp.vec3],
+    joint_C0_ang: wp.array[wp.vec3],
+    joint_is_hard: wp.array[wp.int32],
+    stab_alpha: float,
+    joint_material_k: wp.array[float],
+    joint_rho: wp.array[float],
+    joint_compliant_alm: int,
+    beta_lin: float,
+    beta_ang: float,
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_qd: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_coordinates: JointCoordinateData,
+    joint_friction: JointFrictionData,
+    joint_drive_limit_support: wp.array[float],
+    dt: float,
+    # Input/output
+    joint_penalty_k: wp.array[float],
+    joint_lambda_lin: wp.array[wp.vec3],
+    joint_lambda_ang: wp.array[wp.vec3],
+    joint_drive_lambda: wp.array[float],
+    joint_limit_lambda: wp.array[float],
+):
+    j = tid_in
+
+    if not joint_enabled[j]:
+        return
+
+    parent = joint_parent[j]
+    child = joint_child[j]
+    dt = rigid_step_h(step_size, child, dt)
+
+    # Early exit for invalid joints
+    if child < 0:
+        return
+
+    jt = joint_type[j]
+    if (
+        jt != JointType.ROD
+        and jt != JointType.BALL
+        and jt != JointType.FIXED
+        and jt != JointType.REVOLUTE
+        and jt != JointType.PRISMATIC
+        and jt != JointType.D6
+    ):
+        return
+
+    if joint_friction.use_local_alm == 1:
+        for axis in range(joint_dof_dim[j, 0] + joint_dof_dim[j, 1]):
+            dof = joint_qd_start[j] + axis
+            if joint_friction.rho[dof] > 0.0:
+                displacement, _gp, _gc = _joint_friction_displacement(joint_coordinates, j, axis, body_q, body_q_prev)
+                multiplier, _metric = _project_friction_interval(
+                    displacement, joint_friction.multiplier[dof], joint_friction.rho[dof], joint_friction.bound[dof]
+                )
+                joint_friction.multiplier[dof] = multiplier
+
+    # Read solver constraint start index
+    c_start = joint_constraint_start[j]
+
+    # Compute joint frames in world space
+    if parent >= 0:
+        X_wp = body_q[parent] * joint_X_p[j]
+        X_wp_prev = body_q_prev[parent] * joint_X_p[j]
+    else:
+        X_wp = joint_X_p[j]
+        X_wp_prev = joint_X_p[j]
+    X_wc = body_q[child] * joint_X_c[j]
+    X_wc_prev = body_q_prev[child] * joint_X_c[j]
+
+    # ROD joint: fixed stretch/shear/bend/twist slots.
+    if jt == JointType.ROD:
+        q_wp = wp.transform_get_rotation(X_wp)
+        q_wc = wp.transform_get_rotation(X_wc)
+
+        x_p = wp.transform_get_translation(X_wp)
+        x_c = wp.transform_get_translation(X_wc)
+        C_vec = x_c - x_p
+
+        kappa = compute_geometric_rod_kappa_cached_z(
+            q_wp,
+            q_wc,
+            joint_rod_rest_kb_local[j],
+            joint_rod_rest_twist[j],
+        )
+
+        # Linear penalty update in the parent-material frame: local
+        # u = [shear_x, shear_y, stretch_z], so stretch is z and shear is xy.
+        stretch_idx = c_start
+        shear_idx = c_start + 1
+        u = wp.quat_rotate_inv(q_wp, C_vec)
+        lambda_lin = joint_lambda_lin[j]
+        C0_lin = joint_C0_lin[j]
+
+        u_stretch = wp.vec3(0.0, 0.0, u[2])
+        lam_stretch = _update_joint_structural_dual(
+            u_stretch,
+            wp.vec3(0.0, 0.0, C0_lin[2]),
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            stretch_idx,
+            wp.vec3(0.0, 0.0, lambda_lin[2]),
+            joint_compliant_alm,
+            beta_lin,
+        )
+        if joint_compliant_alm == 0 and joint_is_hard[stretch_idx] == 0:
+            lam_stretch = wp.vec3(0.0)
+
+        u_shear = wp.vec3(u[0], u[1], 0.0)
+        lam_shear = _update_joint_structural_dual(
+            u_shear,
+            wp.vec3(C0_lin[0], C0_lin[1], 0.0),
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            shear_idx,
+            wp.vec3(lambda_lin[0], lambda_lin[1], 0.0),
+            joint_compliant_alm,
+            beta_lin,
+        )
+        if joint_compliant_alm == 0 and joint_is_hard[shear_idx] == 0:
+            lam_shear = wp.vec3(0.0)
+        joint_lambda_lin[j] = lam_stretch + lam_shear
+
+        bend_idx = c_start + 2
+        twist_idx = c_start + 3
+        lambda_ang = joint_lambda_ang[j]
+        C0_ang = joint_C0_ang[j]
+
+        kappa_bend = wp.vec3(kappa[0], kappa[1], 0.0)
+        lam_bend = _update_joint_structural_dual(
+            kappa_bend,
+            wp.vec3(C0_ang[0], C0_ang[1], 0.0),
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            bend_idx,
+            wp.vec3(lambda_ang[0], lambda_ang[1], 0.0),
+            joint_compliant_alm,
+            beta_ang,
+        )
+        if joint_compliant_alm == 0 and joint_is_hard[bend_idx] == 0:
+            lam_bend = wp.vec3(0.0)
+
+        kappa_twist = wp.vec3(0.0, 0.0, kappa[2])
+        lam_twist = _update_joint_structural_dual(
+            kappa_twist,
+            wp.vec3(0.0, 0.0, C0_ang[2]),
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            twist_idx,
+            wp.vec3(0.0, 0.0, lambda_ang[2]),
+            joint_compliant_alm,
+            beta_ang,
+        )
+        if joint_compliant_alm == 0 and joint_is_hard[twist_idx] == 0:
+            lam_twist = wp.vec3(0.0)
+        joint_lambda_ang[j] = lam_bend + lam_twist
+        return
+
+    # BALL joint: update isotropic linear anchor-coincidence penalty (single scalar).
+    if jt == JointType.BALL:
+        x_p = wp.transform_get_translation(X_wp)
+        x_c = wp.transform_get_translation(X_wc)
+        C_vec = x_c - x_p
+
+        i0 = c_start
+        joint_lambda_lin[j] = _update_joint_structural_dual(
+            C_vec,
+            joint_C0_lin[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i0,
+            joint_lambda_lin[j],
+            joint_compliant_alm,
+            beta_lin,
+        )
+        return
+
+    if parent >= 0:
+        X_wp_rest = body_q_rest[parent] * joint_X_p[j]
+    else:
+        X_wp_rest = joint_X_p[j]
+    X_wc_rest = body_q_rest[child] * joint_X_c[j]
+
+    # FIXED joint: update isotropic linear + isotropic angular penalties (2 scalars).
+    if jt == JointType.FIXED:
+        i_lin = c_start + 0
+        i_ang = c_start + 1
+
+        x_p = wp.transform_get_translation(X_wp)
+        x_c = wp.transform_get_translation(X_wc)
+        C_vec_lin = x_c - x_p
+        joint_lambda_lin[j] = _update_joint_structural_dual(
+            C_vec_lin,
+            joint_C0_lin[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i_lin,
+            joint_lambda_lin[j],
+            joint_compliant_alm,
+            beta_lin,
+        )
+
+        q_wp = wp.transform_get_rotation(X_wp)
+        q_wc = wp.transform_get_rotation(X_wc)
+        q_wp_rest = wp.transform_get_rotation(X_wp_rest)
+        q_wc_rest = wp.transform_get_rotation(X_wc_rest)
+        kappa = compute_kappa(q_wp, q_wc, q_wp_rest, q_wc_rest)
+        joint_lambda_ang[j] = _update_joint_structural_dual(
+            kappa,
+            joint_C0_ang[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i_ang,
+            joint_lambda_ang[j],
+            joint_compliant_alm,
+            beta_ang,
+        )
+        return
+
+    # REVOLUTE joint: isotropic linear + perpendicular angular penalties (2 scalars).
+    if jt == JointType.REVOLUTE:
+        i_lin = c_start + 0
+        i_ang = c_start + 1
+        qd_start = joint_qd_start[j]
+        q_wp = wp.transform_get_rotation(X_wp)
+        P_lin, P_ang = build_joint_projectors(jt, joint_axis, qd_start, 0, 1, q_wp)
+
+        x_p = wp.transform_get_translation(X_wp)
+        x_c = wp.transform_get_translation(X_wc)
+        C_vec_lin = P_lin * (x_c - x_p)
+        joint_lambda_lin[j] = _update_joint_structural_dual(
+            C_vec_lin,
+            P_lin * joint_C0_lin[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i_lin,
+            joint_lambda_lin[j],
+            joint_compliant_alm,
+            beta_lin,
+        )
+
+        q_wc = wp.transform_get_rotation(X_wc)
+        q_wp_rest = wp.transform_get_rotation(X_wp_rest)
+        q_wc_rest = wp.transform_get_rotation(X_wc_rest)
+        kappa = compute_kappa(q_wp, q_wc, q_wp_rest, q_wc_rest)
+        kappa_perp = P_ang * kappa
+        lam_old = P_ang * joint_lambda_ang[j]
+        joint_lambda_ang[j] = _update_joint_structural_dual(
+            kappa_perp,
+            P_ang * joint_C0_ang[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i_ang,
+            lam_old,
+            joint_compliant_alm,
+            beta_ang,
+        )
+
+        # Drive/limit dual update for free angular DOF (slot c_start + 2)
+        dof_idx = qd_start
+        axis_dl = _load_joint_axis_drive_limit(
+            dof_idx,
+            joint_target_q_start[j],
+            c_start + 2,
+            joint_target_ke,
+            joint_target_kd,
+            joint_target_q,
+            joint_target_qd,
+            joint_limit_lower,
+            joint_limit_upper,
+            joint_limit_ke,
+            joint_limit_kd,
+            joint_penalty_k,
+            joint_compliant_alm,
+        )
+        has_drive = _drive_row_needs_state_update(axis_dl.material_drive_ke, axis_dl.drive_kd, joint_compliant_alm)
+        has_limits = _limit_row_exists(axis_dl.material_limit_ke, axis_dl.lower, axis_dl.upper)
+
+        if has_drive or has_limits:
+            theta_abs, rate, _gradient = _evaluate_angular_coordinate(joint_coordinates, j, 0, body_q, body_q_prev, dt)
+            _update_joint_axis_drive_limit_state(
+                axis_dl,
+                theta_abs,
+                rate,
+                has_drive,
+                has_limits,
+                dof_idx,
+                c_start + 2,
+                beta_ang,
+                1.0 / dt,
+                joint_penalty_k,
+                joint_material_k,
+                joint_drive_limit_support,
+                joint_drive_lambda,
+                joint_limit_lambda,
+                joint_compliant_alm,
+            )
+        return
+
+    # PRISMATIC joint: perpendicular linear + isotropic angular penalties (2 scalars).
+    if jt == JointType.PRISMATIC:
+        i_lin = c_start + 0
+        i_ang = c_start + 1
+        qd_start = joint_qd_start[j]
+        q_wp = wp.transform_get_rotation(X_wp)
+        P_lin, P_ang = build_joint_projectors(jt, joint_axis, qd_start, 1, 0, q_wp)
+
+        x_p = wp.transform_get_translation(X_wp)
+        x_c = wp.transform_get_translation(X_wc)
+        C_vec = x_c - x_p
+        C_vec_perp = P_lin * C_vec
+        # P_lin rotates with the parent; re-project stored lambda into the current
+        # constrained subspace before accumulating.
+        lam_old = P_lin * joint_lambda_lin[j]
+        joint_lambda_lin[j] = _update_joint_structural_dual(
+            C_vec_perp,
+            P_lin * joint_C0_lin[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i_lin,
+            lam_old,
+            joint_compliant_alm,
+            beta_lin,
+        )
+
+        q_wc = wp.transform_get_rotation(X_wc)
+        q_wp_rest = wp.transform_get_rotation(X_wp_rest)
+        q_wc_rest = wp.transform_get_rotation(X_wc_rest)
+        kappa = compute_kappa(q_wp, q_wc, q_wp_rest, q_wc_rest)
+        kappa_perp = P_ang * kappa
+        joint_lambda_ang[j] = _update_joint_structural_dual(
+            kappa_perp,
+            P_ang * joint_C0_ang[j],
+            stab_alpha,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_is_hard,
+            i_ang,
+            joint_lambda_ang[j],
+            joint_compliant_alm,
+            beta_ang,
+        )
+
+        # Drive/limit dual update for free linear DOF (slot c_start + 2)
+        dof_idx = qd_start
+        axis_dl = _load_joint_axis_drive_limit(
+            dof_idx,
+            joint_target_q_start[j],
+            c_start + 2,
+            joint_target_ke,
+            joint_target_kd,
+            joint_target_q,
+            joint_target_qd,
+            joint_limit_lower,
+            joint_limit_upper,
+            joint_limit_ke,
+            joint_limit_kd,
+            joint_penalty_k,
+            joint_compliant_alm,
+        )
+        has_drive = _drive_row_needs_state_update(axis_dl.material_drive_ke, axis_dl.drive_kd, joint_compliant_alm)
+        has_limits = _limit_row_exists(axis_dl.material_limit_ke, axis_dl.lower, axis_dl.upper)
+
+        if has_drive or has_limits:
+            axis_w_dl = wp.normalize(wp.quat_rotate(q_wp, joint_axis[qd_start]))
+            d_along = wp.dot(C_vec, axis_w_dl)
+            x_p_prev = wp.transform_get_translation(X_wp_prev)
+            x_c_prev = wp.transform_get_translation(X_wc_prev)
+            rate = wp.dot((C_vec - (x_c_prev - x_p_prev)) / dt, axis_w_dl)
+            _update_joint_axis_drive_limit_state(
+                axis_dl,
+                d_along,
+                rate,
+                has_drive,
+                has_limits,
+                dof_idx,
+                c_start + 2,
+                beta_lin,
+                1.0 / dt,
+                joint_penalty_k,
+                joint_material_k,
+                joint_drive_limit_support,
+                joint_drive_lambda,
+                joint_limit_lambda,
+                joint_compliant_alm,
+            )
+        return
+
+    # D6 joint: projected linear + projected angular penalties (2 scalars).
+    if jt == JointType.D6:
+        i_lin = c_start + 0
+        i_ang = c_start + 1
+        lin_count = joint_dof_dim[j, 0]
+        ang_count = joint_dof_dim[j, 1]
+        qd_start = joint_qd_start[j]
+        q_wp_rot = wp.transform_get_rotation(X_wp)
+        P_lin, P_ang = build_joint_projectors(jt, joint_axis, qd_start, lin_count, ang_count, q_wp_rot)
+
+        x_p = wp.transform_get_translation(X_wp)
+        x_c = wp.transform_get_translation(X_wc)
+        C_vec = x_c - x_p
+        x_p_prev = wp.transform_get_translation(X_wp_prev)
+        x_c_prev = wp.transform_get_translation(X_wc_prev)
+        C_vec_prev = x_c_prev - x_p_prev
+        if lin_count < 3:
+            C_vec_perp = P_lin * C_vec
+            # P_lin rotates with the parent; re-project stored lambda into the current
+            # constrained subspace before accumulating.
+            lam_old = P_lin * joint_lambda_lin[j]
+            joint_lambda_lin[j] = _update_joint_structural_dual(
+                C_vec_perp,
+                P_lin * joint_C0_lin[j],
+                stab_alpha,
+                joint_penalty_k,
+                joint_rho,
+                joint_material_k,
+                joint_is_hard,
+                i_lin,
+                lam_old,
+                joint_compliant_alm,
+                beta_lin,
+            )
+
+        q_wc = wp.transform_get_rotation(X_wc)
+        q_wp_rest = wp.transform_get_rotation(X_wp_rest)
+        q_wc_rest = wp.transform_get_rotation(X_wc_rest)
+        kappa = compute_kappa(q_wp_rot, q_wc, q_wp_rest, q_wc_rest)
+        inv_dt = 1.0 / dt
+        if ang_count < 3:
+            kappa_perp = P_ang * kappa
+            lam_old = P_ang * joint_lambda_ang[j]
+            joint_lambda_ang[j] = _update_joint_structural_dual(
+                kappa_perp,
+                P_ang * joint_C0_ang[j],
+                stab_alpha,
+                joint_penalty_k,
+                joint_rho,
+                joint_material_k,
+                joint_is_hard,
+                i_ang,
+                lam_old,
+                joint_compliant_alm,
+                beta_ang,
+            )
+
+        # Drive/limit dual update for D6 free DOFs
+        target_q_base = joint_target_q_start[j]
+        for li in range(3):
+            if li < lin_count:
+                dof_idx = qd_start + li
+                axis_dl = _load_joint_axis_drive_limit(
+                    dof_idx,
+                    target_q_base + li,
+                    c_start + 2 + li,
+                    joint_target_ke,
+                    joint_target_kd,
+                    joint_target_q,
+                    joint_target_qd,
+                    joint_limit_lower,
+                    joint_limit_upper,
+                    joint_limit_ke,
+                    joint_limit_kd,
+                    joint_penalty_k,
+                    joint_compliant_alm,
+                )
+                has_drive = _drive_row_needs_state_update(
+                    axis_dl.material_drive_ke, axis_dl.drive_kd, joint_compliant_alm
+                )
+                has_limits = _limit_row_exists(axis_dl.material_limit_ke, axis_dl.lower, axis_dl.upper)
+
+                if has_drive or has_limits:
+                    axis_w_dl = wp.normalize(wp.quat_rotate(q_wp_rot, joint_axis[dof_idx]))
+                    _update_joint_axis_drive_limit_state(
+                        axis_dl,
+                        wp.dot(C_vec, axis_w_dl),
+                        wp.dot((C_vec - C_vec_prev) / dt, axis_w_dl),
+                        has_drive,
+                        has_limits,
+                        dof_idx,
+                        c_start + 2 + li,
+                        beta_lin,
+                        inv_dt,
+                        joint_penalty_k,
+                        joint_material_k,
+                        joint_drive_limit_support,
+                        joint_drive_lambda,
+                        joint_limit_lambda,
+                        joint_compliant_alm,
+                    )
+
+        for ai in range(3):
+            if ai < ang_count:
+                dof_idx = qd_start + lin_count + ai
+                axis_dl = _load_joint_axis_drive_limit(
+                    dof_idx,
+                    target_q_base + lin_count + ai,
+                    c_start + 2 + lin_count + ai,
+                    joint_target_ke,
+                    joint_target_kd,
+                    joint_target_q,
+                    joint_target_qd,
+                    joint_limit_lower,
+                    joint_limit_upper,
+                    joint_limit_ke,
+                    joint_limit_kd,
+                    joint_penalty_k,
+                    joint_compliant_alm,
+                )
+                has_drive = _drive_row_needs_state_update(
+                    axis_dl.material_drive_ke, axis_dl.drive_kd, joint_compliant_alm
+                )
+                has_limits = _limit_row_exists(axis_dl.material_limit_ke, axis_dl.lower, axis_dl.upper)
+
+                if has_drive or has_limits:
+                    theta_abs, rate, _gradient = _evaluate_angular_coordinate(
+                        joint_coordinates, j, lin_count + ai, body_q, body_q_prev, dt
+                    )
+                    _update_joint_axis_drive_limit_state(
+                        axis_dl,
+                        theta_abs,
+                        rate,
+                        has_drive,
+                        has_limits,
+                        dof_idx,
+                        c_start + 2 + lin_count + ai,
+                        beta_ang,
+                        inv_dt,
+                        joint_penalty_k,
+                        joint_material_k,
+                        joint_drive_limit_support,
+                        joint_drive_lambda,
+                        joint_limit_lambda,
+                        joint_compliant_alm,
+                    )
+        return
 
 
 @wp.kernel
@@ -7391,6 +8462,228 @@ def update_duals_joint(
         return
 
 
+@wp.kernel
+def update_duals_joint_theta(
+    step_size: RigidStepSize,
+    # Inputs
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_rod_rest_kb_local: wp.array[wp.vec3],
+    joint_rod_rest_twist: wp.array[float],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_constraint_start: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    joint_dof_dim: wp.array2d[int],
+    joint_C0_lin: wp.array[wp.vec3],
+    joint_C0_ang: wp.array[wp.vec3],
+    joint_is_hard: wp.array[wp.int32],
+    stab_alpha: float,
+    joint_material_k: wp.array[float],
+    joint_rho: wp.array[float],
+    joint_compliant_alm: int,
+    beta_lin: float,
+    beta_ang: float,
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_qd: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_coordinates: JointCoordinateData,
+    joint_friction: JointFrictionData,
+    joint_drive_limit_support: wp.array[float],
+    dt: float,
+    # Input/output
+    joint_penalty_k: wp.array[float],
+    joint_lambda_lin: wp.array[wp.vec3],
+    joint_lambda_ang: wp.array[wp.vec3],
+    joint_drive_lambda: wp.array[float],
+    joint_limit_lambda: wp.array[float],
+):
+    """update_duals_joint with the per-body step of the BDF2 theta selection (prototype)."""
+    _update_duals_joint_impl(
+        step_size,
+        wp.tid(),
+        joint_type,
+        joint_enabled,
+        joint_parent,
+        joint_child,
+        joint_X_p,
+        joint_X_c,
+        joint_axis,
+        joint_rod_rest_kb_local,
+        joint_rod_rest_twist,
+        joint_qd_start,
+        joint_target_q_start,
+        joint_constraint_start,
+        body_q,
+        body_q_prev,
+        body_q_rest,
+        joint_dof_dim,
+        joint_C0_lin,
+        joint_C0_ang,
+        joint_is_hard,
+        stab_alpha,
+        joint_material_k,
+        joint_rho,
+        joint_compliant_alm,
+        beta_lin,
+        beta_ang,
+        joint_target_ke,
+        joint_target_kd,
+        joint_target_q,
+        joint_target_qd,
+        joint_limit_lower,
+        joint_limit_upper,
+        joint_limit_ke,
+        joint_limit_kd,
+        joint_coordinates,
+        joint_friction,
+        joint_drive_limit_support,
+        dt,
+        joint_penalty_k,
+        joint_lambda_lin,
+        joint_lambda_ang,
+        joint_drive_lambda,
+        joint_limit_lambda,
+    )
+
+
+@wp.func
+def _update_duals_body_body_contacts_impl(
+    step_size: RigidStepSize,
+    idx_in: int,
+    rigid_contact_count: wp.array[int],
+    rigid_contact_shape0: wp.array[int],
+    rigid_contact_shape1: wp.array[int],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_surface_velocity: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[float],
+    rigid_contact_margin1: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    dt: float,
+    contact_material_mu: wp.array[float],
+    contact_C0: wp.array[wp.vec3],
+    stab_alpha: float,
+    legacy_hard_contacts: int,
+    contact_compliant_alm: int,
+    contact_material_ke: wp.array[float],
+    contact_tangent_rho: wp.array[float],
+    contact_normal_rho: wp.array[float],
+    beta: float,
+    # Input/output
+    contact_penalty_k: wp.array[float],
+    contact_lambda: wp.array[wp.vec3],
+):
+    """Body-body contact dual update for one contact slot (shared by the solver-wide and theta kernels)."""
+    idx = idx_in
+    if idx >= rigid_contact_count[0]:
+        return
+
+    shape_id_0 = rigid_contact_shape0[idx]
+    shape_id_1 = rigid_contact_shape1[idx]
+    if shape_id_0 < 0 or shape_id_1 < 0:
+        return
+    body_id_0 = shape_body[shape_id_0]
+    body_id_1 = shape_body[shape_id_1]
+
+    if body_id_0 < 0 and body_id_1 < 0:
+        return
+    step_body = body_id_0
+    if step_body < 0:
+        step_body = body_id_1
+    dt = rigid_step_h(step_size, step_body, dt)
+
+    cp0_local = rigid_contact_point0[idx]
+    cp1_local = rigid_contact_point1[idx]
+    anchor0_local = cp0_local + rigid_contact_offset0[idx]
+    anchor1_local = cp1_local + rigid_contact_offset1[idx]
+
+    if body_id_0 >= 0:
+        p0_world = wp.transform_point(body_q[body_id_0], cp0_local)
+        a0_world = wp.transform_point(body_q[body_id_0], anchor0_local)
+        a0_prev = wp.transform_point(body_q_prev[body_id_0], anchor0_local)
+    else:
+        p0_world = cp0_local
+        a0_world = anchor0_local
+        a0_prev = anchor0_local
+
+    if body_id_1 >= 0:
+        p1_world = wp.transform_point(body_q[body_id_1], cp1_local)
+        a1_world = wp.transform_point(body_q[body_id_1], anchor1_local)
+        a1_prev = wp.transform_point(body_q_prev[body_id_1], anchor1_local)
+    else:
+        p1_world = cp1_local
+        a1_world = anchor1_local
+        a1_prev = anchor1_local
+
+    n = rigid_contact_normal[idx]
+    C_n_raw = -contact_surface_separation(p0_world, p1_world, n, rigid_contact_margin0[idx], rigid_contact_margin1[idx])
+
+    if legacy_hard_contacts == 1 or contact_compliant_alm == 1:
+        if contact_compliant_alm == 1:
+            rho_n = contact_normal_rho[idx]
+        else:
+            rho_n = contact_penalty_k[idx]
+        material_k = contact_material_ke[idx]
+        lam_vec = contact_lambda[idx]
+        mu = contact_material_mu[idx]
+
+        C0_vec = contact_C0[idx]
+        C0_n = wp.dot(n, C0_vec)
+        C_stab_n = C_n_raw - stab_alpha * C0_n
+        C0_t_vec = C0_vec - n * C0_n
+
+        # Bypass C0 stabilization on separation so normal support releases fully.
+        if C_n_raw < 0.0:
+            C_stab_n = C_n_raw
+
+        rel_disp = (a0_world - a0_prev) - (a1_world - a1_prev)
+        if rigid_contact_surface_velocity:
+            rel_disp -= rigid_contact_surface_velocity[idx] * dt
+        tangential_disp = rel_disp - n * wp.dot(n, rel_disp)
+        tangent_residual = tangential_disp + (1.0 - stab_alpha) * C0_t_vec
+
+        if contact_compliant_alm == 1:
+            contact_lambda[idx] = _compliant_contact_dual_step(
+                lam_vec,
+                n,
+                C_stab_n,
+                tangent_residual,
+                material_k,
+                mu,
+                rho_n,
+                contact_tangent_rho[idx],
+            )
+        else:
+            lam_n_old = wp.dot(lam_vec, n)
+            lam_t_old = lam_vec - n * lam_n_old
+            lam_n_new = wp.max(lam_n_old + rho_n * C_stab_n, 0.0)
+            lam_t_new = lam_t_old + rho_n * tangent_residual
+            cone_limit = mu * lam_n_new
+            lam_t_new = _project_coulomb_tangent(lam_t_new, wp.length(lam_t_new), cone_limit)
+            contact_lambda[idx] = n * lam_n_new + lam_t_new
+
+    if contact_compliant_alm == 0 and C_n_raw > 0.0:
+        contact_penalty_k[idx] = _ramp_penalty_k(contact_penalty_k[idx], contact_material_ke[idx], beta, C_n_raw)
+
+
 @functools.cache
 def create_update_duals_body_body_contacts():
     """Create the rigid contact dual update kernel."""
@@ -7524,6 +8817,70 @@ update_duals_body_body_contacts = create_update_duals_body_body_contacts()
 
 
 @wp.kernel
+def update_duals_body_body_contacts_theta(
+    step_size: RigidStepSize,
+    rigid_contact_count: wp.array[int],
+    rigid_contact_shape0: wp.array[int],
+    rigid_contact_shape1: wp.array[int],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_surface_velocity: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[float],
+    rigid_contact_margin1: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    dt: float,
+    contact_material_mu: wp.array[float],
+    contact_C0: wp.array[wp.vec3],
+    stab_alpha: float,
+    legacy_hard_contacts: int,
+    contact_compliant_alm: int,
+    contact_material_ke: wp.array[float],
+    contact_tangent_rho: wp.array[float],
+    contact_normal_rho: wp.array[float],
+    beta: float,
+    # Input/output
+    contact_penalty_k: wp.array[float],
+    contact_lambda: wp.array[wp.vec3],
+):
+    """update_duals_body_body_contacts with the per-body step of the BDF2 theta selection (prototype)."""
+    _update_duals_body_body_contacts_impl(
+        step_size,
+        wp.tid(),
+        rigid_contact_count,
+        rigid_contact_shape0,
+        rigid_contact_shape1,
+        rigid_contact_point0,
+        rigid_contact_point1,
+        rigid_contact_surface_velocity,
+        rigid_contact_offset0,
+        rigid_contact_offset1,
+        rigid_contact_normal,
+        rigid_contact_margin0,
+        rigid_contact_margin1,
+        shape_body,
+        body_q,
+        body_q_prev,
+        dt,
+        contact_material_mu,
+        contact_C0,
+        stab_alpha,
+        legacy_hard_contacts,
+        contact_compliant_alm,
+        contact_material_ke,
+        contact_tangent_rho,
+        contact_normal_rho,
+        beta,
+        contact_penalty_k,
+        contact_lambda,
+    )
+
+
+@wp.kernel
 def update_duals_body_particle_contacts(
     body_particle_contact_count: wp.array[int],
     soft_contact_indices: wp.array[wp.vec3i],
@@ -7622,6 +8979,7 @@ def rotation_vector_from_quat(q: wp.quat) -> wp.vec3:
 
 @wp.kernel
 def bdf2_predict_rigid_bodies(
+    step_size: RigidStepSize,
     h: float,
     dt: float,
     gravity: wp.array[wp.vec3],
@@ -7635,7 +8993,6 @@ def bdf2_predict_rigid_bodies(
     body_inv_inertia: wp.array[wp.mat33],
     use_gyroscopic: int,
     use_rate_reference: int,
-    exact_rotation: int,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     hist_qd: wp.array[wp.spatial_vector],
@@ -7648,6 +9005,8 @@ def bdf2_predict_rigid_bodies(
     rate_reference: wp.array[wp.transform],
     body_disp: wp.array[wp.vec3],
     body_disp_ang: wp.array[wp.vec3],
+    step_d_ang: wp.array[wp.vec3],
+    step_rot_n: wp.array[wp.quat],
 ):
     """BDF2 inertial target and rate reference (prototype).
 
@@ -7672,13 +9031,44 @@ def bdf2_predict_rigid_bodies(
     ``rate_reference`` receives x_n + (x_n - x_{n-1}) / 3, so (x - rate_reference) / h is the
     BDF2 velocity used by damping, drive, friction and contact rates inside the solve.
 
-    ``exact_rotation`` (``NEWTON_VBD_BDF2_EXACT_ROT``): 0 adds the rotation vectors,
-    off_ang = inc_ang / 3 + h w_pred, which is only first-order accurate when the two rotations are
-    large and about different axes. 1 composes them, exp(off_ang) = exp(h w_pred) exp(inc_ang / 3),
-    so the target is the rate reference rotated by h w_pred, exactly as the linear part.
-    ``update_body_velocity`` then reads the rate back by composition too.
+    The rotation offset is the sum off_ang = inc_ang / 3 + h w_pred (first prototype). ``step_d_ang`` and
+    ``step_rot_n`` keep the history increment used and q_n's rotation, so ``bdf2_compose_inertial_rotation``
+    (``NEWTON_VBD_BDF2_EXACT_ROT``) can replace it by the composition exp(h w_pred) exp(inc_ang / 3) in a
+    separate launch. Keeping that out of this kernel keeps its generated code (and the GPU's FMA
+    contraction of the sum) identical to the first prototype when the switch is off.
     """
     tid = wp.tid()
+    if rigid_step_bdf2(step_size, tid, 1) == 0:
+        # Theta selection (prototype): this world takes a BDF1 step this time. Same code as
+        # forward_step_rigid_bodies, plus the history the next BDF2 step needs (v_n here; the step increment
+        # is written by update_body_velocity). The rate reference is body_q_prev, as on a BDF1 solve.
+        q_cur = body_q[tid]
+        if _world_selected(body_world[tid], pose_rebaseline_mask):
+            body_q_prev[tid] = q_cur
+        hist_qd[tid] = body_qd[tid]
+        rate_reference[tid] = body_q_prev[tid]
+        pred_lin[tid] = wp.vec3(0.0)
+        pred_ang[tid] = wp.vec3(0.0)
+        inv_m1 = body_inv_mass[tid]
+        if inv_m1 == 0.0:
+            body_inertia_q[tid] = q_cur
+            return
+        q_new, qd_new = integrate_rigid_body(
+            q_cur,
+            body_qd[tid],
+            body_f[tid],
+            body_com[tid],
+            body_inertia[tid],
+            inv_m1,
+            body_inv_inertia[tid],
+            gravity[body_world[tid]],
+            0.0,
+            dt,
+        )
+        body_q[tid] = q_new
+        body_qd[tid] = qd_new
+        body_inertia_q[tid] = q_new
+        return
     q_n = body_q[tid]
     qd_n = body_qd[tid]
     qd_m = hist_qd[tid]
@@ -7706,6 +9096,8 @@ def bdf2_predict_rigid_bodies(
         d_lin = dt * wp.spatial_top(qd_n) - (0.5 * dt * dt) * a_lin
         d_ang = dt * wp.spatial_bottom(qd_n) - (0.5 * dt * dt) * a_ang
     hist_qd[tid] = qd_n
+    step_d_ang[tid] = d_ang
+    step_rot_n[tid] = rot_n
 
     reference = q_n
     if use_rate_reference != 0:
@@ -7737,10 +9129,6 @@ def bdf2_predict_rigid_bodies(
         w_pred = wp.quat_rotate(rot_n, w_b - wp.inverse(jacobian) * residual)
     off_lin = d_lin * (1.0 / 3.0) + h * v_pred
     off_ang = d_ang * (1.0 / 3.0) + h * w_pred
-    if exact_rotation != 0:
-        off_ang = rotation_vector_from_quat(
-            wp.mul(quat_from_rotation_vector(h * w_pred), quat_from_rotation_vector(d_ang * (1.0 / 3.0)))
-        )
     pred_lin[tid] = off_lin
     pred_ang[tid] = off_ang
     rot_t = wp.normalize(wp.mul(quat_from_rotation_vector(off_ang), rot_n))
@@ -7748,6 +9136,43 @@ def bdf2_predict_rigid_bodies(
     body_q[tid] = q_t
     body_inertia_q[tid] = q_t
     body_qd[tid] = wp.spatial_vector(v_pred, w_pred)
+
+
+@wp.kernel
+def bdf2_compose_inertial_rotation(
+    step_size: RigidStepSize,
+    h: float,
+    body_inv_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    body_qd: wp.array[wp.spatial_vector],
+    step_d_ang: wp.array[wp.vec3],
+    step_rot_n: wp.array[wp.quat],
+    pred_ang: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_inertia_q: wp.array[wp.transform],
+):
+    """``NEWTON_VBD_BDF2_EXACT_ROT``: compose the BDF2 rotational target exp(h w_pred) exp(inc / 3) q_n.
+
+    Runs right after ``bdf2_predict_rigid_bodies`` (which wrote the additive offset and v_pred / w_pred to
+    ``body_qd``). The sum inc / 3 + h w_pred is only first-order accurate when the two rotations are large and
+    about different axes; the composition puts the target exactly at the rate reference rotated by h w_pred,
+    as for the linear part. ``update_body_velocity`` reads the rate back by composition too.
+    """
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0 or rigid_step_bdf2(step_size, tid, 1) == 0:
+        return
+    w_pred = wp.spatial_bottom(body_qd[tid])
+    off_ang = rotation_vector_from_quat(
+        wp.mul(quat_from_rotation_vector(h * w_pred), quat_from_rotation_vector(step_d_ang[tid] * (1.0 / 3.0)))
+    )
+    pred_ang[tid] = off_ang
+    c = body_com[tid]
+    q_add = body_q[tid]
+    com_t = wp.transform_get_translation(q_add) + wp.quat_rotate(wp.transform_get_rotation(q_add), c)
+    rot_t = wp.normalize(wp.mul(quat_from_rotation_vector(off_ang), step_rot_n[tid]))
+    q_t = wp.transform(com_t - wp.quat_rotate(rot_t, c), rot_t)
+    body_q[tid] = q_t
+    body_inertia_q[tid] = q_t
 
 
 @wp.kernel
@@ -7774,6 +9199,7 @@ def add_external_wrench_to_solve(
 
 @wp.kernel
 def update_body_velocity(
+    step_size: RigidStepSize,
     dt: float,
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -7821,6 +9247,9 @@ def update_body_velocity(
         body_q_out: Output body transforms (state_out), fused copy of body_q.
     """
     tid = wp.tid()
+    # Theta selection (prototype): this body's step and integrator.
+    dt = rigid_step_h(step_size, tid, dt)
+    bdf2_step = rigid_step_bdf2(step_size, tid, bdf2_step)
 
     # Read transforms
     pose = body_q[tid]
@@ -7852,6 +9281,10 @@ def update_body_velocity(
         if bdf2_enabled != 0:
             bdf2_inc_lin[tid] = x_com - x_com_prev
             bdf2_inc_ang[tid] = rotation_vector_from_quat(wp.mul(q, wp.quat_inverse(q_prev)))
+    elif bdf2_enabled != 0 and not sparse_dynamic:
+        # BDF1 step of a BDF2 solver (theta selection): keep the step increment for the next BDF2 step.
+        bdf2_inc_lin[tid] = x_com - x_com_prev
+        bdf2_inc_ang[tid] = rotation_vector_from_quat(wp.mul(q, wp.quat_inverse(q_prev)))
     if sparse_dynamic:
         v = wp.spatial_top(body_qd_mirror[tid]) + body_disp[tid] / dt
         # The step's rotation is the predicted rotation exp(omega_pred * dt) followed by the
