@@ -206,7 +206,7 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
 # BDF2 prototype: synthetic start-up history (rigid_bdf2_startup) -> kernel code.
 _BDF2_STARTUP_MODES = {"free_fall": 0, "constant_velocity": 1, "gravity": 2}
 # BDF2 prototype: rotor (armature) residual evaluation (rigid_bdf2_rotor_residual / NEWTON_VBD_BDF2_EXACT_ROTOR).
-_BDF2_THETA_POLICIES = {"off": 0, "fresh": 1, "event": 2, "contact": 3, "bdf1": 4, "bdf2": 5}
+_BDF2_THETA_POLICIES = {"off": 0, "fresh": 1, "event": 2, "contact": 3, "bdf1": 4, "bdf2": 5, "event_nofresh": 6}
 _BDF2_ROTOR_RESIDUAL_MODES = {"linear": 0, "0": 0, "composed": 1, "1": 1, "absolute": 2, "2": 2}
 
 
@@ -800,7 +800,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                 first, so the BDF2 history is made of real increments (the textbook starter;
                 replaces ``rigid_bdf2_startup``). ``"event"``: also on pre-solve events (a contact
                 predicted to activate or release, a joint limit engaging or releasing, a jump of
-                ``joint_f`` or ``body_f``, a velocity jump); the default. ``"contact"``: like ``"event"`` and
+                ``joint_f`` or ``body_f``, a velocity jump); the default. ``"event_nofresh"``: like ``"event"`` but fresh worlds start from the
+                synthetic ``rigid_bdf2_startup`` history instead of BDF1 steps. ``"contact"``: like ``"event"`` and
                 BDF1 while any contact is predicted active in the world. Each event holds BDF1 for
                 ``NEWTON_VBD_BDF2_THETA_HOLD`` (2) steps. ``"bdf1"`` / ``"bdf2"`` force the
                 selection (verification). The ``NEWTON_VBD_BDF2_THETA`` environment variable
@@ -5884,6 +5885,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._step_size.inv_h2 = wp.zeros(n, dtype=float, device=dev)
         self._step_size.bdf2 = wp.zeros(n, dtype=wp.int32, device=dev)
         self._theta_world_bdf2 = wp.zeros(slots, dtype=wp.int32, device=dev)
+        # Diagnostics (see bdf2_theta_select_worlds); read with bdf2_theta_stats().
+        self._theta_event_counts = wp.zeros(10, dtype=wp.int32, device=dev)
         self._theta_world_hold = wp.zeros(slots, dtype=wp.int32, device=dev)
         self._theta_world_event = wp.zeros(slots, dtype=wp.int32, device=dev)
         self._theta_world_contacts = wp.zeros(slots, dtype=wp.int32, device=dev)
@@ -5914,13 +5917,37 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._theta_vel_ang = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_ANG", "0.5"))
         self._theta_vel_rel = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_REL", "0.2"))
 
+    def bdf2_theta_stats(self) -> dict | None:
+        """Diagnostics of the BDF1/BDF2 selection since construction (host read; not for use inside a graph capture).
+
+        Returns the fraction of BDF2 world-steps and how often each detector fired (counts are per detected
+        element: DOF, body or world)."""
+        if not self._theta_active:
+            return None
+        c = self._theta_event_counts.numpy()
+        names = (
+            "fresh",
+            "joint_f_jump",
+            "limit_change",
+            "velocity_jump",
+            "body_f_jump",
+            "contact_change",
+            "contact_active",
+            "pose_write",
+        )
+        out = {n: int(c[i]) for i, n in enumerate(names)}
+        out["bdf2_world_steps"] = int(c[8])
+        out["world_steps"] = int(c[9])
+        out["bdf2_fraction"] = float(c[8]) / max(int(c[9]), 1)
+        return out
+
     def _select_bdf2_theta(self, state_in: State, control: Control, contacts: Contacts | None, dt: float, h: float):
         """Pre-solve BDF1/BDF2 selection per world (device-side; Python constants only)."""
         if not self._theta_active:
             return
         model = self.model
         dev = self.device
-        events = self._theta_policy in (2, 3)
+        events = self._theta_policy in (2, 3, 6)
         n_dof = model.joint_dof_count
         if events and n_dof > 0:
             joint_f = (
@@ -5941,7 +5968,12 @@ class SolverVBD(SolverBase, CouplingInterface):
                     1,
                     int(state_in.joint_q is not None),
                 ],
-                outputs=[self._theta_joint_f_prev, self._theta_limit_prev, self._theta_world_event],
+                outputs=[
+                    self._theta_joint_f_prev,
+                    self._theta_limit_prev,
+                    self._theta_world_event,
+                    self._theta_event_counts,
+                ],
                 device=dev,
             )
         if model.body_count > 0:
@@ -5962,7 +5994,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     int(events),
                     int(events),
                 ],
-                outputs=[self._theta_qd_m2, self._theta_body_f_prev, self._theta_world_event],
+                outputs=[self._theta_qd_m2, self._theta_body_f_prev, self._theta_world_event, self._theta_event_counts],
                 device=dev,
             )
         if events and model.body_count > 0:
@@ -5977,7 +6009,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._theta_pose_lin_tol,
                     self._theta_pose_ang_tol,
                 ],
-                outputs=[self._theta_world_event],
+                outputs=[self._theta_world_event, self._theta_event_counts],
                 device=dev,
             )
         if events and contacts is not None and contacts.rigid_contact_max > 0:
@@ -6015,7 +6047,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._theta_world_event,
                 self._theta_world_hold,
             ],
-            outputs=[self._theta_world_bdf2],
+            outputs=[self._theta_world_bdf2, self._theta_event_counts],
             device=dev,
         )
         wp.launch(

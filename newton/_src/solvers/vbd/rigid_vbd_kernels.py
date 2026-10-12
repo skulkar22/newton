@@ -323,6 +323,7 @@ def bdf2_theta_detect_dofs(
     joint_f_prev: wp.array[float],
     limit_state_prev: wp.array[wp.int32],
     world_event: wp.array[wp.int32],
+    event_counts: wp.array[wp.int32],
 ):
     """Pre-solve detectors per DOF: explicit torque jump and joint-limit engagement or release."""
     d = wp.tid()
@@ -332,6 +333,7 @@ def bdf2_theta_detect_dofs(
         fp = joint_f_prev[d]
         if wp.abs(f - fp) > force_abs_tol + force_rel_tol * wp.abs(fp):
             wp.atomic_max(world_event, slot, 1)
+            wp.atomic_add(event_counts, 1, 1)
         joint_f_prev[d] = f
     c = dof_coord[d]
     if use_limits != 0 and c >= 0:
@@ -346,6 +348,7 @@ def bdf2_theta_detect_dofs(
                 state = 1
         if state != limit_state_prev[d]:
             wp.atomic_max(world_event, slot, 1)
+            wp.atomic_add(event_counts, 2, 1)
         limit_state_prev[d] = state
 
 
@@ -366,6 +369,7 @@ def bdf2_theta_detect_bodies(
     qd_m2: wp.array[wp.spatial_vector],
     body_f_prev: wp.array[wp.spatial_vector],
     world_event: wp.array[wp.int32],
+    event_counts: wp.array[wp.int32],
 ):
     """Pre-solve detectors per body: velocity jump (second difference v_n - 2 v_{n-1} + v_{n-2}) and body_f jump."""
     b = wp.tid()
@@ -382,6 +386,7 @@ def bdf2_theta_detect_bodies(
             wp.spatial_bottom(v)
         ):
             wp.atomic_max(world_event, slot, 1)
+            wp.atomic_add(event_counts, 3, 1)
     qd_m2[b] = vm
     if use_force != 0:
         f = body_f[b]
@@ -391,6 +396,7 @@ def bdf2_theta_detect_bodies(
             wp.spatial_bottom(df)
         ) > force_abs_tol + force_rel_tol * wp.length(wp.spatial_bottom(fp)):
             wp.atomic_max(world_event, slot, 1)
+            wp.atomic_add(event_counts, 4, 1)
         body_f_prev[b] = f
 
 
@@ -456,21 +462,28 @@ def bdf2_theta_select_worlds(
     world_event: wp.array[wp.int32],
     world_hold: wp.array[wp.int32],
     world_bdf2: wp.array[wp.int32],
+    event_counts: wp.array[wp.int32],
 ):
     """Per world: BDF1 (0) or BDF2 (1) for this step. Policies: 1 fresh, 2 event, 3 contact, 4 always BDF1,
-    5 always BDF2 (through the per-body path). An event holds BDF1 for ``hold_steps`` steps (event step included),
+    5 always BDF2 (through the per-body path), 6 events without the fresh-world bootstrap (fresh worlds use the
+    synthetic ``rigid_bdf2_startup`` history). ``event_counts`` accumulates diagnostics: [0] fresh, [1] joint_f jump,
+    [2] limit change, [3] velocity jump, [4] body_f jump, [5] contact count change, [6] contact active (policy contact),
+    [7] pose write, [8] BDF2 world-steps, [9] world-steps. An event holds BDF1 for ``hold_steps`` steps (event step included),
     so the next BDF2 step has a history made of real BDF1 increments."""
     w = wp.tid()
     event = int(0)
-    if rebaseline_mask[w]:
+    if rebaseline_mask[w] and policy != 6:
         event = 1
-    if policy == 2 or policy == 3:
+        wp.atomic_add(event_counts, 0, 1)
+    if policy == 2 or policy == 3 or policy == 6:
         if world_event[w] != 0:
             event = 1
         if world_contacts[w] != world_contacts_prev[w]:
             event = 1
+            wp.atomic_add(event_counts, 5, 1)
     if policy == 3 and world_contacts[w] > 0:
         event = 1
+        wp.atomic_add(event_counts, 6, 1)
     hold = world_hold[w]
     if event != 0:
         hold = hold_steps
@@ -485,6 +498,8 @@ def bdf2_theta_select_worlds(
         hold = 0
     world_hold[w] = hold
     world_bdf2[w] = bdf2
+    wp.atomic_add(event_counts, 8, bdf2)
+    wp.atomic_add(event_counts, 9, 1)
     world_contacts_prev[w] = world_contacts[w]
     world_contacts[w] = 0
     world_event[w] = 0
@@ -9332,6 +9347,7 @@ def bdf2_theta_detect_pose_writes(
     lin_tol: float,
     ang_tol: float,
     world_event: wp.array[wp.int32],
+    event_counts: wp.array[wp.int32],
 ):
     """F6: a body pose that differs from the solver's last final pose (an external write without reset()) makes the
     world's BDF2 history invalid; flag the world so it takes BDF1 steps and rebuilds the history. Kinematic bodies
@@ -9346,6 +9362,7 @@ def bdf2_theta_detect_pose_writes(
     dang = wp.length(rotation_vector_from_quat(dq))
     if dx > lin_tol or dang > ang_tol:
         wp.atomic_max(world_event, _world_slot(body_world[b], world_event.shape[0]), 1)
+        wp.atomic_add(event_counts, 7, 1)
 
 
 @wp.kernel

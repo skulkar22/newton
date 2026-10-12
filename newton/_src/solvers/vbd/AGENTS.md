@@ -82,7 +82,7 @@ Why the prototype blew up on G1 with explicit torques (`Control.joint_f`), in or
 
 ### Theta selection (F2, Stage A: per world)
 
-- `rigid_bdf2_theta_policy` / `NEWTON_VBD_BDF2_THETA`: `off`, `fresh`, `event` (default), `contact`, `bdf1`, `bdf2` (the last two force the selection for verification).
+- `rigid_bdf2_theta_policy` / `NEWTON_VBD_BDF2_THETA`: `off`, `fresh`, `event` (default), `event_nofresh` (events, but fresh worlds use the synthetic `rigid_bdf2_startup` history instead of BDF1 start-up steps), `contact`, `bdf1`, `bdf2` (the last two force the selection for verification). `SolverVBD.bdf2_theta_stats()` returns the BDF2 fraction of world-steps and per-detector event counts.
 - Every step, before the solve, `_select_bdf2_theta` runs device-only detectors and writes `world_bdf2[world]` (1 = BDF2 step, 0 = BDF1 step):
   `bdf2_theta_detect_dofs` (`|joint_f_n − joint_f_{n−1}| > abs + rel·|f_{n−1}|`, joint limit engaging/releasing from `state.joint_q`), `bdf2_theta_detect_bodies` (velocity second difference `v_n − 2v_{n−1} + v_{n−2}` above `lin/ang + rel·|v|`, `body_f` jump), `bdf2_theta_count_contacts` (contacts predicted active this step, `separation + dt·approach rate < 0`; an event when the per-world count changes), the rebaseline mask (construction, `reset()`). `bdf2_theta_select_worlds` holds BDF1 for `NEWTON_VBD_BDF2_THETA_HOLD` (2) steps after an event; `bdf2_theta_expand_bodies` writes the per-body `RigidStepSize` (`h`, `inv_h2`, `bdf2`).
 - Thresholds: `NEWTON_VBD_BDF2_THETA_FORCE_ABS` (1.0) / `_FORCE_REL` (0.5), `_VEL_LIN` (0.05 m/s) / `_VEL_ANG` (0.5 rad/s) / `_VEL_REL` (0.2). Phase 2 tunes them.
