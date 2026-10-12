@@ -9250,6 +9250,7 @@ def add_armature_to_axis_support(
 
 @wp.kernel
 def bdf2_kinematic_rate_reference(
+    step_size: RigidStepSize,
     h: float,
     dt: float,
     body_inv_mass: wp.array[float],
@@ -9265,7 +9266,7 @@ def bdf2_kinematic_rate_reference(
     gives (x_n - reference) / h = (x_n - x_{n-1}) / dt, the BDF1 value.
     """
     tid = wp.tid()
-    if body_inv_mass[tid] != 0.0:
+    if body_inv_mass[tid] != 0.0 or rigid_step_bdf2(step_size, tid, 1) == 0:
         return
     q = body_q[tid]
     qp = body_q_prev[tid]

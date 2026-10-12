@@ -487,6 +487,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_bdf2_exact_rotation: bool = True,
         rigid_bdf2_rotor_residual: str = "composed",
         rigid_bdf2_theta_policy: str = "event",
+        rigid_bdf2_theta_hold: int = 2,
+        rigid_bdf2_kinematic_rate: bool = True,
+        rigid_warm_start_gamma: float = 1.0,
+        rigid_axis_support_armature: bool | None = None,
         rigid_external_force_mode: str | None = None,
         rigid_external_force_guess: bool = False,
         deterministic: wp.DeterministicMode | None = None,
@@ -799,6 +803,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ``NEWTON_VBD_BDF2_THETA_HOLD`` (2) steps. ``"bdf1"`` / ``"bdf2"`` force the
                 selection (verification). The ``NEWTON_VBD_BDF2_THETA`` environment variable
                 overrides this value.
+            rigid_bdf2_theta_hold: BDF2 only. Number of BDF1 steps an event (or a fresh world) holds.
+                ``NEWTON_VBD_BDF2_THETA_HOLD`` overrides it.
+            rigid_bdf2_kinematic_rate: BDF2 only. Rate reference of kinematic bodies
+                ``x_n - (h/dt)(x_n - x_{n-1})``, so a user-animated kinematic body moves at +V in the solve
+                (the first prototype gave -V/2). ``NEWTON_VBD_BDF2_KINEMATIC_RATE`` (``0``/``1``) overrides it.
+            rigid_warm_start_gamma: Fraction of the previous step's displacement used by the warm start
+                (``NEWTON_VBD_WARM_GAMMA`` overrides it).
+            rigid_axis_support_armature: Add ``armature / h^2`` to the support (ALM rho) of revolute drive and
+                limit rows. Without it, a limit between a very light link and a heavy one gets a rho from the light
+                link's inertia only and cannot hold (G1 waist pitch at 2-4 ms). ``None`` (default) enables it for
+                BDF2 and leaves BDF1 unchanged. ``NEWTON_VBD_RHO_ARMATURE`` (``0``/``1``) overrides it.
             rigid_external_force_mode: Where ``State.body_f`` and the mapped ``Control.joint_f``
                 enter the rigid step (experimental). ``None`` (default) selects ``"target"`` for
                 BDF1 and ``"solve"`` for BDF2. ``"target"`` shifts each body's inertial target by
@@ -1228,6 +1243,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_bdf2_exact_rotation,
             rigid_bdf2_rotor_residual,
             rigid_bdf2_theta_policy,
+            rigid_bdf2_theta_hold,
+            rigid_bdf2_kinematic_rate,
+            rigid_warm_start_gamma,
+            rigid_axis_support_armature,
         )
         self._setup_external_force_mode(rigid_external_force_mode, rigid_external_force_guess)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
@@ -3993,6 +4012,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         bdf2_kinematic_rate_reference,
                         dim=model.body_count,
                         inputs=[
+                            self._step_size,
                             dt,
                             self._bdf2_full_dt,
                             self.body_inv_mass_effective,
@@ -5723,6 +5743,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_bdf2_exact_rotation: bool = True,
         rigid_bdf2_rotor_residual: str = "composed",
         rigid_bdf2_theta_policy: str = "event",
+        rigid_bdf2_theta_hold: int = 2,
+        rigid_bdf2_kinematic_rate: bool = True,
+        rigid_warm_start_gamma: float = 1.0,
+        rigid_axis_support_armature: bool | None = None,
     ):
         """Select the rigid time integrator (BDF2 is an experimental prototype).
 
@@ -5749,11 +5773,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Displacement warm start (prototype): allocated here so no step allocates (CUDA-graph safe).
         self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", "1" if mode == "bdf2" else "0") != "0"
         # Warm-start fraction of the previous displacement (1.0 = full, 0.0 = start at the inertial target).
-        self._warm_gamma = float(os.environ.get("NEWTON_VBD_WARM_GAMMA", "1.0"))
+        self._warm_gamma = float(os.environ.get("NEWTON_VBD_WARM_GAMMA", rigid_warm_start_gamma))
         # Armature in the revolute drive/limit row support (ALM rho); opt-in for both integrators.
-        self._rho_armature = os.environ.get("NEWTON_VBD_RHO_ARMATURE", "0") != "0"
+        rho_default = (mode == "bdf2") if rigid_axis_support_armature is None else bool(rigid_axis_support_armature)
+        self._rho_armature = os.environ.get("NEWTON_VBD_RHO_ARMATURE", "1" if rho_default else "0") != "0"
         # BDF2 rate reference of kinematic bodies (user-animated): BDF1-consistent velocity instead of -V/2.
-        self._bdf2_kinematic_rate = os.environ.get("NEWTON_VBD_BDF2_KINEMATIC_RATE", "1") != "0"
+        self._bdf2_kinematic_rate = (
+            os.environ.get("NEWTON_VBD_BDF2_KINEMATIC_RATE", "1" if rigid_bdf2_kinematic_rate else "0") != "0"
+        )
+        self._theta_hold_default = int(rigid_bdf2_theta_hold)
         # F6 pose-write detector tolerances (theta 'event'/'contact').
         self._theta_pose_lin_tol = float(os.environ.get("NEWTON_VBD_BDF2_THETA_POSE_LIN", "1e-6"))
         self._theta_pose_ang_tol = float(os.environ.get("NEWTON_VBD_BDF2_THETA_POSE_ANG", "1e-6"))
@@ -5848,7 +5876,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     dof_coord[ds[j]] = qs[j]
         self._theta_dof_world = wp.array(dof_world, dtype=wp.int32, device=dev)
         self._theta_dof_coord = wp.array(dof_coord, dtype=wp.int32, device=dev)
-        self._theta_hold_steps = int(os.environ.get("NEWTON_VBD_BDF2_THETA_HOLD", "2"))
+        self._theta_hold_steps = int(os.environ.get("NEWTON_VBD_BDF2_THETA_HOLD", self._theta_hold_default))
         self._theta_force_abs = float(os.environ.get("NEWTON_VBD_BDF2_THETA_FORCE_ABS", "1.0"))
         self._theta_force_rel = float(os.environ.get("NEWTON_VBD_BDF2_THETA_FORCE_REL", "0.5"))
         self._theta_vel_lin = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_LIN", "0.05"))
