@@ -2315,6 +2315,20 @@ def solve_articulation_sparse_block32_scalar(
 
 
 @wp.kernel
+def override_articulation_rhs_scalar(
+    articulation_bodies: wp.array[wp.int32],
+    override_rhs: wp.array[wp.spatial_vector],
+    rhs_scalar: wp.array[float],
+):
+    """External-force initial guess (block32 path): replace the assembled right-hand side by f_ext."""
+    local_body = wp.tid()
+    w = override_rhs[articulation_bodies[local_body]]
+    for i in range(3):
+        _scalar_vec_set(rhs_scalar, local_body, i, wp.spatial_top(w)[i])
+        _scalar_vec_set(rhs_scalar, local_body, i + 3, wp.spatial_bottom(w)[i])
+
+
+@wp.kernel
 def apply_articulation_sparse_delta_scalar(
     articulation_bodies: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
@@ -2430,6 +2444,8 @@ def solve_articulation_sparse_serial_scalar(
     body_disp: wp.array[wp.vec3],
     body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
+    rhs_override: int,
+    override_rhs: wp.array[wp.spatial_vector],
     body_q_new: wp.array[wp.transform],
 ):
     articulation_id = wp.tid()
@@ -2539,6 +2555,12 @@ def solve_articulation_sparse_serial_scalar(
                 body_hessian_al,
                 body_hessian_aa,
             )
+
+    if rhs_override != 0:
+        # External-force initial guess: solve H d0 = f_ext with the assembled articulation Hessian.
+        for row in range(body_start, body_end):
+            w = override_rhs[articulation_bodies[row]]
+            rhs[row] = _vec6_from_parts(wp.spatial_top(w), wp.spatial_bottom(w))
 
     body_count = body_end - body_start
     for local_k in range(body_count):

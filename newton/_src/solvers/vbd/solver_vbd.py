@@ -70,6 +70,7 @@ from .rigid_sparse_articulation_kernels import (
     bdf2_armature_offset,
     init_body_displacement,
     mat66f,
+    override_articulation_rhs_scalar,
     predict_articulation_armature,
     predict_articulation_armature_bdf2,
     regularize_articulation_body_hessian,
@@ -109,6 +110,7 @@ from .rigid_vbd_kernels import (
     compute_body_particle_contact_forces,
     compute_rigid_contact_forces,
     compute_rod_dahl_parameters,
+    ext_force_guess_rhs,
     forward_step_rigid_bodies,
     init_body_body_contact_materials,
     init_body_body_contacts_alm,
@@ -483,6 +485,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_bdf2_rotor_residual: str = "composed",
         rigid_bdf2_theta_policy: str = "event",
         rigid_external_force_mode: str | None = None,
+        rigid_external_force_guess: bool = False,
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
@@ -803,6 +806,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                 held by stiff joints (with BDF1 at relaxation 0.65 it also removes a steady-state
                 error of the force-shifted start). Both integrators support it. The ``NEWTON_VBD_EXT_FORCE``
                 environment variable overrides this value.
+            rigid_external_force_guess: With ``rigid_external_force_mode="solve"`` and the block-sparse
+                articulation solve: before the iterations, apply one unrelaxed articulation solve of
+                ``H d0 = f`` (the constrained response to the explicit wrench, with the joint, armature and
+                contact Hessians), or of ``H d0 = f_n - f_{n-1}`` on bodies that are warm started from the
+                previous displacement. Removes the lag of ``solve`` mode at relaxation < 1 without the
+                over-response of ``target`` mode. The ``NEWTON_VBD_EXT_FORCE_GUESS`` environment variable
+                (``0``/``1``) overrides this value.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -1216,7 +1226,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_bdf2_rotor_residual,
             rigid_bdf2_theta_policy,
         )
-        self._setup_external_force_mode(rigid_external_force_mode)
+        self._setup_external_force_mode(rigid_external_force_mode, rigid_external_force_guess)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
 
@@ -2810,6 +2820,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self._initialize_rigid_bodies(state_in, control, contacts, rigid_dt, update_rigid)
         self._init_body_displacement(state_in)
+        self._ext_force_initial_guess(state_in, state_out, control, contacts, rigid_dt)
         self._initialize_particles(state_in, state_out, contacts, dt)
 
         rigid_due, soft_due = self._collision_detection_due((_Frequency.PRE_POST_INIT,))
@@ -3875,6 +3886,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                 # The wrench enters the solve (_add_external_wrench_to_solve); the prediction is force-free.
                 wp.copy(self._ext_wrench, body_f_for_integration)
                 body_f_for_integration = self._ext_zero_wrench
+                if self._ext_guess:
+                    wp.launch(
+                        ext_force_guess_rhs,
+                        dim=model.body_count,
+                        inputs=[
+                            self._step_size,
+                            model.body_world,
+                            self.body_inv_mass_effective,
+                            self._rigid_pose_rebaseline_mask,
+                            int(self._warm_start_enabled()),
+                            self._ext_wrench,
+                        ],
+                        outputs=[self._ext_wrench_prev, self._ext_guess_rhs],
+                        device=self.device,
+                    )
 
             # Rotor inertia must not inherit feedforward/external torques from
             # the body's force-shifted inertial target.
@@ -4870,10 +4896,22 @@ class SolverVBD(SolverBase, CouplingInterface):
         )
 
     def _solve_rigid_body_iteration_block_sparse_joints(
-        self, state_in: State, state_out: State, control: Control, contacts: Contacts | None, dt: float
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts | None,
+        dt: float,
+        guess: bool = False,
     ):
-        """Solve one rigid iteration with coupled sparse articulation updates."""
+        """Solve one rigid iteration with coupled sparse articulation updates.
+
+        ``guess=True`` (external-force initial guess, articulations only): the right-hand side is replaced by
+        the guess right-hand side (``ext_force_guess_rhs``) and the update is applied unrelaxed, so the bodies
+        start the iterations at the constrained response to the explicit wrench.
+        """
         model = self.model
+        relaxation = 1.0 if guess else self.rigid_articulation_relaxation
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
             self._solve_rigid_body_iteration_local(state_in, state_out, control, contacts, dt)
             return
@@ -5018,6 +5056,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
                 block_dim=SPARSE_ARTICULATION_CTA_THREADS,
             )
+            if guess:
+                wp.launch(
+                    kernel=override_articulation_rhs_scalar,
+                    dim=layout.articulation_body_count,
+                    inputs=[layout.articulation_bodies, self._ext_guess_rhs],
+                    outputs=[self._rigid_articulation_sparse_rhs_scalar],
+                    device=self.device,
+                )
 
         else:
             wp.launch(
@@ -5037,7 +5083,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_hessian_ll,
                     self.body_hessian_al,
                     self.body_hessian_aa,
-                    self.rigid_articulation_relaxation,
+                    relaxation,
                     self._has_joint_mimics,
                     self._rigid_articulation_sparse_values_scalar,
                     self._rigid_articulation_sparse_rhs_scalar,
@@ -5047,6 +5093,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._body_disp,
                     self._body_disp_ang,
                     self._use_body_displacement,
+                    int(guess),
+                    self._ext_guess_rhs if guess else self._rhs_override_dummy,
                 ],
                 outputs=[state_in.body_q],
                 device=self.device,
@@ -5096,7 +5144,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     state_in.body_q,
                     self.body_inv_mass_effective,
                     model.body_com,
-                    self.rigid_articulation_relaxation,
+                    relaxation,
                     self._rigid_articulation_sparse_delta_scalar,
                     self.body_inertia_q,
                     self._body_disp,
@@ -5108,7 +5156,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 block_dim=32,
             )
 
-        if layout.local_body_count > 0:
+        if layout.local_body_count > 0 and not guess:
             self._solve_rigid_body_iteration_local(
                 state_in,
                 state_out,
@@ -5118,6 +5166,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                 body_color_groups=layout.local_body_color_groups,
             )
             return
+
+    def _ext_force_initial_guess(
+        self, state_in: State, state_out: State, control: Control, contacts: Contacts | None, dt: float
+    ):
+        """External-force initial guess (``rigid_external_force_guess``): one unrelaxed articulation solve of
+        H d0 = f_ext (or f_n - f_{n-1} on warm-started bodies) before the iterations."""
+        if not self._ext_guess or self.rigid_articulation_sparse_layout is None:
+            return
+        if self.rigid_articulation_sparse_layout.articulation_count == 0:
+            return
+        self._solve_rigid_body_iteration_block_sparse_joints(state_in, state_out, control, contacts, dt, guess=True)
 
     def eval_joint_forces(
         self,
@@ -5841,7 +5900,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=dev,
         )
 
-    def _setup_external_force_mode(self, rigid_external_force_mode: str | None):
+    def _setup_external_force_mode(
+        self, rigid_external_force_mode: str | None, rigid_external_force_guess: bool | None = None
+    ):
         """Select where external wrenches enter the rigid step (``NEWTON_VBD_EXT_FORCE`` overrides)."""
         import os  # noqa: PLC0415
 
@@ -5856,6 +5917,15 @@ class SolverVBD(SolverBase, CouplingInterface):
             # Step snapshot of body_f + mapped joint_f, and a zero wrench for the force-free prediction.
             self._ext_wrench = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
             self._ext_zero_wrench = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
+        guess_env = os.environ.get("NEWTON_VBD_EXT_FORCE_GUESS")
+        guess = bool(rigid_external_force_guess) if guess_env is None else guess_env != "0"
+        self.rigid_external_force_guess = guess
+        self._ext_guess = bool(guess and self._ext_force_in_solve and self.rigid_articulation_sparse_layout is not None)
+        self._rhs_override_dummy = wp.zeros(1, dtype=wp.spatial_vector, device=self.device)
+        self._ext_guess_rhs = None
+        if self._ext_guess:
+            self._ext_guess_rhs = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
+            self._ext_wrench_prev = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
 
     def _add_external_wrench_to_solve(self):
         """``rigid_external_force_mode="solve"``: add the step's external wrench to the zeroed solve forces."""

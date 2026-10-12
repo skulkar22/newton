@@ -9176,6 +9176,38 @@ def bdf2_compose_inertial_rotation(
 
 
 @wp.kernel
+def ext_force_guess_rhs(
+    step_size: RigidStepSize,
+    body_world: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    rebaseline_mask: wp.array[wp.bool],
+    warm_start: int,
+    external_wrench: wp.array[wp.spatial_vector],
+    external_wrench_prev: wp.array[wp.spatial_vector],
+    guess_rhs: wp.array[wp.spatial_vector],
+):
+    """Right-hand side of the external-force initial guess (``rigid_external_force_mode="solve"``).
+
+    Cold-started bodies get the constrained response to the whole wrench, H d0 = f. Warm-started bodies
+    (BDF2 displacement warm start) already carry the previous step's response, so they get the response to
+    the change, H d0 = f_n - f_{n-1}. Fresh worlds and BDF1 steps of the theta selection start cold.
+    """
+    b = wp.tid()
+    f = external_wrench[b]
+    rhs = f
+    if body_inv_mass[b] == 0.0:
+        rhs = wp.spatial_vector()
+    elif (
+        warm_start != 0
+        and rigid_step_bdf2(step_size, b, 1) != 0
+        and not _world_selected(body_world[b], rebaseline_mask)
+    ):
+        rhs = f - external_wrench_prev[b]
+    guess_rhs[b] = rhs
+    external_wrench_prev[b] = f
+
+
+@wp.kernel
 def add_external_wrench_to_solve(
     external_wrench: wp.array[wp.spatial_vector],
     body_inv_mass: wp.array[float],
