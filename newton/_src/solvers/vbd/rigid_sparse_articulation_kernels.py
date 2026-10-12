@@ -28,6 +28,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     quat_from_rotation_vector,
     rigid_step_bdf2,
     rigid_step_h,
+    rotation_vector_compose,
     rotation_vector_from_quat,
 )
 
@@ -919,16 +920,23 @@ def _bdf2_exact_hinge_increment(
     keeps small-term precision; unlike J * (pred + phi) it stays accurate when the predicted and solver
     rotations are large and about different axes.
     """
-    r_c = wp.mul(quat_from_rotation_vector(body_disp_ang[child]), quat_from_rotation_vector(body_pred_ang[child]))
+    e_c = rotation_vector_compose(body_disp_ang[child], body_pred_ang[child])
     q_wp = wp.transform_get_rotation(joint_X_p[joint])
-    r_p_inv = wp.quat_identity()
+    e_p = wp.vec3(0.0)
     if parent >= 0:
-        r_p = wp.mul(quat_from_rotation_vector(body_disp_ang[parent]), quat_from_rotation_vector(body_pred_ang[parent]))
-        r_p_inv = wp.quat_inverse(r_p)
-        q_wp = wp.mul(r_p_inv, wp.mul(wp.transform_get_rotation(body_q[parent]), q_wp))
-    E = wp.mul(r_p_inv, r_c)
-    E_local = wp.normalize(wp.mul(wp.quat_inverse(q_wp), wp.mul(E, q_wp)))
-    return wp.quat_twist_angle_signed(axis, E_local)
+        e_p = rotation_vector_compose(body_disp_ang[parent], body_pred_ang[parent])
+        q_wp = wp.mul(
+            wp.quat_inverse(quat_from_rotation_vector(e_p)), wp.mul(wp.transform_get_rotation(body_q[parent]), q_wp)
+        )
+    # Relative increment exp(-e_p) exp(e_c) in the step-start parent joint frame.
+    e_local = wp.quat_rotate_inv(q_wp, rotation_vector_compose(-e_p, e_c))
+    # Twist about the axis: small angles from the series t + t (theta^2 - t^2) / 12 (no unit-quaternion
+    # rounding), larger ones from the quaternion twist.
+    t = wp.dot(axis, e_local)
+    theta2 = wp.dot(e_local, e_local)
+    small = t + t * (theta2 - t * t) * (1.0 / 12.0)
+    large = wp.quat_twist_angle_signed(axis, quat_from_rotation_vector(e_local))
+    return wp.where(theta2 < 0.0009, small, large)
 
 
 @wp.kernel

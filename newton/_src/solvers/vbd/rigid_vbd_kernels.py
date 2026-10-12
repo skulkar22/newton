@@ -8977,6 +8977,21 @@ def rotation_vector_from_quat(q: wp.quat) -> wp.vec3:
     return 2.0 * v
 
 
+@wp.func
+def rotation_vector_compose(a: wp.vec3, b: wp.vec3) -> wp.vec3:
+    """Rotation vector of exp(a) exp(b) (apply b, then a), keeping small-term precision.
+
+    For small rotations (both below 0.03 rad) the third-order Baker-Campbell-Hausdorff series
+    a + b + (a x b) / 2 + (a x (a x b) + b x (b x a)) / 12 is evaluated on the vectors themselves: composing
+    near-identity unit quaternions would round away the digits of a 1e-5 rad step increment. Larger rotations use
+    the quaternion product. The choice is a select, not a branch, so CUDA graphs and the GPU code are unaffected.
+    """
+    ab = wp.cross(a, b)
+    small = a + b + 0.5 * ab + (wp.cross(a, ab) - wp.cross(b, ab)) * (1.0 / 12.0)
+    large = rotation_vector_from_quat(wp.mul(quat_from_rotation_vector(a), quat_from_rotation_vector(b)))
+    return wp.where(wp.max(wp.length(a), wp.length(b)) < 0.03, small, large)
+
+
 @wp.kernel
 def bdf2_predict_rigid_bodies(
     step_size: RigidStepSize,
@@ -9007,6 +9022,7 @@ def bdf2_predict_rigid_bodies(
     body_disp_ang: wp.array[wp.vec3],
     step_d_ang: wp.array[wp.vec3],
     step_rot_n: wp.array[wp.quat],
+    step_com_n: wp.array[wp.vec3],
 ):
     """BDF2 inertial target and rate reference (prototype).
 
@@ -9098,6 +9114,7 @@ def bdf2_predict_rigid_bodies(
     hist_qd[tid] = qd_n
     step_d_ang[tid] = d_ang
     step_rot_n[tid] = rot_n
+    step_com_n[tid] = com_n
 
     reference = q_n
     if use_rate_reference != 0:
@@ -9147,6 +9164,8 @@ def bdf2_compose_inertial_rotation(
     body_qd: wp.array[wp.spatial_vector],
     step_d_ang: wp.array[wp.vec3],
     step_rot_n: wp.array[wp.quat],
+    step_com_n: wp.array[wp.vec3],
+    pred_lin: wp.array[wp.vec3],
     pred_ang: wp.array[wp.vec3],
     body_q: wp.array[wp.transform],
     body_inertia_q: wp.array[wp.transform],
@@ -9162,15 +9181,11 @@ def bdf2_compose_inertial_rotation(
     if body_inv_mass[tid] == 0.0 or rigid_step_bdf2(step_size, tid, 1) == 0:
         return
     w_pred = wp.spatial_bottom(body_qd[tid])
-    off_ang = rotation_vector_from_quat(
-        wp.mul(quat_from_rotation_vector(h * w_pred), quat_from_rotation_vector(step_d_ang[tid] * (1.0 / 3.0)))
-    )
+    off_ang = rotation_vector_compose(h * w_pred, step_d_ang[tid] * (1.0 / 3.0))
     pred_ang[tid] = off_ang
     c = body_com[tid]
-    q_add = body_q[tid]
-    com_t = wp.transform_get_translation(q_add) + wp.quat_rotate(wp.transform_get_rotation(q_add), c)
     rot_t = wp.normalize(wp.mul(quat_from_rotation_vector(off_ang), step_rot_n[tid]))
-    q_t = wp.transform(com_t - wp.quat_rotate(rot_t, c), rot_t)
+    q_t = wp.transform(step_com_n[tid] + pred_lin[tid] - wp.quat_rotate(rot_t, c), rot_t)
     body_q[tid] = q_t
     body_inertia_q[tid] = q_t
 
@@ -9205,6 +9220,91 @@ def ext_force_guess_rhs(
         rhs = f - external_wrench_prev[b]
     guess_rhs[b] = rhs
     external_wrench_prev[b] = f
+
+
+@wp.kernel
+def add_armature_to_axis_support(
+    step_size: RigidStepSize,
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_armature: wp.array[float],
+    inv_dt_sq: float,
+    joint_drive_limit_support: wp.array[float],
+):
+    """``NEWTON_VBD_RHO_ARMATURE``: count the rotor inertia in a revolute drive/limit row's support (ALM rho).
+
+    The support is the row's effective mass over h^2 from the link inertias only; the armature acts on the same
+    coordinate, so a light link with a large armature got a rho far below its real stiffness scale.
+    """
+    j = wp.tid()
+    if joint_type[j] != JointType.REVOLUTE:
+        return
+    dof = joint_qd_start[j]
+    support = joint_drive_limit_support[dof]
+    if support > 0.0:
+        joint_drive_limit_support[dof] = support + joint_armature[dof] * rigid_step_inv_h2(
+            step_size, joint_child[j], inv_dt_sq
+        )
+
+
+@wp.kernel
+def bdf2_kinematic_rate_reference(
+    h: float,
+    dt: float,
+    body_inv_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    rate_reference: wp.array[wp.transform],
+):
+    """``NEWTON_VBD_BDF2_KINEMATIC_RATE``: rate reference of kinematic bodies on a BDF2 step.
+
+    A kinematic body does not move during the solve, so the BDF2 reference x_n + (x_n - x_{n-1}) / 3 makes its
+    in-solve and reported velocity -V/2 for a user-animated body. The reference x_n - (h / dt) (x_n - x_{n-1})
+    gives (x_n - reference) / h = (x_n - x_{n-1}) / dt, the BDF1 value.
+    """
+    tid = wp.tid()
+    if body_inv_mass[tid] != 0.0:
+        return
+    q = body_q[tid]
+    qp = body_q_prev[tid]
+    c = body_com[tid]
+    rot = wp.transform_get_rotation(q)
+    rot_p = wp.transform_get_rotation(qp)
+    com = wp.transform_get_translation(q) + wp.quat_rotate(rot, c)
+    com_p = wp.transform_get_translation(qp) + wp.quat_rotate(rot_p, c)
+    s = h / dt
+    rot_r = wp.normalize(
+        wp.mul(quat_from_rotation_vector(-s * rotation_vector_from_quat(wp.mul(rot, wp.quat_inverse(rot_p)))), rot)
+    )
+    com_r = com - s * (com - com_p)
+    rate_reference[tid] = wp.transform(com_r - wp.quat_rotate(rot_r, c), rot_r)
+
+
+@wp.kernel
+def bdf2_theta_detect_pose_writes(
+    body_world: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    lin_tol: float,
+    ang_tol: float,
+    world_event: wp.array[wp.int32],
+):
+    """F6: a body pose that differs from the solver's last final pose (an external write without reset()) makes the
+    world's BDF2 history invalid; flag the world so it takes BDF1 steps and rebuilds the history. Kinematic bodies
+    (user-animated by design) are skipped."""
+    b = wp.tid()
+    if body_inv_mass[b] == 0.0:
+        return
+    q = body_q[b]
+    qp = body_q_prev[b]
+    dx = wp.length(wp.transform_get_translation(q) - wp.transform_get_translation(qp))
+    dq = wp.mul(wp.transform_get_rotation(q), wp.quat_inverse(wp.transform_get_rotation(qp)))
+    dang = wp.length(rotation_vector_from_quat(dq))
+    if dx > lin_tol or dang > ang_tol:
+        wp.atomic_max(world_event, _world_slot(body_world[b], world_event.shape[0]), 1)
 
 
 @wp.kernel
@@ -9333,25 +9433,14 @@ def update_body_velocity(
             if bdf2_exact_rotation != 0:
                 # The rotation from the rate reference to the solved pose is exp(phi) exp(h omega_pred)
                 # (bdf2_predict_rigid_bodies with exact_rotation): compose, do not add.
-                omega = (
-                    rotation_vector_from_quat(
-                        wp.mul(
-                            quat_from_rotation_vector(body_disp_ang[tid]), quat_from_rotation_vector(omega_pred * dt)
-                        )
-                    )
-                    / dt
-                )
+                omega = rotation_vector_compose(body_disp_ang[tid], omega_pred * dt) / dt
         if bdf2_enabled != 0:
             # Exact step increment x_{n+1} - x_n for the next BDF2 target, built from small terms.
             if bdf2_step != 0:
                 bdf2_inc_lin[tid] = bdf2_pred_lin[tid] + body_disp[tid]
                 bdf2_inc_ang[tid] = bdf2_pred_ang[tid] + body_disp_ang[tid]
                 if bdf2_exact_rotation != 0:
-                    bdf2_inc_ang[tid] = rotation_vector_from_quat(
-                        wp.mul(
-                            quat_from_rotation_vector(body_disp_ang[tid]), quat_from_rotation_vector(bdf2_pred_ang[tid])
-                        )
-                    )
+                    bdf2_inc_ang[tid] = rotation_vector_compose(body_disp_ang[tid], bdf2_pred_ang[tid])
             else:
                 bdf2_inc_lin[tid] = v * dt
                 bdf2_inc_ang[tid] = omega * dt

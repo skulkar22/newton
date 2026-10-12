@@ -93,14 +93,17 @@ from .rigid_vbd_kernels import (
     accumulate_body_body_contacts_per_body,
     accumulate_body_particle_attachments_per_body,
     accumulate_body_particle_contacts_per_body,
+    add_armature_to_axis_support,
     add_external_wrench_to_solve,
     apply_body_truncation_ts,
     apply_rigid_soft_truncation,
     bdf2_compose_inertial_rotation,
+    bdf2_kinematic_rate_reference,
     bdf2_predict_rigid_bodies,
     bdf2_theta_count_contacts,
     bdf2_theta_detect_bodies,
     bdf2_theta_detect_dofs,
+    bdf2_theta_detect_pose_writes,
     bdf2_theta_expand_bodies,
     bdf2_theta_select_worlds,
     build_body_body_contact_lists,
@@ -2825,7 +2828,13 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         rigid_due, soft_due = self._collision_detection_due((_Frequency.PRE_POST_INIT,))
         self._mid_step_detection(
-            state_in, state_out, contacts, dt, rigid_due=rigid_due, soft_due=soft_due, preserve_history=False
+            state_in,
+            state_out,
+            contacts,
+            rigid_dt if self._bdf2_step else dt,  # BDF2 (no particles): the contact refresh uses the solve step
+            rigid_due=rigid_due,
+            soft_due=soft_due,
+            preserve_history=False,
         )
 
         for iter_num in range(self.iterations):
@@ -3975,9 +3984,25 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._body_disp_ang,
                         self._bdf2_step_d_ang,
                         self._bdf2_step_rot_n,
+                        self._bdf2_step_com_n,
                     ],
                     device=self.device,
                 )
+                if self._bdf2_kinematic_rate:
+                    wp.launch(
+                        bdf2_kinematic_rate_reference,
+                        dim=model.body_count,
+                        inputs=[
+                            dt,
+                            self._bdf2_full_dt,
+                            self.body_inv_mass_effective,
+                            model.body_com,
+                            state_in.body_q,
+                            self.body_q_prev,
+                        ],
+                        outputs=[self._bdf2_rate_ref],
+                        device=self.device,
+                    )
                 if self._bdf2_exact_rot:
                     wp.launch(
                         bdf2_compose_inertial_rotation,
@@ -3990,6 +4015,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                             state_in.body_qd,
                             self._bdf2_step_d_ang,
                             self._bdf2_step_rot_n,
+                            self._bdf2_step_com_n,
+                            self._bdf2_pred_lin,
                         ],
                         outputs=[self._bdf2_pred_ang, state_in.body_q, self.body_inertia_q],
                         device=self.device,
@@ -4097,6 +4124,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                     ],
                     device=self.device,
                 )
+                if self._rho_armature:
+                    wp.launch(
+                        kernel=add_armature_to_axis_support,
+                        dim=model.joint_count,
+                        inputs=[
+                            self._step_size,
+                            model.joint_type,
+                            model.joint_child,
+                            model.joint_qd_start,
+                            model.joint_armature,
+                            1.0 / (dt * dt),
+                        ],
+                        outputs=[self.joint_drive_limit_support],
+                        device=self.device,
+                    )
 
             # Compute rod bend/twist Dahl hysteresis parameters once per timestep.
             if self.enable_dahl_friction and model.joint_count > 0:
@@ -5706,6 +5748,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_startup_mode = _BDF2_STARTUP_MODES[startup]
         # Displacement warm start (prototype): allocated here so no step allocates (CUDA-graph safe).
         self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", "1" if mode == "bdf2" else "0") != "0"
+        # Warm-start fraction of the previous displacement (1.0 = full, 0.0 = start at the inertial target).
+        self._warm_gamma = float(os.environ.get("NEWTON_VBD_WARM_GAMMA", "1.0"))
+        # Armature in the revolute drive/limit row support (ALM rho); opt-in for both integrators.
+        self._rho_armature = os.environ.get("NEWTON_VBD_RHO_ARMATURE", "0") != "0"
+        # BDF2 rate reference of kinematic bodies (user-animated): BDF1-consistent velocity instead of -V/2.
+        self._bdf2_kinematic_rate = os.environ.get("NEWTON_VBD_BDF2_KINEMATIC_RATE", "1") != "0"
+        # F6 pose-write detector tolerances (theta 'event'/'contact').
+        self._theta_pose_lin_tol = float(os.environ.get("NEWTON_VBD_BDF2_THETA_POSE_LIN", "1e-6"))
+        self._theta_pose_ang_tol = float(os.environ.get("NEWTON_VBD_BDF2_THETA_POSE_ANG", "1e-6"))
         self._warm_prev_disp = wp.zeros_like(self._body_disp)
         self._warm_prev_disp_ang = wp.zeros_like(self._body_disp_ang)
         if mode not in ("bdf1", "bdf2"):
@@ -5743,6 +5794,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         # History increment used by the prediction and q_n's rotation (for bdf2_compose_inertial_rotation).
         self._bdf2_step_d_ang = wp.zeros(n, dtype=wp.vec3, device=self.device)
         self._bdf2_step_rot_n = wp.zeros(n, dtype=wp.quat, device=self.device)
+        self._bdf2_step_com_n = wp.zeros(n, dtype=wp.vec3, device=self.device)
         # Rotor target - q_n and the rotor residual at the inertial target, both from small terms.
         self._bdf2_arm_delta = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
         self._bdf2_arm_offset = wp.zeros(self.model.joint_dof_count, dtype=float, device=self.device)
@@ -5852,6 +5904,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                     int(events),
                 ],
                 outputs=[self._theta_qd_m2, self._theta_body_f_prev, self._theta_world_event],
+                device=dev,
+            )
+        if events and model.body_count > 0:
+            wp.launch(
+                bdf2_theta_detect_pose_writes,
+                dim=model.body_count,
+                inputs=[
+                    model.body_world,
+                    self.body_inv_mass_effective,
+                    state_in.body_q,
+                    self.body_q_prev,
+                    self._theta_pose_lin_tol,
+                    self._theta_pose_ang_tol,
+                ],
+                outputs=[self._theta_world_event],
                 device=dev,
             )
         if events and contacts is not None and contacts.rigid_contact_max > 0:
@@ -5979,7 +6046,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.body_com,
                     self._warm_prev_disp,
                     self._warm_prev_disp_ang,
-                    1.0,
+                    self._warm_gamma,
                 ],
                 outputs=[self._body_disp, self._body_disp_ang, state_in.body_q],
                 device=self.device,
