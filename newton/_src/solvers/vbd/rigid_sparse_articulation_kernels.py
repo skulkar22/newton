@@ -893,6 +893,39 @@ def _apply_sparse_delta_value_to_body(
         body_q_new[body] = wp.transform(pos_new, rot_new)
 
 
+@wp.func
+def _bdf2_exact_hinge_increment(
+    joint: int,
+    child: int,
+    parent: int,
+    body_q: wp.array[wp.transform],
+    joint_X_p: wp.array[wp.transform],
+    axis: wp.vec3,
+    body_disp_ang: wp.array[wp.vec3],
+    body_pred_ang: wp.array[wp.vec3],
+) -> float:
+    """BDF2 prototype: hinge angle change q(x) - q_n from the bodies' composed rotation increments.
+
+    Each body's rotation since q_n is exp(phi) exp(pred) (solver rotation after the predicted one). With
+    E = exp(-r_p) exp(r_c) in the world frame and the parent joint frame at step start
+    q_wp,n = exp(-r_p) q_wp(x), the relative rotation is rel(x) = (q_wp,n^-1 E q_wp,n) rel_n, so the
+    angle change is the twist of q_wp,n^-1 E q_wp,n about the hinge axis (exact while rel_n is a pure
+    twist, i.e. the hinge is aligned). Every factor is a composition of rotation vectors, so the result
+    keeps small-term precision; unlike J * (pred + phi) it stays accurate when the predicted and solver
+    rotations are large and about different axes.
+    """
+    r_c = wp.mul(quat_from_rotation_vector(body_disp_ang[child]), quat_from_rotation_vector(body_pred_ang[child]))
+    q_wp = wp.transform_get_rotation(joint_X_p[joint])
+    r_p_inv = wp.quat_identity()
+    if parent >= 0:
+        r_p = wp.mul(quat_from_rotation_vector(body_disp_ang[parent]), quat_from_rotation_vector(body_pred_ang[parent]))
+        r_p_inv = wp.quat_inverse(r_p)
+        q_wp = wp.mul(r_p_inv, wp.mul(wp.transform_get_rotation(body_q[parent]), q_wp))
+    E = wp.mul(r_p_inv, r_c)
+    E_local = wp.normalize(wp.mul(wp.quat_inverse(q_wp), wp.mul(E, q_wp)))
+    return wp.quat_twist_angle_signed(axis, E_local)
+
+
 @wp.kernel
 def predict_articulation_armature(
     coordinates: JointCoordinateData,
@@ -1371,6 +1404,9 @@ def _assemble_articulation_joint_scalar(
     armature_body_disp_ang: wp.array[wp.vec3],
     joint_armature_offset: wp.array[float],
     armature_incremental: int,
+    armature_pred_ang: wp.array[wp.vec3],
+    armature_delta: wp.array[float],
+    armature_exact_rotor: int,
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -1699,7 +1735,8 @@ def _assemble_articulation_joint_scalar(
             q, gp, gc = evaluate_coordinate(joint_coordinates, joint, 0, body_q)
             armature_hessian = armature / (dt * dt)
             residual = q - joint_armature_target[qd_start]
-            if armature_incremental != 0:
+            # armature_exact_rotor 2: BDF2 rotor residual from the absolute coordinate, as BDF1 does.
+            if armature_incremental != 0 and armature_exact_rotor != 2:
                 # BDF2 prototype: q(x) - target = J * disp + (q(x~) - target), all small terms, so the
                 # residual keeps float32 relative precision instead of differencing rounded angles.
                 child = joint_child[joint]
@@ -1710,6 +1747,19 @@ def _assemble_articulation_joint_scalar(
                     residual += wp.dot(
                         gp, wp.spatial_vector(armature_body_disp[parent], armature_body_disp_ang[parent])
                     )
+                if armature_exact_rotor == 1:
+                    # Composed small-term hinge increment (exact for large predicted rotations).
+                    residual = _bdf2_exact_hinge_increment(
+                        joint,
+                        child,
+                        parent,
+                        body_q,
+                        joint_X_p,
+                        joint_axis[qd_start],
+                        armature_body_disp_ang,
+                        armature_pred_ang,
+                    )
+                    residual -= armature_delta[qd_start]
             armature_force = armature_hessian * residual
             _assemble_coordinate_row_scalar(
                 values_scalar,
@@ -1978,6 +2028,9 @@ def assemble_articulation_joints_scalar(
     armature_body_disp_ang: wp.array[wp.vec3],
     joint_armature_offset: wp.array[float],
     armature_incremental: int,
+    armature_pred_ang: wp.array[wp.vec3],
+    armature_delta: wp.array[float],
+    armature_exact_rotor: int,
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -2040,6 +2093,9 @@ def assemble_articulation_joints_scalar(
         armature_body_disp_ang,
         joint_armature_offset,
         armature_incremental,
+        armature_pred_ang,
+        armature_delta,
+        armature_exact_rotor,
         joint_target_q,
         joint_target_vel,
         joint_limit_lower,
@@ -2311,6 +2367,9 @@ def solve_articulation_sparse_serial_scalar(
     armature_body_disp_ang: wp.array[wp.vec3],
     joint_armature_offset: wp.array[float],
     armature_incremental: int,
+    armature_pred_ang: wp.array[wp.vec3],
+    armature_delta: wp.array[float],
+    armature_exact_rotor: int,
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -2424,6 +2483,9 @@ def solve_articulation_sparse_serial_scalar(
             armature_body_disp_ang,
             joint_armature_offset,
             armature_incremental,
+            armature_pred_ang,
+            armature_delta,
+            armature_exact_rotor,
             joint_target_q,
             joint_target_vel,
             joint_limit_lower,

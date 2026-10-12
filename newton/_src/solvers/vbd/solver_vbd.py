@@ -189,6 +189,8 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
 
 # BDF2 prototype: synthetic start-up history (rigid_bdf2_startup) -> kernel code.
 _BDF2_STARTUP_MODES = {"free_fall": 0, "constant_velocity": 1, "gravity": 2}
+# BDF2 prototype: rotor (armature) residual evaluation (rigid_bdf2_rotor_residual / NEWTON_VBD_BDF2_EXACT_ROTOR).
+_BDF2_ROTOR_RESIDUAL_MODES = {"linear": 0, "0": 0, "composed": 1, "1": 1, "absolute": 2, "2": 2}
 
 
 class SolverVBD(SolverBase, CouplingInterface):
@@ -466,6 +468,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_time_integration: str = "bdf1",
         rigid_bdf2_startup: str = "constant_velocity",
+        rigid_bdf2_exact_rotation: bool = True,
+        rigid_bdf2_rotor_residual: str = "composed",
         rigid_external_force_mode: str = "target",
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
@@ -748,6 +752,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ``body_f`` (kept for ablation only: it injects ``dt tau / (4 I_link)`` of spurious
                 joint rate when explicit torques are on). The ``NEWTON_VBD_BDF2_STARTUP``
                 environment variable overrides this value.
+            rigid_bdf2_exact_rotation: BDF2 only. Compose the rotational prediction, step increment
+                and velocity read-back of block-sparse bodies from their small rotation vectors
+                (``exp(phi) exp(h w_pred) exp(inc / 3)``) instead of adding the vectors, which is
+                only first-order accurate for large rotations about different axes (the rotor
+                residual has its own switch, ``rigid_bdf2_rotor_residual``). The
+                ``NEWTON_VBD_BDF2_EXACT_ROT`` environment variable (``0``/``1``) overrides this value.
+            rigid_bdf2_rotor_residual: BDF2 only. How the armature (rotor) residual
+                ``q(x) - target`` of a block-sparse revolute joint is evaluated. ``"linear"``
+                (first prototype) uses ``J * (pred + phi) - delta``, first order in the body
+                rotation increments; its error, scaled by ``armature / h^2``, destabilizes light
+                links whose inertial target is rotated by a large external torque. ``"composed"``
+                (default) uses the twist of the composed parent/child rotation increments, from
+                small terms. ``"absolute"`` differences the absolute coordinate as BDF1 does. The
+                ``NEWTON_VBD_BDF2_EXACT_ROTOR`` environment variable (``linear``/``composed``/
+                ``absolute`` or ``0``/``1``/``2``) overrides this value.
             rigid_external_force_mode: Where ``State.body_f`` and the mapped ``Control.joint_f``
                 enter the rigid step (experimental). ``"target"`` (default) shifts each body's
                 inertial target by ``h^2 M^-1 f``, as before. ``"solve"`` keeps the inertial target
@@ -1162,7 +1181,9 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
         self._update_displacement_mode()
-        self._setup_time_integration(rigid_time_integration, rigid_bdf2_startup)
+        self._setup_time_integration(
+            rigid_time_integration, rigid_bdf2_startup, rigid_bdf2_exact_rotation, rigid_bdf2_rotor_residual
+        )
         self._setup_external_force_mode(rigid_external_force_mode)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
@@ -3875,6 +3896,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.body_inv_inertia_effective,
                         self._bdf2_use_gyro,
                         self._bdf2_use_rates,
+                        self._bdf2_exact_rot,
                         state_in.body_q,
                         state_in.body_qd,
                         self._bdf2_hist_qd,
@@ -4877,6 +4899,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._body_disp_ang,
             self._bdf2_arm_offset if self._bdf2_enabled else self._rigid_articulation_armature_target,
             self._bdf2_step,
+            self._bdf2_pred_ang if self._bdf2_enabled else self._body_disp_ang,
+            self._bdf2_arm_delta if self._bdf2_enabled else self._rigid_articulation_armature_target,
+            self._bdf2_exact_rotor if self._bdf2_enabled else 0,
             control.joint_target_q,
             control.joint_target_qd,
             model.joint_limit_lower,
@@ -5528,7 +5553,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Pose that in-solve rates difference against: x_n (BDF1) or x_n + (x_n - x_{n-1}) / 3 (BDF2)."""
         return self._bdf2_rate_ref if self._bdf2_step else self.body_q_prev
 
-    def _setup_time_integration(self, rigid_time_integration: str, rigid_bdf2_startup: str = "constant_velocity"):
+    def _setup_time_integration(
+        self,
+        rigid_time_integration: str,
+        rigid_bdf2_startup: str = "constant_velocity",
+        rigid_bdf2_exact_rotation: bool = True,
+        rigid_bdf2_rotor_residual: str = "composed",
+    ):
         """Select the rigid time integrator (BDF2 is an experimental prototype).
 
         ``NEWTON_VBD_TIME_INTEGRATION`` and ``NEWTON_VBD_BDF2_STARTUP`` override the arguments
@@ -5541,6 +5572,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         if startup not in _BDF2_STARTUP_MODES:
             raise ValueError(f"rigid_bdf2_startup must be one of {sorted(_BDF2_STARTUP_MODES)}, got {startup!r}")
         self.rigid_bdf2_startup = startup
+        exact_env = os.environ.get("NEWTON_VBD_BDF2_EXACT_ROT")
+        self._bdf2_exact_rot = int(bool(rigid_bdf2_exact_rotation) if exact_env is None else exact_env != "0")
+        rotor = os.environ.get("NEWTON_VBD_BDF2_EXACT_ROTOR", rigid_bdf2_rotor_residual)
+        if rotor not in _BDF2_ROTOR_RESIDUAL_MODES:
+            raise ValueError(
+                f"rigid_bdf2_rotor_residual must be one of {sorted(_BDF2_ROTOR_RESIDUAL_MODES)}, got {rotor!r}"
+            )
+        self.rigid_bdf2_rotor_residual = rotor
+        self._bdf2_exact_rotor = _BDF2_ROTOR_RESIDUAL_MODES[rotor]
         self._bdf2_startup_mode = _BDF2_STARTUP_MODES[startup]
         # Displacement warm start (prototype): allocated here so no step allocates (CUDA-graph safe).
         self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", "1" if mode == "bdf2" else "0") != "0"
@@ -5682,6 +5722,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._bdf2_pred_lin if self._bdf2_enabled else self._body_disp,
                 self._bdf2_pred_ang if self._bdf2_enabled else self._body_disp,
                 self._bdf2_rate_ref if self._bdf2_enabled else self.body_q_prev,
+                self._bdf2_exact_rot if self._bdf2_enabled else 0,
             ],
             outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
             dim=model.body_count,

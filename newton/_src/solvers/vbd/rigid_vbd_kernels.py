@@ -7635,6 +7635,7 @@ def bdf2_predict_rigid_bodies(
     body_inv_inertia: wp.array[wp.mat33],
     use_gyroscopic: int,
     use_rate_reference: int,
+    exact_rotation: int,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     hist_qd: wp.array[wp.spatial_vector],
@@ -7670,6 +7671,12 @@ def bdf2_predict_rigid_bodies(
 
     ``rate_reference`` receives x_n + (x_n - x_{n-1}) / 3, so (x - rate_reference) / h is the
     BDF2 velocity used by damping, drive, friction and contact rates inside the solve.
+
+    ``exact_rotation`` (``NEWTON_VBD_BDF2_EXACT_ROT``): 0 adds the rotation vectors,
+    off_ang = inc_ang / 3 + h w_pred, which is only first-order accurate when the two rotations are
+    large and about different axes. 1 composes them, exp(off_ang) = exp(h w_pred) exp(inc_ang / 3),
+    so the target is the rate reference rotated by h w_pred, exactly as the linear part.
+    ``update_body_velocity`` then reads the rate back by composition too.
     """
     tid = wp.tid()
     q_n = body_q[tid]
@@ -7730,6 +7737,10 @@ def bdf2_predict_rigid_bodies(
         w_pred = wp.quat_rotate(rot_n, w_b - wp.inverse(jacobian) * residual)
     off_lin = d_lin * (1.0 / 3.0) + h * v_pred
     off_ang = d_ang * (1.0 / 3.0) + h * w_pred
+    if exact_rotation != 0:
+        off_ang = rotation_vector_from_quat(
+            wp.mul(quat_from_rotation_vector(h * w_pred), quat_from_rotation_vector(d_ang * (1.0 / 3.0)))
+        )
     pred_lin[tid] = off_lin
     pred_ang[tid] = off_ang
     rot_t = wp.normalize(wp.mul(quat_from_rotation_vector(off_ang), rot_n))
@@ -7778,6 +7789,7 @@ def update_body_velocity(
     bdf2_pred_lin: wp.array[wp.vec3],
     bdf2_pred_ang: wp.array[wp.vec3],
     bdf2_rate_reference: wp.array[wp.transform],
+    bdf2_exact_rotation: int,
     body_q_prev: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_qd_mirror: wp.array[wp.spatial_vector],
@@ -7853,11 +7865,28 @@ def update_body_velocity(
         if bdf2_step != 0:
             # BDF2 (prototype): omega_{n+1} = omega_pred + phi / h in the tangent space at q_n.
             omega = omega_pred + body_disp_ang[tid] / dt
+            if bdf2_exact_rotation != 0:
+                # The rotation from the rate reference to the solved pose is exp(phi) exp(h omega_pred)
+                # (bdf2_predict_rigid_bodies with exact_rotation): compose, do not add.
+                omega = (
+                    rotation_vector_from_quat(
+                        wp.mul(
+                            quat_from_rotation_vector(body_disp_ang[tid]), quat_from_rotation_vector(omega_pred * dt)
+                        )
+                    )
+                    / dt
+                )
         if bdf2_enabled != 0:
             # Exact step increment x_{n+1} - x_n for the next BDF2 target, built from small terms.
             if bdf2_step != 0:
                 bdf2_inc_lin[tid] = bdf2_pred_lin[tid] + body_disp[tid]
                 bdf2_inc_ang[tid] = bdf2_pred_ang[tid] + body_disp_ang[tid]
+                if bdf2_exact_rotation != 0:
+                    bdf2_inc_ang[tid] = rotation_vector_from_quat(
+                        wp.mul(
+                            quat_from_rotation_vector(body_disp_ang[tid]), quat_from_rotation_vector(bdf2_pred_ang[tid])
+                        )
+                    )
             else:
                 bdf2_inc_lin[tid] = v * dt
                 bdf2_inc_ang[tid] = omega * dt
