@@ -7740,6 +7740,28 @@ def bdf2_predict_rigid_bodies(
 
 
 @wp.kernel
+def add_external_wrench_to_solve(
+    external_wrench: wp.array[wp.spatial_vector],
+    body_inv_mass: wp.array[float],
+    body_forces: wp.array[wp.vec3],
+    body_torques: wp.array[wp.vec3],
+):
+    """Add the step's external wrench (``body_f`` plus mapped ``joint_f``, world frame, force at the COM) to the
+    per-body solve forces as a constant generalized force (gradient -f, Hessian 0).
+
+    Used with ``rigid_external_force_mode="solve"``: the inertial target then holds only the kinematic
+    prediction and gravity, so the minimizer is unchanged but the iteration starts from the force-free
+    prediction instead of one shifted by h^2 M^-1 f.
+    """
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0:
+        return
+    w = external_wrench[tid]
+    body_forces[tid] = body_forces[tid] + wp.spatial_top(w)
+    body_torques[tid] = body_torques[tid] + wp.spatial_bottom(w)
+
+
+@wp.kernel
 def update_body_velocity(
     dt: float,
     body_q: wp.array[wp.transform],

@@ -32,6 +32,7 @@ Prototype switches for studies (defaults shown; all CUDA-graph safe because they
 - `NEWTON_VBD_BDF2_GYRO=1`: gyroscopic term, explicit at the extrapolated rate (`0` off, `2` implicit Newton step; tested less accurate).
 - `NEWTON_VBD_WARM_START`: displacement warm start, `1` by default with BDF2 and `0` with BDF1.
 - `NEWTON_VBD_BDF2_STARTUP=constant_velocity|gravity|free_fall`: synthetic history for fresh worlds (`rigid_bdf2_startup`, see the table below).
+- `NEWTON_VBD_EXT_FORCE=target|solve`: where `body_f` and mapped `joint_f` enter (`rigid_external_force_mode`; both integrators). `target` (default) shifts the inertial target by h²M⁻¹f; `solve` keeps the target kinematic + gravity and adds the wrench as a constant force in the solve (`add_external_wrench_to_solve`, launched right after the per-iteration zeroing of `body_forces`), so the velocity read-back `v_pred + d/ĥ` and the BDF2 increment stay exact.
 
 Recommended for whole-body humanoids (from the G1 study):
 - Use the block-sparse articulation solve; BDF2 requires it.

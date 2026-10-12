@@ -91,6 +91,7 @@ from .rigid_vbd_kernels import (
     accumulate_body_body_contacts_per_body,
     accumulate_body_particle_attachments_per_body,
     accumulate_body_particle_contacts_per_body,
+    add_external_wrench_to_solve,
     apply_body_truncation_ts,
     apply_rigid_soft_truncation,
     bdf2_predict_rigid_bodies,
@@ -465,6 +466,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_time_integration: str = "bdf1",
         rigid_bdf2_startup: str = "constant_velocity",
+        rigid_external_force_mode: str = "target",
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
@@ -745,6 +747,14 @@ class SolverVBD(SolverBase, CouplingInterface):
                 built from each body's unconstrained acceleration including ``joint_f`` and
                 ``body_f`` (kept for ablation only: it injects ``dt tau / (4 I_link)`` of spurious
                 joint rate when explicit torques are on). The ``NEWTON_VBD_BDF2_STARTUP``
+                environment variable overrides this value.
+            rigid_external_force_mode: Where ``State.body_f`` and the mapped ``Control.joint_f``
+                enter the rigid step (experimental). ``"target"`` (default) shifts each body's
+                inertial target by ``h^2 M^-1 f``, as before. ``"solve"`` keeps the inertial target
+                kinematic plus gravity and adds the wrench inside the solve as a constant
+                generalized force; the minimizer is the same, but the iteration starts from the
+                force-free prediction, which matters when an explicit torque acts on a light link
+                held by stiff joints. Both integrators support it. The ``NEWTON_VBD_EXT_FORCE``
                 environment variable overrides this value.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
@@ -1153,6 +1163,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
         self._update_displacement_mode()
         self._setup_time_integration(rigid_time_integration, rigid_bdf2_startup)
+        self._setup_external_force_mode(rigid_external_force_mode)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
 
@@ -3804,6 +3815,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                     device=self.device,
                 )
 
+            if self._ext_force_in_solve:
+                # The wrench enters the solve (_add_external_wrench_to_solve); the prediction is force-free.
+                wp.copy(self._ext_wrench, body_f_for_integration)
+                body_f_for_integration = self._ext_zero_wrench
+
             # Rotor inertia must not inherit feedforward/external torques from
             # the body's force-shifted inertial target.
             if self.rigid_articulation_sparse_layout is not None and self._bdf2_enabled:
@@ -4435,6 +4451,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.body_hessian_aa.zero_()
             self.body_hessian_al.zero_()
             self.body_hessian_ll.zero_()
+            self._add_external_wrench_to_solve()
             if self._mimic_solver is not None:
                 self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
             body_color_groups = model.body_color_groups
@@ -4796,6 +4813,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_hessian_aa.zero_()
         self.body_hessian_al.zero_()
         self.body_hessian_ll.zero_()
+        self._add_external_wrench_to_solve()
 
         if self._mimic_solver is not None:
             self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
@@ -5558,6 +5576,32 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._bdf2_use_rates = int(os.environ.get("NEWTON_VBD_BDF2_RATES", "1") != "0")
         # 0 off, 1 explicit (extrapolated), 2 implicit (Newton step on the Euler equation)
         self._bdf2_use_gyro = int(os.environ.get("NEWTON_VBD_BDF2_GYRO", "1"))
+
+    def _setup_external_force_mode(self, rigid_external_force_mode: str):
+        """Select where external wrenches enter the rigid step (``NEWTON_VBD_EXT_FORCE`` overrides)."""
+        import os  # noqa: PLC0415
+
+        mode = os.environ.get("NEWTON_VBD_EXT_FORCE", rigid_external_force_mode)
+        if mode not in ("target", "solve"):
+            raise ValueError(f"rigid_external_force_mode must be 'target' or 'solve', got {mode!r}")
+        self.rigid_external_force_mode = mode
+        self._ext_force_in_solve = mode == "solve" and self._integrates_rigid_bodies and self.model.body_count > 0
+        if self._ext_force_in_solve:
+            # Step snapshot of body_f + mapped joint_f, and a zero wrench for the force-free prediction.
+            self._ext_wrench = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
+            self._ext_zero_wrench = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.device)
+
+    def _add_external_wrench_to_solve(self):
+        """``rigid_external_force_mode="solve"``: add the step's external wrench to the zeroed solve forces."""
+        if not self._ext_force_in_solve:
+            return
+        wp.launch(
+            add_external_wrench_to_solve,
+            dim=self.model.body_count,
+            inputs=[self._ext_wrench, self.body_inv_mass_effective],
+            outputs=[self.body_forces, self.body_torques],
+            device=self.device,
+        )
 
     def _update_displacement_mode(self):
         """Enable the displacement-form sparse update unless another solver writes body poses.
