@@ -5916,6 +5916,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._theta_vel_lin = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_LIN", "0.05"))
         self._theta_vel_ang = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_ANG", "0.5"))
         self._theta_vel_rel = float(os.environ.get("NEWTON_VBD_BDF2_THETA_VEL_REL", "0.2"))
+        self._theta_limit_tol = float(os.environ.get("NEWTON_VBD_BDF2_THETA_LIMIT_TOL", "1e-3"))
 
     def bdf2_theta_stats(self) -> dict | None:
         """Diagnostics of the BDF1/BDF2 selection since construction (host read; not for use inside a graph capture).
@@ -5965,6 +5966,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.joint_limit_upper,
                     self._theta_force_abs,
                     self._theta_force_rel,
+                    self._theta_limit_tol,
                     1,
                     int(state_in.joint_q is not None),
                 ],

@@ -318,6 +318,7 @@ def bdf2_theta_detect_dofs(
     limit_upper: wp.array[float],
     force_abs_tol: float,
     force_rel_tol: float,
+    limit_tol: float,
     use_force: int,
     use_limits: int,
     joint_f_prev: wp.array[float],
@@ -341,10 +342,12 @@ def bdf2_theta_detect_dofs(
         hi = limit_upper[d]
         state = int(0)
         if lo < hi:
+            # Engaged only when the coordinate is past the bound by more than limit_tol, so a joint resting on its
+            # bound (gap ~ 0, flipping sign by rounding) does not fire an event every step.
             q = joint_q[c]
-            if q <= lo:
+            if q < lo - limit_tol:
                 state = -1
-            elif q >= hi:
+            elif q > hi + limit_tol:
                 state = 1
         if state != limit_state_prev[d]:
             wp.atomic_max(world_event, slot, 1)
@@ -484,6 +487,10 @@ def bdf2_theta_select_worlds(
     if policy == 3 and world_contacts[w] > 0:
         event = 1
         wp.atomic_add(event_counts, 6, 1)
+    if policy == 6 and rebaseline_mask[w]:
+        # event_nofresh: a fresh world has no history to compare against (pose, limit and contact states are
+        # initialized by this step), so its first step stays BDF2 on the synthetic start-up history.
+        event = 0
     hold = world_hold[w]
     if event != 0:
         hold = hold_steps

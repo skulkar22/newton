@@ -90,6 +90,20 @@ Why the prototype blew up on G1 with explicit torques (`Control.joint_f`), in or
 - A BDF1 step of a BDF2 solver runs the BDF1 code verbatim: `integrate_rigid_body` prediction (in `bdf2_predict_rigid_bodies`), `body_q_prev` as the rate reference, the BDF1 rotor target and absolute rotor residual, no warm start, BDF1 read-back. It also records the history the next BDF2 step needs (`hist_qd`, the step increment, the rotor rate), so returning to BDF2 needs no synthetic history.
 - Kernels that unit tests launch directly keep their signatures; the theta variants are separate kernels sharing an `_impl` function (`step_body_body_contact_C0_lambda_theta`, `update_duals_joint_theta`, `update_duals_body_body_contacts_theta`).
 - Proofs (CPU fixtures, `stability-runs/identity.sh`): BDF1 default == 8afa14fc; theta `off` == the previous BDF2; theta forced `bdf2` == the previous BDF2; theta forced `bdf1` == BDF1 (8afa14fc) — bit for bit, including contacts.
+- Start-up choice, measured on the RC (default `event` = BDF1 start-up steps vs `event_nofresh` = synthetic gravity history):
+
+  | Test | `event` | `event_nofresh` |
+  |---|---|---|
+  | DevTech pendulum, RMS over 8 s, CPU (0.125/0.25/0.5/1/2 ms) | 4.11/1.53/2.05/3.17/6.95 e-4 | 4.35/1.59/2.29/3.35/7.99 e-4 |
+  | D1 hinge, solve mode, joint_qd after 1 / 50 steps (exact 0.0799 / 3.9944) | 0.0798 / 3.9943 | 0.0532 / 3.9544 |
+  | D1 hinge, reset mid-run, after 1 step (exact 8.0687) | 8.0686 | 8.0020 |
+  | G1 air_cycle / coordinated, 4 ms / 8 it, worst joint error vs converged reference | 0.0352° / 0.0377° | 0.0315° / 0.0375° |
+  | Partner input, internal 4 ms / explicit 0.8 ms (waist_pitch overshoot, q RMS) | 0.003, 0.0037 / 0.004, 0.0034 | identical |
+
+  Worst relative regression: `event` +12 % (air_cycle), `event_nofresh` −33 % first-step velocity on the D1 hinge (a
+  permanent −½·dt·a lag of the synthetic history). Default: `event`. With theta `event`, the first step of a fresh world
+  (and the pose-write detector on it) is always BDF1; `event_nofresh` suppresses all events on fresh worlds.
+- Doctor Legs (contact-rich, 8 it, suite agent): `event` path_rms 0.112 m vs `off`/`fresh` 0.090 vs BDF1 0.123; closure/penetration 351 µm / 5.6 mm vs 430 / 7.5 — `event` runs mostly as BDF1 there (policy trade-off).
 - Stage B (per-body θ inside a world) is not implemented. It would blend only the inertial term and keep the world step for interaction rates; do it only if Phase 2 shows the per-world fallback costs accuracy in contact-rich worlds.
 
 ### GPU bit-identity of the legacy paths (keep it)
