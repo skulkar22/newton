@@ -935,7 +935,10 @@ def predict_articulation_armature_bdf2(
     The previous increment q_n - q_{n-1} is projected from the bodies' exact step increments
     (exact to second order for a hinge: the child and parent increments differ only along the
     axis), not differenced from rounded angles. Worlds without history (``pose_rebaseline_mask``)
-    start with rate_{n-1} = rate_n and q_n - q_{n-1} = dt rate_n. ``deltas`` receives target - q_n.
+    start with rate_{n-1} = rate_n and q_n - q_{n-1} = dt rate_n. That is the bodies' history for
+    ``rigid_bdf2_startup="constant_velocity"`` and also for ``"gravity"`` (gravity has no angular part,
+    so a hinge coordinate does not see it); only the ablation-only ``"free_fall"`` body history
+    disagrees with it. ``deltas`` receives target - q_n.
     """
     joint = joints[wp.tid()]
     if coordinates.joint_type[joint] != JointType.REVOLUTE:

@@ -7627,6 +7627,7 @@ def bdf2_predict_rigid_bodies(
     gravity: wp.array[wp.vec3],
     body_world: wp.array[wp.int32],
     pose_rebaseline_mask: wp.array[wp.bool],
+    startup_mode: int,
     body_f: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     body_inertia: wp.array[wp.mat33],
@@ -7659,10 +7660,13 @@ def bdf2_predict_rigid_bodies(
     BDF2 prediction (stable for fast spins; the explicit form adds energy to tumbling bodies).
 
     Worlds flagged in ``pose_rebaseline_mask`` (construction, reset) have no history yet. They start
-    from the history of constant external acceleration a (gravity, applied force/torque):
-    v_{n-1} = v_n - dt a and x_n - x_{n-1} = dt v_n - dt^2 a / 2. That makes the first step a
-    consistent BDF2 step (v_pred = v_n + dt a, x~ = x_n + dt v_n + dt^2 a / 2) with the same h as every
-    other step, so the step size never changes per world.
+    from a synthetic history of constant acceleration a: v_{n-1} = v_n - dt a and
+    x_n - x_{n-1} = dt v_n - dt^2 a / 2, with the same h as every other step, so the step size never
+    changes per world. ``startup_mode`` selects a: 1 (constant velocity, default) a = 0, which is the
+    rotor's history too, so a held body stays at rest and w* = w_n; 2 (gravity) a = g for the linear
+    part only (exact free fall; revolute rotors are unaffected because gravity has no angular part);
+    0 (free fall, first prototype, ablation only) a = g + f / m, I^-1 tau from the external wrench,
+    which kicks a held link by dt a / 4 and disagrees with the rotor's constant-velocity history.
 
     ``rate_reference`` receives x_n + (x_n - x_{n-1}) / 3, so (x - rate_reference) / h is the
     BDF2 velocity used by damping, drive, friction and contact rates inside the solve.
@@ -7686,9 +7690,11 @@ def bdf2_predict_rigid_bodies(
         body_disp_ang[tid] = wp.vec3(0.0)
         a_lin = wp.vec3(0.0)
         a_ang = wp.vec3(0.0)
-        if inv_m > 0.0:
-            a_lin = gravity[body_world[tid]] + wp.spatial_top(f) * inv_m
-            a_ang = inv_I_world * wp.spatial_bottom(f)
+        if inv_m > 0.0 and startup_mode != 1:
+            a_lin = gravity[body_world[tid]]
+            if startup_mode == 0:
+                a_lin = a_lin + wp.spatial_top(f) * inv_m
+                a_ang = inv_I_world * wp.spatial_bottom(f)
         qd_m = wp.spatial_vector(wp.spatial_top(qd_n) - dt * a_lin, wp.spatial_bottom(qd_n) - dt * a_ang)
         d_lin = dt * wp.spatial_top(qd_n) - (0.5 * dt * dt) * a_lin
         d_ang = dt * wp.spatial_bottom(qd_n) - (0.5 * dt * dt) * a_ang

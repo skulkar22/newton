@@ -31,6 +31,7 @@ Prototype switches for studies (defaults shown; all CUDA-graph safe because they
 - `NEWTON_VBD_BDF2_RATES=1`: BDF2 velocity in every in-solve rate (`0` reproduces the first prototype's 1.5x over-damping).
 - `NEWTON_VBD_BDF2_GYRO=1`: gyroscopic term, explicit at the extrapolated rate (`0` off, `2` implicit Newton step; tested less accurate).
 - `NEWTON_VBD_WARM_START`: displacement warm start, `1` by default with BDF2 and `0` with BDF1.
+- `NEWTON_VBD_BDF2_STARTUP=constant_velocity|gravity|free_fall`: synthetic history for fresh worlds (`rigid_bdf2_startup`, see the table below).
 
 Recommended for whole-body humanoids (from the G1 study):
 - Use the block-sparse articulation solve; BDF2 requires it.
@@ -52,7 +53,7 @@ With ĥ = (2/3)·dt, BDF2 is the same VBD minimisation as BDF1, but uses ĥ inst
 |---|---|
 | Option, guards, buffers | `solver_vbd.py`: `rigid_time_integration` arg, `_setup_time_integration()` |
 | Per-step switch | `step()`: `_bdf2_step = enabled` (constant, no Python branch per step); `rigid_dt = 2/3·dt`. That `rigid_dt` is passed to init, iterations, contact export and finalize. Particles still get `dt`. |
-| Start-up and reset | Worlds flagged in `_rigid_pose_rebaseline_mask` (construction, `reset(world_mask)`) start from a constant-external-acceleration history inside `bdf2_predict_rigid_bodies`: `v_{n−1} = v_n − dt·a`, `x_n − x_{n−1} = dt·v_n − dt²a/2`. Every step uses the same h, so a CUDA graph captured on the first step is exact and resets are per world. |
+| Start-up and reset | Worlds flagged in `_rigid_pose_rebaseline_mask` (construction, `reset(world_mask)`) start from a synthetic history inside `bdf2_predict_rigid_bodies`, chosen by `rigid_bdf2_startup` / `NEWTON_VBD_BDF2_STARTUP`: `constant_velocity` (default: `v_{n−1} = v_n`, `x_n − x_{n−1} = dt·v_n`, the same rule as the rotor history in `predict_articulation_armature_bdf2`), `gravity` (adds g to the linear history only), `free_fall` (first prototype, ablation only: adds `body_f`/`joint_f` accelerations, which kicks a held light link by `dt·τ/(4·I_link)`). Every step uses the same h, so a CUDA graph captured on the first step is exact and resets are per world. |
 | BDF2 inertial target | `rigid_vbd_kernels.py`: `bdf2_predict_rigid_bodies`. Writes `body_inertia_q`, `v_pred`/`ω_pred` (with the gyroscopic torque at `2ω_n − ω_{n−1}`), the prediction offsets `pred_lin`/`pred_ang`, the **rate reference pose** `x_n + (x_n − x_{n−1})/3`, and rebaselines `body_q_prev` for fresh worlds. |
 | In-solve rates | `solver_vbd.py`: `_rate_reference_q` (rate reference on BDF2 steps, `body_q_prev` otherwise) is passed wherever a rate or slip is formed: joint assembly, `update_duals_joint`, body-body contact accumulation and duals, contact-force export, `solve_rigid_body`. Pose uses (coordinate unwrap, friction anchor, C0) keep `body_q_prev`. |
 | Warm start | `rigid_sparse_articulation_kernels.py`: `warm_start_body_displacement`; `solver_vbd.py`: `_init_body_displacement`. Buffers are allocated at construction. |

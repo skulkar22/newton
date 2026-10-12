@@ -186,6 +186,10 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
     return gamma if use_compliant_alm else alpha * gamma
 
 
+# BDF2 prototype: synthetic start-up history (rigid_bdf2_startup) -> kernel code.
+_BDF2_STARTUP_MODES = {"free_fall": 0, "constant_velocity": 1, "gravity": 2}
+
+
 class SolverVBD(SolverBase, CouplingInterface):
     """An implicit solver using Vertex Block Descent (VBD) for particles and Augmented VBD (AVBD) for rigid bodies.
 
@@ -460,6 +464,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_time_integration: str = "bdf1",
+        rigid_bdf2_startup: str = "constant_velocity",
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
         collision_frequency: Mapping[SolverBase.CollisionSlot, int] | None = None,
@@ -726,8 +731,21 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_time_integration: Rigid time integrator. ``"bdf1"`` (default) is backward Euler.
                 ``"bdf2"`` is an experimental second-order prototype that requires
                 ``rigid_articulation_solve="block_sparse_joints"``, no joint mimics and no
-                particles; the first step after construction or :meth:`reset` is a BDF1 step.
+                particles. The first step after construction or :meth:`reset` is a BDF2 step of
+                the same size as every other step, taken from a synthetic history selected by
+                ``rigid_bdf2_startup``.
                 The ``NEWTON_VBD_TIME_INTEGRATION`` environment variable overrides this value.
+            rigid_bdf2_startup: Synthetic BDF2 history for worlds without one (construction,
+                :meth:`reset`); only used with ``rigid_time_integration="bdf2"``.
+                ``"constant_velocity"`` (default) assumes the bodies and rotors moved at their
+                current velocity: ``v_{n-1} = v_n`` and ``x_n - x_{n-1} = dt v_n``, so a held body
+                stays at rest and no external force enters the history. ``"gravity"`` adds the
+                gravity acceleration to the body history (exact free fall, held bodies get a
+                ``dt g / 4`` start-up velocity). ``"free_fall"`` is the first prototype's history
+                built from each body's unconstrained acceleration including ``joint_f`` and
+                ``body_f`` (kept for ablation only: it injects ``dt tau / (4 I_link)`` of spurious
+                joint rate when explicit torques are on). The ``NEWTON_VBD_BDF2_STARTUP``
+                environment variable overrides this value.
             deterministic: Opt-in determinism for this solver's atomic-emitting
                 kernel modules. Pass a :class:`warp.DeterministicMode`, or
                 ``None`` (default) to inherit the current
@@ -1134,7 +1152,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
         self._update_displacement_mode()
-        self._setup_time_integration(rigid_time_integration)
+        self._setup_time_integration(rigid_time_integration, rigid_bdf2_startup)
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
 
@@ -3833,6 +3851,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         model.gravity,
                         model.body_world,
                         self._rigid_pose_rebaseline_mask,
+                        self._bdf2_startup_mode,
                         body_f_for_integration,
                         model.body_com,
                         model.body_inertia,
@@ -5491,14 +5510,20 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Pose that in-solve rates difference against: x_n (BDF1) or x_n + (x_n - x_{n-1}) / 3 (BDF2)."""
         return self._bdf2_rate_ref if self._bdf2_step else self.body_q_prev
 
-    def _setup_time_integration(self, rigid_time_integration: str):
+    def _setup_time_integration(self, rigid_time_integration: str, rigid_bdf2_startup: str = "constant_velocity"):
         """Select the rigid time integrator (BDF2 is an experimental prototype).
 
-        ``NEWTON_VBD_TIME_INTEGRATION`` overrides the argument (prototype convenience only).
+        ``NEWTON_VBD_TIME_INTEGRATION`` and ``NEWTON_VBD_BDF2_STARTUP`` override the arguments
+        (prototype convenience only).
         """
         import os  # noqa: PLC0415
 
         mode = os.environ.get("NEWTON_VBD_TIME_INTEGRATION", rigid_time_integration)
+        startup = os.environ.get("NEWTON_VBD_BDF2_STARTUP", rigid_bdf2_startup)
+        if startup not in _BDF2_STARTUP_MODES:
+            raise ValueError(f"rigid_bdf2_startup must be one of {sorted(_BDF2_STARTUP_MODES)}, got {startup!r}")
+        self.rigid_bdf2_startup = startup
+        self._bdf2_startup_mode = _BDF2_STARTUP_MODES[startup]
         # Displacement warm start (prototype): allocated here so no step allocates (CUDA-graph safe).
         self._warm_start = os.environ.get("NEWTON_VBD_WARM_START", "1" if mode == "bdf2" else "0") != "0"
         self._warm_prev_disp = wp.zeros_like(self._body_disp)
