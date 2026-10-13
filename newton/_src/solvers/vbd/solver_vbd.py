@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import warnings
 import weakref
 from collections.abc import Mapping
@@ -79,7 +80,9 @@ from .reduced_elastic_kernels import (
     copy_elastic_body_transforms_back,
     copy_elastic_joint_frame_to_body,
     create_solve_elastic_body_tiled,
+    elastic_block_solve_tiled_block_dims,
     integrate_elastic_modes_implicit,
+    symmetrize_elastic_blocks,
 )
 from .reduced_elastic_sparse_kernels import (
     assemble_elastic_sparse_frame_blocks,
@@ -165,6 +168,99 @@ from .vbd_coupling_kernels import (
 __all__ = ["SolverVBD"]
 
 _PARTICLE_CONTACT_GATHER_BLOCK_DIM = 128
+
+_WARP_CPU_TILE_SHARED_MEMORY_BYTES = 256 * 1024
+"""Size of Warp's fixed per-block CPU arena for shared-storage tiles."""
+
+_ELASTIC_BLOCK_MIN_BUCKET_MODES = 8
+"""Smallest modal row count of a reduced elastic block-solve bucket."""
+
+
+def _elastic_block_solve_shared_memory_estimate(block_width: int) -> int:
+    """Estimate the dynamic shared memory of the tiled block solve for ``block_width``, in bytes.
+
+    The kernel holds one ``block_width`` squared float32 tile and one ``block_width`` vector,
+    each aligned to 16 bytes. The measured requirement of the compiled kernel is authoritative;
+    the CUDA budget also excludes the kernel's static reservation.
+    """
+
+    def align(num_bytes: int) -> int:
+        return (num_bytes + 15) // 16 * 16
+
+    return align(4 * block_width * block_width) + align(4 * block_width)
+
+
+def _elastic_block_solve_shared_memory_limit(device: wp.Device) -> int:
+    """Return the shared memory budget of one tiled block solve on ``device``, in bytes."""
+    if device.is_cuda:
+        return int(device.max_shared_memory_per_block)
+    return _WARP_CPU_TILE_SHARED_MEMORY_BYTES
+
+
+@functools.cache
+def _measure_elastic_block_solve_shared_memory(device_alias: str, block_width: int, block_dim: int) -> tuple[int, bool]:
+    """Measure the dynamic shared memory of the tiled block solve and whether it fits the device.
+
+    The kernel is compiled and loaded for ``block_width`` and ``block_dim``, and the module's
+    forward shared-memory requirement is checked against the budget left after the kernel's
+    static reservation.
+    """
+    device = wp.get_device(device_alias)
+    kernel = create_solve_elastic_body_tiled(block_width)
+    # A request that does not fit only logs a Warp warning here; the caller reports it.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module_exec = kernel.module.load(device, block_dim)
+    hooks = module_exec.get_kernel_hooks(kernel)
+    return int(hooks.forward_smem_bytes), hooks.forward_smem_shortfall is None
+
+
+def _select_elastic_block_solve_tiled_launch(device: wp.Device, block_width: int) -> tuple[int, int, bool]:
+    """Choose the block size of the tiled block solve for ``block_width`` on ``device``.
+
+    Returns ``(block_dim, shared_memory_bytes, fits)``. CPU launches use one thread per block
+    and Warp's fixed per-block tile arena, which the pre-estimate is compared against. On
+    CUDA the pre-estimate rejects clearly oversized widths without compiling; otherwise the
+    measured requirement of the compiled kernel decides, trying the preferred block sizes in
+    order.
+    """
+    estimate = _elastic_block_solve_shared_memory_estimate(block_width)
+    limit = _elastic_block_solve_shared_memory_limit(device)
+    block_dims = elastic_block_solve_tiled_block_dims(block_width)
+    if not device.is_cuda:
+        return 1, estimate, estimate <= limit
+    if estimate > limit:
+        return block_dims[0], estimate, False
+
+    required_bytes = estimate
+    for block_dim in block_dims:
+        required_bytes, fits = _measure_elastic_block_solve_shared_memory(device.alias, block_width, block_dim)
+        if fits:
+            return block_dim, required_bytes, True
+    return block_dims[0], required_bytes, False
+
+
+def _max_elastic_block_solve_tiled_width(device: wp.Device) -> int:
+    """Return the largest block width whose tiled solve fits the shared memory of ``device``."""
+    limit = _elastic_block_solve_shared_memory_limit(device)
+    width = max(int((np.sqrt(1.0 + limit) - 1.0) / 2.0), 1)
+    while width > 1 and _elastic_block_solve_shared_memory_estimate(width) > limit:
+        width -= 1
+    while width > 1 and not _select_elastic_block_solve_tiled_launch(device, width)[2]:
+        width -= 1
+    return width
+
+
+def _elastic_block_bucket_width(mode_count: int, max_block_width: int) -> int:
+    """Return the block-solve bucket width of a body with ``mode_count`` modes.
+
+    Buckets hold ``6 + 2**k`` rows with at least :data:`_ELASTIC_BLOCK_MIN_BUCKET_MODES`
+    modal rows, capped by the stored block width.
+    """
+    padded = _ELASTIC_BLOCK_MIN_BUCKET_MODES
+    while padded < mode_count:
+        padded *= 2
+    return min(6 + padded, max_block_width)
 
 
 def _particle_contact_scatter_worker_count(soft_contact_max: int, particle_count: int, device) -> int:
@@ -1396,8 +1492,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "bodies from the model."
             )
         self.elastic_body_block_width = int(model.elastic_max_mode_count) + 6
+        self._elastic_block_solve_groups: dict[int, tuple[wp.array, list[tuple[int, int, wp.array]]]] = {}
+        self._elastic_block_solve_launches: list[tuple[int, int, int, str]] = []
         if elastic_body_count > 0:
-            self._validate_elastic_body_block_width(self.elastic_body_block_width)
+            self._build_elastic_block_solve_plan(model)
         self.elastic_body_block_grad = wp.empty(
             (elastic_body_count, self.elastic_body_block_width), dtype=float, device=self.device
         )
@@ -1410,9 +1508,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             device=self.device,
         )
         self.elastic_implicit_mass_coupling, self.elastic_reduced_inv_mass = self._build_elastic_mass_solve_data(model)
-        self._solve_elastic_body_tiled = (
-            create_solve_elastic_body_tiled(self.elastic_body_block_width) if elastic_body_count > 0 else None
-        )
         self._init_sparse_elastic_bodies(model)
         metric_count = model.elastic_body_count if self.elastic_solver_metrics else 0
         self.elastic_body_block_initial_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
@@ -1518,28 +1613,78 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 )
 
     def _validate_elastic_body_block_width(self, block_width: int):
-        """Reject a block width whose tiles cannot fit in the device shared memory budget.
+        """Reject a block width whose tiled solve cannot fit in the device shared memory budget.
 
-        The tiled solve holds the assembled block and its Cholesky factor as ``block_width``
-        squared tiles plus three vectors. Without this check an oversized
-        :attr:`Model.elastic_max_mode_count` surfaces as an opaque allocation failure when the
-        kernel is first launched.
+        The tiled solve holds the assembled block, factorized in place, and one vector in
+        shared memory: about ``4 * (block_width**2 + block_width)`` bytes, which serves as a
+        pre-estimate. The requirement is measured from the compiled kernel when the estimate
+        fits. Without this check an oversized :attr:`Model.elastic_max_mode_count` surfaces
+        as an opaque launch failure.
         """
-        shared_memory_limit = int(getattr(self.device, "max_shared_memory_per_block", 0))
-        if shared_memory_limit <= 0:
+        _block_dim, required_bytes, fits = _select_elastic_block_solve_tiled_launch(self.device, block_width)
+        if fits:
             return
 
-        required_bytes = (2 * block_width * block_width + 3 * block_width) * 4
-        if required_bytes > shared_memory_limit:
-            largest_width = int((np.sqrt(9.0 + 2.0 * shared_memory_limit) - 3.0) / 4.0)
-            max_mode_count = max(largest_width - 6, 0)
-            raise ValueError(
-                f"Reduced elastic block width {block_width} (6 frame DOFs + "
-                f"elastic_max_mode_count={block_width - 6}) needs about {required_bytes} bytes of "
-                f"shared memory per body, but device '{self.device}' provides "
-                f"{shared_memory_limit}. Reduce the largest modal basis to at most "
-                f"{max_mode_count} modes."
-            )
+        limit = _elastic_block_solve_shared_memory_limit(self.device)
+        max_mode_count = max(_max_elastic_block_solve_tiled_width(self.device) - 6, 0)
+        raise ValueError(
+            f"Reduced elastic block width {block_width} (6 frame DOFs + "
+            f"elastic_max_mode_count={block_width - 6}) needs {required_bytes} bytes of "
+            f"shared memory per body, but device '{self.device}' provides "
+            f"{limit} bytes per block. Reduce the largest modal basis to at most "
+            f"{max_mode_count} modes."
+        )
+
+    def _build_elastic_block_solve_plan(self, model: Model):
+        """Bucket the elastic bodies of every color group by block width and validate the widths.
+
+        Each body is solved over the leading ``6 + 2**k`` rows of its block (at least 8
+        modal rows and at most :attr:`elastic_body_block_width`), so a group mixing small
+        and large modal bases does not pad every body to the largest one. Rows past a
+        body's modal count are identity rows, which keeps the leading sub-block
+        self-contained.
+        """
+        body_elastic_index = model.body_elastic_index.numpy()
+        mode_count = model.elastic_mode_count.numpy()
+        max_width = self.elastic_body_block_width
+
+        color_group_lists = [model.body_color_groups]
+        layout = self.rigid_articulation_sparse_layout
+        if layout is not None:
+            color_group_lists.append(layout.local_body_color_groups)
+
+        widths: set[int] = set()
+        for color_groups in color_group_lists:
+            record_launches = color_groups is model.body_color_groups
+            for color, group in enumerate(color_groups):
+                bodies = group.numpy()
+                elastic_bodies = bodies[body_elastic_index[bodies] >= 0]
+                body_widths = np.array(
+                    [
+                        _elastic_block_bucket_width(int(mode_count[body_elastic_index[body]]), max_width)
+                        for body in elastic_bodies
+                    ],
+                    dtype=np.int64,
+                )
+                buckets = []
+                for width in sorted({int(width) for width in body_widths}):
+                    bucket_bodies = elastic_bodies[body_widths == width].astype(np.int32)
+                    buckets.append(
+                        (
+                            width,
+                            _select_elastic_block_solve_tiled_launch(self.device, width)[0],
+                            wp.array(bucket_bodies, dtype=wp.int32, device=self.device),
+                        )
+                    )
+                    widths.add(width)
+                    if record_launches:
+                        self._elastic_block_solve_launches.append((color, width, len(bucket_bodies), "tiled"))
+                self._elastic_block_solve_groups[id(group)] = (group, buckets)
+
+        # Colorless callers fall back to one launch at the maximum width.
+        widths.add(max_width)
+        for width in sorted(widths):
+            self._validate_elastic_body_block_width(width)
 
     def _build_elastic_mass_solve_data(self, model: Model) -> tuple[wp.array, wp.array]:
         """Build coupled-mass flags and generalized inverse-mass blocks.
@@ -3556,14 +3701,32 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             state_out.joint_qd,
         ]
 
-        wp.launch_tiled(
-            kernel=self._solve_elastic_body_tiled,
-            dim=[body_ids.size],
-            inputs=common_inputs + trailing_inputs + metric_inputs,
-            outputs=outputs,
-            block_dim=32,
-            device=self.device,
-        )
+        group = self._elastic_block_solve_groups.get(id(body_ids))
+        if group is not None and group[0] is body_ids:
+            buckets = group[1]
+        else:
+            width = self.elastic_body_block_width
+            buckets = [(width, _select_elastic_block_solve_tiled_launch(self.device, width)[0], body_ids)]
+
+        for width, block_dim, bucket_body_ids in buckets:
+            if bucket_body_ids.size == 0:
+                continue
+            common_inputs[2] = bucket_body_ids
+            wp.launch(
+                kernel=symmetrize_elastic_blocks,
+                dim=(bucket_body_ids.size, width, width),
+                inputs=[bucket_body_ids, model.body_elastic_index],
+                outputs=[self.elastic_body_block_matrix],
+                device=self.device,
+            )
+            wp.launch_tiled(
+                kernel=create_solve_elastic_body_tiled(width),
+                dim=[bucket_body_ids.size],
+                inputs=common_inputs + trailing_inputs + metric_inputs,
+                outputs=outputs,
+                block_dim=block_dim,
+                device=self.device,
+            )
 
     def _elastic_solve_inputs(self, contacts: Contacts | None) -> tuple[int, wp.array, float]:
         """Resolve elastic contact launch bounds and the body-block relaxation."""

@@ -1305,12 +1305,200 @@ def assemble_elastic_contacts(
             contact_idx += _NUM_ELASTIC_CONTACT_THREADS_PER_BODY
 
 
+@wp.kernel
+def symmetrize_elastic_blocks(
+    body_ids: wp.array[wp.int32],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_body_block_matrix: wp.array3d[float],
+):
+    """Mirror the assembled upper triangle of each block into its lower triangle.
+
+    Assembly writes the frame/modal coupling and the modal-modal terms into the upper
+    triangle only. Launch with ``dim=(len(body_ids), width, width)`` to symmetrize the
+    leading ``width x width`` block of every elastic body in ``body_ids``.
+    """
+    body_slot, i, j = wp.tid()
+    if j >= i:
+        return
+    elastic_index = body_elastic_index[body_ids[body_slot]]
+    if elastic_index < 0:
+        return
+    elastic_body_block_matrix[elastic_index, i, j] = elastic_body_block_matrix[elastic_index, j, i]
+
+
+@wp.func
+def _elastic_block_entry(
+    elastic_body_block_matrix: wp.array3d[float],
+    elastic_index: int,
+    row: int,
+    column: int,
+) -> float:
+    """Read one entry of a symmetric block from its upper triangle."""
+    if column < row:
+        return elastic_body_block_matrix[elastic_index, column, row]
+    return elastic_body_block_matrix[elastic_index, row, column]
+
+
+@wp.func
+def _store_elastic_block_delta(
+    elastic_index: int,
+    solution_is_finite: bool,
+    elastic_body_block_grad: wp.array2d[float],
+    elastic_body_block_matrix: wp.array3d[float],
+    row: int,
+    negative_solution: float,
+    elastic_body_block_delta: wp.array2d[float],
+):
+    """Store one solved block entry, or its Jacobi fallback when the factorization failed."""
+    value = negative_solution
+    if not solution_is_finite:
+        value = 0.0
+        diagonal = elastic_body_block_matrix[elastic_index, row, row]
+        if diagonal > 0.0:
+            value = -elastic_body_block_grad[elastic_index, row] / diagonal
+    elastic_body_block_delta[elastic_index, row] = value
+
+
+@wp.func
+def _apply_elastic_block_delta(
+    width: int,
+    dt: float,
+    solve_frame: bool,
+    body: int,
+    elastic_index: int,
+    elastic_joint: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_q_prev: wp.array[float],
+    elastic_body_block_grad: wp.array2d[float],
+    elastic_body_block_delta: wp.array2d[float],
+    elastic_body_block_matrix: wp.array3d[float],
+    elastic_body_block_initial_residual_norm: wp.array[float],
+    elastic_body_block_solve_residual_norm: wp.array[float],
+    elastic_body_block_applied_residual_norm: wp.array[float],
+    elastic_body_block_update_norm: wp.array[float],
+    elastic_body_block_update_max: wp.array[float],
+    elastic_body_relaxation: float,
+    body_q_new: wp.array[wp.transform],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+):
+    """Record optional metrics and apply a relaxed block increment to the frame and modes.
+
+    Every thread of the block executes this redundantly and reads the increment it wrote
+    itself to ``elastic_body_block_delta``, so no barrier is required.
+    """
+    owner_joint = elastic_joint[elastic_index]
+    q_start = joint_q_start[owner_joint] + 7
+    qd_start = joint_qd_start[owner_joint] + 6
+    mode_count = elastic_mode_count[elastic_index]
+
+    if elastic_body_block_initial_residual_norm:
+        initial_residual_sq = float(0.0)
+        solve_residual_sq = float(0.0)
+        applied_residual_sq = float(0.0)
+        update_norm_sq = float(0.0)
+        update_max = float(0.0)
+        for row in range(width):
+            if row < 6:
+                row_is_solved = solve_frame
+            else:
+                row_is_solved = row - 6 < mode_count
+            if row_is_solved:
+                grad_i = elastic_body_block_grad[elastic_index, row]
+                solve_residual_i = grad_i
+                applied_residual_i = grad_i
+                for j in range(width):
+                    delta_j = elastic_body_block_delta[elastic_index, j]
+                    h_ij = _elastic_block_entry(elastic_body_block_matrix, elastic_index, row, j)
+                    solve_residual_i = solve_residual_i + h_ij * delta_j
+                    applied_residual_i = applied_residual_i + h_ij * (elastic_body_relaxation * delta_j)
+
+                applied_delta_i = elastic_body_relaxation * elastic_body_block_delta[elastic_index, row]
+                initial_residual_sq = initial_residual_sq + grad_i * grad_i
+                solve_residual_sq = solve_residual_sq + solve_residual_i * solve_residual_i
+                applied_residual_sq = applied_residual_sq + applied_residual_i * applied_residual_i
+                update_norm_sq = update_norm_sq + applied_delta_i * applied_delta_i
+                update_max = wp.max(update_max, wp.abs(applied_delta_i))
+
+        elastic_body_block_initial_residual_norm[elastic_index] = wp.sqrt(initial_residual_sq)
+        elastic_body_block_solve_residual_norm[elastic_index] = wp.sqrt(solve_residual_sq)
+        elastic_body_block_applied_residual_norm[elastic_index] = wp.sqrt(applied_residual_sq)
+        elastic_body_block_update_norm[elastic_index] = wp.sqrt(update_norm_sq)
+        elastic_body_block_update_max[elastic_index] = update_max
+
+    inv_dt = 1.0 / dt
+    q_current = body_q[body]
+    if solve_frame and body_inv_mass[body] > 0.0:
+        rot_current = wp.transform_get_rotation(q_current)
+        body_R = wp.quat_to_matrix(rot_current)
+        x_delta = wp.vec3(
+            elastic_body_block_delta[elastic_index, 0],
+            elastic_body_block_delta[elastic_index, 1],
+            elastic_body_block_delta[elastic_index, 2],
+        )
+        w_delta = wp.vec3(
+            elastic_body_block_delta[elastic_index, 3],
+            elastic_body_block_delta[elastic_index, 4],
+            elastic_body_block_delta[elastic_index, 5],
+        )
+        x_inc_world = body_R * (elastic_body_relaxation * x_delta)
+        w_world = body_R * (elastic_body_relaxation * w_delta)
+        angle = wp.length(w_world)
+        if angle > _SMALL_ANGLE_EPS:
+            dq_world = wp.quat_from_axis_angle(w_world / angle, angle)
+        else:
+            half_w = 0.5 * w_world
+            dq_world = wp.normalize(wp.quat(half_w[0], half_w[1], half_w[2], 1.0))
+        rot_new = wp.normalize(dq_world * rot_current)
+        com_current = wp.transform_point(q_current, body_com[body])
+        com_new = com_current + x_inc_world
+        pos_new = com_new - wp.quat_rotate(rot_new, body_com[body])
+        body_q_new[body] = wp.transform(pos_new, rot_new)
+    else:
+        body_q_new[body] = q_current
+
+    for mode in range(mode_count):
+        q_idx = q_start + mode
+        qd_idx = qd_start + mode
+        q_prev = joint_q_prev[q_idx]
+        q_old = joint_q[q_idx]
+        q_new = q_old + elastic_body_relaxation * elastic_body_block_delta[elastic_index, 6 + mode]
+        joint_q[q_idx] = q_new
+        joint_qd[qd_idx] = (q_new - q_prev) * inv_dt
+
+
+def elastic_block_solve_tiled_block_dims(block_width: int) -> tuple[int, ...]:
+    """Return the CUDA block sizes to try for the tiled block solve, in order of preference.
+
+    The tiled Cholesky slows down by one to two orders of magnitude once the block width
+    exceeds a few times the thread count, so wider blocks prefer larger thread blocks.
+    Smaller entries are fallbacks for when the static shared memory reserved per thread
+    leaves too little room for the block. Measured on an RTX PRO 6000 Blackwell GPU with
+    Warp 1.18; see the reduced elastic capacity notes.
+    """
+    if block_width <= 70:
+        return (32,)
+    if block_width <= 126:
+        return (128, 64, 32)
+    return (256, 128, 64, 32)
+
+
 @functools.cache
 def create_solve_elastic_body_tiled(block_width: int):
     """Create the coupled frame/modal block solve kernel for one block width.
 
-    The assembled ``(6 + mode_count)`` block is solved by a dense Cholesky factorization.
-    Blocks that are not positive definite fall back to a Jacobi step.
+    The kernel solves the leading ``block_width x block_width`` sub-block of each body's
+    ``elastic_body_block_matrix`` entry, which may be stored with a larger width. The
+    sub-block must hold the full symmetric matrix (see :func:`symmetrize_elastic_blocks`);
+    rows past the body's modal count must be identity rows. The block and the right-hand
+    side are loaded into shared memory once, factorized and solved in place, so the
+    kernel needs about ``4 * (block_width**2 + block_width)`` bytes of dynamic shared
+    memory. Blocks that are not positive definite fall back to a Jacobi step.
     """
     width = int(block_width)
 
@@ -1345,104 +1533,53 @@ def create_solve_elastic_body_tiled(block_width: int):
         if elastic_index < 0:
             return
 
-        h = wp.tile_zeros(shape=(width, width), dtype=float)
-        g = wp.tile_zeros(shape=(width,), dtype=float)
+        factor = wp.tile_load(elastic_body_block_matrix[elastic_index], shape=(width, width), storage="shared")
+        solution = wp.tile_load(elastic_body_block_grad[elastic_index], shape=width, storage="shared")
+        wp.tile_cholesky_inplace(factor)
+        wp.tile_cholesky_solve_inplace(factor, solution)
+
+        solution_is_finite = bool(True)
         for i in range(width):
-            g[i] = elastic_body_block_grad[elastic_index, i]
-            for j in range(width):
-                if j < i:
-                    h[i, j] = elastic_body_block_matrix[elastic_index, j, i]
-                else:
-                    h[i, j] = elastic_body_block_matrix[elastic_index, i, j]
-
-        rhs = wp.tile_map(wp.neg, g)
-        factor = wp.tile_cholesky(h)
-        delta = wp.tile_cholesky_solve(factor, rhs)
-
-        block_is_definite = int(1)
+            if not wp.isfinite(solution[i]):
+                solution_is_finite = False
         for i in range(width):
-            if not wp.isfinite(delta[i]):
-                block_is_definite = int(0)
+            _store_elastic_block_delta(
+                elastic_index,
+                solution_is_finite,
+                elastic_body_block_grad,
+                elastic_body_block_matrix,
+                i,
+                -solution[i],
+                elastic_body_block_delta,
+            )
 
-        safe_delta = wp.tile_zeros(shape=(width,), dtype=float)
-        for i in range(width):
-            if block_is_definite == 1:
-                safe_delta[i] = delta[i]
-            else:
-                diagonal = h[i, i]
-                if diagonal > 0.0:
-                    safe_delta[i] = -g[i] / diagonal
-            elastic_body_block_delta[elastic_index, i] = safe_delta[i]
-
-        owner_joint = elastic_joint[elastic_index]
-        q_start = joint_q_start[owner_joint] + 7
-        qd_start = joint_qd_start[owner_joint] + 6
-        mode_count = elastic_mode_count[elastic_index]
-
-        if elastic_body_block_initial_residual_norm:
-            initial_residual_sq = float(0.0)
-            solve_residual_sq = float(0.0)
-            applied_residual_sq = float(0.0)
-            update_norm_sq = float(0.0)
-            update_max = float(0.0)
-            for row in range(width):
-                if row < 6:
-                    row_is_solved = solve_frame
-                else:
-                    row_is_solved = row - 6 < mode_count
-                if row_is_solved:
-                    grad_i = g[row]
-                    solve_residual_i = grad_i
-                    applied_residual_i = grad_i
-                    for j in range(width):
-                        delta_j = safe_delta[j]
-                        solve_residual_i = solve_residual_i + h[row, j] * delta_j
-                        applied_residual_i = applied_residual_i + h[row, j] * (elastic_body_relaxation * delta_j)
-
-                    applied_delta_i = elastic_body_relaxation * safe_delta[row]
-                    initial_residual_sq = initial_residual_sq + grad_i * grad_i
-                    solve_residual_sq = solve_residual_sq + solve_residual_i * solve_residual_i
-                    applied_residual_sq = applied_residual_sq + applied_residual_i * applied_residual_i
-                    update_norm_sq = update_norm_sq + applied_delta_i * applied_delta_i
-                    update_max = wp.max(update_max, wp.abs(applied_delta_i))
-
-            elastic_body_block_initial_residual_norm[elastic_index] = wp.sqrt(initial_residual_sq)
-            elastic_body_block_solve_residual_norm[elastic_index] = wp.sqrt(solve_residual_sq)
-            elastic_body_block_applied_residual_norm[elastic_index] = wp.sqrt(applied_residual_sq)
-            elastic_body_block_update_norm[elastic_index] = wp.sqrt(update_norm_sq)
-            elastic_body_block_update_max[elastic_index] = update_max
-
-        inv_dt = 1.0 / dt
-        q_current = body_q[body]
-        if solve_frame and body_inv_mass[body] > 0.0:
-            rot_current = wp.transform_get_rotation(q_current)
-            body_R = wp.quat_to_matrix(rot_current)
-            x_delta = wp.vec3(safe_delta[0], safe_delta[1], safe_delta[2])
-            w_delta = wp.vec3(safe_delta[3], safe_delta[4], safe_delta[5])
-            x_inc_world = body_R * (elastic_body_relaxation * x_delta)
-            w_world = body_R * (elastic_body_relaxation * w_delta)
-            angle = wp.length(w_world)
-            if angle > _SMALL_ANGLE_EPS:
-                dq_world = wp.quat_from_axis_angle(w_world / angle, angle)
-            else:
-                half_w = 0.5 * w_world
-                dq_world = wp.normalize(wp.quat(half_w[0], half_w[1], half_w[2], 1.0))
-            rot_new = wp.normalize(dq_world * rot_current)
-            com_current = wp.transform_point(q_current, body_com[body])
-            com_new = com_current + x_inc_world
-            pos_new = com_new - wp.quat_rotate(rot_new, body_com[body])
-            body_q_new[body] = wp.transform(pos_new, rot_new)
-        else:
-            body_q_new[body] = q_current
-
-        for mode in range(mode_count):
-            q_idx = q_start + mode
-            qd_idx = qd_start + mode
-            q_prev = joint_q_prev[q_idx]
-            q_old = joint_q[q_idx]
-            q_new = q_old + elastic_body_relaxation * safe_delta[6 + mode]
-            joint_q[q_idx] = q_new
-            joint_qd[qd_idx] = (q_new - q_prev) * inv_dt
+        _apply_elastic_block_delta(
+            width,
+            dt,
+            solve_frame,
+            body,
+            elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            body_inv_mass,
+            body_com,
+            body_q,
+            joint_q_start,
+            joint_qd_start,
+            joint_q_prev,
+            elastic_body_block_grad,
+            elastic_body_block_delta,
+            elastic_body_block_matrix,
+            elastic_body_block_initial_residual_norm,
+            elastic_body_block_solve_residual_norm,
+            elastic_body_block_applied_residual_norm,
+            elastic_body_block_update_norm,
+            elastic_body_block_update_max,
+            elastic_body_relaxation,
+            body_q_new,
+            joint_q,
+            joint_qd,
+        )
 
     _solve_elastic_body_tiled.__name__ = f"solve_elastic_body_tiled_{width}"
     _solve_elastic_body_tiled.__qualname__ = f"solve_elastic_body_tiled_{width}"

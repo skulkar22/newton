@@ -16,6 +16,7 @@ from newton._src.solvers.vbd.reduced_elastic_kernels import (
     accumulate_elastic_frame_coupling,
     create_solve_elastic_body_tiled,
 )
+from newton._src.solvers.vbd.solver_vbd import _max_elastic_block_solve_tiled_width
 from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
     beam_torsion_linear_modal_properties,
@@ -4193,7 +4194,7 @@ def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
     grad = np.zeros((2, width), dtype=np.float32)
     for block in range(2):
         a = rng.standard_normal((width, width))
-        matrix[block] = np.triu(a @ a.T + width * np.eye(width))
+        matrix[block] = a @ a.T + width * np.eye(width)
         grad[block] = rng.standard_normal(width)
     matrix[1, 3, 3] = -5.0
 
@@ -4234,78 +4235,152 @@ def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
     solved = delta.numpy()
     test.assertTrue(bool(np.isfinite(solved).all()))
 
-    definite = np.triu(matrix[0]) + np.triu(matrix[0], 1).T
-    np.testing.assert_allclose(solved[0], np.linalg.solve(definite, -grad[0]), rtol=1.0e-4, atol=1.0e-5)
+    np.testing.assert_allclose(solved[0], np.linalg.solve(matrix[0], -grad[0]), rtol=1.0e-4, atol=1.0e-5)
 
     diagonal = np.diag(matrix[1])
     expected_fallback = np.where(diagonal > 0.0, -grad[1] / np.where(diagonal > 0.0, diagonal, 1.0), 0.0)
     np.testing.assert_allclose(solved[1], expected_fallback, rtol=1.0e-5, atol=1.0e-6)
 
 
+def _launch_elastic_block_solve(device, width, matrix, grad, mode_counts):
+    """Launch the tiled block solve on symmetric ``matrix`` blocks and return the deltas."""
+    block_count, stored_width = grad.shape
+    kernel = create_solve_elastic_body_tiled(width)
+    delta = wp.zeros((block_count, stored_width), dtype=float, device=device)
+    metrics = [wp.zeros(block_count, dtype=float, device=device) for _ in range(5)]
+    body_ids = wp.array(np.arange(block_count), dtype=wp.int32, device=device)
+    mode_dof_count = int(np.max(mode_counts)) + 1
+    wp.launch_tiled(
+        kernel=kernel,
+        dim=[block_count],
+        inputs=[
+            0.01,
+            False,
+            body_ids,
+            body_ids,
+            wp.zeros(block_count, dtype=wp.int32, device=device),
+            wp.array(mode_counts, dtype=wp.int32, device=device),
+            wp.zeros(block_count, dtype=float, device=device),
+            wp.zeros(block_count, dtype=wp.vec3, device=device),
+            wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
+            wp.zeros(mode_dof_count + 7, dtype=float, device=device),
+            wp.array(grad, dtype=float, device=device),
+            delta,
+            wp.array(matrix, dtype=float, device=device),
+            *metrics,
+            1.0,
+        ],
+        outputs=[
+            wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
+            wp.zeros(mode_dof_count + 7, dtype=float, device=device),
+            wp.zeros(mode_dof_count + 6, dtype=float, device=device),
+        ],
+        block_dim=32,
+        device=device,
+    )
+    return delta.numpy()
+
+
 def test_vbd_elastic_block_solve_supports_representative_widths(test, device):
-    """Tiled Cholesky supports the modal widths used by representative assets."""
+    """Tiled Cholesky solves block widths from small bases up to the shared-memory limit."""
     rng = np.random.default_rng(11)
 
-    for mode_count in (11, 16, 32):
-        width = mode_count + 6
-        kernel = create_solve_elastic_body_tiled(width)
+    for width in (17, 22, 38, 70, 111, 157):
         a = rng.standard_normal((width, width))
-        matrix = np.triu(a @ a.T + width * np.eye(width)).astype(np.float32)[None]
+        matrix = (a @ a.T + width * np.eye(width)).astype(np.float32)[None]
         grad = rng.standard_normal((1, width)).astype(np.float32)
-        delta = wp.zeros((1, width), dtype=float, device=device)
-        metrics = [wp.zeros(1, dtype=float, device=device) for _ in range(5)]
-        zeros_int = wp.zeros(1, dtype=wp.int32, device=device)
 
-        wp.launch_tiled(
-            kernel=kernel,
-            dim=[1],
-            inputs=[
-                0.01,
-                False,
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([mode_count], dtype=wp.int32, device=device),
-                wp.zeros(1, dtype=float, device=device),
-                wp.zeros(1, dtype=wp.vec3, device=device),
-                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-                zeros_int,
-                zeros_int,
-                wp.zeros(width + 1, dtype=float, device=device),
-                wp.array(grad, dtype=float, device=device),
-                delta,
-                wp.array(matrix, dtype=float, device=device),
-                *metrics,
-                1.0,
-            ],
-            outputs=[
-                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-                wp.zeros(width + 1, dtype=float, device=device),
-                wp.zeros(width, dtype=float, device=device),
-            ],
-            block_dim=32,
-            device=device,
-        )
+        delta = _launch_elastic_block_solve(device, width, matrix, grad, [width - 6])
 
-        dense_matrix = np.triu(matrix[0]) + np.triu(matrix[0], 1).T
         np.testing.assert_allclose(
-            delta.numpy()[0],
-            np.linalg.solve(dense_matrix, -grad[0]),
+            delta[0],
+            np.linalg.solve(matrix[0].astype(np.float64), -grad[0]),
             rtol=2.0e-4,
             atol=2.0e-5,
-            err_msg=f"mode_count={mode_count}",
+            err_msg=f"width={width}",
         )
 
 
-def test_vbd_elastic_block_width_rejects_oversized_basis(test, device):
-    """A basis too wide for device shared memory fails at construction, not at launch."""
-    shared_memory_limit = int(getattr(wp.get_device(device), "max_shared_memory_per_block", 0))
-    if shared_memory_limit <= 0:
-        test.skipTest("device reports no shared memory budget")
+def test_vbd_elastic_block_solve_reads_leading_sub_block(test, device):
+    """A narrow kernel solves the leading sub-block of wider block storage."""
+    rng = np.random.default_rng(5)
+    width = 14
+    stored_width = 70
+    matrix = np.zeros((2, stored_width, stored_width), dtype=np.float32)
+    grad = np.zeros((2, stored_width), dtype=np.float32)
+    for block in range(2):
+        a = rng.standard_normal((width, width))
+        matrix[block] = np.eye(stored_width) + rng.standard_normal((stored_width, stored_width))
+        matrix[block, :width, :width] = a @ a.T + width * np.eye(width)
+        grad[block, :width] = rng.standard_normal(width)
 
-    largest_width = int((np.sqrt(9.0 + 2.0 * shared_memory_limit) - 3.0) / 4.0)
-    mode_count = largest_width - 6 + 1
+    delta = _launch_elastic_block_solve(device, width, matrix, grad, [2, 2])
 
+    for block in range(2):
+        expected = np.linalg.solve(matrix[block, :width, :width].astype(np.float64), -grad[block, :width])
+        np.testing.assert_allclose(delta[block, :width], expected, rtol=2.0e-4, atol=2.0e-5)
+        np.testing.assert_array_equal(delta[block, width:], 0.0)
+
+
+def _elastic_block_test_basis(mode_count: int, seed: int) -> newton.ModalBasis:
+    """Return a random lumped modal basis with ``mode_count`` modes."""
+    rng = np.random.default_rng(seed)
+    sample_count = 4
+    return newton.ModalBasis(
+        sample_points=rng.uniform(-0.5, 0.5, (sample_count, 3)),
+        sample_phi=0.1 * rng.standard_normal((sample_count, mode_count, 3)),
+        sample_mass=[0.25] * sample_count,
+        mode_stiffness=list(np.linspace(10.0, 100.0, mode_count)),
+        mode_damping=[0.0] * mode_count,
+    )
+
+
+def _build_elastic_block_test_model(device, mode_counts):
+    """Build free reduced elastic bodies with the given modal counts in a single color group."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    for index, mode_count in enumerate(mode_counts):
+        builder.add_body_elastic(
+            xform=wp.transform((2.0 * index, 0.0, 0.0), wp.quat_identity()),
+            mass=1.0,
+            inertia=_identity_inertia(),
+            mode_q=[0.01] * mode_count,
+            modal_basis=_elastic_block_test_basis(mode_count, seed=index),
+            label=f"elastic_{index}",
+        )
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def test_vbd_elastic_block_solve_buckets_mixed_widths(test, device):
+    """Bodies with small and large bases in one color launch per-width buckets."""
+    model = _build_elastic_block_test_model(device, [2, 64])
+    test.assertEqual(len(model.body_color_groups), 1)
+
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=1)
+    test.assertEqual(solver.elastic_body_block_width, 70)
+    test.assertEqual(sorted(solver._elastic_block_solve_launches), [(0, 14, 1, "tiled"), (0, 70, 1, "tiled")])
+
+    state_0 = model.state()
+    state_1 = model.state()
+    solver.step(state_0, state_1, model.control(), None, 1.0e-2)
+
+    matrix = solver.elastic_body_block_matrix.numpy()
+    grad = solver.elastic_body_block_grad.numpy()
+    delta = solver.elastic_body_block_delta.numpy()
+    test.assertTrue(bool(np.isfinite(delta).all()))
+    for elastic_index, width in enumerate((14, 70)):
+        block = matrix[elastic_index, :width, :width].astype(np.float64)
+        upper = np.triu(block)
+        np.testing.assert_allclose(block, upper + np.triu(block, 1).T, rtol=0.0, atol=0.0)
+        expected = np.linalg.solve(block, -grad[elastic_index, :width])
+        test.assertGreater(float(np.abs(expected).max()), 0.0)
+        np.testing.assert_allclose(delta[elastic_index, :width], expected, rtol=2.0e-4, atol=2.0e-6)
+        np.testing.assert_array_equal(delta[elastic_index, width:], 0.0)
+
+
+def _elastic_block_capacity_model(device, mode_count):
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=np.tile(np.array([[1.0, 0.0, 0.0]]), (1, mode_count, 1)),
@@ -4313,13 +4388,38 @@ def test_vbd_elastic_block_width_rejects_oversized_basis(test, device):
         mode_stiffness=[1.0] * mode_count,
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="oversized")
+    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="capacity")
     builder.color()
-    model = builder.finalize(device=device)
+    return builder.finalize(device=device)
+
+
+def test_vbd_elastic_block_width_rejects_oversized_basis(test, device):
+    """A basis too wide for the measured shared memory budget fails at construction, not at launch."""
+    max_width = _max_elastic_block_solve_tiled_width(wp.get_device(device))
+    model = _elastic_block_capacity_model(device, max_width - 6 + 1)
 
     with test.assertRaises(ValueError) as raised:
         newton.solvers.SolverVBD(model, iterations=1)
     test.assertIn("shared memory", str(raised.exception))
+    test.assertIn(f"at most {max_width - 6} modes", str(raised.exception))
+
+
+def test_vbd_elastic_block_capacity_steps_at_tiled_limit(test, device):
+    """The widest basis that fits the measured shared memory budget constructs and steps."""
+    max_width = _max_elastic_block_solve_tiled_width(wp.get_device(device))
+    model = _elastic_block_capacity_model(device, max_width - 6)
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=1)
+    test.assertEqual(solver.elastic_body_block_width, max_width)
+    test.assertEqual(solver._elastic_block_solve_launches, [(0, max_width, 1, "tiled")])
+
+    state_0 = model.state()
+    state_1 = model.state()
+    control = model.control()
+    for _ in range(2):
+        solver.step(state_0, state_1, control, None, 1.0e-2)
+        state_0, state_1 = state_1, state_0
+    test.assertTrue(bool(np.isfinite(state_0.joint_q.numpy()).all()))
+    test.assertTrue(bool(np.isfinite(solver.elastic_body_block_delta.numpy()).all()))
 
 
 def test_vbd_elastic_block_metrics_cover_frame_rows(test, device):
@@ -4329,7 +4429,7 @@ def test_vbd_elastic_block_metrics_cover_frame_rows(test, device):
 
     rng = np.random.default_rng(3)
     a = rng.standard_normal((width, width))
-    matrix = np.triu(a @ a.T + width * np.eye(width)).astype(np.float32)[None]
+    matrix = (a @ a.T + width * np.eye(width)).astype(np.float32)[None]
     grad = rng.standard_normal((1, width)).astype(np.float32)
 
     zeros_int = wp.zeros(1, dtype=wp.int32, device=device)
@@ -6103,6 +6203,24 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_elastic_block_width_rejects_oversized_basis",
         test_vbd_elastic_block_width_rejects_oversized_basis,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_solve_reads_leading_sub_block",
+        test_vbd_elastic_block_solve_reads_leading_sub_block,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_solve_buckets_mixed_widths",
+        test_vbd_elastic_block_solve_buckets_mixed_widths,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_capacity_steps_at_tiled_limit",
+        test_vbd_elastic_block_capacity_steps_at_tiled_limit,
         devices=[device],
     )
     add_function_test(
