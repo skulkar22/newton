@@ -88,6 +88,50 @@ def _identity_inertia():
     return wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
 
+# Rigid VBD formulations swept by tests whose result must not depend on the joint solver:
+# the deprecated legacy AVBD path and the default compliant ALM path.
+_RIGID_ALM_MODES = (False, True)
+# Compliant ALM reaches the implicit-Euler answer of the material law once its joint multipliers
+# converge; these single-body fixtures converge to float32 precision within eight iterations.
+_ALM_CONVERGED_ITERATIONS = 16
+
+
+def _vbd_fixed_joint_solver(
+    model,
+    *,
+    compliant: bool,
+    iterations: int,
+    linear_k: float,
+    angular_k: float,
+    linear_kd: float = 0.0,
+    angular_kd: float = 0.0,
+    **kwargs,
+):
+    """Create a VBD solver whose structural joint rows use fixed material stiffness.
+
+    Legacy AVBD pins its penalty to the material stiffness. Compliant ALM uses the same values as its
+    material law and needs ``_ALM_CONVERGED_ITERATIONS`` to reproduce single-solve closed forms.
+    """
+    stiffness = {
+        "rigid_joint_linear_ke": linear_k,
+        "rigid_joint_angular_ke": angular_k,
+        "rigid_joint_linear_kd": linear_kd,
+        "rigid_joint_angular_kd": angular_kd,
+    }
+    if compliant:
+        return newton.solvers.SolverVBD(model, rigid_compliant_alm=True, iterations=iterations, **stiffness, **kwargs)
+    return newton.solvers.SolverVBD(
+        model,
+        rigid_compliant_alm=False,
+        iterations=iterations,
+        rigid_joint_linear_k_start=linear_k,
+        rigid_joint_angular_k_start=angular_k,
+        rigid_joint_adaptive_stiffness=False,
+        **stiffness,
+        **kwargs,
+    )
+
+
 def _quat_from_angle_z(theta: float):
     return wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), theta)
 
@@ -3899,11 +3943,11 @@ _REVOLUTE_ELASTIC_MODE_MASS = 1.0
 _REVOLUTE_ELASTIC_DRIVE_K = 200.0
 
 
-def _solve_revolute_elastic_mode(
+def _build_revolute_elastic_mode_model(
     device, *, mode_q: float, target_pos: float, target_ke: float, limit_upper: float
-) -> float:
-    """One VBD step of a kinematic elastic body whose revolute joint rotates a single modal endpoint."""
-    dt, mode_mass, drive_k = _REVOLUTE_ELASTIC_DT, _REVOLUTE_ELASTIC_MODE_MASS, _REVOLUTE_ELASTIC_DRIVE_K
+):
+    """Build a kinematic elastic body whose revolute joint rotates a single modal endpoint about x."""
+    mode_mass, drive_k = _REVOLUTE_ELASTIC_MODE_MASS, _REVOLUTE_ELASTIC_DRIVE_K
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 0.0]]],
@@ -3920,7 +3964,7 @@ def _solve_revolute_elastic_mode(
         modal_basis=basis,
         is_kinematic=True,
     )
-    builder.add_joint_revolute(
+    joint = builder.add_joint_revolute(
         parent=-1,
         child=body,
         axis=(1.0, 0.0, 0.0),
@@ -3933,42 +3977,176 @@ def _solve_revolute_elastic_mode(
         limit_kd=0.0,
     )
     builder.color()
-    model = builder.finalize(device=device)
+    return builder.finalize(device=device), joint
 
+
+def _solve_revolute_elastic_mode(
+    device, *, compliant: bool, mode_q: float, target_pos: float, target_ke: float, limit_upper: float
+) -> tuple[float, float, float]:
+    """Run one VBD step; return the modal coordinate, revolute coordinate [rad], and reported axis torque [N·m].
+
+    Legacy AVBD reproduces the single-solve closed form in one iteration; compliant ALM reaches it once
+    its drive/limit multipliers converge.
+    """
+    model, joint = _build_revolute_elastic_mode_model(
+        device, mode_q=mode_q, target_pos=target_pos, target_ke=target_ke, limit_upper=limit_upper
+    )
     state_0 = model.state()
     state_1 = model.state()
-    solver = newton.solvers.SolverVBD(
+    solver = _vbd_fixed_joint_solver(
         model,
-        rigid_compliant_alm=False,
-        iterations=1,
-        rigid_joint_linear_k_start=1.0,
-        rigid_joint_linear_ke=1.0,
-        rigid_joint_angular_k_start=100.0,
-        rigid_joint_angular_ke=100.0,
-        rigid_joint_adaptive_stiffness=False,
+        compliant=compliant,
+        iterations=_ALM_CONVERGED_ITERATIONS if compliant else 1,
+        linear_k=1.0,
+        angular_k=100.0,
     )
-    solver.step(state_0, state_1, model.control(), None, dt)
+    body_q_prev = wp.clone(state_0.body_q)
+    solver.step(state_0, state_1, model.control(), None, _REVOLUTE_ELASTIC_DT)
+    joint_wrench = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
+    solver.eval_joint_forces(state_1, joint_wrench, body_q_prev=body_q_prev, dt=_REVOLUTE_ELASTIC_DT)
     q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])]) + 7
-    return float(state_1.joint_q.numpy()[q_start])
+    joint_q = state_1.joint_q.numpy()
+    # The revolute axis is x in the child joint frame.
+    axis_torque = float(joint_wrench.numpy()[joint][3])
+    return float(joint_q[q_start]), float(joint_q[int(model.joint_q_start.numpy()[joint])]), axis_torque
 
 
 def test_vbd_revolute_drive_projects_into_elastic_modes(test, device):
+    """Drive a revolute joint whose only mobility is its elastic endpoint rotation.
+
+    Under compliant ALM the drive row's support must include the endpoint's modal mobility; with rigid
+    mobility only, the kinematic frame gives zero support and the drive is dropped.
+    """
     dt, mode_mass, drive_k = _REVOLUTE_ELASTIC_DT, _REVOLUTE_ELASTIC_MODE_MASS, _REVOLUTE_ELASTIC_DRIVE_K
     modal_inertia = mode_mass / (dt * dt)
-    drive_result = _solve_revolute_elastic_mode(device, mode_q=0.0, target_pos=0.25, target_ke=drive_k, limit_upper=1.0)
     drive_expected = drive_k * 0.25 / (modal_inertia + drive_k)
-    np.testing.assert_allclose(drive_result, drive_expected, rtol=1.0e-6, atol=1.0e-7)
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            drive_result, _angle, _torque = _solve_revolute_elastic_mode(
+                device, compliant=compliant, mode_q=0.0, target_pos=0.25, target_ke=drive_k, limit_upper=1.0
+            )
+            np.testing.assert_allclose(drive_result, drive_expected, rtol=1.0e-6, atol=1.0e-7)
 
 
 def test_vbd_revolute_limit_projects_into_elastic_modes(test, device):
-    """Expected failure on the integration branch: the continuous joint coordinates that drive
-    revolute limits measure the angle at the undeformed attachment frame, so rotation that only
-    comes from the elastic endpoint (psi * q) does not engage the limit."""
+    """Engage a revolute limit with rotation that only comes from the elastic endpoint.
+
+    The continuous joint coordinate that drives limits is measured at the deformed attachment frame, so
+    endpoint rotation ``psi * q`` beyond the upper bound pushes the mode back and the reported joint
+    reaction carries the limit torque.
+    """
     dt, mode_mass, drive_k = _REVOLUTE_ELASTIC_DT, _REVOLUTE_ELASTIC_MODE_MASS, _REVOLUTE_ELASTIC_DRIVE_K
     modal_inertia = mode_mass / (dt * dt)
-    limit_result = _solve_revolute_elastic_mode(device, mode_q=0.25, target_pos=0.0, target_ke=0.0, limit_upper=0.1)
     limit_expected = 0.25 - drive_k * (0.25 - 0.1) / (modal_inertia + drive_k)
-    np.testing.assert_allclose(limit_result, limit_expected, rtol=1.0e-6, atol=1.0e-7)
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            limit_result, angle, axis_torque = _solve_revolute_elastic_mode(
+                device, compliant=compliant, mode_q=0.25, target_pos=0.0, target_ke=0.0, limit_upper=0.1
+            )
+            np.testing.assert_allclose(limit_result, limit_expected, rtol=1.0e-6, atol=1.0e-7)
+            np.testing.assert_allclose(angle, limit_result, rtol=1.0e-5)
+            np.testing.assert_allclose(axis_torque, -drive_k * (angle - 0.1), rtol=1.0e-4)
+
+
+def test_vbd_revolute_coordinate_includes_elastic_endpoint_rotation(test, device):
+    """Report a revolute coordinate that includes the elastic endpoint's modal rotation."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            mode_result, angle, _torque = _solve_revolute_elastic_mode(
+                device, compliant=compliant, mode_q=0.25, target_pos=0.0, target_ke=0.0, limit_upper=1.0
+            )
+            # A free mode keeps its rotation; the kinematic frame does not rotate.
+            np.testing.assert_allclose(mode_result, 0.25, rtol=1.0e-6)
+            np.testing.assert_allclose(angle, mode_result, rtol=1.0e-5, atol=1.0e-6)
+
+
+def _rod_elastic_endpoint_frame_rows(device, *, compliant: bool, mode: str) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble one step of a ROD joint at an elastic endpoint and return the frame rows of its block.
+
+    Args:
+        device: Warp device.
+        compliant: Rigid VBD formulation.
+        mode: ``"elastic"`` deforms the attachment through the endpoint's ``phi``/``psi``;
+            ``"baked"`` zeroes them and bakes the same deformed frame into ``joint_X_c``;
+            ``"rest"`` zeroes them and keeps the undeformed frame.
+
+    Returns:
+        The frame gradient rows ``[6]`` and frame Hessian block ``[6, 6]``.
+    """
+    dt = 0.01
+    mode_q = 0.08
+    anchor = np.array([0.0, 0.0, 0.2], dtype=np.float32)
+    phi = np.array([0.03, -0.02, 0.05], dtype=np.float32)
+    psi = np.array([0.4, -0.3, 0.2], dtype=np.float32)
+    basis = newton.ModalBasis(
+        sample_points=[anchor],
+        sample_phi=[[phi]],
+        sample_psi=[[psi]],
+        mode_mass=[1.0],
+        mode_stiffness=[0.0],
+        mode_damping=[0.0],
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity()),
+        mass=2.0,
+        inertia=_identity_inertia(),
+        mode_q=[mode_q],
+        modal_basis=basis,
+    )
+    joint = builder.add_joint_rod(
+        parent=-1,
+        child=body,
+        parent_xform=wp.transform_identity(),
+        child_xform=wp.transform(wp.vec3(*anchor), wp.quat_identity()),
+        stretch_stiffness=2.0e3,
+        shear_stiffness=1.5e3,
+        bend_stiffness=40.0,
+        twist_stiffness=30.0,
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    if int(model.joint_child_elastic_endpoint.numpy()[joint]) < 0:
+        raise AssertionError("the ROD child attachment must be an elastic endpoint")
+
+    state_0 = model.state()
+    state_1 = model.state()
+    legacy = {} if compliant else {"rigid_joint_adaptive_stiffness": False}
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=1, **legacy)
+    # Rest bend/twist invariants were cached from the undeformed frame; keep them for every variant.
+    if mode != "elastic":
+        model.elastic_endpoint_phi.zero_()
+        model.elastic_endpoint_psi.zero_()
+    if mode == "baked":
+        theta = psi * mode_q
+        angle = float(np.linalg.norm(theta))
+        deformed = wp.transform(
+            wp.vec3(*(anchor + phi * mode_q)), wp.quat_from_axis_angle(wp.vec3(*(theta / angle)), angle)
+        )
+        joint_X_c = model.joint_X_c.numpy()
+        joint_X_c[joint] = np.array(deformed, dtype=np.float32)
+        model.joint_X_c.assign(joint_X_c)
+    solver.step(state_0, state_1, model.control(), None, dt)
+    grad = solver.elastic_body_block_grad.numpy()[0, :6].copy()
+    matrix_upper = solver.elastic_body_block_matrix.numpy()[0]
+    matrix = np.triu(matrix_upper) + np.triu(matrix_upper, 1).T
+    return grad, matrix[:6, :6].copy()
+
+
+def test_vbd_rod_joint_uses_elastic_endpoint(test, device):
+    """Evaluate ROD stretch, shear, bend, and twist at a deformed elastic endpoint.
+
+    The frame rows must match the same joint with the deformation baked into ``joint_X_c`` and differ
+    from the undeformed attachment.
+    """
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            grad, hessian = _rod_elastic_endpoint_frame_rows(device, compliant=compliant, mode="elastic")
+            baked_grad, baked_hessian = _rod_elastic_endpoint_frame_rows(device, compliant=compliant, mode="baked")
+            rest_grad, _rest_hessian = _rod_elastic_endpoint_frame_rows(device, compliant=compliant, mode="rest")
+            test.assertGreater(float(np.linalg.norm(baked_grad - rest_grad)), 1.0)
+            np.testing.assert_allclose(grad, baked_grad, rtol=1.0e-4, atol=1.0e-3)
+            np.testing.assert_allclose(hessian, baked_hessian, rtol=1.0e-4, atol=1.0e-2)
 
 
 def test_fourbar_elastic_coupler_geometry(test, device):
@@ -5162,6 +5340,18 @@ for device in devices:
     )
     add_function_test(
         TestReducedElasticBody,
+        "test_vbd_revolute_coordinate_includes_elastic_endpoint_rotation",
+        test_vbd_revolute_coordinate_includes_elastic_endpoint_rotation,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_rod_joint_uses_elastic_endpoint",
+        test_vbd_rod_joint_uses_elastic_endpoint,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
         "test_fourbar_elastic_coupler_geometry",
         test_fourbar_elastic_coupler_geometry,
         devices=[device],
@@ -5270,11 +5460,6 @@ for device in devices:
             devices=[device],
         )
 
-
-# Joint limits read the continuous joint coordinate, which ignores elastic endpoint rotation (see the test docstring).
-for _name in dir(TestReducedElasticBody):
-    if _name.startswith("test_vbd_revolute_limit_projects_into_elastic_modes"):
-        setattr(TestReducedElasticBody, _name, unittest.expectedFailure(getattr(TestReducedElasticBody, _name)))
 
 if __name__ == "__main__":
     unittest.main()

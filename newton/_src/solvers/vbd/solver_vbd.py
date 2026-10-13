@@ -3255,6 +3255,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.tendon_alm_k.zero_()
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
+        self._set_joint_coordinate_modal_state(state_out.joint_q, state_in.joint_q)
         self._init_body_displacement(state_in)
         self._step_tendon_alm_state(dt)
         self._resolve_tendon_alm_rows()
@@ -4460,6 +4461,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # ---------------------------
         if self._integrates_rigid_bodies:
             self._refresh_rigid_contact_state(contacts, refresh)
+            # Per-step setup pairs state_in poses with state_in modal coordinates; step() switches
+            # to the state_out modal iterate before the solve iterations.
+            self._set_joint_coordinate_modal_state(state_in.joint_q, state_in.joint_q)
             self._joint_coordinates.begin_step(
                 state_in,
                 self._rigid_pose_rebaseline_mask,
@@ -4589,6 +4593,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.elastic_endpoint_phi,
                         model.elastic_endpoint_psi,
                         model.elastic_max_mode_count,
+                        self.elastic_reduced_inv_mass,
                         self.joint_constraint_start,
                         self.joint_constraint_dim,
                         self.joint_is_hard,
@@ -5788,6 +5793,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             # forces against them; the last color also feeds the dual updates.
             self._rigid_penetration_free_truncation(state_in, contacts)
 
+    def _set_joint_coordinate_modal_state(
+        self, joint_q: wp.array[float] | None, joint_q_prev: wp.array[float] | None
+    ) -> None:
+        """Pair continuous joint coordinates with the reduced elastic modal coordinates in use.
+
+        Joints attached to reduced elastic endpoints measure drives, limits, friction, and mimics at
+        the deformed attachment frame. Mimic data holds a copy of the coordinate struct, so refresh it too.
+        """
+        coordinates = self._joint_coordinates
+        if coordinates is None or not coordinates.has_elastic_endpoints:
+            return
+        coordinates.set_elastic_coordinates(joint_q, joint_q_prev)
+        if self._mimic_solver is not None:
+            self._mimic_solver.data.coordinates = coordinates.data
+
     def _update_rigid_body_duals(
         self,
         state_in: State,
@@ -6525,6 +6545,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         data = JointForceData()
         data.coordinates = self._joint_coordinates.data
+        if self._joint_coordinates.has_elastic_endpoints:
+            # Match the reduced elastic endpoint frames below to the reported state's modal coordinates.
+            data.coordinates.elastic_q = state.joint_q
+            data.coordinates.elastic_q_prev = state.joint_q
         data.joint_friction = self._joint_friction
         data.body_q_rest = model.body_q
         if self.rigid_articulation_sparse_layout is not None:
@@ -6856,6 +6880,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             device=self.device,
         )
 
+        self._set_joint_coordinate_modal_state(state_out.joint_q, state_in.joint_q)
         self._joint_coordinates.end_step(state_in, state_out)
 
         if self.enable_dahl_friction and model.joint_count > 0:

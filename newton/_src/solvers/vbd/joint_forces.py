@@ -7,7 +7,7 @@ import warp as wp
 
 from ...sim import JointType
 from ...sim.articulation import transform_2d_rotational_axes, transform_3d_rotational_axes
-from .joint_coordinates import JointCoordinateData, evaluate_coordinate
+from .joint_coordinates import JointCoordinateData, evaluate_coordinate, evaluate_coordinate_prev
 from .rigid_vbd_kernels import (
     _DRIVE_LIMIT_MODE_DRIVE,
     JointFrictionData,
@@ -155,7 +155,7 @@ def _drive_effort(
         data.compliant_alm,
     )
     q, _g_p, _g_c = evaluate_coordinate(c, joint, component, body_q)
-    q_prev, _g_pp, _g_cp = evaluate_coordinate(c, joint, component, body_q_prev)
+    q_prev, _g_pp, _g_cp = evaluate_coordinate_prev(c, joint, component, body_q_prev)
     displacement = q - q_prev
     if component >= c.dof_dim[joint, 0]:
         displacement = wp.atan2(wp.sin(displacement), wp.cos(displacement))

@@ -7,7 +7,11 @@ import warp as wp
 
 from newton._src.math import quat_velocity
 from newton._src.sim import JointType
-from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData, evaluate_coordinate
+from newton._src.solvers.vbd.joint_coordinates import (
+    JointCoordinateData,
+    evaluate_coordinate,
+    evaluate_coordinate_prev,
+)
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _drive_row_applies_force,
     _eval_joint_axis_drive_limit,
@@ -1339,6 +1343,7 @@ def _assemble_articulation_joint_scalar(
     if parent >= 0:
         parent_local = body_articulation_local[parent]
 
+    # Sparse articulations exclude reduced elastic bodies, so rod frames are the rigid attachments.
     if jt == JointType.ROD:
         child_force, child_torque, child_H_ll, child_H_al, child_H_aa = evaluate_rod_joint_force_hessian(
             child,
@@ -1348,8 +1353,10 @@ def _assemble_articulation_joint_scalar(
             body_com,
             joint_parent,
             joint_child,
-            joint_X_p,
-            joint_X_c,
+            joint_X_p[joint],
+            joint_X_c[joint],
+            joint_X_p[joint],
+            joint_X_c[joint],
             joint_rod_rest_kb_local,
             joint_rod_rest_twist,
             joint_constraint_start,
@@ -1390,8 +1397,10 @@ def _assemble_articulation_joint_scalar(
                 body_com,
                 joint_parent,
                 joint_child,
-                joint_X_p,
-                joint_X_c,
+                joint_X_p[joint],
+                joint_X_c[joint],
+                joint_X_p[joint],
+                joint_X_c[joint],
                 joint_rod_rest_kb_local,
                 joint_rod_rest_twist,
                 joint_constraint_start,
@@ -1596,7 +1605,7 @@ def _assemble_articulation_joint_scalar(
             damping = wp.max(joint_damping[dof], 0.0)
             if friction > 0.0 or damping > 0.0:
                 q, gp, gc = evaluate_coordinate(joint_coordinates, joint, component, body_q)
-                q_prev, _gp_prev, _gc_prev = evaluate_coordinate(joint_coordinates, joint, component, body_q_prev)
+                q_prev, _gp_prev, _gc_prev = evaluate_coordinate_prev(joint_coordinates, joint, component, body_q_prev)
                 delta = q - q_prev
                 if component >= lin_count:
                     delta = wp.atan2(wp.sin(delta), wp.cos(delta))

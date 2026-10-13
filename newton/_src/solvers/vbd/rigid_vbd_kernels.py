@@ -41,7 +41,12 @@ from newton._src.solvers.vbd.interval_arithmetic import (
     rigid_point_plane_signed_distance_interval,
 )
 
-from .joint_coordinates import JointCoordinateData, evaluate_coordinate
+from .joint_coordinates import (
+    JointCoordinateData,
+    eval_elastic_endpoint_xform,
+    evaluate_coordinate,
+    evaluate_coordinate_prev,
+)
 from .tendon_kernels import TendonForceElementAdjacencyInfo, evaluate_tendon_force_hessians
 
 wp.set_module_options({"enable_backward": False})
@@ -3380,7 +3385,7 @@ def _joint_friction_displacement(
             wp.spatial_vector(wp.vec3(0.0), gradient),
         )
     q, gradient_parent, gradient_child = evaluate_coordinate(data, joint, component, body_q)
-    q_prev, _gp_prev, _gc_prev = evaluate_coordinate(data, joint, component, body_q_prev)
+    q_prev, _gp_prev, _gc_prev = evaluate_coordinate_prev(data, joint, component, body_q_prev)
     displacement = q - q_prev
     if component >= data.dof_dim[joint, 0] and wp.abs(displacement) >= wp.pi:
         displacement = wp.atan2(wp.sin(displacement), wp.cos(displacement))
@@ -3522,7 +3527,7 @@ def _evaluate_angular_coordinate(
 ):
     """Measure the continuous angle, step velocity, and world-space angular gradient."""
     q, _g_p, g_c = evaluate_coordinate(data, joint, component, body_q)
-    q_prev, _g_p_prev, _g_c_prev = evaluate_coordinate(data, joint, component, body_q_prev)
+    q_prev, _g_p_prev, _g_c_prev = evaluate_coordinate_prev(data, joint, component, body_q_prev)
     delta = q - q_prev
     rate = wp.atan2(wp.sin(delta), wp.cos(delta)) / dt
     return q, rate, wp.spatial_bottom(g_c)
@@ -3564,56 +3569,6 @@ def apply_linear_drive_limit_force(
     force = f_attachment if is_parent else -f_attachment
     torque = wp.cross(r, force)
     return force, torque, Hll, Hal, Haa
-
-
-@wp.func
-def eval_elastic_endpoint_xform(
-    joint_index: int,
-    body_index: int,
-    is_parent_side: bool,
-    xform_rest: wp.transform,
-    body_elastic_index: wp.array[wp.int32],
-    elastic_joint: wp.array[wp.int32],
-    elastic_mode_count: wp.array[wp.int32],
-    joint_q: wp.array[float],
-    joint_q_start: wp.array[int],
-    joint_parent_elastic_endpoint: wp.array[wp.int32],
-    joint_child_elastic_endpoint: wp.array[wp.int32],
-    elastic_endpoint_phi: wp.array[wp.vec3],
-    elastic_endpoint_psi: wp.array[wp.vec3],
-    elastic_max_mode_count: int,
-):
-    if body_index < 0:
-        return xform_rest
-
-    elastic_index = body_elastic_index[body_index]
-    if elastic_index < 0:
-        return xform_rest
-
-    endpoint = joint_child_elastic_endpoint[joint_index]
-    if is_parent_side:
-        endpoint = joint_parent_elastic_endpoint[joint_index]
-    if endpoint < 0:
-        return xform_rest
-
-    p = wp.transform_get_translation(xform_rest)
-    q = wp.transform_get_rotation(xform_rest)
-    owner_joint = elastic_joint[elastic_index]
-    q_start = joint_q_start[owner_joint] + 7
-    mode_count = elastic_mode_count[elastic_index]
-
-    theta = wp.vec3(0.0, 0.0, 0.0)
-    for i in range(elastic_max_mode_count):
-        if i < mode_count:
-            idx = endpoint * elastic_max_mode_count + i
-            p = p + elastic_endpoint_phi[idx] * joint_q[q_start + i]
-            theta = theta + elastic_endpoint_psi[idx] * joint_q[q_start + i]
-
-    angle = wp.length(theta)
-    if angle > _SMALL_ANGLE_EPS:
-        q = wp.quat_from_axis_angle(theta / angle, angle) * q
-
-    return wp.transform(p, q)
 
 
 @wp.func
@@ -3712,8 +3667,10 @@ def evaluate_rod_joint_force_hessian(
     body_com: wp.array[wp.vec3],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
+    X_pj: wp.transform,
+    X_cj: wp.transform,
+    X_pj_prev: wp.transform,
+    X_cj_prev: wp.transform,
     joint_rod_rest_kb_local: wp.array[wp.vec3],
     joint_rod_rest_twist: wp.array[float],
     joint_constraint_start: wp.array[int],
@@ -3732,13 +3689,17 @@ def evaluate_rod_joint_force_hessian(
     joint_compliant_alm: int,
     dt: float,
 ):
-    """Compute exact split ROD force and self-Hessian terms for one body."""
+    """Compute exact split ROD force and self-Hessian terms for one body.
+
+    ``X_pj``/``X_cj`` are the body-local parent/child attachment frames at the current
+    iterate and ``X_pj_prev``/``X_cj_prev`` those at the previous step. Rigid callers
+    pass ``joint_X_p[joint]``/``joint_X_c[joint]`` for both; reduced elastic endpoints
+    pass their deformed frames so the rod measures strain at the deformed attachment.
+    """
     parent_index = joint_parent[joint_index]
     child_index = joint_child[joint_index]
     is_parent_body = parent_index >= 0 and body_index == parent_index
 
-    X_pj = joint_X_p[joint_index]
-    X_cj = joint_X_c[joint_index]
     if parent_index >= 0:
         parent_pose = body_q[parent_index]
         parent_pose_prev = body_q_prev[parent_index]
@@ -3754,8 +3715,8 @@ def evaluate_rod_joint_force_hessian(
 
     X_wp = parent_pose * X_pj
     X_wc = child_pose * X_cj
-    X_wp_prev = parent_pose_prev * X_pj
-    X_wc_prev = child_pose_prev * X_cj
+    X_wp_prev = parent_pose_prev * X_pj_prev
+    X_wc_prev = child_pose_prev * X_cj_prev
     q_wp = wp.transform_get_rotation(X_wp)
     q_wc = wp.transform_get_rotation(X_wc)
     q_wp_prev = wp.transform_get_rotation(X_wp_prev)
@@ -4006,36 +3967,6 @@ def evaluate_joint_force_hessian(
     if body_index != child_index and (parent_index < 0 or body_index != parent_index):
         return _zero_force_hessian()
 
-    if jt == JointType.ROD:
-        return evaluate_rod_joint_force_hessian(
-            body_index,
-            joint_index,
-            body_q,
-            body_q_prev,
-            body_com,
-            joint_parent,
-            joint_child,
-            joint_X_p,
-            joint_X_c,
-            joint_rod_rest_kb_local,
-            joint_rod_rest_twist,
-            joint_constraint_start,
-            joint_penalty_k,
-            joint_rho,
-            joint_material_k,
-            joint_penalty_kd,
-            joint_sigma_start,
-            joint_C_fric,
-            joint_lambda_lin,
-            joint_lambda_ang,
-            joint_C0_lin,
-            joint_C0_ang,
-            joint_is_hard,
-            stab_alpha,
-            joint_compliant_alm,
-            dt,
-        )
-
     is_parent_body = parent_index >= 0 and body_index == parent_index
 
     X_pj = eval_elastic_endpoint_xform(
@@ -4102,6 +4033,39 @@ def evaluate_joint_force_hessian(
         elastic_endpoint_psi,
         elastic_max_mode_count,
     )
+
+    # ROD joints share the deformed elastic endpoint frames with the other joint types.
+    if jt == JointType.ROD:
+        return evaluate_rod_joint_force_hessian(
+            body_index,
+            joint_index,
+            body_q,
+            body_q_prev,
+            body_com,
+            joint_parent,
+            joint_child,
+            X_pj,
+            X_cj,
+            X_pj_prev,
+            X_cj_prev,
+            joint_rod_rest_kb_local,
+            joint_rod_rest_twist,
+            joint_constraint_start,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_penalty_kd,
+            joint_sigma_start,
+            joint_C_fric,
+            joint_lambda_lin,
+            joint_lambda_ang,
+            joint_C0_lin,
+            joint_C0_ang,
+            joint_is_hard,
+            stab_alpha,
+            joint_compliant_alm,
+            dt,
+        )
 
     if parent_index >= 0:
         parent_pose = body_q[parent_index]
@@ -5360,6 +5324,192 @@ def _joint_coordinate_support(
     return 0.0
 
 
+@wp.func
+def _elastic_endpoint_row_jacobian(
+    coordinate: int,
+    linear_local: wp.vec3,
+    angular_local: wp.vec3,
+    lever_local: wp.vec3,
+    endpoint: int,
+    mode_count: int,
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_max_mode_count: int,
+):
+    """One reduced-coordinate component of a joint row at an elastic endpoint.
+
+    Reduced coordinates follow ``elastic_reduced_inv_mass``: body-local COM translation,
+    body-local rotation, then modal coordinates.
+    """
+    if coordinate < 3:
+        return linear_local[coordinate]
+    if coordinate < 6:
+        return (wp.cross(lever_local, linear_local) + angular_local)[coordinate - 3]
+    mode = coordinate - 6
+    if mode < mode_count:
+        idx = endpoint * elastic_max_mode_count + mode
+        return wp.dot(elastic_endpoint_phi[idx], linear_local) + wp.dot(elastic_endpoint_psi[idx], angular_local)
+    return 0.0
+
+
+@wp.func
+def _joint_side_axis_mobility(
+    joint: int,
+    body: int,
+    is_parent_side: bool,
+    body_pose: wp.transform,
+    anchor_local: wp.transform,
+    linear_axis_world: wp.vec3,
+    angular_axis_world: wp.vec3,
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[float],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    joint_parent_elastic_endpoint: wp.array[wp.int32],
+    joint_child_elastic_endpoint: wp.array[wp.int32],
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_max_mode_count: int,
+    elastic_reduced_inv_mass: wp.array3d[float],
+):
+    """Return one body's inverse-mass mobility ``J M^-1 J^T`` for a joint axis row.
+
+    A reduced elastic endpoint uses the body's generalized inverse mass, so modal
+    coordinates move the attachment even when the floating frame is kinematic.
+    """
+    if body < 0:
+        return 0.0
+    rotation = wp.transform_get_rotation(body_pose)
+    linear_local = wp.quat_rotate_inv(rotation, linear_axis_world)
+    angular_local = wp.quat_rotate_inv(rotation, angular_axis_world)
+    lever_local = wp.transform_get_translation(anchor_local) - body_com[body]
+
+    elastic_index = body_elastic_index[body]
+    endpoint = int(-1)
+    if elastic_index >= 0:
+        endpoint = joint_child_elastic_endpoint[joint]
+        if is_parent_side:
+            endpoint = joint_parent_elastic_endpoint[joint]
+    if endpoint < 0:
+        if body_inv_mass[body] <= 0.0:
+            return 0.0
+        moment = wp.cross(lever_local, linear_local) + angular_local
+        return body_inv_mass[body] * wp.dot(linear_local, linear_local) + wp.dot(
+            moment, body_inv_inertia[body] * moment
+        )
+
+    mode_count = elastic_mode_count[elastic_index]
+    width = elastic_max_mode_count + 6
+    mobility = float(0.0)
+    for row in range(width):
+        jacobian_row = _elastic_endpoint_row_jacobian(
+            row,
+            linear_local,
+            angular_local,
+            lever_local,
+            endpoint,
+            mode_count,
+            elastic_endpoint_phi,
+            elastic_endpoint_psi,
+            elastic_max_mode_count,
+        )
+        if jacobian_row != 0.0:
+            projected = float(0.0)
+            for column in range(width):
+                projected = projected + elastic_reduced_inv_mass[elastic_index, row, column] * (
+                    _elastic_endpoint_row_jacobian(
+                        column,
+                        linear_local,
+                        angular_local,
+                        lever_local,
+                        endpoint,
+                        mode_count,
+                        elastic_endpoint_phi,
+                        elastic_endpoint_psi,
+                        elastic_max_mode_count,
+                    )
+                )
+            mobility = mobility + jacobian_row * projected
+    return mobility
+
+
+@wp.func
+def _joint_axis_support_with_elastic_endpoints(
+    joint: int,
+    parent: int,
+    child: int,
+    parent_pose: wp.transform,
+    child_pose: wp.transform,
+    parent_anchor: wp.transform,
+    child_anchor: wp.transform,
+    linear_axis_world: wp.vec3,
+    angular_axis_world: wp.vec3,
+    body_com: wp.array[wp.vec3],
+    body_inv_mass: wp.array[float],
+    body_inv_inertia: wp.array[wp.mat33],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    joint_parent_elastic_endpoint: wp.array[wp.int32],
+    joint_child_elastic_endpoint: wp.array[wp.int32],
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_max_mode_count: int,
+    elastic_reduced_inv_mass: wp.array3d[float],
+    inv_dt_sq: float,
+):
+    """Return the scalar inverse-Delassus support of a drive/limit axis with elastic endpoints.
+
+    Matches :func:`_joint_axis_linear_support` and :func:`_joint_axis_angular_support` for
+    rigid endpoints and adds the modal mobility of reduced elastic endpoints. Without it, a
+    drive or limit whose only mobility is elastic deformation (for example on a kinematic
+    frame) would get zero support and be dropped by the compliant-ALM row evaluators.
+    """
+    w = _joint_side_axis_mobility(
+        joint,
+        parent,
+        True,
+        parent_pose,
+        parent_anchor,
+        linear_axis_world,
+        angular_axis_world,
+        body_com,
+        body_inv_mass,
+        body_inv_inertia,
+        body_elastic_index,
+        elastic_mode_count,
+        joint_parent_elastic_endpoint,
+        joint_child_elastic_endpoint,
+        elastic_endpoint_phi,
+        elastic_endpoint_psi,
+        elastic_max_mode_count,
+        elastic_reduced_inv_mass,
+    )
+    w = w + _joint_side_axis_mobility(
+        joint,
+        child,
+        False,
+        child_pose,
+        child_anchor,
+        linear_axis_world,
+        angular_axis_world,
+        body_com,
+        body_inv_mass,
+        body_inv_inertia,
+        body_elastic_index,
+        elastic_mode_count,
+        joint_parent_elastic_endpoint,
+        joint_child_elastic_endpoint,
+        elastic_endpoint_phi,
+        elastic_endpoint_psi,
+        elastic_max_mode_count,
+        elastic_reduced_inv_mass,
+    )
+    if w > 0.0:
+        return inv_dt_sq / w
+    return 0.0
+
+
 @wp.kernel
 def step_joint_C0_lambda_rho(
     joint_type: wp.array[int],
@@ -5386,6 +5536,7 @@ def step_joint_C0_lambda_rho(
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
     elastic_max_mode_count: int,
+    elastic_reduced_inv_mass: wp.array3d[float],
     joint_constraint_start: wp.array[wp.int32],
     joint_constraint_dim: wp.array[wp.int32],
     joint_is_hard: wp.array[wp.int32],
@@ -5426,6 +5577,8 @@ def step_joint_C0_lambda_rho(
 
     Bilateral structural and drive auto-rho keep ``k_eff >= 0.9K`` in each local
     solve. Limits use their directional support directly as the ALM metric.
+    Drive/limit supports of joints with reduced elastic endpoints include the
+    endpoint's modal mobility through ``elastic_reduced_inv_mass``.
     """
     j = wp.tid()
     zero = wp.vec3(0.0)
@@ -5580,6 +5733,7 @@ def step_joint_C0_lambda_rho(
             if parent >= 0:
                 parent_pose = body_q_prev[parent]
             child_pose = body_q_prev[child]
+            has_elastic_endpoint = joint_child_elastic_endpoint[j] >= 0 or joint_parent_elastic_endpoint[j] >= 0
             parent_joint_xform = eval_elastic_endpoint_xform(
                 j,
                 parent,
@@ -5627,19 +5781,44 @@ def step_joint_C0_lambda_rho(
                     joint_limit_ke,
                 ):
                     axis_world = wp.normalize(wp.quat_rotate(q_wp, joint_axis[dof]))
-                    joint_drive_limit_support[dof] = _joint_axis_linear_support(
-                        parent,
-                        child,
-                        parent_pose,
-                        child_pose,
-                        parent_joint_xform,
-                        child_joint_xform,
-                        axis_world,
-                        body_com,
-                        body_inv_mass,
-                        body_inv_inertia,
-                        inv_dt_sq,
-                    )
+                    if has_elastic_endpoint:
+                        joint_drive_limit_support[dof] = _joint_axis_support_with_elastic_endpoints(
+                            j,
+                            parent,
+                            child,
+                            parent_pose,
+                            child_pose,
+                            parent_joint_xform,
+                            child_joint_xform,
+                            axis_world,
+                            wp.vec3(0.0),
+                            body_com,
+                            body_inv_mass,
+                            body_inv_inertia,
+                            body_elastic_index,
+                            elastic_mode_count,
+                            joint_parent_elastic_endpoint,
+                            joint_child_elastic_endpoint,
+                            elastic_endpoint_phi,
+                            elastic_endpoint_psi,
+                            elastic_max_mode_count,
+                            elastic_reduced_inv_mass,
+                            inv_dt_sq,
+                        )
+                    else:
+                        joint_drive_limit_support[dof] = _joint_axis_linear_support(
+                            parent,
+                            child,
+                            parent_pose,
+                            child_pose,
+                            parent_joint_xform,
+                            child_joint_xform,
+                            axis_world,
+                            body_com,
+                            body_inv_mass,
+                            body_inv_inertia,
+                            inv_dt_sq,
+                        )
 
             if has_angular_material_row:
                 q_wp_rest = wp.transform_get_rotation(
@@ -5658,16 +5837,41 @@ def step_joint_C0_lambda_rho(
                         joint_limit_ke,
                     ):
                         gradient_world = angular_jacobian_world * wp.normalize(joint_axis[dof])
-                        joint_drive_limit_support[dof] = _joint_axis_angular_support(
-                            parent,
-                            child,
-                            parent_pose,
-                            child_pose,
-                            gradient_world,
-                            body_inv_mass,
-                            body_inv_inertia,
-                            inv_dt_sq,
-                        )
+                        if has_elastic_endpoint:
+                            joint_drive_limit_support[dof] = _joint_axis_support_with_elastic_endpoints(
+                                j,
+                                parent,
+                                child,
+                                parent_pose,
+                                child_pose,
+                                parent_joint_xform,
+                                child_joint_xform,
+                                wp.vec3(0.0),
+                                gradient_world,
+                                body_com,
+                                body_inv_mass,
+                                body_inv_inertia,
+                                body_elastic_index,
+                                elastic_mode_count,
+                                joint_parent_elastic_endpoint,
+                                joint_child_elastic_endpoint,
+                                elastic_endpoint_phi,
+                                elastic_endpoint_psi,
+                                elastic_max_mode_count,
+                                elastic_reduced_inv_mass,
+                                inv_dt_sq,
+                            )
+                        else:
+                            joint_drive_limit_support[dof] = _joint_axis_angular_support(
+                                parent,
+                                child,
+                                parent_pose,
+                                child_pose,
+                                gradient_world,
+                                body_inv_mass,
+                                body_inv_inertia,
+                                inv_dt_sq,
+                            )
 
     # 4. C0 snapshot + lambda retention for stabilized structural slots.
     if not joint_enabled[j] or c_dim == 0 or child < 0:
