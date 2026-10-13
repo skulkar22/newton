@@ -132,6 +132,19 @@ def _vbd_fixed_joint_solver(
     )
 
 
+def _first_solve_joint_k(solver, joint: int, slot: int, material_k: float, compliant: bool) -> float:
+    """Return a structural row's stiffness in the first local solve of a step.
+
+    Legacy AVBD uses the material stiffness ``K``. Compliant ALM uses ``K * rho / (K + rho)`` with the
+    solver-selected ``rho``; its multiplier, zero on the first iteration, carries the remainder.
+    """
+    if not compliant:
+        return material_k
+    row = int(solver.joint_constraint_start.numpy()[joint]) + slot
+    rho = float(solver.joint_rho.numpy()[row])
+    return material_k * rho / (material_k + rho)
+
+
 def _quat_from_angle_z(theta: float):
     return wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), theta)
 
@@ -278,23 +291,17 @@ def _assert_elastic_modal_projection_matches_joint_force(test, device, joint_kin
     modal_force_from_energy = -grad
     np.testing.assert_allclose(modal_force_from_energy, modal_force_from_joint, rtol=1.0e-6, atol=1.0e-7)
 
-    solver = newton.solvers.SolverVBD(
-        model,
-        rigid_compliant_alm=False,
-        iterations=1,
-        rigid_joint_linear_k_start=k,
-        rigid_joint_linear_ke=k,
-        rigid_joint_angular_ke=0.0,
-        rigid_joint_linear_kd=0.0,
-        rigid_joint_angular_kd=0.0,
-        rigid_joint_adaptive_stiffness=False,
-    )
-    solver.step(state_0, state_1, control, None, 0.01)
-
     owner_joint = int(model.elastic_joint.numpy()[0])
     q_start = int(model.joint_q_start.numpy()[owner_joint])
     q_expected = modal_force_from_joint / h
-    np.testing.assert_allclose(state_1.joint_q.numpy()[q_start + 7], q_expected, rtol=1.0e-5, atol=1.0e-6)
+    # The massless mode makes the first solve independent of the effective row stiffness.
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            state_0 = model.state()
+            state_1 = model.state()
+            solver = _vbd_fixed_joint_solver(model, compliant=compliant, iterations=1, linear_k=k, angular_k=0.0)
+            solver.step(state_0, state_1, control, None, 0.01)
+            np.testing.assert_allclose(state_1.joint_q.numpy()[q_start + 7], q_expected, rtol=1.0e-5, atol=1.0e-6)
 
 
 def test_modal_basis_add_sample(test, device):
@@ -1698,7 +1705,7 @@ def _pure_twist_basis(
     )
 
 
-def test_elastic_clamp_moment_reaction(test, device):
+def _check_elastic_clamp_moment_reaction(test, device, compliant: bool):
     clamp_local = (0.5, 0.0, 0.0)
     initial_twist = 0.3
 
@@ -1738,7 +1745,7 @@ def test_elastic_clamp_moment_reaction(test, device):
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=24)
 
     identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
     max_angle = dict.fromkeys(rigid_bodies, 0.0)
@@ -1765,7 +1772,14 @@ def test_elastic_clamp_moment_reaction(test, device):
     )
 
 
-def test_elastic_clamp_moment_reaction_parent_side(test, device):
+def test_elastic_clamp_moment_reaction(test, device):
+    """Transmit a pure modal twist moment through a clamp to the rigid side in both rigid formulations."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_elastic_clamp_moment_reaction(test, device, compliant)
+
+
+def _check_elastic_clamp_moment_reaction_parent_side(test, device, compliant: bool):
     clamp_local = (0.5, 0.0, 0.0)
     initial_twist = 0.3
 
@@ -1811,7 +1825,7 @@ def test_elastic_clamp_moment_reaction_parent_side(test, device):
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=24)
 
     identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
     max_angle = dict.fromkeys(rigid_bodies, 0.0)
@@ -1838,7 +1852,14 @@ def test_elastic_clamp_moment_reaction_parent_side(test, device):
     )
 
 
-def test_elastic_clamp_moment_conserves_angular_momentum(test, device):
+def test_elastic_clamp_moment_reaction_parent_side(test, device):
+    """Transmit a modal twist moment from an elastic parent endpoint in both rigid formulations."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_elastic_clamp_moment_reaction_parent_side(test, device, compliant)
+
+
+def _check_elastic_clamp_moment_conserves_angular_momentum(test, device, compliant: bool):
     clamp_local = (0.5, 0.0, 0.0)
     initial_twist = 0.3
     inertia = wp.mat33(0.02, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.05)
@@ -1876,7 +1897,7 @@ def test_elastic_clamp_moment_conserves_angular_momentum(test, device):
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=128)
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=128)
 
     max_spin = 0.0
     max_imbalance = 0.0
@@ -1904,6 +1925,13 @@ def test_elastic_clamp_moment_conserves_angular_momentum(test, device):
         f"angular momentum not conserved at the joint: max |qx_beam + qx_rigid| = {max_imbalance:.3e} "
         f"vs max |qx| = {max_spin:.3e}",
     )
+
+
+def test_elastic_clamp_moment_conserves_angular_momentum(test, device):
+    """Conserve angular momentum across an elastic clamp in both rigid formulations."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_elastic_clamp_moment_conserves_angular_momentum(test, device, compliant)
 
 
 def test_modal_basis_shared_by_elastic_bodies(test, device):
@@ -2219,6 +2247,12 @@ def test_elastic_surface_contact_uses_deformed_vertex(test, device):
 
 
 def test_vbd_elastic_contact_solves_modal_penetration(test, device):
+    """Solve a massless-mode penetration in one legacy hard-contact iteration.
+
+    Legacy AVBD only: compliant ALM conditions a contact by the inverse-mass mobility of its row, which is
+    zero for a massless mode, so it drops the row. The compliant counterpart with a massive mode is
+    ``test_vbd_elastic_compliant_contact_solves_modal_penetration``.
+    """
     q0 = 0.005
     model, _body = _build_elastic_ground_contact_model(device, z=0.05, q0=q0)
     state_0 = model.state()
@@ -2259,7 +2293,7 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
 
 def test_vbd_elastic_body_relaxation_is_general_and_validated(test, device):
     model, _body = _build_elastic_ground_contact_model(device, z=0.2)
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, elastic_body_relaxation=0.37)
+    solver = newton.solvers.SolverVBD(model, elastic_body_relaxation=0.37)
 
     contact_max, _contact_count, relaxation = solver._elastic_solve_inputs(None)
     test.assertEqual(contact_max, 0)
@@ -2268,7 +2302,7 @@ def test_vbd_elastic_body_relaxation_is_general_and_validated(test, device):
         test.assertEqual(values.shape, (0,))
     for invalid in (-0.1, 1.1, np.nan, np.inf):
         with test.assertRaisesRegex(ValueError, "elastic_body_relaxation"):
-            newton.solvers.SolverVBD(model, rigid_compliant_alm=False, elastic_body_relaxation=invalid)
+            newton.solvers.SolverVBD(model, elastic_body_relaxation=invalid)
 
 
 def test_vbd_elastic_compliant_contact_solves_modal_penetration(test, device):
@@ -2347,7 +2381,7 @@ def test_vbd_elastic_compliant_contact_uses_modal_mobility_for_rho_and_forces(te
     test.assertGreater(float(np.max(force_norm)), 0.0)
 
 
-def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
+def _check_vbd_elastic_contact_overflow_assembles_consistent_block(test, device, compliant: bool):
     """Overflowing the per-body contact list must not truncate only the rigid frame block."""
 
     def assemble_block(contact_buffer_size: int):
@@ -2360,13 +2394,14 @@ def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
         contact_count = int(contacts.rigid_contact_count.numpy()[0])
         test.assertGreater(contact_count, 1)
 
+        legacy_contact = {} if compliant else {"rigid_contact_k_start": 1000.0}
         solver = newton.solvers.SolverVBD(
             model,
-            rigid_compliant_alm=False,
+            rigid_compliant_alm=compliant,
             iterations=1,
-            rigid_contact_k_start=1000.0,
             rigid_body_contact_buffer_size=contact_buffer_size,
             elastic_body_relaxation=1.0,
+            **legacy_contact,
         )
         solver.step(state_0, state_1, model.control(), contacts, 0.01)
 
@@ -2380,6 +2415,13 @@ def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
     np.testing.assert_allclose(overflow_matrix, complete_matrix, rtol=2.0e-6, atol=1.0e-5)
     np.testing.assert_allclose(overflow_delta, complete_delta, rtol=2.0e-6, atol=1.0e-7)
     test.assertGreater(float(np.linalg.eigvalsh(overflow_matrix)[0]), 0.0)
+
+
+def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
+    """Assemble the same elastic block whether or not the per-body contact list overflows."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_elastic_contact_overflow_assembles_consistent_block(test, device, compliant)
 
 
 def test_elastic_contact_local_mat33_projection_matches_world(test, device):
@@ -2642,7 +2684,7 @@ def test_cantilever_tip_load_solution(test, device):
     jf[qd_start + 6] = tip_load
     control.joint_f.assign(jf)
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=0)
+    solver = newton.solvers.SolverVBD(model, iterations=0)
     solver.step(state_0, state_1, control, None, 0.01)
 
     expected_tip_deflection = tip_load * length**3 / (3.0 * ei)
@@ -2695,7 +2737,7 @@ def test_cantilever_modal_vibration_solution(test, device):
     q_start = int(model.joint_q_start.numpy()[owner_joint])
     qd_start = int(model.joint_qd_start.numpy()[owner_joint])
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=0)
+    solver = newton.solvers.SolverVBD(model, iterations=0)
     for _ in range(180):
         solver.step(state_0, state_1, control, None, dt)
         denom = mode_mass + dt * damping + dt * dt * stiffness
@@ -2743,7 +2785,7 @@ def test_elastic_modal_implicit_solution_vbd(test, device):
     jf[qd_start + 6] = force
     control.joint_f.assign(jf)
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=0)
+    solver = newton.solvers.SolverVBD(model, iterations=0)
     solver.step(state_0, state_1, control, None, dt)
 
     v_expected = (mode_mass * v0 + dt * (force - stiffness * q0)) / (mode_mass + dt * damping + dt * dt * stiffness)
@@ -2779,7 +2821,7 @@ def test_elastic_gravity_modal_force(test, device):
     owner_joint = int(model.elastic_joint.numpy()[0])
     q_start = int(model.joint_q_start.numpy()[owner_joint])
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=16)
+    solver = newton.solvers.SolverVBD(model, iterations=16)
     solver.step(state_0, state_1, control, None, dt)
 
     coupling_z = 2.0
@@ -2813,7 +2855,7 @@ def test_elastic_free_fall_no_modal_force(test, device):
     owner_joint = int(model.elastic_joint.numpy()[0])
     q_start = int(model.joint_q_start.numpy()[owner_joint])
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=16)
+    solver = newton.solvers.SolverVBD(model, iterations=16)
     max_abs_q = 0.0
     for _ in range(40):
         solver.step(state_0, state_1, control, None, dt)
@@ -2822,7 +2864,7 @@ def test_elastic_free_fall_no_modal_force(test, device):
     test.assertLess(max_abs_q, 1.0e-3)
 
 
-def test_elastic_euler_modal_force(test, device):
+def _check_elastic_euler_modal_force(test, device, compliant: bool):
     length = 0.8
     n = 17
     xs = np.linspace(0.0, length, n, dtype=np.float32)
@@ -2866,18 +2908,7 @@ def test_elastic_euler_modal_force(test, device):
     coupling_centrifugal = np.array(basis.mode_coupling_centrifugal[0], dtype=np.float64)
 
     joint_k = 1.0e7
-    solver = newton.solvers.SolverVBD(
-        model,
-        rigid_compliant_alm=False,
-        iterations=24,
-        rigid_joint_linear_k_start=joint_k,
-        rigid_joint_angular_k_start=joint_k,
-        rigid_joint_linear_ke=joint_k,
-        rigid_joint_angular_ke=joint_k,
-        rigid_joint_linear_kd=0.0,
-        rigid_joint_angular_kd=0.0,
-        rigid_joint_adaptive_stiffness=False,
-    )
+    solver = _vbd_fixed_joint_solver(model, compliant=compliant, iterations=24, linear_k=joint_k, angular_k=joint_k)
     dt = 1.0 / 480.0
     alpha = 2.0
 
@@ -2907,6 +2938,13 @@ def test_elastic_euler_modal_force(test, device):
     np.testing.assert_allclose(q_final, q_expected, rtol=0.05, atol=1.0e-4)
 
 
+def test_elastic_euler_modal_force(test, device):
+    """Drive a bending mode with the Euler and centrifugal loads of a spin-up."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_elastic_euler_modal_force(test, device, compliant)
+
+
 def _elastic_free_joint_starts(model, body):
     joint_parent = model.joint_parent.numpy()
     joint_child = model.joint_child.numpy()
@@ -2916,7 +2954,7 @@ def _elastic_free_joint_starts(model, body):
     raise RuntimeError("no free joint")
 
 
-def test_elastic_centrifugal_modal_force(test, device):
+def _check_elastic_centrifugal_modal_force(test, device, compliant: bool):
     length = 1.0
     n = 21
     xs = np.linspace(0.0, length, n, dtype=np.float32)
@@ -2935,8 +2973,14 @@ def test_elastic_centrifugal_modal_force(test, device):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
+    # The frame mass must match the basis's lumped sample mass (1 kg). A lighter frame makes the reduced
+    # mass matrix indefinite; the solver then couples frame and modes explicitly, which diverges unless the
+    # clamp is effectively rigid (legacy hard joints hid this).
     beam = builder.add_body_elastic(
-        xform=wp.transform_identity(), mass=0.2, inertia=_identity_inertia(), modal_basis=basis
+        xform=wp.transform_identity(),
+        mass=float(np.sum(basis.sample_mass)),
+        inertia=_identity_inertia(),
+        modal_basis=basis,
     )
     builder.add_joint_fixed(
         parent=base, child=beam, parent_xform=wp.transform_identity(), child_xform=wp.transform_identity()
@@ -2951,7 +2995,7 @@ def test_elastic_centrifugal_modal_force(test, device):
     owner = int(model.elastic_joint.numpy()[0])
     q_index = int(model.joint_q_start.numpy()[owner]) + 7
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=24)
     dt = 1.0 / 240.0
     omega = 4.0
     velocities = {base: (wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, omega))}
@@ -2969,6 +3013,13 @@ def test_elastic_centrifugal_modal_force(test, device):
     expected = omega * omega * m_xx / stiffness
     test.assertGreater(q_final, 0.0)
     test.assertAlmostEqual(q_final, expected, delta=0.1 * expected)
+
+
+def test_elastic_centrifugal_modal_force(test, device):
+    """Stretch an axial mode by the centrifugal load of a steady spin."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_elastic_centrifugal_modal_force(test, device, compliant)
 
 
 def test_elastic_coriolis_modal_force(test, device):
@@ -3008,7 +3059,7 @@ def test_elastic_coriolis_modal_force(test, device):
         base_q_start, base_qd_start = _elastic_free_joint_starts(model, base)
         owner = int(model.elastic_joint.numpy()[0])
         q0_index = int(model.joint_q_start.numpy()[owner]) + 7
-        solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+        solver = newton.solvers.SolverVBD(model, iterations=24)
         dt = 1.0 / 240.0
         velocities = {base: (wp.vec3(0.0, 0.0, 0.0), wp.vec3(omega, 0.0, 0.0))}
         peak = 0.0
@@ -3067,7 +3118,7 @@ def test_elastic_frame_coupling_conserves_com(test, device):
     frame_z_index = q_start + 2
     mode_index = q_start + 7
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+    solver = newton.solvers.SolverVBD(model, iterations=24)
     dt = 1.0 / 240.0
 
     def frame_and_com():
@@ -3126,7 +3177,7 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
     frame_wy_index = qd_start + 4
     mode_vel_index = qd_start + 6
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+    solver = newton.solvers.SolverVBD(model, iterations=24)
     dt = 1.0 / 240.0
     max_total_h = 0.0
     max_frame_spin = 0.0
@@ -3186,7 +3237,7 @@ def test_elastic_frame_coupling_conserves_spinning_momentum(test, device):
     qd0[qd_start + 5] = spin
     state_0.joint_qd.assign(qd0)
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=24)
+    solver = newton.solvers.SolverVBD(model, iterations=24)
     dt = 1.0 / 240.0
 
     def true_com():
@@ -3259,7 +3310,7 @@ def test_vbd_revolute_uses_elastic_endpoint(test, device):
     np.testing.assert_allclose(state_1.body_q.numpy()[body, :3], [abs(rest_anchor) + eta, 0.0, 0.0], atol=1.0e-4)
 
 
-def test_vbd_revolute_constraint_solves_elastic_mode(test, device):
+def _check_vbd_revolute_constraint_solves_elastic_mode(test, device, compliant: bool):
     rest_anchor = -0.5
     target_anchor = 0.1
 
@@ -3293,19 +3344,27 @@ def test_vbd_revolute_constraint_solves_elastic_mode(test, device):
     owner_joint = int(model.elastic_joint.numpy()[0])
     q_start = int(model.joint_q_start.numpy()[owner_joint])
 
+    legacy = {} if compliant else {"rigid_joint_linear_k_start": 1.0e6}
     solver = newton.solvers.SolverVBD(
         model,
-        rigid_compliant_alm=False,
+        rigid_compliant_alm=compliant,
         iterations=4,
-        rigid_joint_linear_k_start=1.0e6,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_linear_kd=0.0,
+        **legacy,
     )
     solver.step(state_0, state_1, control, None, 0.01)
 
     np.testing.assert_allclose(state_1.joint_q.numpy()[q_start + 7], -target_anchor, atol=1.0e-4)
     after = _deformed_endpoint_world(model, state_1, joint, "child")
     np.testing.assert_allclose(after, [target_anchor, 0.0, 0.0], atol=1.0e-4)
+
+
+def test_vbd_revolute_constraint_solves_elastic_mode(test, device):
+    """Satisfy a revolute anchor by deforming the elastic endpoint of a kinematic frame."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_revolute_constraint_solves_elastic_mode(test, device, compliant)
 
 
 def test_vbd_fixed_joint_stiffness_pins_penalties(test, device):
@@ -3353,7 +3412,7 @@ def test_vbd_elastic_modal_force_matches_joint_projection(test, device):
     _assert_elastic_modal_projection_matches_joint_force(test, device, "revolute", elastic_side="parent")
 
 
-def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
+def _check_vbd_elastic_joint_assembles_one_coupled_block(test, device, compliant: bool):
     dt = 0.01
     joint_k = 1000.0
     frame_x = 0.1
@@ -3380,27 +3439,17 @@ def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
 
     state_0 = model.state()
     state_1 = model.state()
-    solver = newton.solvers.SolverVBD(
-        model,
-        rigid_compliant_alm=False,
-        iterations=1,
-        rigid_joint_linear_k_start=joint_k,
-        rigid_joint_angular_k_start=joint_k,
-        rigid_joint_linear_ke=joint_k,
-        rigid_joint_angular_ke=joint_k,
-        rigid_joint_linear_kd=0.0,
-        rigid_joint_angular_kd=0.0,
-        rigid_joint_adaptive_stiffness=False,
-    )
+    solver = _vbd_fixed_joint_solver(model, compliant=compliant, iterations=1, linear_k=joint_k, angular_k=joint_k)
     solver.step(state_0, state_1, model.control(), None, dt)
+    linear_k = _first_solve_joint_k(solver, 0, 0, joint_k, compliant)
 
     matrix_upper = solver.elastic_body_block_matrix.numpy()[0]
     matrix = np.triu(matrix_upper) + np.triu(matrix_upper, 1).T
     grad = solver.elastic_body_block_grad.numpy()[0]
     delta = solver.elastic_body_block_delta.numpy()[0]
-    expected_frame_diagonal = 3.0 / (dt * dt) + joint_k
-    expected_cross = 1.0 / (dt * dt) + joint_k
-    expected_modal_diagonal = 1.0 / (dt * dt) + joint_k
+    expected_frame_diagonal = 3.0 / (dt * dt) + linear_k
+    expected_cross = 1.0 / (dt * dt) + linear_k
+    expected_modal_diagonal = 1.0 / (dt * dt) + linear_k
 
     test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     np.testing.assert_allclose(matrix[0, 0], expected_frame_diagonal, rtol=1.0e-6)
@@ -3414,6 +3463,13 @@ def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
     solved_mode_q = float(state_1.joint_q.numpy()[q_start + 7])
     np.testing.assert_allclose(body_x, frame_x + delta[0], rtol=1.0e-6, atol=1.0e-7)
     np.testing.assert_allclose(solved_mode_q, mode_q + delta[6], rtol=1.0e-6, atol=1.0e-7)
+
+
+def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
+    """Assemble frame, modal, and frame-mode coupling rows of an elastic joint in one block."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_elastic_joint_assembles_one_coupled_block(test, device, compliant)
 
 
 def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
@@ -3431,9 +3487,7 @@ def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
     model = builder.finalize(device=device)
 
     with test.assertRaises(NotImplementedError):
-        newton.solvers.SolverVBD(
-            model, rigid_compliant_alm=False, iterations=1, integrate_with_external_rigid_solver=True
-        )
+        newton.solvers.SolverVBD(model, iterations=1, integrate_with_external_rigid_solver=True)
 
 
 def test_vbd_elastic_body_rejects_block_sparse_joints(test, device):
@@ -3452,9 +3506,7 @@ def test_vbd_elastic_body_rejects_block_sparse_joints(test, device):
     model = builder.finalize(device=device)
 
     with test.assertRaisesRegex(NotImplementedError, "block_sparse_joints"):
-        newton.solvers.SolverVBD(
-            model, rigid_compliant_alm=False, iterations=1, rigid_articulation_solve="block_sparse_joints"
-        )
+        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
 
 
 def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
@@ -3592,7 +3644,7 @@ def test_vbd_elastic_block_width_rejects_oversized_basis(test, device):
     model = builder.finalize(device=device)
 
     with test.assertRaises(ValueError) as raised:
-        newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=1)
+        newton.solvers.SolverVBD(model, iterations=1)
     test.assertIn("shared memory", str(raised.exception))
 
 
@@ -3665,74 +3717,87 @@ def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
     builder.color()
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=1)
+    solver = newton.solvers.SolverVBD(model, iterations=1)
     np.testing.assert_array_equal(solver.elastic_implicit_mass_coupling.numpy(), [False, True])
 
 
+def _craig_bampton_clamped_trajectory(device, *, iterations: int, compliant: bool) -> np.ndarray:
+    """Return 40 steps of modal coordinates of a Craig-Bampton body clamped at both interfaces."""
+    interface_positions, mass, stiffness, damping, sample_points, recovery, _ = _build_craig_bampton_test_data()
+    generator = newton.ModalGeneratorCraigBampton(
+        interface_positions=interface_positions,
+        interface_names=["left", "right"],
+        mass_matrix=mass,
+        stiffness_matrix=stiffness,
+        damping_matrix=damping,
+        sample_points=sample_points,
+        recovery_matrix=recovery,
+    )
+    basis = generator.build()
+    mode_qd = np.zeros(basis.mode_count, dtype=np.float32)
+    mode_qd[0] = 1.0
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(
+        mass=generator.mass,
+        com=wp.vec3(*generator.com),
+        inertia=wp.mat33(*generator.inertia.flatten()),
+        modal_basis=basis,
+        mode_qd=mode_qd,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Adding a FIXED joint.*", category=UserWarning)
+        for position in interface_positions:
+            xform = wp.transform(wp.vec3(*position), wp.quat_identity())
+            builder.add_joint_fixed(parent=-1, child=body, parent_xform=xform, child_xform=xform)
+    builder.color()
+    model = builder.finalize(device=device)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    control = model.control()
+    solver = _vbd_fixed_joint_solver(model, compliant=compliant, iterations=iterations, linear_k=1.0e6, angular_k=1.0e6)
+
+    owner_joint = int(model.elastic_joint.numpy()[0])
+    q_start = int(model.joint_q_start.numpy()[owner_joint]) + 7
+    trajectory = []
+    for _ in range(40):
+        solver.step(state_0, state_1, control, None, 1.0e-3)
+        state_0, state_1 = state_1, state_0
+        trajectory.append(state_0.joint_q.numpy()[q_start : q_start + basis.mode_count].copy())
+    return np.asarray(trajectory)
+
+
+def _relative_difference(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+
 def test_vbd_craig_bampton_coupled_solve_iteration_invariant(test, device):
-    def run(iterations: int) -> np.ndarray:
-        interface_positions, mass, stiffness, damping, sample_points, recovery, _ = _build_craig_bampton_test_data()
-        generator = newton.ModalGeneratorCraigBampton(
-            interface_positions=interface_positions,
-            interface_names=["left", "right"],
-            mass_matrix=mass,
-            stiffness_matrix=stiffness,
-            damping_matrix=damping,
-            sample_points=sample_points,
-            recovery_matrix=recovery,
-        )
-        basis = generator.build()
-        mode_qd = np.zeros(basis.mode_count, dtype=np.float32)
-        mode_qd[0] = 1.0
+    """Reproduce the same Craig-Bampton trajectory for one and eight coupled solves per step.
 
-        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        body = builder.add_body_elastic(
-            mass=generator.mass,
-            com=wp.vec3(*generator.com),
-            inertia=wp.mat33(*generator.inertia.flatten()),
-            modal_basis=basis,
-            mode_qd=mode_qd,
-        )
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Adding a FIXED joint.*", category=UserWarning)
-            for position in interface_positions:
-                xform = wp.transform(wp.vec3(*position), wp.quat_identity())
-                builder.add_joint_fixed(parent=-1, child=body, parent_xform=xform, child_xform=xform)
-        builder.color()
-        model = builder.finalize(device=device)
-
-        state_0 = model.state()
-        state_1 = model.state()
-        control = model.control()
-        solver = newton.solvers.SolverVBD(
-            model,
-            rigid_compliant_alm=False,
-            iterations=iterations,
-            rigid_joint_linear_k_start=1.0e6,
-            rigid_joint_angular_k_start=1.0e6,
-            rigid_joint_linear_ke=1.0e6,
-            rigid_joint_angular_ke=1.0e6,
-            rigid_joint_linear_kd=0.0,
-            rigid_joint_angular_kd=0.0,
-            rigid_joint_adaptive_stiffness=False,
-        )
-
-        owner_joint = int(model.elastic_joint.numpy()[0])
-        q_start = int(model.joint_q_start.numpy()[owner_joint]) + 7
-        trajectory = []
-        for _ in range(40):
-            solver.step(state_0, state_1, control, None, 1.0e-3)
-            state_0, state_1 = state_1, state_0
-            trajectory.append(state_0.joint_q.numpy()[q_start : q_start + basis.mode_count].copy())
-        return np.asarray(trajectory)
-
-    one_iteration = run(1)
-    eight_iterations = run(8)
-    relative_difference = np.linalg.norm(one_iteration - eight_iterations) / np.linalg.norm(eight_iterations)
-    test.assertLess(relative_difference, 5.0e-5)
+    Legacy AVBD only: with a fixed penalty and no multiplier updates each step is one linear solve, so
+    extra iterations must not change it. Compliant ALM updates its multipliers every iteration by
+    design; ``test_vbd_craig_bampton_coupled_solve_converges_compliant_alm`` covers that path.
+    """
+    one_iteration = _craig_bampton_clamped_trajectory(device, iterations=1, compliant=False)
+    eight_iterations = _craig_bampton_clamped_trajectory(device, iterations=8, compliant=False)
+    test.assertLess(_relative_difference(one_iteration, eight_iterations), 5.0e-5)
 
 
-def test_vbd_elastic_modal_joint_damping_projection(test, device):
+def test_vbd_craig_bampton_coupled_solve_converges_compliant_alm(test, device):
+    """Converge the clamped Craig-Bampton trajectory under compliant ALM to the legacy linear solve.
+
+    Compliant ALM carries part of each clamp reaction in multipliers, so one iteration differs from the
+    converged trajectory; more iterations must settle on the fixed-penalty answer.
+    """
+    legacy = _craig_bampton_clamped_trajectory(device, iterations=8, compliant=False)
+    converged = _craig_bampton_clamped_trajectory(device, iterations=_ALM_CONVERGED_ITERATIONS, compliant=True)
+    refined = _craig_bampton_clamped_trajectory(device, iterations=2 * _ALM_CONVERGED_ITERATIONS, compliant=True)
+    test.assertLess(_relative_difference(converged, refined), 5.0e-5)
+    test.assertLess(_relative_difference(converged, legacy), 5.0e-5)
+
+
+def _check_vbd_elastic_modal_joint_damping_projection(test, device, compliant: bool):
     dt = 0.01
     mode_mass = 1.0
     mode_qd = 0.5
@@ -3766,14 +3831,13 @@ def test_vbd_elastic_modal_joint_damping_projection(test, device):
 
     state_0 = model.state()
     state_1 = model.state()
-    solver = newton.solvers.SolverVBD(
+    solver = _vbd_fixed_joint_solver(
         model,
-        rigid_compliant_alm=False,
-        iterations=1,
-        rigid_joint_linear_k_start=joint_k,
-        rigid_joint_linear_ke=joint_k,
-        rigid_joint_linear_kd=joint_kd,
-        rigid_joint_adaptive_stiffness=False,
+        compliant=compliant,
+        iterations=_ALM_CONVERGED_ITERATIONS if compliant else 1,
+        linear_k=joint_k,
+        angular_k=0.0,
+        linear_kd=joint_kd,
     )
     solver.step(state_0, state_1, model.control(), None, dt)
 
@@ -3788,7 +3852,14 @@ def test_vbd_elastic_modal_joint_damping_projection(test, device):
     np.testing.assert_allclose(state_1.joint_q.numpy()[q_start + 7], q_expected, rtol=1.0e-6, atol=1.0e-7)
 
 
-def test_vbd_elastic_angular_constraint_without_linear_stiffness(test, device):
+def test_vbd_elastic_modal_joint_damping_projection(test, device):
+    """Project joint damping onto the modal velocity of an elastic endpoint."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_elastic_modal_joint_damping_projection(test, device, compliant)
+
+
+def _check_vbd_elastic_angular_constraint_without_linear_stiffness(test, device, compliant: bool):
     dt = 0.01
     mode_mass = 0.05
     mode_q = 0.3
@@ -3816,15 +3887,12 @@ def test_vbd_elastic_angular_constraint_without_linear_stiffness(test, device):
 
     state_0 = model.state()
     state_1 = model.state()
-    solver = newton.solvers.SolverVBD(
+    solver = _vbd_fixed_joint_solver(
         model,
-        rigid_compliant_alm=False,
-        iterations=1,
-        rigid_joint_linear_k_start=0.0,
-        rigid_joint_linear_ke=0.0,
-        rigid_joint_angular_k_start=angular_k,
-        rigid_joint_angular_ke=angular_k,
-        rigid_joint_adaptive_stiffness=False,
+        compliant=compliant,
+        iterations=_ALM_CONVERGED_ITERATIONS if compliant else 1,
+        linear_k=0.0,
+        angular_k=angular_k,
     )
     solver.step(state_0, state_1, model.control(), None, dt)
 
@@ -3834,7 +3902,14 @@ def test_vbd_elastic_angular_constraint_without_linear_stiffness(test, device):
     np.testing.assert_allclose(state_1.joint_q.numpy()[q_start], expected, rtol=1.0e-6, atol=1.0e-7)
 
 
-def test_vbd_rigid_angular_damping_includes_modal_velocity(test, device):
+def test_vbd_elastic_angular_constraint_without_linear_stiffness(test, device):
+    """Solve a fixed joint's angular row through endpoint rotation when the linear row is disabled."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_elastic_angular_constraint_without_linear_stiffness(test, device, compliant)
+
+
+def _check_vbd_rigid_angular_damping_includes_modal_velocity(test, device, compliant: bool):
     dt = 0.01
     angular_k = 100.0
 
@@ -3863,16 +3938,8 @@ def test_vbd_rigid_angular_damping_includes_modal_velocity(test, device):
 
         state_0 = model.state()
         state_1 = model.state()
-        solver = newton.solvers.SolverVBD(
-            model,
-            rigid_compliant_alm=False,
-            iterations=1,
-            rigid_joint_linear_k_start=0.0,
-            rigid_joint_linear_ke=0.0,
-            rigid_joint_angular_k_start=angular_k,
-            rigid_joint_angular_ke=angular_k,
-            rigid_joint_angular_kd=angular_kd,
-            rigid_joint_adaptive_stiffness=False,
+        solver = _vbd_fixed_joint_solver(
+            model, compliant=compliant, iterations=1, linear_k=0.0, angular_k=angular_k, angular_kd=angular_kd
         )
         solver.step(state_0, state_1, model.control(), None, dt)
         q = state_1.body_q.numpy()[parent, 3:7]
@@ -3887,7 +3954,14 @@ def test_vbd_rigid_angular_damping_includes_modal_velocity(test, device):
     )
 
 
-def test_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device):
+def test_vbd_rigid_angular_damping_includes_modal_velocity(test, device):
+    """React joint angular damping of an elastic endpoint's modal velocity on the rigid parent."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_rigid_angular_damping_includes_modal_velocity(test, device, compliant)
+
+
+def _check_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device, compliant: bool):
     dt = 0.01
     mode_mass = np.array([1.0, 1.0], dtype=np.float32)
     mode_q = np.array([0.6, 0.4], dtype=np.float32)
@@ -3916,17 +3990,9 @@ def test_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device):
 
     state_0 = model.state()
     state_1 = model.state()
-    solver = newton.solvers.SolverVBD(
-        model,
-        rigid_compliant_alm=False,
-        iterations=1,
-        rigid_joint_linear_k_start=1.0,
-        rigid_joint_linear_ke=1.0,
-        rigid_joint_angular_k_start=angular_k,
-        rigid_joint_angular_ke=angular_k,
-        rigid_joint_adaptive_stiffness=False,
-    )
+    solver = _vbd_fixed_joint_solver(model, compliant=compliant, iterations=1, linear_k=1.0, angular_k=angular_k)
     solver.step(state_0, state_1, model.control(), None, dt)
+    angular_k = _first_solve_joint_k(solver, 0, 1, angular_k, compliant)
 
     theta = psi.T @ mode_q
     projector = np.diag([0.0, 1.0, 1.0])
@@ -3936,6 +4002,13 @@ def test_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device):
     actual_hessian = solver.elastic_body_block_matrix.numpy()[0, 6:8, 6:8]
     np.testing.assert_allclose(actual_grad, expected_grad, rtol=5.0e-4, atol=2.0e-2)
     np.testing.assert_allclose(actual_hessian, expected_hessian, rtol=1.0e-5, atol=6.0e-2)
+
+
+def test_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device):
+    """Project an elastic endpoint's angular joint row through the exponential-map Jacobian."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_elastic_angular_projection_uses_exponential_jacobian(test, device, compliant)
 
 
 _REVOLUTE_ELASTIC_DT = 0.01
@@ -4218,7 +4291,7 @@ def test_fourbar_elastic_coupler_geometry(test, device):
     np.testing.assert_allclose(np.linalg.norm(p_bc_parent - p_ab_child), b_eff, atol=2.0e-6)
 
 
-def test_vbd_prismatic_rotates_elastic_child(test, device):
+def _check_vbd_prismatic_rotates_elastic_child(test, device, compliant: bool):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     inertia = wp.mat33(0.02, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.02)
     parent = builder.add_link(
@@ -4256,14 +4329,14 @@ def test_vbd_prismatic_rotates_elastic_child(test, device):
     joint_f[parent_qd_start] = 4.0
     control.joint_f.assign(joint_f)
 
+    legacy = {} if compliant else {"rigid_joint_linear_k_start": 1.0e5, "rigid_joint_angular_k_start": 1.0e5}
     solver = newton.solvers.SolverVBD(
         model,
-        rigid_compliant_alm=False,
+        rigid_compliant_alm=compliant,
         iterations=20,
-        rigid_joint_linear_k_start=1.0e5,
-        rigid_joint_angular_k_start=1.0e5,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_angular_ke=1.0e6,
+        **legacy,
     )
     for _ in range(60):
         solver.step(state_0, state_1, control, None, 1.0 / 180.0)
@@ -4275,6 +4348,13 @@ def test_vbd_prismatic_rotates_elastic_child(test, device):
     test.assertGreater(abs(parent_angle), 0.1)
     test.assertLess(_quat_angle_error(body_q[parent, 3:7], body_q[child, 3:7]), 1.0e-4)
     np.testing.assert_allclose(child_angle, parent_angle, atol=1.0e-4)
+
+
+def test_vbd_prismatic_rotates_elastic_child(test, device):
+    """Carry an elastic prismatic child around with its rotating parent."""
+    for compliant in _RIGID_ALM_MODES:
+        with test.subTest(rigid_compliant_alm=compliant):
+            _check_vbd_prismatic_rotates_elastic_child(test, device, compliant)
 
 
 def test_crank_slider_elastic_analytic_geometry(test, device):
@@ -5300,6 +5380,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_craig_bampton_coupled_solve_iteration_invariant",
         test_vbd_craig_bampton_coupled_solve_iteration_invariant,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_craig_bampton_coupled_solve_converges_compliant_alm",
+        test_vbd_craig_bampton_coupled_solve_converges_compliant_alm,
         devices=[device],
     )
     add_function_test(
