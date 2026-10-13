@@ -137,7 +137,7 @@ Setting the pinned column reproduces 8afa14fc BDF2 bit for bit. All switches are
 
 ## How to test this branch (external teams)
 
-Branch `vbd-bdf2-stability` is experimental and may receive one more commit before the final stamp. All configurations
+The published branch is `vbd-bdf2-prototype` (github.com/skulkar22/newton); it is experimental and not merged anywhere. All configurations
 below use the block-sparse articulation solve and compliant ALM, as the G1 studies did:
 
 ```python
@@ -188,6 +188,6 @@ Absolute positions and quaternions are float32. Their rounding (~1e-7 relative) 
 - **Accuracy:** passive double pendulum against an exact ODE solution, 30 s, several dt. Error must fall when dt shrinks; if it rises, look for rounded-pose differencing.
 - **Conservation:** free two-link body without gravity. COM drift and momentum should stay at µm / 1e-6 levels.
 - **Robots:** G1 smoke cases and a contact case.
-- **CUDA graphs:** capture after one eager step.
+- **CUDA graphs:** capture at construction is supported, before any step has run. Graph == eager must hold bitwise from step 1, including a `reset(world_mask)` between launches (`stability-runs/graph_check.py`: odd substep count with `State.assign`, chain, fixed-base G1, G1 with contacts under `RUN_TO_RUN`).
 
 The full study, its scripts and data live in the shared package `vbd-bdf2-prototype` (report.html, AGENTS.md, scripts/, data/).
