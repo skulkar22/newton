@@ -62,7 +62,7 @@ class Example:
             mode_specs=[
                 {
                     "type": newton.ModalGeneratorBeam.Mode.BENDING_Z,
-                    "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_TIP,
+                    "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_STATIC,
                 }
             ],
             sample_count=33,

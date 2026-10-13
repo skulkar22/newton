@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 
@@ -935,6 +935,64 @@ class ModalGeneratorSampled:
         )
 
 
+_DAMPING_PROJECTIONS = ("diagonal", "error")
+
+
+def _validate_damping_projection(damping_projection: str) -> str:
+    value = str(damping_projection)
+    if value not in _DAMPING_PROJECTIONS:
+        raise ValueError(f"damping_projection must be one of {_DAMPING_PROJECTIONS}, got '{value}'")
+    return value
+
+
+def _project_modal_damping(generator: Any, modal_damping: np.ndarray, source: str) -> np.ndarray:
+    """Reduce a projected modal damping matrix to its diagonal.
+
+    Records the off-diagonal ratio in ``generator.damping_off_diagonal_ratio``
+    before applying ``generator.damping_projection``.
+
+    Args:
+        generator: Generator providing ``damping_projection`` and
+            ``damping_coupling_tolerance``.
+        modal_damping: Damping matrix projected onto mass-normalized modes
+            [N s/m per modal coordinate], shape ``[mode_count, mode_count]``.
+        source: Generator name used in diagnostics.
+
+    Returns:
+        The non-negative diagonal modal damping [N s/m per modal coordinate].
+    """
+    tolerance = generator.damping_coupling_tolerance
+    modal_damping = 0.5 * (modal_damping + modal_damping.T)
+    diagonal = np.diag(modal_damping).copy()
+    generator.damping_off_diagonal_ratio = 0.0
+    if diagonal.shape[0] == 0:
+        return diagonal
+    off_diagonal = modal_damping - np.diag(diagonal)
+    diagonal_scale = max(float(np.max(np.abs(diagonal))), np.finfo(np.float64).eps)
+    ratio = float(np.max(np.abs(off_diagonal))) / diagonal_scale
+    generator.damping_off_diagonal_ratio = ratio
+    if ratio > tolerance:
+        message = (
+            f"{source} damping is not diagonal in the retained elastic modal basis "
+            f"(off-diagonal ratio {ratio:.3g} exceeds damping_coupling_tolerance {tolerance:.3g})"
+        )
+        if generator.damping_projection == "error":
+            raise ValueError(message)
+        warnings.warn(f"{message}; discarding the off-diagonal terms", stacklevel=3)
+    return _clamp_modal_diagonal(diagonal, tolerance * diagonal_scale, f"{source} damping", stacklevel=4)
+
+
+def _clamp_modal_diagonal(values: np.ndarray, tolerance: float, name: str, stacklevel: int = 3) -> np.ndarray:
+    """Clamp negative projected modal values to zero, warning beyond the roundoff ``tolerance``."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape[0] > 0 and float(np.min(values)) < -tolerance:
+        warnings.warn(
+            f"{name} has negative modal diagonal entries (minimum {float(np.min(values)):.3g}); clamping them to zero",
+            stacklevel=stacklevel,
+        )
+    return np.maximum(values, 0.0)
+
+
 class ModalGeneratorCraigBampton:
     """Build a Newton modal basis from Craig-Bampton reduced matrices.
 
@@ -942,14 +1000,19 @@ class ModalGeneratorCraigBampton:
     six DOFs per interface in ``[tx, ty, tz, rx, ry, rz]`` order, followed by
     any fixed-interface modes. A setup-time generalized eigensolve separates the
     six global rigid-body modes and transforms all remaining coordinates into
-    ``reduced_dof_count - 6`` mass-normalized elastic modes. The resulting modal
-    mass and stiffness are diagonal, so importing dense reduced matrices does not
-    add matrix bandwidth to Newton's runtime elastic solve.
+    ``reduced_dof_count - 6`` mass-normalized elastic modes. The eigensolve
+    diagonalizes the reduced mass and stiffness matrices exactly, so importing
+    dense reduced matrices does not add matrix bandwidth to Newton's runtime
+    elastic solve.
 
-    Because :class:`ModalBasis` stores diagonal structural damping, off-diagonal
-    entries in the transformed damping matrix are omitted with a warning. Modal,
-    Rayleigh, and other damping models diagonalized by the same modes remain
-    exact.
+    Damping is not part of the eigenproblem: ``damping_matrix`` is only projected
+    onto the elastic modes. Because :class:`ModalBasis` stores diagonal modal
+    damping, the off-diagonal part of the projected damping matrix is discarded
+    (``damping_projection="diagonal"``, with a warning above
+    ``damping_coupling_tolerance``) or rejected (``damping_projection="error"``).
+    The projection is exact only for damping that the undamped modes
+    diagonalize, such as modal or Rayleigh damping. :meth:`build` records the
+    measured coupling in ``damping_off_diagonal_ratio``.
 
     The reduced matrices determine the exact modal mass matrix, the rigid mass
     properties, and the rigid-to-modal linear and angular inertia coupling. They
@@ -980,13 +1043,18 @@ class ModalGeneratorCraigBampton:
             to ``interface_0``, ``interface_1``, and so on.
         rigid_mode_tolerance: Relative eigenvalue tolerance used to identify the
             six global rigid-body modes and reject additional zero-energy modes.
-        damping_coupling_tolerance: Relative off-diagonal damping magnitude above
-            which the diagonal approximation emits a warning.
+        damping_coupling_tolerance: Relative off-diagonal damping magnitude,
+            measured against the largest diagonal entry, above which
+            ``damping_projection`` warns or raises.
         label: Optional basis label.
         sample_mass: Optional lumped mass [kg] for each recovery sample point,
             shape ``[sample_count]``. Enables the centrifugal, Coriolis, and
             mode-pair inertia integrals of the returned basis. Interface frames
             appended as extra samples receive zero mass.
+        damping_projection: How to reduce the projected modal damping matrix to
+            the diagonal damping stored by :class:`ModalBasis`. ``"diagonal"``
+            discards off-diagonal terms, warning when their relative magnitude
+            exceeds ``damping_coupling_tolerance``; ``"error"`` raises instead.
     """
 
     def __init__(
@@ -1003,6 +1071,7 @@ class ModalGeneratorCraigBampton:
         label: str | None = None,
         *,
         sample_mass: Sequence[float] | np.ndarray | None = None,
+        damping_projection: str = "diagonal",
     ):
         self.interface_positions = np.asarray(interface_positions, dtype=np.float64)
         if self.interface_positions.ndim != 2 or self.interface_positions.shape[1] != 3:
@@ -1070,6 +1139,7 @@ class ModalGeneratorCraigBampton:
         self.damping_coupling_tolerance = float(damping_coupling_tolerance)
         if self.damping_coupling_tolerance < 0.0:
             raise ValueError(f"damping_coupling_tolerance must be non-negative, got {self.damping_coupling_tolerance}")
+        self.damping_projection = _validate_damping_projection(damping_projection)
         self.label = label
 
         self.fixed_interface_mode_count = self.reduced_dof_count - self.interface_dof_count
@@ -1191,28 +1261,13 @@ class ModalGeneratorCraigBampton:
         modal_mass = modal_matrix.T @ mass @ modal_matrix
         modal_stiffness = modal_matrix.T @ stiffness @ modal_matrix
         mode_mass = np.diag(modal_mass)
-        mode_stiffness = np.maximum(np.diag(modal_stiffness), 0.0)
+        mode_stiffness = _clamp_modal_diagonal(np.diag(modal_stiffness), rigid_threshold, "Craig-Bampton stiffness")
 
         if damping is None:
             mode_damping = np.zeros(self.mode_count, dtype=np.float64)
             self.damping_off_diagonal_ratio = 0.0
         else:
-            modal_damping = modal_matrix.T @ damping @ modal_matrix
-            modal_damping = 0.5 * (modal_damping + modal_damping.T)
-            diagonal = np.diag(modal_damping)
-            off_diagonal = modal_damping - np.diag(diagonal)
-            if self.mode_count == 0:
-                self.damping_off_diagonal_ratio = 0.0
-            else:
-                diagonal_scale = max(float(np.max(np.abs(diagonal))), np.finfo(np.float64).eps)
-                self.damping_off_diagonal_ratio = float(np.max(np.abs(off_diagonal))) / diagonal_scale
-            if self.damping_off_diagonal_ratio > self.damping_coupling_tolerance:
-                warnings.warn(
-                    "Craig-Bampton damping is not diagonal in the retained elastic modal basis; "
-                    f"discarding off-diagonal terms with relative magnitude {self.damping_off_diagonal_ratio:.3g}",
-                    stacklevel=2,
-                )
-            mode_damping = np.maximum(diagonal, 0.0)
+            mode_damping = _project_modal_damping(self, modal_matrix.T @ damping @ modal_matrix, "Craig-Bampton")
 
         sample_rigid = np.hstack(
             (
@@ -1441,6 +1496,25 @@ class ModalGeneratorFEM:
     ``K phi = lambda M phi`` on translational nodal DOFs, mass-normalizes the
     selected eigenvectors, and returns a sampled :class:`ModalBasis`.
 
+    Rigid-body modes are identified by their mass-weighted overlap with the
+    analytic rigid-body translations and rotations of the nodes, not by
+    eigenvalue magnitude, so they are removed reliably even when roundoff lifts
+    their eigenvalues for stiff materials. A free-free model (no fixed DOFs by
+    default) must contain exactly one rigid-body mode per independent rigid
+    motion, normally six. A constrained model must not retain any zero-energy
+    mode. Remaining zero-energy mechanisms are rejected unless they are skipped
+    deliberately with ``discard_mode_count``.
+
+    Damping is not part of the eigenproblem. ``damping_matrix`` is projected onto
+    the selected modes and only its diagonal is stored; see
+    ``damping_projection``.
+
+    After :meth:`build`, ``rigid_mode_count`` and ``rigid_modal_matrix``
+    (``[3 * node_count, rigid_mode_count]``, mass-orthonormal rigid-body nodal
+    motions; empty for constrained models) describe the removed rigid-body
+    subspace, and ``damping_off_diagonal_ratio`` records the discarded damping
+    coupling.
+
     Args:
         node_positions: Rest node positions [m], shape ``[node_count, 3]``.
         mass_matrix: Nodal mass matrix [kg], shape
@@ -1454,20 +1528,32 @@ class ModalGeneratorFEM:
         sample_node_indices: Optional node index for each sample point. When
             provided, sample values are copied exactly from those FEM nodes.
             Otherwise values are interpolated from nodal modes.
-        mode_count: Number of modes to retain.
+        mode_count: Number of elastic modes to retain.
         fixed_node_indices: Nodes whose translational DOFs are fixed during the
             eigen solve. Their modal displacement is zero in the returned basis.
         fixed_dof_indices: Individual nodal DOF indices fixed during the solve.
-        discard_mode_count: Number of lowest eigenmodes to skip. Use this to
-            drop rigid modes in free-free models.
-        eigenvalue_tolerance: Minimum eigenvalue [1/s^2] retained after fixed
-            DOFs and discarded modes are removed.
+        discard_mode_count: Number of lowest elastic modes to skip after
+            rigid-body modes have been removed; rigid modes of free-free models
+            are detected automatically.
+        eigenvalue_tolerance: Relative eigenvalue threshold, scaled by
+            ``max(max |lambda|, 1)``, below which a non-rigid mode is treated as
+            a zero-energy mechanism.
         damping_ratio: Modal damping ratio used when ``damping_matrix`` is not
             provided.
         derive_psi: Whether to estimate angular mode samples from the
             displacement gradient of the nodal modes, enabling joint rotational
             coupling.
         label: Optional basis label.
+        free_free: Whether the model is an unconstrained free body whose
+            rigid-body modes must be removed. ``None`` treats the model as
+            free-free when no DOFs are fixed. A free-free stiffness matrix must
+            annihilate rigid-body motion.
+        damping_projection: How to reduce the projected modal damping matrix to
+            the diagonal damping stored by :class:`ModalBasis`. ``"diagonal"``
+            discards off-diagonal terms, warning when their relative magnitude
+            exceeds ``damping_coupling_tolerance``; ``"error"`` raises instead.
+        damping_coupling_tolerance: Relative off-diagonal damping magnitude
+            allowed before ``damping_projection`` warns or raises.
     """
 
     def __init__(
@@ -1486,7 +1572,12 @@ class ModalGeneratorFEM:
         damping_ratio: float = 0.0,
         derive_psi: bool = False,
         label: str | None = None,
+        *,
+        free_free: bool | None = None,
+        damping_projection: str = "diagonal",
+        damping_coupling_tolerance: float = 1.0e-5,
     ):
+        self._node_positions64 = np.asarray(node_positions, dtype=np.float64)
         self.node_positions = np.asarray(node_positions, dtype=np.float32)
         if self.node_positions.ndim != 2 or self.node_positions.shape[1] != 3:
             raise ValueError(f"node_positions must have shape [node_count, 3], got {self.node_positions.shape}")
@@ -1542,13 +1633,26 @@ class ModalGeneratorFEM:
         if self.discard_mode_count < 0:
             raise ValueError(f"discard_mode_count must be non-negative, got {self.discard_mode_count}")
         self.eigenvalue_tolerance = float(eigenvalue_tolerance)
+        if self.eigenvalue_tolerance < 0.0:
+            raise ValueError(f"eigenvalue_tolerance must be non-negative, got {self.eigenvalue_tolerance}")
         self.damping_ratio = float(damping_ratio)
         self.derive_psi = bool(derive_psi)
         self.label = label
 
+        self.free_free = self.fixed_dof_indices.shape[0] == 0 if free_free is None else bool(free_free)
+        if self.free_free and self.fixed_dof_indices.shape[0] > 0:
+            raise ValueError("free_free=True cannot be combined with fixed nodes or DOFs")
+        self.damping_projection = _validate_damping_projection(damping_projection)
+        self.damping_coupling_tolerance = float(damping_coupling_tolerance)
+        if self.damping_coupling_tolerance < 0.0:
+            raise ValueError(f"damping_coupling_tolerance must be non-negative, got {self.damping_coupling_tolerance}")
+
         self.eigenvalues = np.zeros(0, dtype=np.float64)
         self.frequencies = np.zeros(0, dtype=np.float64)
         self.modal_matrix = np.zeros((self.dof_count, 0), dtype=np.float64)
+        self.rigid_mode_count = 0
+        self.rigid_modal_matrix = np.zeros((self.dof_count, 0), dtype=np.float64)
+        self.damping_off_diagonal_ratio = 0.0
 
     @staticmethod
     def _coerce_square_matrix(matrix: Sequence[Sequence[float]] | np.ndarray, size: int, name: str) -> np.ndarray:
@@ -1557,8 +1661,45 @@ class ModalGeneratorFEM:
             raise ValueError(f"{name} must have shape ({size}, {size}), got {array.shape}")
         return 0.5 * (array + array.T)
 
+    def _rigid_vectors(self) -> np.ndarray:
+        """Return nodal rigid translations and rotations about the mass center, shape ``[dof_count, 6]``."""
+        positions = self._node_positions64
+        translation = np.tile(np.eye(3, dtype=np.float64), (self.node_count, 1))
+        total_mass = float(np.trace(translation.T @ self.mass_matrix @ translation)) / 3.0
+        if total_mass > 0.0:
+            center = (translation.T @ self.mass_matrix @ positions.reshape(-1)) / total_mass
+        else:
+            center = np.mean(positions, axis=0)
+        rigid = np.zeros((self.dof_count, 6), dtype=np.float64)
+        rigid[:, :3] = translation
+        for axis in range(3):
+            unit = np.zeros(3, dtype=np.float64)
+            unit[axis] = 1.0
+            rigid[:, 3 + axis] = np.cross(unit, positions - center).reshape(-1)
+        return rigid
+
+    @staticmethod
+    def _mass_orthonormal_columns(vectors: np.ndarray, mass: np.ndarray) -> np.ndarray:
+        """Return an ``M``-orthonormal basis of the column span of ``vectors``, dropping dependent directions."""
+        gram = vectors.T @ mass @ vectors
+        gram = 0.5 * (gram + gram.T)
+        values, rotation = np.linalg.eigh(gram)
+        scale = max(float(np.max(np.abs(values))), np.finfo(np.float64).tiny)
+        keep = values > 1.0e-10 * scale
+        return vectors @ (rotation[:, keep] / np.sqrt(values[keep]))
+
     def build(self) -> ModalBasis:
-        """Build a sampled modal basis."""
+        """Build a sampled modal basis.
+
+        Returns:
+            The sampled modal basis of the selected elastic modes.
+
+        Raises:
+            ValueError: If the mass matrix is not positive definite on the free
+                DOFs, a free-free stiffness matrix does not preserve rigid-body
+                motion, the rigid-body mode count is inconsistent, zero-energy
+                mechanisms remain, or projected damping coupling is rejected.
+        """
         free_dofs = np.ones(self.dof_count, dtype=bool)
         free_dofs[self.fixed_dof_indices] = False
         free = np.nonzero(free_dofs)[0]
@@ -1579,37 +1720,99 @@ class ModalGeneratorFEM:
         order = np.argsort(eigenvalues)
         eigenvalues = eigenvalues[order]
         eigenvectors = eigenvectors[:, order]
+        eigen_modes = np.linalg.solve(chol.T, eigenvectors)
+        eigenvalue_scale = max(float(np.max(np.abs(eigenvalues))), 1.0)
+        zero_threshold = self.eigenvalue_tolerance * eigenvalue_scale
 
-        valid = eigenvalues > self.eigenvalue_tolerance
-        valid_indices = np.nonzero(valid)[0]
-        if self.discard_mode_count:
-            valid_indices = valid_indices[self.discard_mode_count :]
+        rigid_free = self._rigid_vectors()[free]
+        rigid_basis = self._mass_orthonormal_columns(rigid_free, mass)
+        zero_indices = np.nonzero(eigenvalues <= zero_threshold)[0]
+        if zero_indices.shape[0] > 1:
+            # Rigid modes and mechanisms share one degenerate zero-energy eigenspace, in which the
+            # eigensolver returns arbitrary mixtures. Rotate that subspace so leading vectors align
+            # with rigid-body motion before the per-mode overlap test.
+            zero_modes = eigen_modes[:, zero_indices]
+            _, _, alignment = np.linalg.svd(rigid_basis.T @ mass @ zero_modes)
+            zero_modes = zero_modes @ alignment.T
+            eigen_modes[:, zero_indices] = zero_modes
+            eigenvalues[zero_indices] = np.einsum("di,de,ei->i", zero_modes, stiffness, zero_modes)
+        rigid_overlap = np.sum((rigid_basis.T @ (mass @ eigen_modes)) ** 2, axis=0)
+        if self.free_free:
+            stiffness_scale = max(float(np.linalg.norm(stiffness, ord=np.inf)), 1.0)
+            rigid_scale = max(float(np.linalg.norm(rigid_free, ord=np.inf)), 1.0)
+            rigid_stiffness_ratio = float(np.linalg.norm(stiffness @ rigid_free, ord=np.inf)) / (
+                stiffness_scale * rigid_scale
+            )
+            if rigid_stiffness_ratio > 1.0e-7:
+                raise ValueError(
+                    "The free-free stiffness_matrix does not preserve rigid-body motion "
+                    f"(relative residual {rigid_stiffness_ratio:.3g}); fix the stiffness model or "
+                    "constrain the model with fixed_node_indices or fixed_dof_indices"
+                )
+            rigid_mask = rigid_overlap > 0.5
+            expected_rigid_count = int(rigid_basis.shape[1])
+            if int(np.count_nonzero(rigid_mask)) != expected_rigid_count:
+                raise ValueError(
+                    f"Expected {expected_rigid_count} rigid-body modes in the free-free model, identified "
+                    f"{int(np.count_nonzero(rigid_mask))}; check that mass_matrix and stiffness_matrix describe a "
+                    "single connected body"
+                )
+        else:
+            rigid_mask = np.zeros(eigenvalues.shape[0], dtype=bool)
+
+        elastic_indices = np.nonzero(~rigid_mask)[0]
+        mechanism = eigenvalues[elastic_indices] <= zero_threshold
+        mechanism_count = int(np.count_nonzero(mechanism))
+        if mechanism_count > self.discard_mode_count:
+            if not self.free_free and np.any(rigid_overlap[elastic_indices[mechanism]] > 0.5):
+                raise ValueError(
+                    f"The constrained model has {mechanism_count} zero-energy modes dominated by rigid-body motion; "
+                    "the fixed nodes or DOFs do not remove all rigid-body motion. Fix more DOFs, or build an "
+                    "unconstrained body with free_free=True"
+                )
+            raise ValueError(
+                f"The model has {mechanism_count} zero-energy mechanism modes with eigenvalues at or below "
+                f"{zero_threshold:.3g} 1/s^2 (relative tolerance {self.eigenvalue_tolerance:.3g}); fix the "
+                f"stiffness model, or set discard_mode_count >= {mechanism_count} to drop them deliberately"
+            )
+
+        valid_indices = elastic_indices[self.discard_mode_count :]
         if self.mode_count is not None:
             valid_indices = valid_indices[: self.mode_count]
         if valid_indices.shape[0] == 0:
             raise ValueError("No eigenmodes remain after filtering")
 
-        free_modes = np.linalg.solve(chol.T, eigenvectors[:, valid_indices])
+        free_modes = eigen_modes[:, valid_indices]
         full_modes = np.zeros((self.dof_count, valid_indices.shape[0]), dtype=np.float64)
         full_modes[free, :] = free_modes
 
         mode_mass = np.zeros(valid_indices.shape[0], dtype=np.float64)
-        mode_stiffness = np.zeros(valid_indices.shape[0], dtype=np.float64)
-        mode_damping = np.zeros(valid_indices.shape[0], dtype=np.float64)
         for i in range(valid_indices.shape[0]):
             phi = full_modes[:, i]
             modal_mass = float(phi @ self.mass_matrix @ phi)
             if modal_mass <= 0.0:
                 raise ValueError(f"Mode {i} has non-positive modal mass {modal_mass}")
-            scale = 1.0 / math.sqrt(modal_mass)
-            full_modes[:, i] *= scale
+            full_modes[:, i] *= 1.0 / math.sqrt(modal_mass)
             phi = full_modes[:, i]
             mode_mass[i] = float(phi @ self.mass_matrix @ phi)
-            mode_stiffness[i] = max(float(phi @ self.stiffness_matrix @ phi), 0.0)
-            if self.damping_matrix is not None:
-                mode_damping[i] = max(float(phi @ self.damping_matrix @ phi), 0.0)
-            elif self.damping_ratio > 0.0:
-                mode_damping[i] = 2.0 * self.damping_ratio * math.sqrt(mode_mass[i] * mode_stiffness[i])
+        mode_stiffness = _clamp_modal_diagonal(
+            np.einsum("di,de,ei->i", full_modes, self.stiffness_matrix, full_modes),
+            zero_threshold,
+            "FEM stiffness",
+        )
+        if self.damping_matrix is not None:
+            mode_damping = _project_modal_damping(self, full_modes.T @ self.damping_matrix @ full_modes, "FEM")
+        else:
+            self.damping_off_diagonal_ratio = 0.0
+            mode_damping = np.zeros(valid_indices.shape[0], dtype=np.float64)
+            if self.damping_ratio > 0.0:
+                mode_damping = 2.0 * self.damping_ratio * np.sqrt(mode_mass * mode_stiffness)
+
+        rigid_modal_matrix = np.zeros((self.dof_count, rigid_basis.shape[1] if self.free_free else 0))
+        if self.free_free:
+            rigid_modal_matrix[free, :] = rigid_basis
+        self.rigid_mode_count = int(rigid_modal_matrix.shape[1])
+        self.rigid_modal_matrix = rigid_modal_matrix
 
         nodal_phi = np.transpose(full_modes.reshape((self.node_count, 3, -1)), (0, 2, 1))
         nodal_psi = _estimate_sample_psi(self.node_positions, nodal_phi) if self.derive_psi else None
@@ -1690,17 +1893,93 @@ class ModalGeneratorFEM:
         return mass, com, inertia
 
 
+# Roots of ``cos(x) cosh(x) = -1``: clamped-free Euler-Bernoulli eigenvalues ``beta_n L``.
+_CANTILEVER_BETA_L = (
+    1.8751040687119611,
+    4.6940911329741746,
+    7.8547574382376126,
+    10.995540734875467,
+    14.137168391046471,
+)
+
+
+def _cantilever_beta_l(order: int) -> float:
+    """Return the clamped-free bending eigenvalue ``beta_n L`` of 1-based ``order``."""
+    if order <= len(_CANTILEVER_BETA_L):
+        return _CANTILEVER_BETA_L[order - 1]
+    x = (float(order) - 0.5) * math.pi
+    # Newton iterations on cos(x) + 1 / cosh(x) = 0, written without overflow for large x.
+    for _ in range(4):
+        decay = math.exp(-x)
+        sech = 2.0 * decay / (1.0 + decay * decay)
+        tanh = (1.0 - decay * decay) / (1.0 + decay * decay)
+        x -= (math.cos(x) + sech) / (-math.sin(x) - tanh * sech)
+    return x
+
+
+def _cantilever_eigenfunction(s: np.ndarray, beta_l: float, length: float) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate an un-normalized clamped-free bending eigenfunction and its slope.
+
+    ``W(s) = cosh(beta s) - cos(beta s) - sigma (sinh(beta s) - sin(beta s))`` with
+    ``sigma = (cosh(beta L) + cos(beta L)) / (sinh(beta L) + sin(beta L))``.
+    The growing hyperbolic terms nearly cancel for high orders, so
+    ``cosh(x) - sigma sinh(x)`` is evaluated as
+    ``((1 - sigma) exp(x) + (1 + sigma) exp(-x)) / 2`` with ``(1 - sigma) exp(x)``
+    formed from ``exp(x - beta L)``.
+
+    Args:
+        s: Arc-length coordinates from the clamped root [m].
+        beta_l: Dimensionless eigenvalue ``beta L``.
+        length: Beam length [m].
+
+    Returns:
+        ``(W, dW/ds)`` evaluated at ``s``, with ``W(L) = 2 (-1)^(n + 1)``.
+    """
+    beta = beta_l / length
+    decay = math.exp(-beta_l)
+    sin_l = math.sin(beta_l)
+    cos_l = math.cos(beta_l)
+    denominator = 1.0 - decay * decay + 2.0 * decay * sin_l
+    sigma = (1.0 + decay * decay + 2.0 * decay * cos_l) / denominator
+    # (1 - sigma) exp(beta L) and (1 + sigma), both of order one.
+    grow_coefficient = 2.0 * (sin_l - cos_l - decay) / denominator
+    decay_coefficient = 2.0 * (1.0 + decay * (sin_l + cos_l)) / denominator
+
+    x = beta * np.asarray(s, dtype=np.float64)
+    grow = grow_coefficient * np.exp(x - beta_l)
+    shrink = decay_coefficient * np.exp(-x)
+    w = 0.5 * (grow + shrink) - np.cos(x) + sigma * np.sin(x)
+    dw = beta * (0.5 * (grow - shrink) + np.sin(x) + sigma * np.cos(x))
+    return w, dw
+
+
 class ModalGeneratorBeam:
     """Build sampled linear modes for a straight Euler-Bernoulli beam.
 
-    The beam lies along local ``x`` with its midpoint at the body origin.
+    The beam lies along local ``x`` with its midpoint at the body origin. Fixed
+    (clamped) boundaries are at the root ``x = -length / 2``; arc length
+    ``s = x + length / 2`` runs from the root to the free tip. Cantilever and
+    fixed-free modes are normalized to unit tip deflection or rotation;
+    pinned-pinned and linear modes have unit peak amplitude. Modal masses and
+    stiffnesses are the exact Euler-Bernoulli centerline integrals of each shape
+    for the uniform section; cross-section rotary inertia is neglected.
+
+    Mode specifications are dictionaries with a ``type`` from :class:`Mode` and
+    optional ``order`` (1-based, default ``1``) and ``boundary`` from
+    :class:`Boundary`. Supported combinations:
+
+    - Bending: ``CANTILEVER_TIP`` (default), ``CANTILEVER_STATIC`` (order 1 only),
+      and ``PINNED_PINNED``.
+    - Torsion: ``FIXED_FREE`` (default) and ``LINEAR``.
+    - Axial: ``LINEAR`` (default, order 1 only) and ``FIXED_FREE``.
 
     Args:
         length: Beam length [m].
         half_width_y: Half width in local ``y`` [m].
         half_width_z: Half width in local ``z`` [m].
-        mode_specs: Sequence of mode dictionaries. Supported ``type`` values are
-            ``"axial"``, ``"bending_y"``, ``"bending_z"``, and ``"torsion"``.
+        mode_specs: Sequence of mode dictionaries, or bare mode type names. Supported
+            ``type`` values are ``"axial"``, ``"bending_y"``, ``"bending_z"``, and
+            ``"torsion"``.
         sample_count: Number of samples along the beam length.
         density: Density [kg/m^3].
         young_modulus: Young's modulus [Pa].
@@ -1722,12 +2001,35 @@ class ModalGeneratorBeam:
         TORSION = "torsion"
 
     class Boundary:
-        """Beam boundary names used by mode specifications."""
+        """Beam boundary names used by mode specifications.
+
+        Attributes:
+            PINNED_PINNED: Bending ``sin(n pi s / L)``, simply supported at both ends.
+            CANTILEVER_TIP: Clamped-free Euler-Bernoulli bending eigenfunctions
+                ``cosh(beta s) - cos(beta s) - sigma (sinh(beta s) - sin(beta s))``
+                for every order, with zero root deflection and slope and unit tip
+                deflection. The modes are mass- and stiffness-orthogonal.
+            CANTILEVER_STATIC: Order-1 static tip-load bending shape
+                ``s^2 (3 L - s) / (2 L^3)``. Its stiffness ``3 E I / L^3`` reproduces
+                the exact static tip-load deflection; its modal mass is
+                ``33 rho A L / 140``.
+            FIXED_FREE: Torsion or axial ``sin((n - 1/2) pi s / L)``, fixed at the root.
+            LINEAR: Axial stretch ``x / L`` about the midpoint (order 1 only), or
+                torsion ``(s / L)^n``.
+        """
 
         PINNED_PINNED = "pinned-pinned"
         CANTILEVER_TIP = "cantilever-tip"
+        CANTILEVER_STATIC = "cantilever-static"
         FIXED_FREE = "fixed-free"
         LINEAR = "linear"
+
+    _SUPPORTED_BOUNDARIES: ClassVar[dict[str, tuple[str, ...]]] = {
+        Mode.AXIAL: (Boundary.LINEAR, Boundary.FIXED_FREE),
+        Mode.BENDING_Y: (Boundary.CANTILEVER_TIP, Boundary.CANTILEVER_STATIC, Boundary.PINNED_PINNED),
+        Mode.BENDING_Z: (Boundary.CANTILEVER_TIP, Boundary.CANTILEVER_STATIC, Boundary.PINNED_PINNED),
+        Mode.TORSION: (Boundary.FIXED_FREE, Boundary.LINEAR),
+    }
 
     def __init__(
         self,
@@ -1773,16 +2075,27 @@ class ModalGeneratorBeam:
         self.damping_ratio = float(damping_ratio)
         self.label = label
 
-    @staticmethod
-    def _coerce_mode_spec(spec: dict[str, Any] | str) -> dict[str, Any]:
-        if isinstance(spec, str):
-            return {"type": spec}
-        result = dict(spec)
+    @classmethod
+    def _coerce_mode_spec(cls, spec: dict[str, Any] | str) -> dict[str, Any]:
+        result = {"type": spec} if isinstance(spec, str) else dict(spec)
         if "type" not in result:
             raise ValueError("Each beam mode spec must include a 'type' value")
+        mode_type = str(result["type"])
+        if mode_type not in cls._SUPPORTED_BOUNDARIES:
+            raise ValueError(f"Unsupported beam mode type '{mode_type}'")
         order = int(result.get("order", 1))
         if order < 1:
             raise ValueError(f"Beam mode order must be at least 1, got {order}")
+        boundary = str(result.get("boundary", cls._default_boundary(mode_type)))
+        if boundary not in cls._SUPPORTED_BOUNDARIES[mode_type]:
+            raise ValueError(f"Unsupported boundary '{boundary}' for beam mode type '{mode_type}'")
+        if order > 1 and boundary == cls.Boundary.CANTILEVER_STATIC:
+            raise ValueError(
+                "The cantilever-static bending shape supports only order 1; use the cantilever-tip "
+                "eigenfunctions for higher orders"
+            )
+        if order > 1 and mode_type == cls.Mode.AXIAL and boundary == cls.Boundary.LINEAR:
+            raise ValueError("The linear axial shape supports only order 1; use the fixed-free axial boundary")
         return result
 
     def build(self, sample_points: Sequence[Sequence[float]] | np.ndarray | None = None) -> ModalBasis:
@@ -1800,13 +2113,7 @@ class ModalGeneratorBeam:
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError(f"sample_points must have shape [sample_count, 3], got {points.shape}")
 
-        sample_phi = np.zeros((points.shape[0], len(self.mode_specs), 3), dtype=np.float32)
-        sample_psi = np.zeros((points.shape[0], len(self.mode_specs), 3), dtype=np.float32)
-        for sample_index, point in enumerate(points):
-            for mode_index, spec in enumerate(self.mode_specs):
-                phi, psi = self._evaluate_mode(spec, point)
-                sample_phi[sample_index, mode_index] = phi
-                sample_psi[sample_index, mode_index] = psi
+        sample_phi, sample_psi = self._evaluate_modes(points)
 
         mode_mass = np.zeros(len(self.mode_specs), dtype=np.float32)
         mode_stiffness = np.zeros(len(self.mode_specs), dtype=np.float32)
@@ -1822,8 +2129,8 @@ class ModalGeneratorBeam:
 
         return ModalBasis(
             sample_points=points,
-            sample_phi=sample_phi,
-            sample_psi=sample_psi,
+            sample_phi=sample_phi.astype(np.float32),
+            sample_psi=sample_psi.astype(np.float32),
             mode_mass=mode_mass,
             mode_stiffness=mode_stiffness,
             mode_damping=mode_damping,
@@ -1853,61 +2160,104 @@ class ModalGeneratorBeam:
                 points.append((float(x), y, z))
         return np.asarray(points, dtype=np.float32)
 
+    def _evaluate_modes(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Evaluate every configured mode at body-local points.
+
+        Args:
+            points: Body-local points [m], shape ``[point_count, 3]``.
+
+        Returns:
+            ``(phi, psi)`` in float64, each with shape ``[point_count, mode_count, 3]``:
+            translational mode values [m per modal coordinate] and body-local
+            infinitesimal rotations [rad per modal coordinate].
+        """
+        points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        phi = np.zeros((points.shape[0], len(self.mode_specs), 3), dtype=np.float64)
+        psi = np.zeros_like(phi)
+        for mode_index, spec in enumerate(self.mode_specs):
+            phi[:, mode_index], psi[:, mode_index] = self._evaluate_mode_points(spec, points)
+        return phi, psi
+
     def _evaluate_mode(self, spec: dict[str, Any], point: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        phi, psi = self._evaluate_mode_points(spec, np.asarray(point, dtype=np.float64).reshape((1, 3)))
+        return phi[0].astype(np.float32), psi[0].astype(np.float32)
+
+    def _evaluate_mode_points(self, spec: dict[str, Any], points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mode_type = str(spec["type"])
         order = int(spec.get("order", 1))
         boundary = str(spec.get("boundary", self._default_boundary(mode_type)))
-        x = float(point[0])
-        y = float(point[1])
-        z = float(point[2])
-        s = min(max(x + 0.5 * self.length, 0.0), self.length)
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+        s = np.clip(x + 0.5 * self.length, 0.0, self.length)
+        zero = np.zeros_like(x)
+        phi = np.zeros((points.shape[0], 3), dtype=np.float64)
+        psi = np.zeros_like(phi)
 
         if mode_type == self.Mode.AXIAL:
-            phi = np.array([x / self.length, 0.0, 0.0], dtype=np.float32)
-            return phi, np.zeros(3, dtype=np.float32)
+            if boundary == self.Boundary.LINEAR:
+                phi[:, 0] = x / self.length
+            else:
+                phi[:, 0], _ = self._fixed_free_shape(s, order)
+            return phi, psi
 
         if mode_type == self.Mode.BENDING_Y:
-            phi, slope = self._bending_shape(s, order, boundary)
-            return np.array([-y * slope, phi, 0.0], dtype=np.float32), np.array([0.0, 0.0, slope], dtype=np.float32)
+            deflection, slope = self._bending_shape(s, order, boundary)
+            phi[:] = np.stack((-y * slope, deflection, zero), axis=1)
+            psi[:, 2] = slope
+            return phi, psi
 
         if mode_type == self.Mode.BENDING_Z:
-            phi, slope = self._bending_shape(s, order, boundary)
-            return np.array([-z * slope, 0.0, phi], dtype=np.float32), np.array([0.0, -slope, 0.0], dtype=np.float32)
+            deflection, slope = self._bending_shape(s, order, boundary)
+            phi[:] = np.stack((-z * slope, zero, deflection), axis=1)
+            psi[:, 1] = -slope
+            return phi, psi
 
         if mode_type == self.Mode.TORSION:
             theta, _ = self._torsion_shape(s, order, boundary)
-            return np.array([0.0, -z * theta, y * theta], dtype=np.float32), np.array(
-                [theta, 0.0, 0.0], dtype=np.float32
-            )
+            phi[:] = np.stack((zero, -z * theta, y * theta), axis=1)
+            psi[:, 0] = theta
+            return phi, psi
 
         raise ValueError(f"Unsupported beam mode type '{mode_type}'")
 
-    def _default_boundary(self, mode_type: str) -> str:
-        if mode_type == self.Mode.TORSION:
-            return self.Boundary.FIXED_FREE
-        if mode_type == self.Mode.AXIAL:
-            return self.Boundary.LINEAR
-        return self.Boundary.CANTILEVER_TIP
+    @classmethod
+    def _default_boundary(cls, mode_type: str) -> str:
+        if mode_type == cls.Mode.TORSION:
+            return cls.Boundary.FIXED_FREE
+        if mode_type == cls.Mode.AXIAL:
+            return cls.Boundary.LINEAR
+        return cls.Boundary.CANTILEVER_TIP
 
-    def _bending_shape(self, s: float, order: int, boundary: str) -> tuple[float, float]:
+    def _bending_shape(self, s: np.ndarray, order: int, boundary: str) -> tuple[np.ndarray, np.ndarray]:
+        s = np.asarray(s, dtype=np.float64)
         if boundary == self.Boundary.PINNED_PINNED:
             k = float(order) * math.pi / self.length
-            return math.sin(k * s), k * math.cos(k * s)
+            return np.sin(k * s), k * np.cos(k * s)
 
         if boundary == self.Boundary.CANTILEVER_TIP:
-            if order != 1:
-                k = (float(order) - 0.5) * math.pi / self.length
-                tip = math.sin(k * self.length)
-                scale = 1.0 / tip if abs(tip) > 1.0e-8 else 1.0
-                return scale * math.sin(k * s), scale * k * math.cos(k * s)
+            beta_l = _cantilever_beta_l(order)
+            tip, _ = _cantilever_eigenfunction(np.array(self.length), beta_l, self.length)
+            deflection, slope = _cantilever_eigenfunction(s, beta_l, self.length)
+            return deflection / float(tip), slope / float(tip)
 
-            phi = (s * s * (3.0 * self.length - s)) / (2.0 * self.length**3)
+        if boundary == self.Boundary.CANTILEVER_STATIC:
+            if order != 1:
+                raise ValueError("The cantilever-static bending shape supports only order 1")
+            deflection = (s * s * (3.0 * self.length - s)) / (2.0 * self.length**3)
             slope = (3.0 * s * (2.0 * self.length - s)) / (2.0 * self.length**3)
-            return phi, slope
+            return deflection, slope
 
         raise ValueError(f"Unsupported bending boundary '{boundary}'")
 
-    def _torsion_shape(self, s: float, order: int, boundary: str) -> tuple[float, float]:
+    def _fixed_free_shape(self, s: np.ndarray, order: int) -> tuple[np.ndarray, np.ndarray]:
+        # sin((n - 1/2) pi) = (-1)^(n + 1), so dividing by it gives a unit tip value.
+        k = (float(order) - 0.5) * math.pi / self.length
+        tip = -1.0 if order % 2 == 0 else 1.0
+        return tip * np.sin(k * s), tip * k * np.cos(k * s)
+
+    def _torsion_shape(self, s: np.ndarray, order: int, boundary: str) -> tuple[np.ndarray, np.ndarray]:
+        s = np.asarray(s, dtype=np.float64)
         if boundary == self.Boundary.LINEAR:
             power = max(1, order)
             xi = s / self.length
@@ -1916,10 +2266,7 @@ class ModalGeneratorBeam:
             return theta, dtheta
 
         if boundary == self.Boundary.FIXED_FREE:
-            k = (float(order) - 0.5) * math.pi / self.length
-            tip = math.sin(k * self.length)
-            scale = 1.0 / tip if abs(tip) > 1.0e-8 else 1.0
-            return scale * math.sin(k * s), scale * k * math.cos(k * s)
+            return self._fixed_free_shape(s, order)
 
         raise ValueError(f"Unsupported torsion boundary '{boundary}'")
 
@@ -1930,9 +2277,13 @@ class ModalGeneratorBeam:
         mass_per_length = self.density * self.area
 
         if mode_type == self.Mode.AXIAL:
-            mass = mass_per_length * self.length / 12.0
-            stiffness = self.young_modulus * self.area / self.length if self.area > 0.0 else 0.0
-            return mass, stiffness
+            ea = self.young_modulus * self.area
+            if boundary == self.Boundary.LINEAR:
+                mass = mass_per_length * self.length / 12.0
+                stiffness = ea / self.length if self.area > 0.0 else 0.0
+                return mass, stiffness
+            k = (float(order) - 0.5) * math.pi / self.length
+            return mass_per_length * self.length / 2.0, ea * k * k * self.length / 2.0
 
         if mode_type in (self.Mode.BENDING_Y, self.Mode.BENDING_Z):
             inertia = self.area_moment_z if mode_type == self.Mode.BENDING_Y else self.area_moment_y
@@ -1942,13 +2293,18 @@ class ModalGeneratorBeam:
                 mass = mass_per_length * self.length / 2.0
                 stiffness = ei * k**4 * self.length / 2.0
                 return mass, stiffness
-            if boundary == self.Boundary.CANTILEVER_TIP and order == 1:
+            if boundary == self.Boundary.CANTILEVER_STATIC:
                 mass = mass_per_length * self.length * (33.0 / 140.0)
                 stiffness = 3.0 * ei / (self.length**3)
                 return mass, stiffness
-            k = (float(order) - 0.5) * math.pi / self.length
-            mass = mass_per_length * self.length / 2.0
-            stiffness = ei * k**4 * self.length / 2.0
+            # The un-normalized eigenfunction satisfies int_0^L W^2 ds = L and
+            # int_0^L W''^2 ds = beta^4 L; the unit-tip shape divides W by W(L) = +-2.
+            beta_l = _cantilever_beta_l(order)
+            tip, _ = _cantilever_eigenfunction(np.array(self.length), beta_l, self.length)
+            tip_squared = float(tip) ** 2
+            beta = beta_l / self.length
+            mass = mass_per_length * self.length / tip_squared
+            stiffness = ei * beta**4 * self.length / tip_squared
             return mass, stiffness
 
         if mode_type == self.Mode.TORSION:

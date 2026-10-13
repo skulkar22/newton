@@ -608,6 +608,362 @@ def test_modal_generator_craig_bampton_nonclassical_damping(test, device):
     np.testing.assert_allclose(basis.mode_damping, np.diag(modal_damping), rtol=1.0e-5)
 
 
+def _cantilever_root(order):
+    """Return the ``order``-th root of ``cos(x) cosh(x) = -1`` by bisection."""
+    lower = (order - 1) * math.pi
+    upper = order * math.pi
+
+    def residual(x):
+        return math.cos(x) + 1.0 / math.cosh(x)
+
+    for _ in range(200):
+        middle = 0.5 * (lower + upper)
+        if residual(lower) * residual(middle) <= 0.0:
+            upper = middle
+        else:
+            lower = middle
+    return 0.5 * (lower + upper)
+
+
+def test_modal_generator_beam_cantilever_eigenfunctions(test, device):
+    """Verify cantilever-tip bending modes are clamped, orthogonal Euler-Bernoulli eigenfunctions.
+
+    Each shape must have zero root deflection and rotation, unit tip deflection,
+    mass orthogonality to the other orders, and modal mass and stiffness equal
+    to their quadrature integrals with ``k / m = beta^4 E I / (rho A)``.
+    """
+    length = 1.25
+    half_width_y = 0.055
+    half_width_z = 0.038
+    density = 420.0
+    young_modulus = 7.5e5
+    orders = (1, 2, 3, 4)
+    generator = newton.ModalGeneratorBeam(
+        length=length,
+        half_width_y=half_width_y,
+        half_width_z=half_width_z,
+        mode_specs=[
+            {
+                "type": newton.ModalGeneratorBeam.Mode.BENDING_Z,
+                "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_TIP,
+                "order": order,
+            }
+            for order in orders
+        ],
+        density=density,
+        young_modulus=young_modulus,
+    )
+    area = generator.area
+    ei = young_modulus * generator.area_moment_y
+
+    endpoints = np.array([[-0.5 * length, 0.0, 0.0], [0.5 * length, 0.0, 0.0]], dtype=np.float32)
+    basis = generator.build(sample_points=endpoints)
+    np.testing.assert_allclose(basis.sample_phi[0], 0.0, atol=1.0e-9)
+    np.testing.assert_allclose(basis.sample_psi[0], 0.0, atol=1.0e-9)
+    np.testing.assert_allclose(basis.sample_phi[1, :, 2], 1.0, atol=1.0e-6)
+
+    # Uniform lumped mass at cell midpoints of the centerline.
+    cell_count = 4000
+    ds = length / cell_count
+    s = (np.arange(cell_count) + 0.5) * ds
+    points = np.column_stack((s - 0.5 * length, np.zeros(cell_count), np.zeros(cell_count)))
+    phi, psi = generator._evaluate_modes(points)
+    deflection = phi[:, :, 2]
+    gram = density * area * ds * deflection.T @ deflection
+    normalized = gram / np.sqrt(np.outer(np.diag(gram), np.diag(gram)))
+    test.assertLess(float(np.max(np.abs(normalized - np.eye(len(orders))))), 1.0e-3)
+
+    curvature = np.gradient(-psi[:, :, 1], ds, axis=0)
+    for index, order in enumerate(orders):
+        mode_mass, mode_stiffness = generator._mode_properties(generator.mode_specs[index])
+        beta = _cantilever_root(order) / length
+        np.testing.assert_allclose(mode_mass, density * area * length / 4.0, rtol=1.0e-12)
+        np.testing.assert_allclose(mode_stiffness / mode_mass, beta**4 * ei / (density * area), rtol=1.0e-9)
+        np.testing.assert_allclose(gram[index, index], mode_mass, rtol=1.0e-3)
+        stiffness_integral = ei * float(np.sum(curvature[1:-1, index] ** 2)) * ds
+        np.testing.assert_allclose(stiffness_integral, mode_stiffness, rtol=1.0e-2)
+        np.testing.assert_allclose(basis.mode_mass[index], mode_mass, rtol=1.0e-6)
+        np.testing.assert_allclose(basis.mode_stiffness[index], mode_stiffness, rtol=1.0e-6)
+
+
+def test_modal_generator_beam_cantilever_static_compat(test, device):
+    """Verify the cantilever-static shape keeps the exact static tip-load response."""
+    length = 1.0
+    ei = 0.24
+    generator = newton.ModalGeneratorBeam(
+        length=length,
+        half_width_y=0.045,
+        half_width_z=0.035,
+        area_moment_y=ei / 1.0e6,
+        young_modulus=1.0e6,
+        mode_specs=[
+            {
+                "type": newton.ModalGeneratorBeam.Mode.BENDING_Z,
+                "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_STATIC,
+            }
+        ],
+    )
+    s = np.linspace(0.0, length, 7)
+    points = np.column_stack((s - 0.5 * length, np.zeros_like(s), np.zeros_like(s))).astype(np.float32)
+    basis = generator.build(sample_points=points)
+
+    expected = s * s * (3.0 * length - s) / (2.0 * length**3)
+    np.testing.assert_allclose(basis.sample_phi[:, 0, 2], expected, atol=1.0e-6)
+    np.testing.assert_allclose(basis.sample_psi[0, 0], 0.0, atol=1.0e-9)
+    np.testing.assert_allclose(basis.mode_stiffness, [3.0 * ei / length**3], rtol=1.0e-6)
+    np.testing.assert_allclose(
+        basis.mode_mass, [generator.density * generator.area * length * 33.0 / 140.0], rtol=1.0e-6
+    )
+    with test.assertRaisesRegex(ValueError, "only order 1"):
+        newton.ModalGeneratorBeam(
+            length=length,
+            mode_specs=[
+                {
+                    "type": newton.ModalGeneratorBeam.Mode.BENDING_Z,
+                    "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_STATIC,
+                    "order": 2,
+                }
+            ],
+        )
+
+
+def test_modal_generator_beam_axial_fixed_free_properties(test, device):
+    """Verify fixed-free axial modes and reject ignored linear axial orders."""
+    length = 2.0
+    density = 800.0
+    young_modulus = 3.0e6
+    orders = (1, 2)
+    generator = newton.ModalGeneratorBeam(
+        length=length,
+        half_width_y=0.1,
+        half_width_z=0.05,
+        density=density,
+        young_modulus=young_modulus,
+        mode_specs=[
+            {
+                "type": newton.ModalGeneratorBeam.Mode.AXIAL,
+                "boundary": newton.ModalGeneratorBeam.Boundary.FIXED_FREE,
+                "order": order,
+            }
+            for order in orders
+        ],
+    )
+    area = generator.area
+    endpoints = np.array([[-0.5 * length, 0.05, 0.0], [0.5 * length, 0.0, -0.02]], dtype=np.float32)
+    basis = generator.build(sample_points=endpoints)
+    np.testing.assert_allclose(basis.sample_phi[0], 0.0, atol=1.0e-7)
+    np.testing.assert_allclose(basis.sample_phi[1], [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], atol=1.0e-6)
+    np.testing.assert_allclose(basis.sample_psi, 0.0, atol=1.0e-9)
+
+    cell_count = 2000
+    ds = length / cell_count
+    s = (np.arange(cell_count) + 0.5) * ds
+    phi, _ = generator._evaluate_modes(np.column_stack((s - 0.5 * length, np.zeros_like(s), np.zeros_like(s))))
+    strain = np.gradient(phi[:, :, 0], ds, axis=0)
+    for index, order in enumerate(orders):
+        k = (order - 0.5) * math.pi / length
+        np.testing.assert_allclose(basis.mode_mass[index], density * area * length / 2.0, rtol=1.0e-6)
+        np.testing.assert_allclose(
+            basis.mode_stiffness[index], young_modulus * area * k * k * length / 2.0, rtol=1.0e-6
+        )
+        np.testing.assert_allclose(
+            density * area * ds * np.sum(phi[:, index, 0] ** 2), basis.mode_mass[index], rtol=1.0e-4
+        )
+        np.testing.assert_allclose(
+            young_modulus * area * ds * np.sum(strain[1:-1, index] ** 2), basis.mode_stiffness[index], rtol=1.0e-2
+        )
+
+    with test.assertRaisesRegex(ValueError, "only order 1"):
+        newton.ModalGeneratorBeam(
+            length=length, mode_specs=[{"type": newton.ModalGeneratorBeam.Mode.AXIAL, "order": 2}]
+        )
+
+
+def _spring_lattice(shape, spacing, spring_stiffness, node_mass, braced=True):
+    """Build a lumped-mass spring lattice that preserves rigid-body motion.
+
+    Args:
+        shape: Node counts along ``x``, ``y``, and ``z``.
+        spacing: Node spacing [m].
+        spring_stiffness: Axial stiffness scale [N] divided by spring length.
+        node_mass: Lumped node mass [kg].
+        braced: Whether to add face and body diagonal springs. Without them
+            the lattice has zero-energy shear mechanisms.
+
+    Returns:
+        Node positions [m], mass matrix [kg], and stiffness matrix [N/m].
+    """
+    points = np.array(
+        [
+            [i * spacing, j * spacing, k * spacing]
+            for i in range(shape[0])
+            for j in range(shape[1])
+            for k in range(shape[2])
+        ],
+        dtype=np.float64,
+    )
+    points -= points.mean(axis=0)
+    node_count = points.shape[0]
+    reach = (math.sqrt(3.0) if braced else 1.0) * spacing * 1.0001
+    stiffness = np.zeros((3 * node_count, 3 * node_count), dtype=np.float64)
+    for a in range(node_count):
+        for b in range(a + 1, node_count):
+            delta = points[b] - points[a]
+            distance = float(np.linalg.norm(delta))
+            if distance <= reach:
+                direction = delta / distance
+                block = spring_stiffness / distance * np.outer(direction, direction)
+                stiffness[3 * a : 3 * a + 3, 3 * a : 3 * a + 3] += block
+                stiffness[3 * b : 3 * b + 3, 3 * b : 3 * b + 3] += block
+                stiffness[3 * a : 3 * a + 3, 3 * b : 3 * b + 3] -= block
+                stiffness[3 * b : 3 * b + 3, 3 * a : 3 * a + 3] -= block
+    mass = node_mass * np.eye(3 * node_count)
+    return points, mass, stiffness
+
+
+def _generalized_eigenvalues(mass, stiffness):
+    chol = np.linalg.cholesky(mass)
+    standard = np.linalg.solve(chol, np.linalg.solve(chol, stiffness).T).T
+    return np.sort(np.linalg.eigvalsh(0.5 * (standard + standard.T)))
+
+
+def test_modal_generator_fem_free_free_rigid_modes_removed(test, device):
+    """Remove all six rigid-body modes of a stiff free-free FEM model.
+
+    At steel-like stiffness, roundoff lifts the rigid-body eigenvalues above
+    any small absolute threshold; the generator must still exclude them and
+    return only elastic modes.
+    """
+    points, mass, stiffness = _spring_lattice((4, 2, 2), 0.01, 2.0e9, 8.0e-3)
+    reference = _generalized_eigenvalues(mass, stiffness)
+    first_elastic = float(reference[6])
+    total_mass = float(np.trace(mass)) / 3.0
+
+    generator = newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=8)
+    basis = generator.build()
+
+    test.assertEqual(basis.mode_count, 8)
+    test.assertGreater(float(np.min(generator.eigenvalues)), 1.0e-6 * first_elastic)
+    np.testing.assert_allclose(generator.eigenvalues, reference[6:14], rtol=1.0e-6)
+    test.assertEqual(generator.rigid_mode_count, 6)
+    rigid = generator.rigid_modal_matrix
+    np.testing.assert_allclose(rigid.T @ mass @ rigid, np.eye(6), atol=1.0e-9)
+    np.testing.assert_allclose(rigid.T @ mass @ generator.modal_matrix, 0.0, atol=1.0e-6)
+    np.testing.assert_allclose(basis.mode_mass, 1.0, rtol=1.0e-6)
+    test.assertLess(float(np.max(np.abs(basis.mode_coupling_linear))), 1.0e-6 * math.sqrt(total_mass))
+    radius = float(np.max(np.linalg.norm(points, axis=1)))
+    test.assertLess(float(np.max(np.abs(basis.mode_coupling_angular))), 1.0e-6 * math.sqrt(total_mass) * radius)
+
+
+def test_modal_generator_fem_discard_skips_elastic_modes(test, device):
+    """Skip the lowest elastic modes, not rigid-body modes, with ``discard_mode_count``."""
+    points, mass, stiffness = _spring_lattice((4, 2, 2), 0.01, 2.0e9, 8.0e-3)
+    reference = _generalized_eigenvalues(mass, stiffness)
+    test.assertGreaterEqual(reference.shape[0] - 6, 16)
+
+    generator = newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4, discard_mode_count=2)
+    basis = generator.build()
+
+    test.assertEqual(basis.mode_count, 4)
+    np.testing.assert_allclose(generator.eigenvalues, reference[8:12], rtol=1.0e-6)
+    test.assertEqual(generator.rigid_mode_count, 6)
+
+
+def test_modal_generator_fem_rejects_mechanism(test, device):
+    """Reject zero-energy mechanisms and constraints that leave rigid-body motion."""
+    points, mass, stiffness = _spring_lattice((4, 2, 2), 0.1, 1.0e3, 1.0e-2, braced=False)
+    with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
+        newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4).build()
+
+    points, mass, stiffness = _spring_lattice((4, 2, 2), 0.1, 1.0e3, 1.0e-2)
+    with test.assertRaisesRegex(ValueError, "do not remove all rigid-body motion"):
+        newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4, fixed_node_indices=[0]).build()
+
+    broken = stiffness.copy()
+    broken[0, 0] += 1.0e3
+    with test.assertRaisesRegex(ValueError, "does not preserve rigid-body motion"):
+        newton.ModalGeneratorFEM(points, mass, broken, mode_count=4).build()
+
+
+def test_modal_generator_fem_damping_projection(test, device):
+    """Record, warn about, or reject non-diagonal projected FEM damping."""
+    nodes = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+    mass = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+    stiffness = np.diag([0.0, 0.0, 0.0, 8.0, 18.0, 32.0])
+    damping = np.diag([0.0, 0.0, 0.0, 0.4, 0.6, 0.8])
+    damping[3, 4] = damping[4, 3] = 0.2
+
+    def make(**kwargs):
+        return newton.ModalGeneratorFEM(
+            nodes, mass, stiffness, damping_matrix=damping, fixed_node_indices=[0], mode_count=3, **kwargs
+        )
+
+    generator = make()
+    with test.assertWarnsRegex(UserWarning, "damping is not diagonal"):
+        basis = generator.build()
+    np.testing.assert_allclose(generator.damping_off_diagonal_ratio, 0.1 / 0.4, rtol=1.0e-6)
+    np.testing.assert_allclose(basis.mode_damping, [0.2, 0.3, 0.4], rtol=1.0e-6)
+    with test.assertRaisesRegex(ValueError, "damping is not diagonal"):
+        make(damping_projection="error").build()
+    with test.assertRaisesRegex(ValueError, "damping_projection"):
+        make(damping_projection="full")
+
+
+def test_modal_generator_craig_bampton_damping_projection_error(test, device):
+    """Reject non-diagonal Craig-Bampton modal damping when projection errors are requested."""
+    interface_positions, mass, stiffness, _, sample_points, recovery, _ = _build_craig_bampton_test_data()
+    undamped_generator = newton.ModalGeneratorCraigBampton(
+        interface_positions=interface_positions,
+        mass_matrix=mass,
+        stiffness_matrix=stiffness,
+        sample_points=sample_points,
+        recovery_matrix=recovery,
+    )
+    undamped_basis = undamped_generator.build()
+    modes = undamped_generator.modal_matrix
+    modal_damping = np.diag(0.01 * undamped_basis.mode_stiffness.astype(np.float64))
+    modal_damping[0, 1] = modal_damping[1, 0] = 0.05 * float(np.max(np.diag(modal_damping)))
+    damping = mass @ modes @ modal_damping @ modes.T @ mass
+
+    def make(**kwargs):
+        return newton.ModalGeneratorCraigBampton(
+            interface_positions=interface_positions,
+            mass_matrix=mass,
+            stiffness_matrix=stiffness,
+            damping_matrix=damping,
+            sample_points=sample_points,
+            recovery_matrix=recovery,
+            **kwargs,
+        )
+
+    generator = make(damping_projection="error")
+    with test.assertRaisesRegex(ValueError, "damping is not diagonal"):
+        generator.build()
+    np.testing.assert_allclose(generator.damping_off_diagonal_ratio, 0.05, rtol=1.0e-4)
+
+    tolerant = make(damping_projection="error", damping_coupling_tolerance=0.1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        basis = tolerant.build()
+    np.testing.assert_allclose(basis.mode_damping, np.diag(modal_damping), rtol=1.0e-5)
+
+
+def test_modal_generator_craig_bampton_negative_damping_warns(test, device):
+    """Warn when negative projected Craig-Bampton modal damping is clamped to zero."""
+    interface_positions, mass, stiffness, _, sample_points, recovery, _ = _build_craig_bampton_test_data()
+    generator = newton.ModalGeneratorCraigBampton(
+        interface_positions=interface_positions,
+        mass_matrix=mass,
+        stiffness_matrix=stiffness,
+        damping_matrix=-0.01 * stiffness,
+        sample_points=sample_points,
+        recovery_matrix=recovery,
+    )
+    with test.assertWarnsRegex(UserWarning, "negative modal diagonal"):
+        basis = generator.build()
+    np.testing.assert_allclose(basis.mode_damping, 0.0, atol=0.0)
+
+
 def test_modal_basis_lumped_inertia_coupling(test, device):
     points = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     sample_phi = np.array(
@@ -4271,6 +4627,60 @@ for device in devices:
         TestReducedElasticBody,
         "test_modal_generator_craig_bampton_nonclassical_damping",
         test_modal_generator_craig_bampton_nonclassical_damping,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_beam_cantilever_eigenfunctions",
+        test_modal_generator_beam_cantilever_eigenfunctions,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_beam_cantilever_static_compat",
+        test_modal_generator_beam_cantilever_static_compat,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_beam_axial_fixed_free_properties",
+        test_modal_generator_beam_axial_fixed_free_properties,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_fem_free_free_rigid_modes_removed",
+        test_modal_generator_fem_free_free_rigid_modes_removed,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_fem_discard_skips_elastic_modes",
+        test_modal_generator_fem_discard_skips_elastic_modes,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_fem_rejects_mechanism",
+        test_modal_generator_fem_rejects_mechanism,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_fem_damping_projection",
+        test_modal_generator_fem_damping_projection,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_craig_bampton_damping_projection_error",
+        test_modal_generator_craig_bampton_damping_projection_error,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_craig_bampton_negative_damping_warns",
+        test_modal_generator_craig_bampton_negative_damping_warns,
         devices=[device],
     )
     add_function_test(
