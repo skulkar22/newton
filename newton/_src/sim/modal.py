@@ -20,9 +20,162 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
+
+_PAIR_CHUNK_BYTES = 256 * 1024 * 1024
+"""Upper bound [bytes] for each float64 GEMM operand chunk in :func:`_reduced_inertia_from_pairs`."""
+
+
+class _ReducedInertia(NamedTuple):
+    """Reduced floating-frame inertia integrals of a sampled modal basis.
+
+    Units assume displacement-valued modal coordinates, so ``phi`` is
+    dimensionless. Every array is ``float32``; rigid properties are ``None``
+    unless a lumped sample mass was supplied.
+    """
+
+    mode_coupling_quadratic: np.ndarray
+    """``P[i, j] = sum_s phi_i(s) outer (m phi_j)(s)`` [kg], shape ``[mode_count, mode_count, 3, 3]``."""
+    mode_mass_matrix: np.ndarray
+    """``Mf[i, j] = trace(P[i, j])`` [kg], shape ``[mode_count, mode_count]``."""
+    mode_mass: np.ndarray
+    """Diagonal of ``mode_mass_matrix`` [kg], shape ``[mode_count]``."""
+    mode_coupling_linear: np.ndarray
+    """``S[i] = sum_s (m phi_i)(s)`` [kg], shape ``[mode_count, 3]``."""
+    mode_coupling_angular: np.ndarray
+    """``G[i] = sum_s (m phi_i)(s) cross x_s`` [kg m], shape ``[mode_count, 3]``."""
+    mode_coupling_centrifugal: np.ndarray
+    """``B[i] = sum_s (m phi_i)(s) outer x_s`` [kg m], shape ``[mode_count, 3, 3]``."""
+    mode_coupling_coriolis: np.ndarray
+    """``C[i, j] = sum_s phi_j(s) cross (m phi_i)(s)`` [kg], shape ``[mode_count, mode_count, 3]``."""
+    rigid_mass: float | None
+    """Total lumped mass [kg]."""
+    rigid_com: np.ndarray | None
+    """Lumped center of mass in the sample frame [m], shape ``[3]``."""
+    rigid_inertia: np.ndarray | None
+    """Lumped rotational inertia about ``rigid_com`` [kg m^2], shape ``[3, 3]``."""
+
+
+def _mass_matrix_from_quadratic(quadratic: np.ndarray) -> np.ndarray:
+    """Return ``Mf[i, j] = trace(P[i, j])`` [kg] from a ``[M, M, 3, 3]`` pair tensor."""
+    return np.einsum("ijcc->ij", quadratic)
+
+
+def _coriolis_from_quadratic(quadratic: np.ndarray) -> np.ndarray:
+    """Return ``C[i, j] = sum_s phi_j cross (m phi_i)`` from ``P[i, j] = sum_s phi_i outer (m phi_j)``.
+
+    ``P[j, i][c, d] = sum_s phi_j[c] (m phi_i)[d]``, so each cross-product
+    component is an antisymmetric difference of two ``P[j, i]`` entries.
+    """
+    p_ji = np.swapaxes(quadratic, 0, 1)
+    coriolis = np.empty((*quadratic.shape[:2], 3), dtype=quadratic.dtype)
+    coriolis[..., 0] = p_ji[..., 1, 2] - p_ji[..., 2, 1]
+    coriolis[..., 1] = p_ji[..., 2, 0] - p_ji[..., 0, 2]
+    coriolis[..., 2] = p_ji[..., 0, 1] - p_ji[..., 1, 0]
+    return coriolis
+
+
+def _mass_coupling_ratio(mass_matrix: np.ndarray | None) -> float:
+    """Return ``max_{i != j} |Mf_ij| / sqrt(Mf_ii Mf_jj)``, or ``0.0`` when undefined."""
+    if mass_matrix is None or mass_matrix.shape[0] < 2:
+        return 0.0
+    matrix = np.asarray(mass_matrix, dtype=np.float64)
+    diagonal = np.sqrt(np.maximum(np.diag(matrix), 0.0))
+    scale = np.outer(diagonal, diagonal)
+    off_diagonal = np.abs(matrix - np.diag(np.diag(matrix)))
+    ratio = np.divide(off_diagonal, scale, out=np.zeros_like(off_diagonal), where=scale > 0.0)
+    return float(np.max(ratio))
+
+
+def _reduced_inertia_from_pairs(
+    points: np.ndarray,
+    phi: np.ndarray,
+    mass_phi: np.ndarray | None = None,
+    mass: np.ndarray | None = None,
+    *,
+    chunk_bytes: int = _PAIR_CHUNK_BYTES,
+) -> _ReducedInertia:
+    """Return the reduced inertia integrals of a sampled modal basis.
+
+    The mode-pair tensor ``P[i, j] = sum_s phi_i(s) outer (m phi_j)(s)`` is
+    accumulated in ``float64`` as one GEMM per sample chunk, so memory stays
+    ``O(mode_count^2 + chunk * mode_count)`` instead of materializing a
+    ``[sample_count, mode_count, mode_count, 3]`` temporary. The modal mass
+    matrix and Coriolis integral are derived from ``P``. ``mass_phi`` is the
+    mass-weighted mode field: ``mass[:, None, None] * phi`` for lumped masses,
+    or ``(M Phi)`` reshaped to ``[sample_count, mode_count, 3]`` for a
+    consistent mass matrix.
+
+    Args:
+        points: Sample points [m], shape ``[sample_count, 3]``.
+        phi: Mode samples [m/m], shape ``[sample_count, mode_count, 3]``.
+        mass_phi: Mass-weighted mode samples [kg], shape
+            ``[sample_count, mode_count, 3]``. Formed per chunk from ``mass``
+            when omitted.
+        mass: Lumped sample masses [kg], shape ``[sample_count]``. Required when
+            ``mass_phi`` is omitted; also yields the rigid mass properties.
+        chunk_bytes: Upper bound [bytes] for each chunked ``float64`` operand.
+
+    Returns:
+        The reduced inertia integrals, stored as ``float32``.
+    """
+    if mass_phi is None and mass is None:
+        raise ValueError("Either mass_phi or mass must be provided")
+    points64 = np.asarray(points, dtype=np.float64)
+    sample_count, mode_count = int(phi.shape[0]), int(phi.shape[1])
+    mass64 = None if mass is None else np.asarray(mass, dtype=np.float64).reshape((-1,))
+
+    width = 3 * mode_count
+    pairs = np.zeros((width, width), dtype=np.float64)
+    linear = np.zeros((mode_count, 3), dtype=np.float64)
+    angular = np.zeros((mode_count, 3), dtype=np.float64)
+    centrifugal = np.zeros((mode_count, 3, 3), dtype=np.float64)
+    chunk = max(1, int(chunk_bytes) // max(8 * width, 1))
+    for start in range(0, sample_count, chunk):
+        stop = min(start + chunk, sample_count)
+        phi_chunk = np.asarray(phi[start:stop], dtype=np.float64)
+        if mass_phi is None:
+            mass_phi_chunk = mass64[start:stop, None, None] * phi_chunk
+        else:
+            mass_phi_chunk = np.asarray(mass_phi[start:stop], dtype=np.float64)
+        points_chunk = points64[start:stop]
+        # [3M, s] @ [s, 3M] -> pairs[(i, c), (j, d)] = sum_s phi_i[c] (m phi_j)[d]
+        pairs += phi_chunk.transpose(1, 2, 0).reshape((width, stop - start)) @ mass_phi_chunk.reshape(
+            (stop - start, width)
+        )
+        linear += mass_phi_chunk.sum(axis=0)
+        angular += np.cross(mass_phi_chunk, points_chunk[:, None, :]).sum(axis=0)
+        centrifugal += np.einsum("smc,sd->mcd", mass_phi_chunk, points_chunk)
+
+    quadratic = pairs.reshape((mode_count, 3, mode_count, 3)).transpose(0, 2, 1, 3)
+    mass_matrix = _mass_matrix_from_quadratic(quadratic)
+    coriolis = _coriolis_from_quadratic(quadratic)
+
+    rigid_mass = rigid_com = rigid_inertia = None
+    if mass64 is not None and float(np.sum(mass64)) > 0.0:
+        rigid_mass = float(np.sum(mass64))
+        com = (mass64 @ points64) / rigid_mass
+        offsets = points64 - com
+        inertia = (
+            np.sum(mass64 * np.sum(offsets * offsets, axis=1)) * np.eye(3) - (mass64[:, None] * offsets).T @ offsets
+        )
+        rigid_com = com.astype(np.float32)
+        rigid_inertia = inertia.astype(np.float32)
+
+    return _ReducedInertia(
+        mode_coupling_quadratic=quadratic.astype(np.float32),
+        mode_mass_matrix=mass_matrix.astype(np.float32),
+        mode_mass=np.diag(mass_matrix).astype(np.float32),
+        mode_coupling_linear=linear.astype(np.float32),
+        mode_coupling_angular=angular.astype(np.float32),
+        mode_coupling_centrifugal=centrifugal.astype(np.float32),
+        mode_coupling_coriolis=coriolis.astype(np.float32),
+        rigid_mass=rigid_mass,
+        rigid_com=rigid_com,
+        rigid_inertia=rigid_inertia,
+    )
 
 
 class ModalBasis:
@@ -34,6 +187,15 @@ class ModalBasis:
     stored samples, keeping the runtime representation independent of how the
     modes were generated.
 
+    Units below assume displacement-valued modal coordinates ``q`` [m], so
+    ``phi`` is dimensionless [m/m]. Other normalizations are equivalent: the
+    reduced dynamics are invariant under ``phi -> phi / a``, ``q -> a q``,
+    ``mode_mass -> mode_mass / a^2``, and ``mode_stiffness -> mode_stiffness / a^2``,
+    with ``mode_damping`` and the mode-pair integrals (``mode_mass_matrix``,
+    ``mode_coupling_coriolis``, ``mode_coupling_quadratic``) also scaling by
+    ``1 / a^2`` and the single-mode integrals (``mode_coupling_linear``,
+    ``_angular``, ``_centrifugal``) by ``1 / a``.
+
     Args:
         sample_points: Body-local sample points [m], shape ``[sample_count, 3]``.
         sample_phi: Translational mode values [m per modal coordinate], shape
@@ -44,13 +206,17 @@ class ModalBasis:
             a unit modal coordinate. Defaults to zeros, which disables rotational
             joint coupling.
         sample_mass: Optional per-sample lumped mass [kg], shape ``[sample_count]``.
-            When supplied, ``mode_mass`` and any unspecified inertia coupling
-            integrals (``mode_coupling_linear``, ``_angular``, ``_centrifugal``,
-            ``_coriolis``) are computed from it.
+            When supplied, ``mode_mass``, ``mode_mass_matrix``, the rigid mass
+            properties, and any unspecified inertia coupling integrals
+            (``mode_coupling_linear``, ``_angular``, ``_centrifugal``,
+            ``_coriolis``, ``_quadratic``) are computed from it.
         mode_mass: Optional modal mass [kg], shape ``[mode_count]``. An explicit
-            value always takes precedence; when omitted it is derived from
-            ``sample_mass`` as ``sum_s mass_s |phi_i(x_s)|^2``, sharing the mass
-            distribution used for the coupling integrals.
+            value always takes precedence; when omitted it is the diagonal of
+            ``mode_mass_matrix``, i.e. ``sum_s mass_s |phi_i(x_s)|^2`` for lumped
+            sample masses. An explicit diagonal also defines a diagonal
+            ``mode_mass_matrix`` unless ``mode_mass_matrix`` is given, and a
+            warning is emitted when the sampled integrals show off-diagonal
+            mass coupling above ``mode_coupling_tolerance``.
         mode_stiffness: Modal stiffness values [N/m], shape ``[mode_count]``.
         mode_damping: Modal damping values [N s/m], shape ``[mode_count]``.
         mode_coupling_linear: Optional linear coupling integral
@@ -62,17 +228,38 @@ class ModalBasis:
             ``[mode_count, 3]``. Couples floating-frame angular acceleration
             into each mode. ``None`` when unavailable.
         mode_coupling_centrifugal: Optional centrifugal coupling integral
-            ``sum_s mass_s (phi_i(x_s) outer x_s)`` [kg m^2], shape
+            ``sum_s mass_s (phi_i(x_s) outer x_s)`` [kg m], shape
             ``[mode_count, 3, 3]``. Couples the floating-frame centrifugal
             acceleration into each mode. ``None`` when unavailable.
         mode_coupling_coriolis: Optional Coriolis coupling integral
-            ``sum_s mass_s (phi_j(x_s) cross phi_i(x_s))`` [kg m^2], shape
+            ``sum_s mass_s (phi_j(x_s) cross phi_i(x_s))`` [kg], shape
             ``[mode_count, mode_count, 3]``. Couples the floating-frame angular
-            velocity with the modal velocities. Antisymmetric in ``(i, j)``, so
-            it vanishes for a single mode. ``None`` when unavailable.
+            velocity with the modal velocities. Antisymmetric in ``(i, j)`` for
+            lumped masses, so it vanishes for a single mode. ``None`` when
+            unavailable. Derived from ``mode_coupling_quadratic`` when omitted.
         label: Optional basis label.
         interpolation_epsilon: Distance regularizer [m] used for inverse-distance
             interpolation.
+        mode_coupling_quadratic: Optional mode-pair inertia integral
+            ``P_ij = sum_s phi_i(x_s) outer (mass_s phi_j(x_s))`` [kg], shape
+            ``[mode_count, mode_count, 3, 3]``. Its trace is the modal mass
+            matrix and its antisymmetric part the Coriolis integral; it also
+            provides the deformation-dependent inertia terms. ``None`` when
+            unavailable.
+        mode_mass_matrix: Optional full modal mass matrix [kg], shape
+            ``[mode_count, mode_count]``. When omitted it is the trace of
+            ``mode_coupling_quadratic``, or diagonal when ``mode_mass`` is
+            explicit. Its diagonal must match an explicit ``mode_mass``.
+        rigid_mass: Optional rigid body mass [kg] represented by the basis.
+            Defaults to ``sum(sample_mass)``.
+        rigid_com: Optional rigid center of mass [m] in the basis frame, shape
+            ``[3]``. Defaults to the lumped sample-mass centroid.
+        rigid_inertia: Optional rigid rotational inertia [kg m^2] about
+            ``rigid_com``, shape ``[3, 3]``. Defaults to the lumped sample-mass
+            inertia.
+        mode_coupling_tolerance: Relative off-diagonal modal mass coupling
+            ``max_{i != j} |Mf_ij| / sqrt(Mf_ii Mf_jj)`` above which an explicit
+            diagonal ``mode_mass`` emits a warning.
     """
 
     def __init__(
@@ -90,9 +277,19 @@ class ModalBasis:
         mode_coupling_coriolis: Sequence[Sequence[Sequence[float]]] | np.ndarray | None = None,
         label: str | None = None,
         interpolation_epsilon: float = 1.0e-8,
+        *,
+        mode_coupling_quadratic: np.ndarray | None = None,
+        mode_mass_matrix: Sequence[Sequence[float]] | np.ndarray | None = None,
+        rigid_mass: float | None = None,
+        rigid_com: Sequence[float] | np.ndarray | None = None,
+        rigid_inertia: Sequence[Sequence[float]] | np.ndarray | None = None,
+        mode_coupling_tolerance: float = 1.0e-2,
     ):
         self.label = label
         self.interpolation_epsilon = float(interpolation_epsilon)
+        self.mode_coupling_tolerance = float(mode_coupling_tolerance)
+        if self.mode_coupling_tolerance < 0.0:
+            raise ValueError(f"mode_coupling_tolerance must be non-negative, got {self.mode_coupling_tolerance}")
 
         if sample_points is None:
             points = np.zeros((0, 3), dtype=np.float32)
@@ -134,16 +331,6 @@ class ModalBasis:
         self.sample_psi = np.array(psi, dtype=np.float32, copy=True)
         self.sample_mass = self._coerce_sample_mass(sample_mass, points.shape[0])
 
-        lumped_mass = lumped_linear = lumped_angular = lumped_centrifugal = lumped_coriolis = None
-        if self.sample_mass is not None and mode_count > 0:
-            (
-                lumped_mass,
-                lumped_linear,
-                lumped_angular,
-                lumped_centrifugal,
-                lumped_coriolis,
-            ) = self._lumped_reduced_inertia(self.sample_points, self.sample_phi, self.sample_mass)
-
         self.mode_mass = self._coerce_mode_array(mode_mass, mode_count, 1.0, "mode_mass")
         self.mode_stiffness = self._coerce_mode_array(mode_stiffness, mode_count, 0.0, "mode_stiffness")
         self.mode_damping = self._coerce_mode_array(mode_damping, mode_count, 0.0, "mode_damping")
@@ -155,17 +342,101 @@ class ModalBasis:
         self.mode_coupling_coriolis = self._coerce_coupling_pairs(
             mode_coupling_coriolis, mode_count, "mode_coupling_coriolis"
         )
+        self.mode_coupling_quadratic = self._coerce_coupling_quadratic(
+            mode_coupling_quadratic, mode_count, "mode_coupling_quadratic"
+        )
+        explicit_mass_matrix = self._coerce_mode_mass_matrix(mode_mass_matrix, mode_count)
+        self.rigid_mass = None if rigid_mass is None else float(rigid_mass)
+        self.rigid_com = self._coerce_fixed_shape(rigid_com, (3,), "rigid_com")
+        self.rigid_inertia = self._coerce_fixed_shape(rigid_inertia, (3, 3), "rigid_inertia")
 
-        if mode_mass is None and lumped_mass is not None:
-            self.mode_mass = lumped_mass
-        if self.mode_coupling_linear is None:
-            self.mode_coupling_linear = lumped_linear
-        if self.mode_coupling_angular is None:
-            self.mode_coupling_angular = lumped_angular
-        if self.mode_coupling_centrifugal is None:
-            self.mode_coupling_centrifugal = lumped_centrifugal
-        if self.mode_coupling_coriolis is None:
-            self.mode_coupling_coriolis = lumped_coriolis
+        lumped = None
+        if self.sample_mass is not None and (
+            any(
+                value is None
+                for value in (
+                    self.mode_coupling_linear,
+                    self.mode_coupling_angular,
+                    self.mode_coupling_centrifugal,
+                    self.mode_coupling_coriolis,
+                    self.mode_coupling_quadratic,
+                    self.rigid_mass,
+                    self.rigid_com,
+                    self.rigid_inertia,
+                )
+            )
+            or (mode_mass is None and explicit_mass_matrix is None)
+        ):
+            lumped = _reduced_inertia_from_pairs(self.sample_points, self.sample_phi, mass=self.sample_mass)
+            if self.rigid_mass is None:
+                self.rigid_mass = lumped.rigid_mass
+            if self.rigid_com is None:
+                self.rigid_com = lumped.rigid_com
+            if self.rigid_inertia is None:
+                self.rigid_inertia = lumped.rigid_inertia
+            if mode_count == 0:
+                lumped = None
+
+        # Explicit mode-pair integrals take precedence; the Coriolis integral and
+        # modal mass matrix default to values derived from the same pair tensor.
+        derived_mass_matrix = None
+        if self.mode_coupling_quadratic is not None:
+            quadratic64 = self.mode_coupling_quadratic.astype(np.float64)
+            derived_mass_matrix = _mass_matrix_from_quadratic(quadratic64).astype(np.float32)
+            if self.mode_coupling_coriolis is None:
+                self.mode_coupling_coriolis = _coriolis_from_quadratic(quadratic64).astype(np.float32)
+        elif lumped is not None:
+            self.mode_coupling_quadratic = lumped.mode_coupling_quadratic
+            derived_mass_matrix = lumped.mode_mass_matrix
+        if lumped is not None:
+            if self.mode_coupling_linear is None:
+                self.mode_coupling_linear = lumped.mode_coupling_linear
+            if self.mode_coupling_angular is None:
+                self.mode_coupling_angular = lumped.mode_coupling_angular
+            if self.mode_coupling_centrifugal is None:
+                self.mode_coupling_centrifugal = lumped.mode_coupling_centrifugal
+            if self.mode_coupling_coriolis is None:
+                self.mode_coupling_coriolis = lumped.mode_coupling_coriolis
+
+        self._mode_mass_coupling_ratio = _mass_coupling_ratio(
+            derived_mass_matrix if derived_mass_matrix is not None else explicit_mass_matrix
+        )
+        if explicit_mass_matrix is not None:
+            if mode_mass is None:
+                self.mode_mass = np.array(np.diag(explicit_mass_matrix), dtype=np.float32, copy=True)
+            else:
+                diagonal = np.diag(explicit_mass_matrix).astype(np.float64)
+                scale = max(float(np.max(np.abs(diagonal), initial=0.0)), 1.0e-30)
+                if not np.allclose(diagonal, self.mode_mass, rtol=1.0e-5, atol=1.0e-6 * scale):
+                    raise ValueError("mode_mass must match the diagonal of mode_mass_matrix")
+            self.mode_mass_matrix = explicit_mass_matrix
+        elif mode_mass is not None:
+            self.mode_mass_matrix = None if derived_mass_matrix is None else np.diag(self.mode_mass)
+            if self._mode_mass_coupling_ratio > self.mode_coupling_tolerance:
+                warnings.warn(
+                    "ModalBasis modes are not mass-orthogonal under the sampled mass distribution "
+                    f"(relative off-diagonal modal mass {self._mode_mass_coupling_ratio:.3g} > "
+                    f"mode_coupling_tolerance {self.mode_coupling_tolerance:.3g}); the explicit diagonal "
+                    "mode_mass discards this coupling. Pass mode_mass_matrix or omit mode_mass to keep it.",
+                    stacklevel=2,
+                )
+        elif derived_mass_matrix is not None:
+            self.mode_mass_matrix = derived_mass_matrix
+            self.mode_mass = np.array(np.diag(derived_mass_matrix), dtype=np.float32, copy=True)
+        else:
+            self.mode_mass_matrix = None
+
+    @property
+    def mode_mass_coupling_ratio(self) -> float:
+        """Largest relative off-diagonal modal mass coupling.
+
+        ``max_{i != j} |Mf_ij| / sqrt(Mf_ii Mf_jj)`` of the modal mass matrix
+        integrated from ``mode_coupling_quadratic`` (or of an explicit
+        ``mode_mass_matrix`` when no pair integral exists). ``0.0`` for fewer
+        than two modes or when no full modal mass matrix is known. Mass-orthogonal
+        modes give ``0.0``.
+        """
+        return self._mode_mass_coupling_ratio
 
     @property
     def mode_count(self) -> int:
@@ -255,37 +526,42 @@ class ModalBasis:
         return np.array(array, dtype=np.float32, copy=True)
 
     @staticmethod
-    def _lumped_reduced_inertia(
-        points: np.ndarray,
-        phi: np.ndarray,
-        sample_mass: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return lumped modal mass and the floating-frame coupling integrals.
+    def _coerce_coupling_quadratic(
+        values: np.ndarray | None,
+        mode_count: int,
+        name: str,
+    ) -> np.ndarray | None:
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=np.float32)
+        if array.shape != (mode_count, mode_count, 3, 3):
+            raise ValueError(f"{name} must have shape ({mode_count}, {mode_count}, 3, 3), got {array.shape}")
+        return np.array(array, dtype=np.float32, copy=True)
 
-        ``mass[i] = sum_s mass_s |phi_i(x_s)|^2`` [kg], shape ``[mode_count]``;
-        ``linear[i] = sum_s mass_s phi_i(x_s)`` [kg] and
-        ``angular[i] = sum_s mass_s (phi_i(x_s) cross x_s)`` [kg m], each shape
-        ``[mode_count, 3]``; ``centrifugal[i] = sum_s mass_s (phi_i(x_s) outer x_s)``
-        [kg m^2], shape ``[mode_count, 3, 3]``; ``coriolis[i, j] = sum_s mass_s
-        (phi_j(x_s) cross phi_i(x_s))`` [kg m^2], shape ``[mode_count, mode_count, 3]``.
-        """
-        mass = sample_mass.astype(np.float64)
-        phi64 = phi.astype(np.float64)
-        points64 = points.astype(np.float64)
-        modal_mass = np.einsum("s,smc,smc->m", mass, phi64, phi64)
-        linear = np.einsum("s,smc->mc", mass, phi64)
-        cross = np.cross(phi64, points64[:, None, :])
-        angular = np.einsum("s,smc->mc", mass, cross)
-        centrifugal = np.einsum("s,smc,sd->mcd", mass, phi64, points64)
-        cross_pairs = np.cross(phi64[:, None, :, :], phi64[:, :, None, :])
-        coriolis = np.einsum("s,sijc->ijc", mass, cross_pairs)
-        return (
-            modal_mass.astype(np.float32),
-            linear.astype(np.float32),
-            angular.astype(np.float32),
-            centrifugal.astype(np.float32),
-            coriolis.astype(np.float32),
-        )
+    @staticmethod
+    def _coerce_mode_mass_matrix(
+        values: Sequence[Sequence[float]] | np.ndarray | None,
+        mode_count: int,
+    ) -> np.ndarray | None:
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=np.float32)
+        if array.shape != (mode_count, mode_count):
+            raise ValueError(f"mode_mass_matrix must have shape ({mode_count}, {mode_count}), got {array.shape}")
+        return np.array(array, dtype=np.float32, copy=True)
+
+    @staticmethod
+    def _coerce_fixed_shape(
+        values: Sequence[float] | Sequence[Sequence[float]] | np.ndarray | None,
+        shape: tuple[int, ...],
+        name: str,
+    ) -> np.ndarray | None:
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=np.float32)
+        if array.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+        return np.array(array, dtype=np.float32, copy=True)
 
     def copy(self) -> ModalBasis:
         """Return a deep copy of this basis."""
@@ -303,6 +579,12 @@ class ModalBasis:
             mode_coupling_coriolis=self.mode_coupling_coriolis,
             label=self.label,
             interpolation_epsilon=self.interpolation_epsilon,
+            mode_coupling_quadratic=self.mode_coupling_quadratic,
+            mode_mass_matrix=self.mode_mass_matrix,
+            rigid_mass=self.rigid_mass,
+            rigid_com=self.rigid_com,
+            rigid_inertia=self.rigid_inertia,
+            mode_coupling_tolerance=self.mode_coupling_tolerance,
         )
 
     def find_sample(self, point: Sequence[float] | np.ndarray, tolerance: float = 1.0e-7) -> int:
@@ -608,6 +890,9 @@ class ModalGeneratorSampled:
         derive_psi: When ``True`` and ``sample_psi`` is not given, estimate the
             angular samples from the displacement gradient of ``sample_phi``.
         label: Optional basis label.
+        sample_mass: Optional per-sample lumped mass [kg], shape
+            ``[sample_count]``, forwarded to :class:`ModalBasis` to compute the
+            modal mass and inertia coupling integrals.
     """
 
     def __init__(
@@ -620,6 +905,8 @@ class ModalGeneratorSampled:
         mode_damping: Sequence[float] | np.ndarray | None = None,
         derive_psi: bool = False,
         label: str | None = None,
+        *,
+        sample_mass: Sequence[float] | np.ndarray | None = None,
     ):
         self.sample_points = np.asarray(sample_points, dtype=np.float32)
         self.sample_phi = np.asarray(sample_phi, dtype=np.float32)
@@ -629,6 +916,7 @@ class ModalGeneratorSampled:
         self.mode_damping = None if mode_damping is None else np.asarray(mode_damping, dtype=np.float32)
         self.derive_psi = bool(derive_psi)
         self.label = label
+        self.sample_mass = None if sample_mass is None else np.asarray(sample_mass, dtype=np.float32)
 
     def build(self) -> ModalBasis:
         """Build the sampled modal basis."""
@@ -639,6 +927,7 @@ class ModalGeneratorSampled:
             sample_points=self.sample_points,
             sample_phi=self.sample_phi,
             sample_psi=sample_psi,
+            sample_mass=self.sample_mass,
             mode_mass=self.mode_mass,
             mode_stiffness=self.mode_stiffness,
             mode_damping=self.mode_damping,
@@ -662,10 +951,14 @@ class ModalGeneratorCraigBampton:
     Rayleigh, and other damping models diagonalized by the same modes remain
     exact.
 
-    The reduced matrices determine rigid-to-modal linear and angular inertia
-    coupling. They do not contain the higher-order centrifugal and Coriolis
-    integrals used by Newton's nonlinear floating-frame coupling, so those
-    optional terms remain unavailable in the returned basis.
+    The reduced matrices determine the exact modal mass matrix, the rigid mass
+    properties, and the rigid-to-modal linear and angular inertia coupling. They
+    do not contain the higher-order centrifugal, Coriolis, and mode-pair
+    integrals used by Newton's nonlinear floating-frame coupling. Supply
+    ``sample_mass`` to integrate those terms with lumped masses over the
+    recovered ``sample_phi``; the exact reduced-matrix values keep precedence.
+    Without ``sample_mass`` they remain unavailable, so the body's rotational
+    inertia stays frozen at its rigid value (no deformation-dependent inertia).
 
     Args:
         interface_positions: Body-local interface-frame positions [m], shape
@@ -690,6 +983,10 @@ class ModalGeneratorCraigBampton:
         damping_coupling_tolerance: Relative off-diagonal damping magnitude above
             which the diagonal approximation emits a warning.
         label: Optional basis label.
+        sample_mass: Optional lumped mass [kg] for each recovery sample point,
+            shape ``[sample_count]``. Enables the centrifugal, Coriolis, and
+            mode-pair inertia integrals of the returned basis. Interface frames
+            appended as extra samples receive zero mass.
     """
 
     def __init__(
@@ -704,6 +1001,8 @@ class ModalGeneratorCraigBampton:
         rigid_mode_tolerance: float = 1.0e-8,
         damping_coupling_tolerance: float = 1.0e-5,
         label: str | None = None,
+        *,
+        sample_mass: Sequence[float] | np.ndarray | None = None,
     ):
         self.interface_positions = np.asarray(interface_positions, dtype=np.float64)
         if self.interface_positions.ndim != 2 or self.interface_positions.shape[1] != 3:
@@ -755,6 +1054,15 @@ class ModalGeneratorCraigBampton:
             raise ValueError(
                 f"recovery_matrix must have shape {expected_recovery_shape}, got {self.recovery_matrix.shape}"
             )
+        self.sample_mass = None
+        if sample_mass is not None:
+            self.sample_mass = np.asarray(sample_mass, dtype=np.float64).reshape((-1,))
+            if self.sample_mass.shape[0] != self.sample_points.shape[0]:
+                raise ValueError(
+                    f"sample_mass must have length {self.sample_points.shape[0]}, got {self.sample_mass.shape[0]}"
+                )
+            if np.any(self.sample_mass < 0.0):
+                raise ValueError("sample_mass must be non-negative")
 
         self.rigid_mode_tolerance = float(rigid_mode_tolerance)
         if self.rigid_mode_tolerance <= 0.0:
@@ -929,6 +1237,7 @@ class ModalGeneratorCraigBampton:
         basis_points = np.array(self.sample_points, dtype=np.float32, copy=True)
         basis_phi = np.array(sample_phi, dtype=np.float32, copy=True)
         basis_psi = np.array(sample_psi, dtype=np.float32, copy=True)
+        basis_mass = None if self.sample_mass is None else np.array(self.sample_mass, dtype=np.float32, copy=True)
 
         self.interface_sample_indices = {}
         for interface, (name, point) in enumerate(zip(self.interface_names, self.interface_positions, strict=True)):
@@ -946,6 +1255,8 @@ class ModalGeneratorCraigBampton:
                 basis_points = np.vstack((basis_points, point.astype(np.float32)))
                 basis_phi = np.concatenate((basis_phi, interface_phi[None]), axis=0)
                 basis_psi = np.concatenate((basis_psi, interface_psi[None]), axis=0)
+                if basis_mass is not None:
+                    basis_mass = np.append(basis_mass, np.float32(0.0))
             self.interface_sample_indices[name] = sample_index
 
         spatial_mass = rigid.T @ mass @ rigid
@@ -963,12 +1274,17 @@ class ModalGeneratorCraigBampton:
             sample_points=basis_points,
             sample_phi=basis_phi,
             sample_psi=basis_psi,
+            sample_mass=basis_mass,
             mode_mass=mode_mass,
             mode_stiffness=mode_stiffness,
             mode_damping=mode_damping,
             mode_coupling_linear=coupling_linear,
             mode_coupling_angular=coupling_angular,
             label=self.label,
+            mode_mass_matrix=modal_mass,
+            rigid_mass=self.mass,
+            rigid_com=self.com,
+            rigid_inertia=self.inertia,
         )
 
 
@@ -1318,24 +1634,12 @@ class ModalGeneratorFEM:
         self.frequencies = np.sqrt(np.maximum(self.eigenvalues, 0.0)) / (2.0 * math.pi)
         self.modal_matrix = np.array(full_modes, dtype=np.float64, copy=True)
 
-        # Exact inertia coupling integrals from the consistent mass matrix
-        translation_modes = np.tile(np.eye(3, dtype=np.float64), (self.node_count, 1))
-        rotation_modes = np.zeros((self.dof_count, 3), dtype=np.float64)
-        for j in range(self.node_count):
-            position = self.node_positions[j].astype(np.float64)
-            for axis in range(3):
-                unit = np.zeros(3, dtype=np.float64)
-                unit[axis] = 1.0
-                rotation_modes[3 * j : 3 * j + 3, axis] = np.cross(unit, position)
+        # Exact inertia integrals from the consistent mass matrix: the
+        # mass-weighted mode field (M Phi) replaces the lumped mass_s phi_s.
         mass_modes = self.mass_matrix @ full_modes
-        coupling_linear = (mass_modes.T @ translation_modes).astype(np.float32)
-        coupling_angular = (-mass_modes.T @ rotation_modes).astype(np.float32)
-        mass_modes_n = mass_modes.T.reshape((-1, self.node_count, 3))  # [mode, node, 3]
-        node_positions = self.node_positions.astype(np.float64)
-        coupling_centrifugal = np.einsum("isc,sd->icd", mass_modes_n, node_positions).astype(np.float32)
-        mass_phi = mass_modes_n.transpose(1, 0, 2)  # [node, mode, 3]
-        nodal_phi64 = nodal_phi.astype(np.float64)
-        coupling_coriolis = np.cross(nodal_phi64[:, None, :, :], mass_phi[:, :, None, :]).sum(axis=0).astype(np.float32)
+        mass_phi = np.transpose(mass_modes.reshape((self.node_count, 3, -1)), (0, 2, 1))  # [node, mode, 3]
+        integrals = _reduced_inertia_from_pairs(self.node_positions, nodal_phi, mass_phi)
+        rigid_mass, rigid_com, rigid_inertia = self._rigid_properties()
 
         return ModalBasis(
             sample_points=self.sample_points,
@@ -1344,12 +1648,46 @@ class ModalGeneratorFEM:
             mode_mass=mode_mass,
             mode_stiffness=mode_stiffness,
             mode_damping=mode_damping,
-            mode_coupling_linear=coupling_linear,
-            mode_coupling_angular=coupling_angular,
-            mode_coupling_centrifugal=coupling_centrifugal,
-            mode_coupling_coriolis=coupling_coriolis,
+            mode_coupling_linear=integrals.mode_coupling_linear,
+            mode_coupling_angular=integrals.mode_coupling_angular,
+            mode_coupling_centrifugal=integrals.mode_coupling_centrifugal,
+            mode_coupling_coriolis=integrals.mode_coupling_coriolis,
             label=self.label,
+            mode_coupling_quadratic=integrals.mode_coupling_quadratic,
+            mode_mass_matrix=full_modes.T @ mass_modes,
+            rigid_mass=rigid_mass,
+            rigid_com=rigid_com,
+            rigid_inertia=rigid_inertia,
         )
+
+    def _rigid_properties(self) -> tuple[float | None, np.ndarray | None, np.ndarray | None]:
+        """Return the rigid mass [kg], center of mass [m], and inertia about it [kg m^2].
+
+        The spatial mass ``[T R]^T M [T R]`` is projected from the nodal mass
+        matrix with rigid translation ``T`` and rotation ``R`` fields. Returns
+        ``None`` values when ``mass_matrix`` is not a physical nodal mass matrix.
+        """
+        positions = self.node_positions.astype(np.float64)
+        rigid = np.zeros((self.dof_count, 6), dtype=np.float64)
+        rigid[:, :3] = np.tile(np.eye(3), (self.node_count, 1))
+        for axis in range(3):
+            unit = np.zeros(3, dtype=np.float64)
+            unit[axis] = 1.0
+            rigid[:, 3 + axis] = np.cross(unit, positions).reshape((-1,))
+        spatial_mass = rigid.T @ self.mass_matrix @ rigid
+        tolerance = 1.0e-7 * max(float(np.max(np.abs(spatial_mass))), 1.0)
+        mass = float(np.trace(spatial_mass[:3, :3]) / 3.0)
+        com_skew = -spatial_mass[:3, 3:] / mass if mass > 0.0 else np.zeros((3, 3))
+        if (
+            mass <= 0.0
+            or np.max(np.abs(spatial_mass[:3, :3] - mass * np.eye(3))) > tolerance
+            or np.max(np.abs(com_skew + com_skew.T)) > tolerance
+        ):
+            return None, None, None
+        com = np.array([com_skew[2, 1], com_skew[0, 2], com_skew[1, 0]], dtype=np.float64)
+        inertia = 0.5 * (spatial_mass[3:, 3:] + spatial_mass[3:, 3:].T)
+        inertia -= mass * ((com @ com) * np.eye(3) - np.outer(com, com))
+        return mass, com, inertia
 
 
 class ModalGeneratorBeam:

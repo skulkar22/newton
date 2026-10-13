@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import tracemalloc
 import unittest
 import warnings
 
@@ -9,7 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.sim.modal import _estimate_sample_psi
+from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pairs
 from newton._src.solvers.vbd.reduced_elastic_kernels import create_solve_elastic_body_tiled
 from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
@@ -969,6 +970,48 @@ def test_elastic_coriolis_array_merge_different_mode_count(test, device):
     expected_b[1] = [2.0, 0.0, 0.0]
     expected_b[2] = [-2.0, 0.0, 0.0]
     np.testing.assert_allclose(coriolis[block_b : block_b + 4], expected_b, atol=1.0e-6)
+
+
+def test_elastic_mode_pair_arrays_padding(test, device):
+    """Pad quadratic and modal mass matrix blocks per body and default to the diagonal mode mass."""
+    basis_a = newton.ModalBasis(
+        sample_points=[[1.0, 0.0, 0.0]],
+        sample_phi=[[[0.0, 0.0, 1.0]]],
+        sample_mass=[1.0],
+    )
+    basis_b = newton.ModalBasis(
+        sample_points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        sample_phi=[[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+        sample_mass=[1.0, 2.0],
+    )
+    sub = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    sub.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_b, label="b")
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_a, label="a")
+    builder.add_builder(sub)
+    builder.add_body_elastic(
+        mass=1.0, inertia=_identity_inertia(), mode_count=2, mode_mass=[3.0, 4.0], mode_stiffness=[1.0, 1.0]
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+
+    test.assertEqual(model.elastic_max_mode_count, 2)
+    quadratic = model.elastic_mode_coupling_quadratic.numpy()
+    mass_matrix = model.elastic_mode_mass_matrix.numpy()
+    test.assertEqual(quadratic.shape, (12, 3, 3))
+    test.assertEqual(mass_matrix.shape, (12,))
+
+    expected_quadratic = np.zeros((3, 2, 2, 3, 3), dtype=np.float32)
+    expected_quadratic[0, :1, :1] = basis_a.mode_coupling_quadratic
+    expected_quadratic[1] = basis_b.mode_coupling_quadratic
+    np.testing.assert_allclose(quadratic, expected_quadratic.reshape((12, 3, 3)), atol=1.0e-6)
+
+    expected_mass_matrix = np.zeros((3, 2, 2), dtype=np.float32)
+    expected_mass_matrix[0, 0, 0] = 1.0
+    expected_mass_matrix[1] = [[1.0, 1.0], [1.0, 3.0]]
+    expected_mass_matrix[2] = np.diag([3.0, 4.0])
+    np.testing.assert_allclose(mass_matrix, expected_mass_matrix.reshape((12,)), atol=1.0e-6)
+    np.testing.assert_allclose(model.elastic_mode_mass.numpy(), [1.0, 1.0, 3.0, 3.0, 4.0], atol=1.0e-6)
 
 
 def _deformed_endpoint_world(model, state, joint: int, side: str) -> np.ndarray:
@@ -3955,7 +3998,221 @@ def test_elastic_chair_stick_slip_example(test, device):
 
 
 class TestReducedElasticBody(unittest.TestCase):
-    pass
+    def test_reduced_inertia_pairs_match_brute_force(self):
+        """Match the GEMM pair tensor and derived integrals to brute-force sums for lumped and consistent mass."""
+        rng = np.random.default_rng(7)
+        points = rng.uniform(-1.0, 1.0, size=(7, 3))
+        phi = rng.uniform(-1.0, 1.0, size=(7, 3, 3))
+        mass = rng.uniform(0.5, 1.5, size=7)
+        factor = rng.uniform(-0.3, 0.3, size=(21, 21))
+        consistent = factor @ factor.T + np.eye(21)
+        cases = {
+            "lumped": (None, mass, mass[:, None, None] * phi),
+            "consistent": (
+                (consistent @ phi.transpose(0, 2, 1).reshape((21, 3))).reshape((7, 3, 3)).transpose(0, 2, 1),
+                None,
+                None,
+            ),
+        }
+        for name, (mass_phi, lumped_mass, lumped_mass_phi) in cases.items():
+            with self.subTest(name):
+                weighted = lumped_mass_phi if mass_phi is None else mass_phi
+                # Two-sample chunks exercise the chunked accumulation.
+                result = _reduced_inertia_from_pairs(points, phi, mass_phi, lumped_mass, chunk_bytes=2 * 8 * 9)
+                expected_pairs = np.einsum("sic,sjd->ijcd", phi, weighted)
+                expected_coriolis = np.cross(phi[:, None, :, :], weighted[:, :, None, :]).sum(axis=0)
+                np.testing.assert_allclose(result.mode_coupling_quadratic, expected_pairs, rtol=1.0e-6, atol=1.0e-6)
+                np.testing.assert_allclose(result.mode_coupling_coriolis, expected_coriolis, rtol=1.0e-6, atol=1.0e-6)
+                np.testing.assert_allclose(
+                    result.mode_mass_matrix, np.einsum("ijcc->ij", expected_pairs), rtol=1.0e-6, atol=1.0e-6
+                )
+                np.testing.assert_allclose(result.mode_coupling_linear, weighted.sum(axis=0), rtol=1.0e-6, atol=1.0e-6)
+                np.testing.assert_allclose(
+                    result.mode_coupling_angular,
+                    np.cross(weighted, points[:, None, :]).sum(axis=0),
+                    rtol=1.0e-6,
+                    atol=1.0e-6,
+                )
+                np.testing.assert_allclose(
+                    result.mode_coupling_centrifugal,
+                    np.einsum("smc,sd->mcd", weighted, points),
+                    rtol=1.0e-6,
+                    atol=1.0e-6,
+                )
+                if name == "lumped":
+                    np.testing.assert_allclose(
+                        expected_pairs, expected_pairs.transpose(1, 0, 3, 2), rtol=1.0e-12, atol=1.0e-12
+                    )
+                    com = mass @ points / mass.sum()
+                    offsets = points - com
+                    inertia = np.einsum("s,sk,sk->", mass, offsets, offsets) * np.eye(3) - np.einsum(
+                        "s,sa,sb->ab", mass, offsets, offsets
+                    )
+                    self.assertAlmostEqual(result.rigid_mass, float(mass.sum()), places=12)
+                    np.testing.assert_allclose(result.rigid_com, com, rtol=1.0e-6, atol=1.0e-6)
+                    np.testing.assert_allclose(result.rigid_inertia, inertia, rtol=1.0e-6, atol=1.0e-6)
+                else:
+                    # A consistent mass matrix breaks the lumped P_ji = P_ij^T symmetry.
+                    self.assertGreater(
+                        float(np.max(np.abs(expected_pairs - expected_pairs.transpose(1, 0, 3, 2)))), 1.0e-3
+                    )
+                    self.assertIsNone(result.rigid_mass)
+
+    def test_reduced_inertia_pairs_bounded_memory(self):
+        """Form the lumped mode-pair integrals for 2000 samples and 256 modes without a quartic temporary."""
+        rng = np.random.default_rng(3)
+        sample_count, mode_count = 2000, 256
+        points = rng.uniform(-1.0, 1.0, size=(sample_count, 3)).astype(np.float32)
+        phi = rng.uniform(-1.0, 1.0, size=(sample_count, mode_count, 3)).astype(np.float32)
+        mass = np.full(sample_count, 1.0 / sample_count, dtype=np.float32)
+
+        tracemalloc.start()
+        try:
+            basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=mass)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # The former [sample_count, mode_count, mode_count, 3] float64 temporary alone needs 3.1 GB.
+        self.assertLess(peak, 200 * 1024 * 1024)
+        self.assertEqual(basis.mode_coupling_quadratic.shape, (mode_count, mode_count, 3, 3))
+        self.assertEqual(basis.mode_mass_matrix.shape, (mode_count, mode_count))
+        np.testing.assert_allclose(basis.mode_mass, np.diag(basis.mode_mass_matrix), atol=0.0)
+
+    def test_modal_basis_mode_mass_matrix_coupled_modes(self):
+        """Expose the full sampled modal mass matrix and warn when an explicit diagonal discards its coupling."""
+        points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+        phi = [[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=[1.0, 1.0])
+            clone = basis.copy()
+        np.testing.assert_allclose(basis.mode_mass_matrix, [[1.0, 1.0], [1.0, 2.0]], atol=1.0e-7)
+        np.testing.assert_allclose(basis.mode_mass, [1.0, 2.0], atol=1.0e-7)
+        self.assertAlmostEqual(basis.mode_mass_coupling_ratio, 1.0 / math.sqrt(2.0), places=6)
+        np.testing.assert_allclose(clone.mode_mass_matrix, basis.mode_mass_matrix, atol=0.0)
+        np.testing.assert_allclose(clone.mode_coupling_quadratic, basis.mode_coupling_quadratic, atol=0.0)
+        self.assertEqual(clone.rigid_mass, basis.rigid_mass)
+
+        with self.assertWarnsRegex(UserWarning, "not mass-orthogonal"):
+            explicit = newton.ModalBasis(
+                sample_points=points, sample_phi=phi, sample_mass=[1.0, 1.0], mode_mass=[1.0, 2.0]
+            )
+        np.testing.assert_allclose(explicit.mode_mass_matrix, np.diag([1.0, 2.0]), atol=0.0)
+        self.assertAlmostEqual(explicit.mode_mass_coupling_ratio, 1.0 / math.sqrt(2.0), places=6)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            newton.ModalBasis(
+                sample_points=points,
+                sample_phi=phi,
+                sample_mass=[1.0, 1.0],
+                mode_mass=[1.0, 2.0],
+                mode_coupling_tolerance=0.8,
+            )
+        with self.assertRaises(ValueError):
+            newton.ModalBasis(
+                sample_points=points, sample_phi=phi, mode_mass=[1.0, 3.0], mode_mass_matrix=[[1.0, 1.0], [1.0, 2.0]]
+            )
+
+    def test_modal_basis_lumped_coriolis_matches_legacy_cross(self):
+        """Match the lumped Coriolis integral to the brute-force cross-product sum for 500 samples and 32 modes."""
+        rng = np.random.default_rng(11)
+        sample_count, mode_count = 500, 32
+        points = rng.uniform(-1.0, 1.0, size=(sample_count, 3)).astype(np.float32)
+        phi = rng.uniform(-1.0, 1.0, size=(sample_count, mode_count, 3)).astype(np.float32)
+        mass = rng.uniform(0.5, 1.5, size=sample_count).astype(np.float32) / sample_count
+        basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=mass)
+
+        phi64 = phi.astype(np.float64)
+        expected = np.einsum(
+            "s,sijc->ijc", mass.astype(np.float64), np.cross(phi64[:, None, :, :], phi64[:, :, None, :])
+        )
+        np.testing.assert_allclose(basis.mode_coupling_coriolis, expected, rtol=1.0e-5, atol=1.0e-6)
+        np.testing.assert_allclose(
+            basis.mode_coupling_coriolis, -basis.mode_coupling_coriolis.transpose(1, 0, 2), atol=1.0e-6
+        )
+
+    def test_modal_generator_craig_bampton_sample_mass(self):
+        """Integrate lumped pair terms over Craig-Bampton recovery samples while keeping exact reduced-matrix values."""
+        interface_positions, mass, stiffness, _, sample_points, recovery, _ = _build_craig_bampton_test_data()
+        sample_mass = np.linspace(0.5, 1.0, sample_points.shape[0])
+        frozen = newton.ModalGeneratorCraigBampton(
+            interface_positions=interface_positions,
+            mass_matrix=mass,
+            stiffness_matrix=stiffness,
+            sample_points=sample_points,
+            recovery_matrix=recovery,
+        ).build()
+        generator = newton.ModalGeneratorCraigBampton(
+            interface_positions=interface_positions,
+            mass_matrix=mass,
+            stiffness_matrix=stiffness,
+            sample_points=sample_points,
+            recovery_matrix=recovery,
+            sample_mass=sample_mass,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            basis = generator.build()
+
+        self.assertIsNone(frozen.mode_coupling_centrifugal)
+        self.assertIsNone(frozen.mode_coupling_coriolis)
+        self.assertIsNone(frozen.mode_coupling_quadratic)
+        self.assertIsNotNone(basis.mode_coupling_centrifugal)
+        self.assertIsNotNone(basis.mode_coupling_coriolis)
+        self.assertIsNotNone(basis.mode_coupling_quadratic)
+
+        np.testing.assert_allclose(basis.mode_mass, frozen.mode_mass, atol=0.0)
+        np.testing.assert_allclose(basis.mode_mass, 1.0, atol=1.0e-6)
+        np.testing.assert_allclose(basis.mode_mass_matrix, np.eye(basis.mode_count), atol=1.0e-6)
+        np.testing.assert_allclose(basis.mode_coupling_linear, frozen.mode_coupling_linear, atol=0.0)
+        np.testing.assert_allclose(basis.mode_coupling_angular, frozen.mode_coupling_angular, atol=0.0)
+        for current in (basis, frozen):
+            self.assertAlmostEqual(current.rigid_mass, generator.mass, places=6)
+            np.testing.assert_allclose(current.rigid_com, generator.com, atol=1.0e-6)
+            np.testing.assert_allclose(current.rigid_inertia, generator.inertia, atol=1.0e-6)
+
+        # Appended interface samples carry zero mass, so the pair tensor uses the recovery samples only.
+        sample_count = sample_points.shape[0]
+        np.testing.assert_allclose(basis.sample_mass[sample_count:], 0.0, atol=0.0)
+        phi = basis.sample_phi[:sample_count].astype(np.float64)
+        expected_pairs = np.einsum("s,sic,sjd->ijcd", sample_mass, phi, phi)
+        np.testing.assert_allclose(basis.mode_coupling_quadratic, expected_pairs, rtol=1.0e-5, atol=1.0e-6)
+
+    def test_modal_generator_fem_consistent_mass_pairs(self):
+        """Integrate FEM mode-pair inertia and rigid properties from the consistent mass matrix."""
+        nodes = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+        bar = np.array([[2.0, 1.0, 0.0], [1.0, 4.0, 1.0], [0.0, 1.0, 2.0]]) / 12.0
+        mass = np.kron(bar, np.eye(3))
+        stiffness = np.kron(np.array([[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]]) * 50.0, np.eye(3))
+        generator = newton.ModalGeneratorFEM(
+            node_positions=nodes,
+            mass_matrix=mass,
+            stiffness_matrix=stiffness,
+            sample_node_indices=[0, 1, 2],
+            fixed_node_indices=[0],
+            mode_count=4,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            basis = generator.build()
+
+        modes = generator.modal_matrix
+        nodal_phi = modes.reshape((3, 3, -1)).transpose(0, 2, 1)
+        mass_phi = (mass @ modes).reshape((3, 3, -1)).transpose(0, 2, 1)
+        expected_pairs = np.einsum("sic,sjd->ijcd", nodal_phi, mass_phi)
+        expected_coriolis = np.cross(nodal_phi[:, None, :, :], mass_phi[:, :, None, :]).sum(axis=0)
+        np.testing.assert_allclose(basis.mode_coupling_quadratic, expected_pairs, rtol=1.0e-5, atol=1.0e-6)
+        np.testing.assert_allclose(basis.mode_coupling_coriolis, expected_coriolis, rtol=1.0e-5, atol=1.0e-6)
+        np.testing.assert_allclose(basis.mode_mass_matrix, np.eye(4), atol=1.0e-6)
+        self.assertLess(basis.mode_mass_coupling_ratio, 1.0e-6)
+
+        node_mass = bar.sum(axis=1)
+        self.assertAlmostEqual(basis.rigid_mass, float(node_mass.sum()), places=6)
+        np.testing.assert_allclose(basis.rigid_com, node_mass @ nodes / node_mass.sum(), atol=1.0e-6)
+        consistent_ixx = float(nodes[:, 0] @ bar @ nodes[:, 0]) - basis.rigid_mass * float(basis.rigid_com[0]) ** 2
+        np.testing.assert_allclose(basis.rigid_inertia, np.diag([0.0, consistent_ixx, consistent_ixx]), atol=1.0e-6)
 
 
 for device in devices:
@@ -4092,6 +4349,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_coriolis_array_merge_different_mode_count",
         test_elastic_coriolis_array_merge_different_mode_count,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_mode_pair_arrays_padding",
+        test_elastic_mode_pair_arrays_padding,
         devices=[device],
     )
     add_function_test(

@@ -735,6 +735,8 @@ class ModelBuilder:
                 "elastic_mode_coupling_angular",
                 "elastic_mode_coupling_centrifugal",
                 "elastic_mode_coupling_coriolis",
+                "elastic_mode_coupling_quadratic",
+                "elastic_mode_mass_matrix",
                 "elastic_mode_shape_fn",
                 "modal_bases",
                 "elastic_basis",
@@ -2034,9 +2036,16 @@ class ModelBuilder:
         self.elastic_mode_coupling_angular: list[tuple[float, float, float]] = []
         """Reduced elastic angular inertia coupling integrals [kg m]."""
         self.elastic_mode_coupling_centrifugal: list[wp.mat33] = []
-        """Reduced elastic centrifugal coupling integrals [kg m^2], row-major 3x3 per mode."""
-        self.elastic_mode_coupling_coriolis: list[tuple[float, float, float]] = []
-        """Reduced elastic Coriolis coupling integrals [kg m^2], row-major mode pairs per elastic body."""
+        """Reduced elastic centrifugal coupling integrals [kg m], row-major 3x3 per mode."""
+        self.elastic_mode_coupling_coriolis: list[np.ndarray] = []
+        """Reduced elastic Coriolis coupling integrals [kg], one ``float32`` block of shape
+        ``[mode_count, mode_count, 3]`` per elastic body."""
+        self.elastic_mode_coupling_quadratic: list[np.ndarray] = []
+        """Reduced elastic mode-pair inertia integrals [kg], one ``float32`` block of shape
+        ``[mode_count, mode_count, 3, 3]`` per elastic body."""
+        self.elastic_mode_mass_matrix: list[np.ndarray] = []
+        """Reduced elastic modal mass matrices [kg], one ``float32`` block of shape
+        ``[mode_count, mode_count]`` per elastic body."""
         self.elastic_mode_shape_fn: list[Callable[[np.ndarray], Any] | None] = []
         """Builder-only mode-shape sampling callables for reduced elastic bodies."""
         self.modal_bases: list[ModalBasis] = []
@@ -3966,6 +3975,8 @@ class ModelBuilder:
             self.elastic_mode_coupling_angular.extend(builder.elastic_mode_coupling_angular)
             self.elastic_mode_coupling_centrifugal.extend(builder.elastic_mode_coupling_centrifugal)
             self.elastic_mode_coupling_coriolis.extend(builder.elastic_mode_coupling_coriolis)
+            self.elastic_mode_coupling_quadratic.extend(builder.elastic_mode_coupling_quadratic)
+            self.elastic_mode_mass_matrix.extend(builder.elastic_mode_mass_matrix)
             self.elastic_mode_shape_fn.extend(builder.elastic_mode_shape_fn)
             self.elastic_basis.extend(
                 modal_basis_map[basis_index] if basis_index >= 0 else -1 for basis_index in builder.elastic_basis
@@ -5681,29 +5692,36 @@ class ModelBuilder:
         return [wp.mat33(*block.tolist()) for block in blocks]
 
     @staticmethod
-    def _coerce_coupling_pairs(values: np.ndarray | None, mode_count: int) -> list[tuple[float, float, float]]:
-        """Return row-major mode-pair vec3 coupling rows, zeros when the basis has none."""
+    def _coerce_coupling_pairs(
+        values: np.ndarray | None, mode_count: int, value_shape: tuple[int, ...], name: str
+    ) -> np.ndarray:
+        """Return one body's ``float32`` mode-pair block, zeros when the basis has none."""
+        shape = (mode_count, mode_count, *value_shape)
         if values is None:
-            return [(0.0, 0.0, 0.0)] * (mode_count * mode_count)
-        rows = np.asarray(values, dtype=np.float32).reshape((mode_count * mode_count, 3))
-        return [(float(r[0]), float(r[1]), float(r[2])) for r in rows]
+            return np.zeros(shape, dtype=np.float32)
+        block = np.asarray(values, dtype=np.float32)
+        if block.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {block.shape}")
+        return np.array(block, dtype=np.float32, copy=True)
 
-    def _padded_coriolis_blocks(self) -> list[wp.vec3]:
-        """Pad each elastic body's row-major mode-pair Coriolis block to ``elastic_max_mode_count``."""
+    def _padded_pair_blocks(self, values_per_body: Sequence[np.ndarray], value_shape: tuple[int, ...]) -> np.ndarray:
+        """Pad per-body mode-pair blocks into one row-major ``float32`` array.
+
+        Args:
+            values_per_body: One block of shape ``[mode_count, mode_count, *value_shape]``
+                per elastic body.
+            value_shape: Shape of each mode-pair entry, e.g. ``()``, ``(3,)``, or ``(3, 3)``.
+
+        Returns:
+            Zero-padded array of shape
+            ``[elastic_body_count * elastic_max_mode_count^2, *value_shape]``.
+        """
         max_modes = self.elastic_max_mode_count
-        padded: list[wp.vec3] = []
-        offset = 0
-        for e in range(len(self.elastic_body)):
-            n = int(self.elastic_mode_count[e])
-            for i in range(max_modes):
-                for j in range(max_modes):
-                    if i < n and j < n:
-                        v = self.elastic_mode_coupling_coriolis[offset + i * n + j]
-                        padded.append(wp.vec3(float(v[0]), float(v[1]), float(v[2])))
-                    else:
-                        padded.append(wp.vec3(0.0))
-            offset += n * n
-        return padded
+        padded = np.zeros((len(values_per_body), max_modes, max_modes, *value_shape), dtype=np.float32)
+        for e, block in enumerate(values_per_body):
+            n = int(block.shape[0])
+            padded[e, :n, :n] = block
+        return padded.reshape((-1, *value_shape))
 
     def _register_modal_basis(self, basis: ModalBasis) -> int:
         basis_id = id(basis)
@@ -5923,6 +5941,8 @@ class ModelBuilder:
         coupling_angular = None
         coupling_centrifugal = None
         coupling_coriolis = None
+        coupling_quadratic = None
+        mode_mass_matrix = None
         if modal_basis is not None:
             if mode_count == 0:
                 mode_count = modal_basis.mode_count
@@ -5933,6 +5953,7 @@ class ModelBuilder:
             basis_index = self._register_modal_basis(modal_basis)
             if mode_mass is None:
                 mode_mass = modal_basis.mode_mass
+                mode_mass_matrix = modal_basis.mode_mass_matrix
             if mode_stiffness is None:
                 mode_stiffness = modal_basis.mode_stiffness
             if mode_damping is None:
@@ -5941,6 +5962,7 @@ class ModelBuilder:
             coupling_angular = modal_basis.mode_coupling_angular
             coupling_centrifugal = modal_basis.mode_coupling_centrifugal
             coupling_coriolis = modal_basis.mode_coupling_coriolis
+            coupling_quadratic = modal_basis.mode_coupling_quadratic
 
         if armature is not None:
             if armature < 0.0:
@@ -5974,13 +5996,25 @@ class ModelBuilder:
         self.elastic_joint.append(joint_id)
         self.elastic_mode_start.append(len(self.elastic_mode_mass))
         self.elastic_mode_count.append(mode_count)
-        self.elastic_mode_mass.extend(self._coerce_mode_values(mode_mass, mode_count, 1.0, "mode_mass"))
+        mode_mass_values = self._coerce_mode_values(mode_mass, mode_count, 1.0, "mode_mass")
+        self.elastic_mode_mass.extend(mode_mass_values)
         self.elastic_mode_stiffness.extend(self._coerce_mode_values(mode_stiffness, mode_count, 0.0, "mode_stiffness"))
         self.elastic_mode_damping.extend(self._coerce_mode_values(mode_damping, mode_count, 0.0, "mode_damping"))
         self.elastic_mode_coupling_linear.extend(self._coerce_coupling_values(coupling_linear, mode_count))
         self.elastic_mode_coupling_angular.extend(self._coerce_coupling_values(coupling_angular, mode_count))
         self.elastic_mode_coupling_centrifugal.extend(self._coerce_coupling_matrices(coupling_centrifugal, mode_count))
-        self.elastic_mode_coupling_coriolis.extend(self._coerce_coupling_pairs(coupling_coriolis, mode_count))
+        self.elastic_mode_coupling_coriolis.append(
+            self._coerce_coupling_pairs(coupling_coriolis, mode_count, (3,), "mode_coupling_coriolis")
+        )
+        self.elastic_mode_coupling_quadratic.append(
+            self._coerce_coupling_pairs(coupling_quadratic, mode_count, (3, 3), "mode_coupling_quadratic")
+        )
+        # Bodies without a full modal mass matrix use the diagonal so the solver has one code path.
+        if mode_mass_matrix is None:
+            mode_mass_matrix = np.diag(np.asarray(mode_mass_values, dtype=np.float32).reshape((mode_count,)))
+        self.elastic_mode_mass_matrix.append(
+            self._coerce_coupling_pairs(mode_mass_matrix, mode_count, (), "mode_mass_matrix")
+        )
         self.elastic_mode_shape_fn.append(mode_shape_fn)
         self.elastic_basis.append(basis_index)
         self.elastic_max_mode_count = max(self.elastic_max_mode_count, mode_count)
@@ -15845,7 +15879,19 @@ class ModelBuilder:
                 self.elastic_mode_coupling_centrifugal, dtype=wp.mat33, requires_grad=requires_grad
             )
             m.elastic_mode_coupling_coriolis = wp.array(
-                self._padded_coriolis_blocks(), dtype=wp.vec3, requires_grad=requires_grad
+                self._padded_pair_blocks(self.elastic_mode_coupling_coriolis, (3,)),
+                dtype=wp.vec3,
+                requires_grad=requires_grad,
+            )
+            m.elastic_mode_coupling_quadratic = wp.array(
+                self._padded_pair_blocks(self.elastic_mode_coupling_quadratic, (3, 3)),
+                dtype=wp.mat33,
+                requires_grad=requires_grad,
+            )
+            m.elastic_mode_mass_matrix = wp.array(
+                self._padded_pair_blocks(self.elastic_mode_mass_matrix, ()),
+                dtype=wp.float32,
+                requires_grad=requires_grad,
             )
             m.elastic_endpoint_sample = wp.array(self.elastic_endpoint_sample, dtype=wp.int32)
             m.elastic_endpoint_phi = wp.array(self.elastic_endpoint_phi, dtype=wp.vec3, requires_grad=requires_grad)
