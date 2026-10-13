@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import tracemalloc
 import unittest
 import warnings
@@ -11,7 +12,10 @@ import warp as wp
 
 import newton
 from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pairs
-from newton._src.solvers.vbd.reduced_elastic_kernels import create_solve_elastic_body_tiled
+from newton._src.solvers.vbd.reduced_elastic_kernels import (
+    accumulate_elastic_frame_coupling,
+    create_solve_elastic_body_tiled,
+)
 from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
     beam_torsion_linear_modal_properties,
@@ -49,6 +53,7 @@ from newton.examples.basic.example_basic_reduced_elastic_gripper_contact import 
 from newton.examples.basic.example_basic_reduced_elastic_matrix_rom import Example as MatrixROMExample
 from newton.examples.basic.example_basic_reduced_elastic_scraper_contact import Example as ScraperContactExample
 from newton.examples.basic.example_basic_reduced_elastic_wall_contact import Example as WallContactExample
+from newton.tests import _reduced_elastic_reference as elastic_reference
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 devices = get_test_devices()
@@ -2970,6 +2975,7 @@ def _check_elastic_centrifugal_modal_force(test, device, compliant: bool):
         mode_damping=[3.0],
     )
     m_xx = float(basis.mode_coupling_centrifugal[0][0, 0])
+    p_xx = float(basis.mode_coupling_quadratic[0, 0][0, 0])
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
@@ -3010,13 +3016,17 @@ def _check_elastic_centrifugal_modal_force(test, device, compliant: bool):
         t += dt
 
     q_final = float(state_0.joint_q.numpy()[q_index])
-    expected = omega * omega * m_xx / stiffness
+    expected = omega * omega * m_xx / (stiffness - omega * omega * p_xx)
     test.assertGreater(q_final, 0.0)
     test.assertAlmostEqual(q_final, expected, delta=0.1 * expected)
 
 
 def test_elastic_centrifugal_modal_force(test, device):
-    """Stretch an axial mode by the centrifugal load of a steady spin."""
+    """Stretch an axial mode of a beam spun about z to its centrifugal equilibrium.
+
+    The exact kinetic energy gives ``k q = w^2 (B_xx + P_xx q)``: the deformed samples also feel the
+    centrifugal load, which softens the mode to ``q = w^2 B_xx / (k - w^2 P_xx)``.
+    """
     for compliant in _RIGID_ALM_MODES:
         with test.subTest(rigid_compliant_alm=compliant):
             _check_elastic_centrifugal_modal_force(test, device, compliant)
@@ -3137,10 +3147,15 @@ def test_elastic_frame_coupling_conserves_com(test, device):
         max_frame_move = max(max_frame_move, abs(frame_z - frame_z0))
 
     test.assertGreater(max_frame_move, 0.05)
-    test.assertLess(max_com_drift, 0.01 * max_frame_move)
+    test.assertLess(max_com_drift, 1.0e-3 * max_frame_move)
 
 
 def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
+    """Conserve the full angular momentum of a free beam whose bending mode rotates its frame.
+
+    With ``S = 0`` the angular momentum about the rest COM is ``I(q) w - G(q) qdot``; for this planar
+    motion its y component is ``(I_yy + Mf q^2) w_y - G_y qdot``.
+    """
     total_mass = 1.0
     stiffness = 10.0
     deflection = 0.1
@@ -3159,6 +3174,7 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
         mode_damping=[0.0],
     )
     angular_y = float(basis.mode_coupling_angular[0][1])
+    modal_mass = float(basis.mode_mass[0])
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     beam = builder.add_body_elastic(
         xform=wp.transform_identity(),
@@ -3173,9 +3189,10 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    _, qd_start = _elastic_free_joint_starts(model, beam)
+    q_start, qd_start = _elastic_free_joint_starts(model, beam)
     frame_wy_index = qd_start + 4
     mode_vel_index = qd_start + 6
+    mode_index = q_start + 7
 
     solver = newton.solvers.SolverVBD(model, iterations=24)
     dt = 1.0 / 240.0
@@ -3188,16 +3205,365 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
         jqd = state_0.joint_qd.numpy()
         frame_wy = float(jqd[frame_wy_index])
         mode_vel = float(jqd[mode_vel_index])
-        total_h = inertia_yy * frame_wy - angular_y * mode_vel
+        mode_q = float(state_0.joint_q.numpy()[mode_index])
+        total_h = (inertia_yy + modal_mass * mode_q * mode_q) * frame_wy - angular_y * mode_vel
         max_total_h = max(max_total_h, abs(total_h))
         max_frame_spin = max(max_frame_spin, abs(frame_wy))
         modal_h_scale = max(modal_h_scale, abs(angular_y * mode_vel))
 
     test.assertGreater(max_frame_spin, 0.05)
-    test.assertLess(max_total_h, 0.02 * max(modal_h_scale, 1.0e-9))
+    test.assertLess(max_total_h, 1.0e-3 * max(modal_h_scale, 1.0e-9))
 
 
-def test_elastic_frame_coupling_conserves_spinning_momentum(test, device):
+def _rod_model(
+    device,
+    mode: str = "cos",
+    *,
+    com=(0.0, 0.0, 0.0),
+    position=(0.0, 0.0, 0.0),
+    velocity=(0.0, 0.0, 0.0),
+    spin=(0.0, 0.0, 0.0),
+    q0: float = 0.02,
+    qd0: float = 0.1,
+    stiffness: float = 30.0,
+    gravity=(0.0, 0.0, 0.0),
+    rigid_control: bool = False,
+):
+    """Build the one-mode reference rod (see :func:`_reduced_elastic_reference.rod_fixture`).
+
+    The physical body does not depend on ``com``: the samples are shifted by ``com`` and the frame
+    origin is placed at ``position - com``, so the rest COM starts at ``position``. With
+    ``rigid_control`` a plain rigid body with the rod's mass and inertia is added at the same position.
+    """
+    points, mass, phi = elastic_reference.rod_fixture(mode)
+    offset = np.asarray(com, dtype=np.float32)
+    local_points = (points + offset).astype(np.float32)
+    inertia = elastic_reference.lumped_inertia(points, mass, np.zeros(3))
+    basis = newton.ModalBasis(
+        sample_points=local_points,
+        sample_phi=phi,
+        sample_mass=mass,
+        mode_stiffness=[stiffness],
+        mode_damping=[0.0],
+    )
+    builder = newton.ModelBuilder(gravity=gravity)
+    origin = np.asarray(position, dtype=np.float32) - offset
+    body = builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(*origin), wp.quat_identity()),
+        com=wp.vec3(*offset),
+        mass=float(mass.sum()),
+        inertia=wp.mat33(*inertia.ravel()),
+        modal_basis=basis,
+        mode_q=[q0],
+        mode_qd=[qd0],
+    )
+    rigid = -1
+    if rigid_control:
+        rigid = builder.add_body(
+            xform=wp.transform(wp.vec3(*np.asarray(position, dtype=np.float32)), wp.quat_identity()),
+            mass=float(mass.sum()),
+            inertia=wp.mat33(*inertia.ravel()),
+        )
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    q_start, qd_start = _elastic_free_joint_starts(model, body)
+    joint_qd = state.joint_qd.numpy()
+    joint_qd[qd_start : qd_start + 3] = velocity
+    joint_qd[qd_start + 3 : qd_start + 6] = spin
+    if rigid_control:
+        _rigid_q_start, rigid_qd_start = _elastic_free_joint_starts(model, rigid)
+        joint_qd[rigid_qd_start : rigid_qd_start + 3] = velocity
+        joint_qd[rigid_qd_start + 3 : rigid_qd_start + 6] = spin
+    state.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    data = {
+        "points": local_points,
+        "mass": mass,
+        "phi": phi,
+        "com": offset.astype(np.float64),
+        "q_start": q_start,
+        "qd_start": qd_start,
+        "rigid": rigid,
+    }
+    return model, state, data
+
+
+def _rod_joint_state(state, data):
+    """Return the elastic body's ``(joint_q, joint_qd)`` as float64 arrays."""
+    q_start, qd_start = data["q_start"], data["qd_start"]
+    return (
+        state.joint_q.numpy()[q_start : q_start + 8].astype(np.float64),
+        state.joint_qd.numpy()[qd_start : qd_start + 7].astype(np.float64),
+    )
+
+
+def _rod_physical(state, data):
+    """Return the rod's sampled COM, linear momentum, and angular momentum about the COM."""
+    joint_q, joint_qd = _rod_joint_state(state, data)
+    return elastic_reference.physical_state(data["points"], data["mass"], data["phi"], data["com"], joint_q, joint_qd)
+
+
+def _simulate_rod(device, steps: int, dt: float, *, iterations: int = 24, record: bool = False, **kwargs):
+    """Step the reference rod with :class:`~newton.solvers.SolverVBD` and summarize the trajectory.
+
+    Returns a dict with the final joint state, the maximum ballistic COM error, the maximum drift of the
+    angular momentum about the COM, and (with ``record``) the COM and quaternion series.
+    """
+    model, state_0, data = _rod_model(device, **kwargs)
+    state_1 = model.state()
+    control = model.control()
+    solver = newton.solvers.SolverVBD(model, iterations=iterations)
+    com_0, momentum_0, angular_0 = _rod_physical(state_0, data)
+    total_mass = float(np.sum(data["mass"]))
+    gravity = np.asarray(kwargs.get("gravity", (0.0, 0.0, 0.0)), dtype=np.float64)
+    ballistic = 0.0
+    angular_drift = 0.0
+    coms = [com_0]
+    quats = [_rod_joint_state(state_0, data)[0][3:7]]
+    for step in range(steps):
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+        t = (step + 1) * dt
+        com, _momentum, angular = _rod_physical(state_0, data)
+        # Backward Euler advances a uniform acceleration as g t (t + dt) / 2.
+        expected = com_0 + t * momentum_0 / total_mass + 0.5 * t * (t + dt) * gravity
+        ballistic = max(ballistic, float(np.linalg.norm(com - expected)))
+        angular_drift = max(angular_drift, float(np.linalg.norm(angular - angular_0)))
+        if record:
+            coms.append(com)
+            quats.append(_rod_joint_state(state_0, data)[0][3:7])
+    joint_q, joint_qd = _rod_joint_state(state_0, data)
+    result = {
+        "joint_q": joint_q,
+        "joint_qd": joint_qd,
+        "ballistic": ballistic,
+        "angular_drift": angular_drift,
+        "momentum_0": momentum_0,
+        "state": state_0,
+        "data": data,
+    }
+    if record:
+        result["com"] = np.asarray(coms)
+        result["quat"] = np.asarray(quats)
+    return result
+
+
+def _launch_frame_coupling(
+    device,
+    basis,
+    com,
+    dt,
+    rot_prev,
+    omega_prev,
+    omega,
+    q_prev,
+    qd_prev,
+    q,
+    *,
+    velocity=(0.0, 0.0, 0.0),
+    accel_rel=(0.0, 0.0, 0.0),
+):
+    """Launch ``accumulate_elastic_frame_coupling`` for one body and return ``(rot, force, torque)``.
+
+    The iterate rotation is ``exp(dt omega) rot_prev``, the frame origin moves by ``dt velocity``, and the
+    inertial target is displaced so that ``(x_c - x_c*) / dt^2`` equals ``accel_rel``.
+    """
+    mode_count = basis.mode_count
+
+    def array(values, dtype):
+        return wp.array(values, dtype=dtype, device=device)
+
+    zero_index = array([0], wp.int32)
+    rot = elastic_reference.quat_multiply(elastic_reference.quat_from_rotvec(dt * np.asarray(omega)), rot_prev)
+    position = dt * np.asarray(velocity, dtype=np.float64)
+    target = position - dt * dt * np.asarray(accel_rel, dtype=np.float64)
+    forces = wp.zeros(1, dtype=wp.vec3, device=device)
+    torques = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        accumulate_elastic_frame_coupling,
+        dim=1,
+        inputs=[
+            dt,
+            zero_index,
+            zero_index,
+            zero_index,
+            array([mode_count], wp.int32),
+            mode_count,
+            array(basis.mode_coupling_linear, wp.vec3),
+            array(basis.mode_coupling_angular, wp.vec3),
+            array(basis.mode_coupling_centrifugal, wp.mat33),
+            array(basis.mode_coupling_coriolis.reshape((-1, 3)), wp.vec3),
+            array(basis.mode_coupling_quadratic.reshape((-1, 3, 3)), wp.mat33),
+            array([wp.transform(wp.vec3(*position), wp.quat(*rot))], wp.transform),
+            array([wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat(*rot_prev))], wp.transform),
+            array([wp.transform(wp.vec3(*target), wp.quat(*rot))], wp.transform),
+            array([wp.vec3(*com)], wp.vec3),
+            array([1.0 / float(basis.rigid_mass)], float),
+            array([wp.spatial_vector()], wp.spatial_vector),
+            zero_index,
+            zero_index,
+            array(np.r_[position, rot, q], float),
+            array(np.r_[np.zeros(3), rot_prev, q_prev], float),
+            array(np.r_[velocity, omega_prev, qd_prev], float),
+        ],
+        outputs=[forces, torques],
+        device=device,
+    )
+    return rot, forces.numpy()[0].astype(np.float64), torques.numpy()[0].astype(np.float64)
+
+
+def test_elastic_frame_coupling_wrench_matches_reference(test, device):
+    """Check the frame coupling wrench against brute-force sample momenta.
+
+    The kernel must return ``F = -dP_e/dt`` and ``tau = -dh_e/dt - s x (a_c - g)`` with the elastic
+    excess momenta summed directly over the samples, approach the continuous transport
+    ``-R [S qdd + 2 W S qd + (W^2 + A) S q]`` for a small step, and ignore a uniform frame velocity
+    (the frozen-inertia kernel returned a torque change of (0, 0, 0.6) N m for ``v = (0, 3, 0)``,
+    ``S = (1, 0, 0)``, ``qdot = 0.2``).
+    """
+    rng = np.random.default_rng(42)
+    sample_count, mode_count = 24, 2
+    points = rng.uniform(-0.5, 0.5, (sample_count, 3)).astype(np.float32)
+    mass = rng.uniform(0.02, 0.06, sample_count).astype(np.float32)
+    phi = (0.5 * rng.normal(size=(sample_count, mode_count, 3))).astype(np.float32)
+    basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=mass)
+    com = np.asarray(basis.rigid_com, dtype=np.float64)
+    inertia_0 = elastic_reference.lumped_inertia(points, mass, com)
+
+    def excess_momenta(rot, omega, q, qd):
+        R = elastic_reference.quat_to_matrix(rot)
+        y = (points - com + np.einsum("smc,m->sc", phi, q)) @ R.T
+        u = np.cross(omega, y) + np.einsum("smc,m->sc", phi, qd) @ R.T
+        m = mass.astype(np.float64)[:, None]
+        linear = (m * u).sum(0)
+        angular = (m * np.cross(y, u)).sum(0) - R @ inertia_0 @ R.T @ omega
+        return linear, angular, (m * y).sum(0)
+
+    dt = 0.01
+    rot_prev = elastic_reference.quat_from_rotvec([0.3, -0.5, 0.2])
+    omega_prev = np.array([1.2, -0.7, 2.1])
+    omega = np.array([1.5, -0.4, 1.8])
+    q_prev = np.array([0.04, -0.03])
+    qd_prev = np.array([0.6, -0.3])
+    q = np.array([0.047, -0.031])
+    accel_rel = np.array([0.8, -1.3, 0.4])
+    rot, force, torque = _launch_frame_coupling(
+        device, basis, com, dt, rot_prev, omega_prev, omega, q_prev, qd_prev, q, accel_rel=accel_rel
+    )
+    linear_1, angular_1, s_1 = excess_momenta(rot, omega, q, (q - q_prev) / dt)
+    linear_0, angular_0, _s_0 = excess_momenta(rot_prev, omega_prev, q_prev, qd_prev)
+    expected_force = -(linear_1 - linear_0) / dt
+    expected_torque = -(angular_1 - angular_0) / dt - np.cross(s_1, accel_rel)
+    scale = max(np.linalg.norm(expected_force), np.linalg.norm(expected_torque))
+    np.testing.assert_allclose(force, expected_force, rtol=0.0, atol=1.0e-5 * scale)
+    np.testing.assert_allclose(torque, expected_torque, rtol=0.0, atol=1.0e-5 * scale)
+
+    # Small step at constant spin and modal acceleration: continuous translational transport. The
+    # step and the modal data are powers of two so that float32 represents q exactly; the remaining
+    # deviation is O(dt |w|) plus the float32 resolution of the quaternion step.
+    dt = 2.0**-10
+    omega = np.array([0.0, 0.0, 5.0])
+    qdd = np.array([2.0, -1.5])
+    q_prev = np.array([0.03125, -0.015625])
+    qd_prev = np.array([0.375, 0.25])
+    q = q_prev + dt * qd_prev + dt * dt * qdd
+    rot, force, _torque = _launch_frame_coupling(device, basis, com, dt, rot_prev, omega, omega, q_prev, qd_prev, q)
+    R = elastic_reference.quat_to_matrix(rot)
+    omega_skew = elastic_reference.skew(R.T @ omega)
+    s_bar = basis.mode_coupling_linear.astype(np.float64).T
+    qd = qd_prev + dt * qdd
+    continuous = -R @ (s_bar @ qdd + 2.0 * omega_skew @ s_bar @ qd + omega_skew @ omega_skew @ s_bar @ q)
+    np.testing.assert_allclose(force, continuous, rtol=0.0, atol=1.0e-2 * np.linalg.norm(continuous))
+
+    # A uniform frame velocity changes neither the force nor the torque.
+    single = newton.ModalBasis(
+        sample_points=[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        sample_phi=[[[0.5, 0.0, 0.0]], [[0.5, 0.0, 0.0]]],
+        sample_mass=[1.0, 1.0],
+    )
+    np.testing.assert_allclose(single.mode_coupling_linear[0], [1.0, 0.0, 0.0], atol=1.0e-7)
+    identity = np.array([0.0, 0.0, 0.0, 1.0])
+    results = [
+        _launch_frame_coupling(
+            device,
+            single,
+            np.zeros(3),
+            0.01,
+            identity,
+            np.array([0.0, 0.0, 1.0]),
+            np.array([0.0, 0.0, 1.0]),
+            np.zeros(1),
+            np.array([0.2]),
+            np.array([0.0025]),
+            velocity=velocity,
+        )
+        for velocity in ((0.0, 0.0, 0.0), (0.0, 3.0, 0.0))
+    ]
+    test.assertGreater(np.linalg.norm(results[0][1]), 0.1)
+    test.assertGreater(np.linalg.norm(results[0][2]), 1.0e-4)
+    np.testing.assert_array_equal(results[1][1], results[0][1])
+    np.testing.assert_array_equal(results[1][2], results[0][2])
+
+
+def test_elastic_reduced_mass_matches_brute_force(test, device):
+    """Check the assembled coupled block against ``M(q) = sum_s m_s J_s^T J_s``.
+
+    With ``J_s = [1, -skew(y_s), Phi_s]`` and ``y_s = (r_s - c) + Phi_s q``, this pins the sign and
+    transpose of ``I(q)``, the translation-rotation block ``-skew(S q)``, the deformed rotation-mode
+    columns ``-(G_i + c x S_i - sum_j C_ij q_j)``, and the full modal mass matrix.
+    """
+    rng = np.random.default_rng(7)
+    sample_count, mode_count = 30, 3
+    points = rng.uniform(-0.5, 0.5, (sample_count, 3)).astype(np.float32)
+    mass = rng.uniform(0.02, 0.06, sample_count).astype(np.float32)
+    phi = (0.5 * rng.normal(size=(sample_count, mode_count, 3))).astype(np.float32)
+    basis = newton.ModalBasis(
+        sample_points=points,
+        sample_phi=phi,
+        sample_mass=mass,
+        mode_stiffness=[0.0] * mode_count,
+        mode_damping=[0.0] * mode_count,
+    )
+    test.assertGreater(basis.mode_mass_coupling_ratio, 0.05)
+    com = np.asarray(basis.rigid_com, dtype=np.float64)
+    inertia = elastic_reference.lumped_inertia(points, mass, com)
+    q = rng.uniform(-0.1, 0.1, mode_count)
+    rot = elastic_reference.quat_from_rotvec(rng.normal(size=3))
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(0.3, -0.2, 0.1), wp.quat(*rot)),
+        com=wp.vec3(*com),
+        mass=float(mass.sum()),
+        inertia=wp.mat33(*inertia.ravel()),
+        modal_basis=basis,
+        mode_q=q.tolist(),
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    state_0 = model.state()
+    state_1 = model.state()
+    solver = newton.solvers.SolverVBD(model, iterations=1)
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
+
+    # At rest without loads the single assembly happens at the initial pose and modes.
+    dt = 0.01
+    solver.step(state_0, state_1, model.control(), None, dt)
+    assembled = solver.elastic_body_block_matrix.numpy()[0].astype(np.float64) * dt * dt
+    expected = elastic_reference.reduced_mass_brute_force(points, mass, phi, com, q)
+    scale = float(np.max(np.abs(np.diag(expected))))
+    # The solve reads the upper triangle.
+    np.testing.assert_allclose(np.triu(assembled), np.triu(expected), rtol=0.0, atol=1.0e-5 * scale)
+
+
+def test_elastic_spinning_com_is_ballistic(test, device):
+    """Keep the physical center of mass of a spinning, deforming free body on its ballistic path.
+
+    The initial physical momentum ``P0 = w x (R S q0)`` is nonzero although the stored rest-COM
+    velocity is zero, so the sampled COM must travel ``t P0 / m`` (about 0.33 m in 1 s); conserving
+    ``m v_c + R S qdot`` instead leaves it near its start.
+    """
     total_mass = 1.0
     stiffness = 60.0
     deflection = 0.1
@@ -3216,51 +3582,329 @@ def test_elastic_frame_coupling_conserves_spinning_momentum(test, device):
         mode_damping=[0.0],
     )
     s_bar = np.array(basis.mode_coupling_linear[0], dtype=np.float64)
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    beam = builder.add_body_elastic(
-        xform=wp.transform_identity(),
-        com=wp.vec3(0.0, 0.0, 0.0),
-        mass=total_mass,
-        inertia=wp.mat33(0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2),
-        mode_q=[deflection],
-        modal_basis=basis,
+
+    def run(dt: float, duration: float):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        beam = builder.add_body_elastic(
+            xform=wp.transform_identity(),
+            com=wp.vec3(0.0, 0.0, 0.0),
+            mass=total_mass,
+            inertia=wp.mat33(0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2),
+            mode_q=[deflection],
+            modal_basis=basis,
+        )
+        builder.color()
+        model = builder.finalize(device=device)
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        q_start, qd_start = _elastic_free_joint_starts(model, beam)
+        mode_index = q_start + 7
+        qd0 = state_0.joint_qd.numpy()
+        qd0[qd_start + 5] = spin
+        state_0.joint_qd.assign(qd0)
+        solver = newton.solvers.SolverVBD(model, iterations=24)
+
+        def true_com():
+            bq = state_0.body_q.numpy()[beam].astype(np.float64)
+            q_mode = float(state_0.joint_q.numpy()[mode_index])
+            return bq[:3] + quat_rotate(bq[3:7], s_bar * q_mode) / total_mass
+
+        com_0 = true_com()
+        momentum_0 = np.cross([0.0, 0.0, spin], s_bar * deflection)
+        max_error = 0.0
+        max_mode_excursion = 0.0
+        max_spin_angle = 0.0
+        steps = round(duration / dt)
+        for step in range(steps):
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+            t = (step + 1) * dt
+            max_error = max(max_error, float(np.linalg.norm(true_com() - com_0 - t * momentum_0 / total_mass)))
+            max_mode_excursion = max(max_mode_excursion, abs(float(state_0.joint_q.numpy()[mode_index])))
+            bq = state_0.body_q.numpy()[beam]
+            max_spin_angle = max(max_spin_angle, 2.0 * math.atan2(abs(float(bq[5])), abs(float(bq[6]))))
+        travel = float(np.linalg.norm(true_com() - com_0))
+        return max_error, max_mode_excursion, max_spin_angle, travel, float(np.linalg.norm(momentum_0))
+
+    error_coarse, mode_excursion, spin_angle, travel, momentum = run(1.0 / 240.0, 1.0)
+    test.assertGreater(momentum, 0.3)
+    test.assertGreater(travel, 0.3)
+    test.assertGreater(spin_angle, 1.0)
+    test.assertGreater(mode_excursion, 0.5 * deflection)
+    test.assertLess(error_coarse, 5.0e-3)
+    error_fine = run(1.0 / 480.0, 1.0)[0]
+    test.assertLessEqual(error_fine, error_coarse / 1.5)
+
+
+def test_elastic_free_body_boost_invariance(test, device):
+    """Make a free elastic body's rotation and deformation independent of a uniform boost and of gravity.
+
+    A uniform velocity or a uniform gravity field must only translate the body: rotation, modal
+    coordinate, and the angular momentum about the COM stay as in the unboosted, weightless run. The
+    frozen-inertia formulation rotated this ``cos`` rod by about 2 rad in 0.2 s under a 1 m/s z boost.
+    """
+    dt = 1.0 / 960.0
+    steps = 192
+    reference = _simulate_rod(device, steps, dt, mode="cos")
+    floor = max(reference["angular_drift"], 1.0e-9)
+    cases = [{"velocity": boost} for boost in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
+    cases.append({"gravity": (0.0, 0.0, -9.81)})
+    for case in cases:
+        result = _simulate_rod(device, steps, dt, mode="cos", **case)
+        rotation = elastic_reference.rotation_angle_between(reference["joint_q"][3:7], result["joint_q"][3:7])
+        test.assertLessEqual(rotation, 1.0e-6, msg=str(case))
+        test.assertLessEqual(abs(result["joint_q"][7] - reference["joint_q"][7]), 1.0e-5, msg=str(case))
+        test.assertLessEqual(result["angular_drift"], max(2.0 * floor, 1.0e-6), msg=str(case))
+        test.assertLessEqual(result["ballistic"], 1.0e-5, msg=str(case))
+
+
+def test_elastic_free_body_origin_offset_invariance(test, device):
+    """Make a free elastic body's motion independent of where its frame origin is placed.
+
+    The same physical rod is described with its frame origin offset by +-0.1 m along each axis from the
+    rest COM; the sampled COM trajectory and the attitude must match the centered description, both
+    spinning and at rest. The frozen-inertia torque ``-v_origin x S qdot`` depended on this choice.
+    """
+    dt = 1.0 / 480.0
+    steps = 96
+    for spin in ((0.0, 0.0, 0.0), (0.0, 0.0, 5.0)):
+        reference = _simulate_rod(device, steps, dt, mode="cos", spin=spin, record=True)
+        for axis in range(3):
+            for sign in (-1.0, 1.0):
+                com = [0.0, 0.0, 0.0]
+                com[axis] = 0.1 * sign
+                result = _simulate_rod(device, steps, dt, mode="cos", spin=spin, com=com, record=True)
+                com_error = float(np.max(np.linalg.norm(result["com"] - reference["com"], axis=1)))
+                rotation_error = max(
+                    elastic_reference.rotation_angle_between(a, b)
+                    for a, b in zip(reference["quat"], result["quat"], strict=True)
+                )
+                # Poses store the frame origin, so each update rounds the origin-COM offset (float32 floor ~1e-6 m).
+                test.assertLessEqual(com_error, 2.0e-6, msg=f"spin={spin} com={com}")
+                test.assertLessEqual(rotation_error, 1.0e-5, msg=f"spin={spin} com={com}")
+
+
+def test_elastic_asymmetric_zero_spin_counterexample(test, device):
+    """Keep the COM of a non-spinning body with ``S != 0`` and ``G != 0`` ballistic.
+
+    Adding only the missing ``2 W S qdot`` transport term to the frozen-inertia frame force makes this
+    case about four times worse than before (7.9e-4 m vs 1.95e-4 m); the momentum-difference form is
+    exact up to the integrator.
+    """
+    result = _simulate_rod(device, 192, 1.0 / 960.0, mode="cos_offset")
+    test.assertLess(result["ballistic"], 5.0e-5)
+
+
+def test_elastic_random_state_matches_reference(test, device):
+    """Follow a float64 Kane-equation reference from random free-body states.
+
+    Four seeded states (``|v| <= 2`` m/s, ``|w| <= 3`` rad/s, ``|q| <= 0.05``, ``|qdot| <= 0.5``) of the
+    ``cos_offset`` rod are stepped for 0.05 s. The backward-Euler integrator is first order, so the
+    attitude error is bounded at two step sizes and must shrink with the step; the COM, which the
+    momentum-difference form keeps on the exact ballistic path, has a tight bound.
+    """
+    rng = np.random.default_rng(1234)
+    duration = 0.05
+    for _ in range(4):
+        velocity = rng.uniform(-2.0, 2.0, 3) / np.sqrt(3.0)
+        spin = rng.uniform(-3.0, 3.0, 3) / np.sqrt(3.0)
+        q0 = float(rng.uniform(-0.05, 0.05))
+        qd0 = float(rng.uniform(-0.5, 0.5))
+        errors = []
+        for dt in (1.0 / 960.0, 1.0 / 1920.0):
+            result = _simulate_rod(
+                device,
+                round(duration / dt),
+                dt,
+                iterations=48,
+                mode="cos_offset",
+                velocity=velocity,
+                spin=spin,
+                q0=q0,
+                qd0=qd0,
+            )
+            data = result["data"]
+            joint_q_0 = np.r_[np.zeros(3), 0.0, 0.0, 0.0, 1.0, q0]
+            joint_qd_0 = np.r_[velocity, spin, qd0]
+            start = elastic_reference.newton_to_reference(joint_q_0, joint_qd_0, data["com"], 1)
+            end = elastic_reference.integrate_reference(
+                data["points"], data["mass"], data["phi"], [30.0], start, duration, 1.0 / 7680.0
+            )
+            ref_q, ref_qd = elastic_reference.reference_to_newton(end, data["com"], 1)
+            ref_com = elastic_reference.physical_state(
+                data["points"], data["mass"], data["phi"], data["com"], ref_q, ref_qd
+            )[0]
+            com = elastic_reference.physical_state(
+                data["points"], data["mass"], data["phi"], data["com"], result["joint_q"], result["joint_qd"]
+            )[0]
+            errors.append(
+                (
+                    elastic_reference.rotation_angle_between(ref_q[3:7], result["joint_q"][3:7]),
+                    float(np.linalg.norm(com - ref_com)),
+                    abs(result["joint_q"][7] - ref_q[7]) / max(abs(ref_q[7]), 1.0e-3),
+                )
+            )
+        (rot_coarse, _com_coarse, _q_coarse), (rot_fine, com_fine, q_fine) = errors
+        test.assertLess(rot_fine, 3.0e-3)
+        test.assertLess(com_fine, 1.0e-5)
+        test.assertLess(q_fine, 1.0e-2)
+        test.assertLess(rot_fine, rot_coarse / 1.6)
+
+
+def _large_coordinate_run(device, y: float, steps: int, dt: float):
+    """Drift the reference rod and a rigid twin along y from ``(0, y, 0)``; return errors and the final state."""
+    velocity = np.array([0.0, 0.0573, 0.0])
+    model, state_0, data = _rod_model(device, "cos", position=(0.0, y, 0.0), velocity=velocity, rigid_control=True)
+    state_1 = model.state()
+    control = model.control()
+    solver = newton.solvers.SolverVBD(model, iterations=24)
+    rigid = data["rigid"]
+    com_0, momentum_0, _ = _rod_physical(state_0, data)
+    total_mass = float(np.sum(data["mass"]))
+    rigid_0 = state_0.body_q.numpy()[rigid][:3].astype(np.float64)
+    elastic_error = 0.0
+    rigid_error = 0.0
+    for step in range(steps):
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+        t = (step + 1) * dt
+        com = _rod_physical(state_0, data)[0]
+        elastic_error = max(elastic_error, float(np.linalg.norm(com - com_0 - t * momentum_0 / total_mass)))
+        rigid_pos = state_0.body_q.numpy()[rigid][:3].astype(np.float64)
+        rigid_error = max(rigid_error, float(np.linalg.norm(rigid_pos - rigid_0 - t * velocity)))
+    return elastic_error, rigid_error, _rod_joint_state(state_0, data)[0]
+
+
+def test_elastic_large_coordinate_invariance(test, device):
+    """Keep a free elastic body's attitude and deformation independent of its absolute position.
+
+    The rod drifts along y from y = 0, 10 and 100 m. Its frame acceleration is taken from the rigid
+    row's displacement from the inertial target, not from double-differenced absolute float32
+    positions, so the modal coordinate and the attitude match the run at the origin; at y = 0 the
+    COM stays ballistic.
+    """
+    dt = 1.0 / 960.0
+    steps = 192
+    elastic_error, _rigid_error, reference = _large_coordinate_run(device, 0.0, steps, dt)
+    test.assertLessEqual(elastic_error, 1.0e-6)
+    for y in (10.0, 100.0):
+        _elastic_error, _rigid_error, joint_q = _large_coordinate_run(device, y, steps, dt)
+        test.assertLessEqual(abs(joint_q[7] - reference[7]), 1.0e-6, msg=f"y={y}")
+        test.assertLessEqual(
+            elastic_reference.rotation_angle_between(reference[3:7], joint_q[3:7]), 1.0e-6, msg=f"y={y}"
+        )
+
+
+def test_elastic_large_coordinate_ballistic_com(test, device):
+    """Keep a free elastic body's COM at a rigid body's float32 error level 100 m from the origin.
+
+    Known limitation: the frame's per-step response to the elastic coupling force,
+    ``dt^2 F / m`` (about 7e-7 m here), is below half the float32 spacing at 100 m (3.8e-6 m), so the
+    absolute-position frame update rounds it away and the COM drifts by about 34 mm in 0.2 s while a
+    rigid twin stays within 1 mm. Accumulating the frame displacement from the inertial target in a
+    separate buffer, as the block-sparse articulation solve does, would remove it.
+    """
+    elastic_error, rigid_error, _joint_q = _large_coordinate_run(device, 100.0, 192, 1.0 / 960.0)
+    test.assertLessEqual(elastic_error, max(3.0 * rigid_error, 1.0e-6))
+    test.assertLessEqual(elastic_error, 2.0e-3)
+
+
+def _uncoupled_elastic_model(device):
+    """Build a free elastic body whose basis has no sample mass, so every coupling integral is zero.
+
+    Must stay identical to ``uncoupled_model`` in the script that recorded the golden trajectories
+    (see :func:`test_elastic_uncoupled_body_matches_base_trajectory`).
+    """
+    points = np.array([[-0.4, 0.0, 0.0], [0.0, 0.05, 0.0], [0.4, 0.0, -0.05]], dtype=np.float32)
+    phi = np.array(
+        [[[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0], [0.0, 0.0, -0.5]], [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
+        dtype=np.float32,
     )
+    basis = newton.ModalBasis(
+        sample_points=points, sample_phi=phi, mode_mass=[0.5, 0.8], mode_stiffness=[20.0, 45.0], mode_damping=[0.1, 0.0]
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(0.1, -0.2, 1.0), wp.quat_from_axis_angle(wp.vec3(0.0, 0.6, 0.8), 0.4)),
+        com=wp.vec3(0.05, -0.02, 0.03),
+        mass=1.3,
+        inertia=wp.mat33(0.2, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.4),
+        modal_basis=basis,
+        mode_q=[0.02, -0.01],
+        mode_qd=[0.4, -0.3],
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    joint_qd = state.joint_qd.numpy()
+    joint_qd[:6] = [0.3, -0.2, 0.5, 1.0, 2.0, -1.5]
+    state.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    control = model.control()
+    joint_f = control.joint_f.numpy()
+    joint_f[6:8] = [0.1, -0.2]
+    control.joint_f.assign(joint_f)
+    return model, state, control
+
+
+def test_elastic_uncoupled_body_matches_base_trajectory(test, device):
+    """Reproduce the pre-consistent-inertia trajectory when every coupling integral is zero.
+
+    With ``S = G = B = C = P = 0`` and a diagonal modal mass the frame and the modes are independent,
+    so the deformation-dependent inertia terms must add exact zeros. The golden ``joint_q`` series
+    (180 steps) was recorded with the frozen-inertia kernels (integration branch 930e01c1, Warp 1.18.0).
+    CPU results must match bit for bit. CUDA matches bit for bit when FMA contraction is disabled
+    (``fuse_fp=False``); with the default contraction the recompiled kernels may round differently, so
+    CUDA is compared to the CUDA recording within 1e-5.
+    """
+    model, state_0, control = _uncoupled_elastic_model(device)
+    state_1 = model.state()
+    solver = newton.solvers.SolverVBD(model, iterations=16)
+    trajectory = []
+    for _ in range(180):
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+        trajectory.append(state_0.joint_q.numpy().copy())
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    golden_dir = os.path.join(os.path.dirname(__file__), "golden_data", "test_reduced_elastic_body")
+    if wp.get_device(device).is_cuda:
+        golden = np.load(os.path.join(golden_dir, "uncoupled_joint_q_cuda.npy"))
+        np.testing.assert_allclose(trajectory, golden, rtol=0.0, atol=1.0e-5)
+    else:
+        golden = np.load(os.path.join(golden_dir, "uncoupled_joint_q_cpu.npy"))
+        np.testing.assert_array_equal(trajectory.view(np.uint32), golden.view(np.uint32))
+
+
+def test_elastic_nonorthogonal_modes_use_full_mass_matrix(test, device):
+    """Accelerate non-mass-orthogonal modes with the full modal mass matrix.
+
+    Two sampled modes with ``Mf = [[1, 1], [1, 2]]`` on a kinematic frame receive a modal force
+    ``Q = (0, 1)``. The modal acceleration is ``Mf^-1 Q = (-1, 1)``; the diagonal masses alone would
+    give ``(0, 0.5)``.
+    """
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    phi = [[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+    basis = newton.ModalBasis(
+        sample_points=points, sample_phi=phi, sample_mass=[1.0, 1.0], mode_stiffness=[0.0, 0.0], mode_damping=[0.0, 0.0]
+    )
+    np.testing.assert_allclose(basis.mode_mass_matrix, [[1.0, 1.0], [1.0, 2.0]], atol=1.0e-7)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(mass=2.0, inertia=_identity_inertia(), modal_basis=basis, is_kinematic=True)
     builder.color()
     model = builder.finalize(device=device)
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    q_start, qd_start = _elastic_free_joint_starts(model, beam)
-    mode_index = q_start + 7
-
-    qd0 = state_0.joint_qd.numpy()
-    qd0[qd_start + 5] = spin
-    state_0.joint_qd.assign(qd0)
-
-    solver = newton.solvers.SolverVBD(model, iterations=24)
-    dt = 1.0 / 240.0
-
-    def true_com():
-        bq = state_0.body_q.numpy()[beam]
-        translation = np.array(bq[:3], dtype=np.float64)
-        q_mode = float(state_0.joint_q.numpy()[mode_index])
-        return translation + quat_rotate(bq[3:7], s_bar * q_mode) / total_mass
-
-    com0 = true_com()
-    max_com_drift = 0.0
-    max_mode_excursion = 0.0
-    max_spin_angle = 0.0
-    for _ in range(240):
-        solver.step(state_0, state_1, control, None, dt)
-        state_0, state_1 = state_1, state_0
-        max_com_drift = max(max_com_drift, float(np.linalg.norm(true_com() - com0)))
-        max_mode_excursion = max(max_mode_excursion, abs(float(state_0.joint_q.numpy()[mode_index])))
-        bq = state_0.body_q.numpy()[beam]
-        max_spin_angle = max(max_spin_angle, 2.0 * math.atan2(abs(float(bq[5])), abs(float(bq[6]))))
-
-    test.assertGreater(max_spin_angle, 1.0)
-    test.assertGreater(max_mode_excursion, 0.5 * deflection)
-    test.assertLess(max_com_drift, 0.05)
+    _q_start, qd_start = _elastic_free_joint_starts(model, body)
+    joint_f = control.joint_f.numpy()
+    joint_f[qd_start + 7] = 1.0
+    control.joint_f.assign(joint_f)
+    solver = newton.solvers.SolverVBD(model, iterations=8)
+    dt = 1.0e-3
+    solver.step(state_0, state_1, control, None, dt)
+    qdd = state_1.joint_qd.numpy()[qd_start + 6 : qd_start + 8] / dt
+    np.testing.assert_allclose(qdd, [-1.0, 1.0], rtol=1.0e-4, atol=1.0e-4)
 
 
 def test_vbd_revolute_uses_elastic_endpoint(test, device):
@@ -5069,8 +5713,68 @@ for device in devices:
     )
     add_function_test(
         TestReducedElasticBody,
-        "test_elastic_frame_coupling_conserves_spinning_momentum",
-        test_elastic_frame_coupling_conserves_spinning_momentum,
+        "test_elastic_frame_coupling_wrench_matches_reference",
+        test_elastic_frame_coupling_wrench_matches_reference,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_reduced_mass_matches_brute_force",
+        test_elastic_reduced_mass_matches_brute_force,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_spinning_com_is_ballistic",
+        test_elastic_spinning_com_is_ballistic,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_free_body_boost_invariance",
+        test_elastic_free_body_boost_invariance,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_free_body_origin_offset_invariance",
+        test_elastic_free_body_origin_offset_invariance,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_asymmetric_zero_spin_counterexample",
+        test_elastic_asymmetric_zero_spin_counterexample,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_random_state_matches_reference",
+        test_elastic_random_state_matches_reference,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_large_coordinate_invariance",
+        test_elastic_large_coordinate_invariance,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_large_coordinate_ballistic_com",
+        test_elastic_large_coordinate_ballistic_com,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_uncoupled_body_matches_base_trajectory",
+        test_elastic_uncoupled_body_matches_base_trajectory,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_nonorthogonal_modes_use_full_mass_matrix",
+        test_elastic_nonorthogonal_modes_use_full_mass_matrix,
         devices=[device],
     )
     add_function_test(TestReducedElasticBody, "test_elastic_link_layout", test_elastic_link_layout, devices=[device])
@@ -5546,6 +6250,11 @@ for device in devices:
             devices=[device],
         )
 
+
+# The elastic frame update rounds sub-ulp coupling displacements far from the origin (see the test docstring).
+for _name in dir(TestReducedElasticBody):
+    if _name.startswith("test_elastic_large_coordinate_ballistic_com"):
+        setattr(TestReducedElasticBody, _name, unittest.expectedFailure(getattr(TestReducedElasticBody, _name)))
 
 if __name__ == "__main__":
     unittest.main()

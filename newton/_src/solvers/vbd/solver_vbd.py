@@ -1455,7 +1455,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
 
     def _build_elastic_mass_solve_data(self, model: Model) -> tuple[wp.array, wp.array]:
-        """Build coupled-mass flags and generalized inverse-mass blocks."""
+        """Build coupled-mass flags and generalized inverse-mass blocks.
+
+        The reduced mass ``M(0)`` of a dynamic frame couples the rest-COM translation, the
+        rotation, and the modes through ``S_i`` and ``-(G_i + c x S_i)`` and uses the full
+        modal mass matrix :attr:`Model.elastic_mode_mass_matrix`. Bodies whose ``M(0)`` is
+        not positive definite keep block-diagonal inverse masses and the uncoupled solve.
+        """
         elastic_body_count = int(model.elastic_body_count)
         if elastic_body_count == 0:
             return (
@@ -1469,6 +1475,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         mode_start = model.elastic_mode_start.numpy()
         mode_count = model.elastic_mode_count.numpy()
         mode_mass = model.elastic_mode_mass.numpy()
+        max_modes = int(model.elastic_max_mode_count)
+        mode_mass_matrix = model.elastic_mode_mass_matrix.numpy().reshape((elastic_body_count, max_modes, max_modes))
         coupling_linear = model.elastic_mode_coupling_linear.numpy()
         coupling_angular = model.elastic_mode_coupling_angular.numpy()
         body_mass = model.body_mass.numpy()
@@ -1507,7 +1515,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 angular = np.asarray(coupling_angular[start + mode], dtype=np.float64)
                 cross_mass[:3, mode] = linear
                 cross_mass[3:, mode] = -(angular + np.cross(body_com[body], linear))
-            modal_mass = np.diag(np.asarray(mode_mass[start : start + count], dtype=np.float64))
+            modal_mass = np.asarray(mode_mass_matrix[elastic_index, :count, :count], dtype=np.float64)
+            modal_mass = 0.5 * (modal_mass + modal_mass.T)
             reduced_mass = np.block([[frame_mass, cross_mass], [cross_mass.T, modal_mass]])
             diagonal_scale = max(float(np.max(np.abs(np.diag(reduced_mass)))), 1.0)
             is_spd = float(np.linalg.eigvalsh(reduced_mass)[0]) > 1.0e-8 * diagonal_scale
@@ -1771,6 +1780,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
             # Persistent scratch for joint_f accumulation
             self._body_f_for_integration = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.device)
+            # Body wrenches the current step's rigid predictor applied (``state.body_f`` or the scratch above).
+            self._body_f_integrated = self._body_f_for_integration
 
             # Hessian blocks (6x6 block structure: angular-angular, angular-linear, linear-linear)
             self.body_hessian_aa = wp.zeros(model.body_count, dtype=wp.mat33, device=self.device)
@@ -4531,6 +4542,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     device=self.device,
                 )
 
+            # The reduced elastic coupling recovers the predictor's COM acceleration from this wrench.
+            self._body_f_integrated = body_f_for_integration
+
             # Forward integrate rigid bodies (body_q modified in-place for dynamic bodies only).
             wp.launch(
                 kernel=forward_step_rigid_bodies,
@@ -5477,11 +5491,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.elastic_joint,
                         model.elastic_mode_start,
                         model.elastic_mode_count,
+                        model.elastic_max_mode_count,
                         model.elastic_mode_coupling_linear,
                         model.elastic_mode_coupling_angular,
+                        model.elastic_mode_coupling_centrifugal,
+                        model.elastic_mode_coupling_coriolis,
+                        model.elastic_mode_coupling_quadratic,
                         state_in.body_q,
                         self.body_q_prev,
+                        self.body_inertia_q,
                         model.body_com,
+                        self.body_inv_mass_effective,
+                        self._body_f_integrated,
                         model.joint_q_start,
                         model.joint_qd_start,
                         state_out.joint_q,
@@ -5532,6 +5553,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.elastic_mode_coupling_angular,
                         model.elastic_mode_coupling_centrifugal,
                         model.elastic_mode_coupling_coriolis,
+                        model.elastic_mode_coupling_quadratic,
+                        model.elastic_mode_mass_matrix,
                         self.elastic_implicit_mass_coupling,
                         self.rigid_adjacency,
                         model.elastic_endpoint_phi,
@@ -5548,6 +5571,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.body_com,
                         model.body_world,
                         model.gravity,
+                        self._body_f_integrated,
                         self.body_forces,
                         self.body_torques,
                         self.body_hessian_ll,
