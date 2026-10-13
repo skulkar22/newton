@@ -1460,7 +1460,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         The reduced mass ``M(0)`` of a dynamic frame couples the rest-COM translation, the
         rotation, and the modes through ``S_i`` and ``-(G_i + c x S_i)`` and uses the full
         modal mass matrix :attr:`Model.elastic_mode_mass_matrix`. Bodies whose ``M(0)`` is
-        not positive definite keep block-diagonal inverse masses and the uncoupled solve.
+        not positive definite keep block-diagonal inverse masses and the explicitly coupled
+        solve, and a :class:`UserWarning` names each of them.
         """
         elastic_body_count = int(model.elastic_body_count)
         if elastic_body_count == 0:
@@ -1519,8 +1520,22 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             modal_mass = 0.5 * (modal_mass + modal_mass.T)
             reduced_mass = np.block([[frame_mass, cross_mass], [cross_mass.T, modal_mass]])
             diagonal_scale = max(float(np.max(np.abs(np.diag(reduced_mass)))), 1.0)
-            is_spd = float(np.linalg.eigvalsh(reduced_mass)[0]) > 1.0e-8 * diagonal_scale
+            min_eigenvalue = float(np.linalg.eigvalsh(reduced_mass)[0])
+            is_spd = min_eigenvalue > 1.0e-8 * diagonal_scale
             flags[elastic_index] = is_spd
+            if not is_spd:
+                labels = getattr(model, "body_label", None)
+                name = labels[body] if labels is not None and body < len(labels) and labels[body] else f"body {body}"
+                warnings.warn(
+                    f"Reduced elastic body '{name}' (body index {int(body)}) has an indefinite reduced mass "
+                    f"matrix M(0) (smallest eigenvalue {min_eigenvalue:.3e}). The frame mass/inertia is likely "
+                    "inconsistent with the modal basis mass distribution (e.g. a frame lighter than the lumped "
+                    "sample mass, or modal coupling integrals S/G larger than the frame mass and inertia allow). "
+                    "SolverVBD falls back to explicit frame/mode coupling for this body, which can diverge under "
+                    "stiff or compliant joints; pass the basis's rigid mass, COM, and inertia to add_body_elastic.",
+                    UserWarning,
+                    stacklevel=3,
+                )
             if is_spd:
                 active_width = 6 + count
                 inverse_mass[elastic_index, :active_width, :active_width] = np.linalg.inv(reduced_mass).astype(

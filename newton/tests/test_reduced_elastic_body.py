@@ -4349,6 +4349,7 @@ def test_vbd_elastic_block_metrics_cover_frame_rows(test, device):
 
 
 def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
+    """Disable implicit frame/mode coupling and warn when the reduced mass matrix is indefinite."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -4361,8 +4362,14 @@ def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
     builder.color()
     model = builder.finalize(device=device)
 
-    solver = newton.solvers.SolverVBD(model, iterations=1)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = newton.solvers.SolverVBD(model, iterations=1)
     np.testing.assert_array_equal(solver.elastic_implicit_mass_coupling.numpy(), [False, True])
+    messages = [str(w.message) for w in caught if "indefinite reduced mass" in str(w.message)]
+    test.assertEqual(len(messages), 1)
+    test.assertIn("'indefinite'", messages[0])
+    test.assertIn("smallest eigenvalue", messages[0])
 
 
 def _craig_bampton_clamped_trajectory(device, *, iterations: int, compliant: bool) -> np.ndarray:
