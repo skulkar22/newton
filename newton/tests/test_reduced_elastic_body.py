@@ -5658,6 +5658,101 @@ def test_elastic_chair_stick_slip_example(test, device):
     _run_reduced_elastic_contact_example(ChairStickSlipExample, 240, device)
 
 
+def _lattice_craig_bampton(direct_interface: bool, fixed_mode_count: int = 8):
+    """Reduce a 27-node spring lattice with one interface at its top-face centroid node.
+
+    The interface reference point coincides with the physical node at the top-face
+    centroid. A distributing (RBE3-style) interface constrains the least-squares
+    rigid fit of the top-face nodes, so fixed-interface modes still move that node.
+    A direct (RBE2-style) interface constrains the node's own translation and the
+    fitted rotation, so the node's recovered motion equals the interface motion.
+
+    Returns:
+        ``(points, interface_position, center_node, reduced_mass, reduced_stiffness,
+        recovery)``, with every node a recovery sample.
+    """
+    points, mass, stiffness = _spring_lattice((3, 3, 3), 0.1, 1000.0, 0.01)
+    node_count = points.shape[0]
+
+    def skew(value):
+        x, y, z = value
+        return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+
+    def rigid_rows(nodes, center):
+        return np.vstack([np.column_stack((np.eye(3), -skew(node - center))) for node in nodes])
+
+    top = np.nonzero(np.isclose(points[:, 2], points[:, 2].max()))[0]
+    interface_position = points[top].mean(axis=0)
+    center_node = int(top[np.argmin(np.linalg.norm(points[top] - interface_position, axis=1))])
+    fit_rows = rigid_rows(points[top], interface_position)
+    fit = np.linalg.solve(fit_rows.T @ fit_rows, fit_rows.T)
+    constraint = np.zeros((6, 3 * node_count), dtype=np.float64)
+    for j, node in enumerate(top):
+        constraint[:, 3 * node : 3 * node + 3] = fit[:, 3 * j : 3 * j + 3]
+    if direct_interface:
+        constraint[:3] = 0.0
+        constraint[:3, 3 * center_node : 3 * center_node + 3] = np.eye(3)
+    rigid_all = rigid_rows(points, interface_position)
+    np.testing.assert_allclose(constraint @ rigid_all, np.eye(6), atol=1.0e-12)
+
+    # Fixed-interface modes span the null space of the interface constraint.
+    _, _, vt = np.linalg.svd(constraint)
+    null = vt[6:].T
+    null_mass = null.T @ mass @ null
+    null_stiffness = null.T @ stiffness @ null
+    chol = np.linalg.cholesky(null_mass)
+    standard = np.linalg.solve(chol, np.linalg.solve(chol, null_stiffness).T).T
+    _, vectors = np.linalg.eigh(0.5 * (standard + standard.T))
+    fixed_modes = null @ np.linalg.solve(chol.T, vectors[:, :fixed_mode_count])
+
+    transform = np.hstack((rigid_all, fixed_modes))
+    return (
+        points,
+        interface_position,
+        center_node,
+        transform.T @ mass @ transform,
+        transform.T @ stiffness @ transform,
+        transform,
+    )
+
+
+def test_elastic_endpoint_uses_attachment_frame(test, device):
+    points, interface_position, center_node, reduced_mass, reduced_stiffness, recovery = _lattice_craig_bampton(
+        direct_interface=False
+    )
+    generator = newton.ModalGeneratorCraigBampton(
+        interface_positions=[interface_position],
+        interface_names=["mount"],
+        mass_matrix=reduced_mass,
+        stiffness_matrix=reduced_stiffness,
+        sample_points=points,
+        recovery_matrix=recovery,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Craig-Bampton interfaces", category=UserWarning)
+        basis = generator.build()
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(modal_basis=basis)
+    xform = wp.transform(wp.vec3(*interface_position), wp.quat_identity())
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Adding a FIXED joint.*", category=UserWarning)
+        joint = builder.add_joint_fixed(parent=-1, child=body, parent_xform=xform, child_xform=xform)
+    builder.color()
+    model = builder.finalize(device=device)
+
+    endpoint = int(model.joint_child_elastic_endpoint.numpy()[joint])
+    mode_count = basis.mode_count
+    max_modes = int(model.elastic_max_mode_count)
+    endpoint_phi = model.elastic_endpoint_phi.numpy()[endpoint * max_modes : endpoint * max_modes + mode_count]
+    endpoint_psi = model.elastic_endpoint_psi.numpy()[endpoint * max_modes : endpoint * max_modes + mode_count]
+    np.testing.assert_allclose(endpoint_phi, basis.frame_phi[0], atol=1.0e-7)
+    np.testing.assert_allclose(endpoint_psi, basis.frame_psi[0], atol=1.0e-7)
+    # The endpoint keeps the coincident material sample for render and contact bookkeeping.
+    test.assertEqual(int(model.elastic_endpoint_sample.numpy()[endpoint]), center_node)
+    test.assertGreater(float(np.max(np.abs(basis.sample_phi[center_node] - basis.frame_phi[0]))), 0.1)
+
+
 class TestReducedElasticBody(unittest.TestCase):
     def test_reduced_inertia_pairs_match_brute_force(self):
         """Match the GEMM pair tensor and derived integrals to brute-force sums for lumped and consistent mass."""
@@ -5874,6 +5969,150 @@ class TestReducedElasticBody(unittest.TestCase):
         np.testing.assert_allclose(basis.rigid_com, node_mass @ nodes / node_mass.sum(), atol=1.0e-6)
         consistent_ixx = float(nodes[:, 0] @ bar @ nodes[:, 0]) - basis.rigid_mass * float(basis.rigid_com[0]) ** 2
         np.testing.assert_allclose(basis.rigid_inertia, np.diag([0.0, consistent_ixx, consistent_ixx]), atol=1.0e-6)
+
+    def test_modal_generator_craig_bampton_distributing_interface(self):
+        """Keep recovered material samples at a coincident distributing interface and expose the frame."""
+        points, interface_position, center_node, reduced_mass, reduced_stiffness, recovery = _lattice_craig_bampton(
+            direct_interface=False
+        )
+        generator = newton.ModalGeneratorCraigBampton(
+            interface_positions=[interface_position],
+            mass_matrix=reduced_mass,
+            stiffness_matrix=reduced_stiffness,
+            sample_points=points,
+            recovery_matrix=recovery,
+        )
+        with self.assertWarnsRegex(UserWarning, "distributing interfaces"):
+            basis = generator.build()
+
+        node_count = points.shape[0]
+        modes = generator.modal_matrix
+        expected_phi = (recovery @ modes).reshape((node_count, 3, -1)).transpose(0, 2, 1)
+        np.testing.assert_allclose(basis.sample_phi[:node_count], expected_phi, atol=1.0e-6)
+        self.assertEqual(basis.sample_count, node_count)
+        self.assertEqual(generator.interface_sample_indices["interface_0"], center_node)
+        self.assertGreater(
+            generator.interface_recovery_deviation["interface_0"], generator.interface_recovery_tolerance
+        )
+
+        self.assertEqual(basis.frame_count, 1)
+        self.assertEqual(basis.frame_labels, ["interface_0"])
+        np.testing.assert_allclose(basis.frame_points[0], interface_position, atol=1.0e-7)
+        np.testing.assert_allclose(basis.frame_phi[0], modes[0:3].T, atol=1.0e-6)
+        np.testing.assert_allclose(basis.frame_psi[0], modes[3:6].T, atol=1.0e-6)
+        self.assertEqual(basis.find_frame(interface_position), 0)
+        self.assertEqual(basis.find_frame(interface_position + 1.0e-3), -1)
+        self.assertGreater(float(np.max(np.abs(expected_phi[center_node] - modes[0:3].T))), 0.1)
+        self.assertAlmostEqual(basis.rigid_mass, node_count * 0.01, places=6)
+        self.assertEqual(basis.copy().frame_count, 1)
+
+    def test_modal_generator_craig_bampton_direct_interface(self):
+        """Reuse a coincident recovery sample of a direct interface and take the exact interface rotation."""
+        points, interface_position, center_node, reduced_mass, reduced_stiffness, recovery = _lattice_craig_bampton(
+            direct_interface=True
+        )
+        generator = newton.ModalGeneratorCraigBampton(
+            interface_positions=[interface_position],
+            mass_matrix=reduced_mass,
+            stiffness_matrix=reduced_stiffness,
+            sample_points=points,
+            recovery_matrix=recovery,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            basis = generator.build()
+
+        node_count = points.shape[0]
+        modes = generator.modal_matrix
+        expected_phi = (recovery @ modes).reshape((node_count, 3, -1)).transpose(0, 2, 1)
+        np.testing.assert_allclose(basis.sample_phi[:node_count], expected_phi, atol=1.0e-6)
+        self.assertEqual(basis.sample_count, node_count)
+        self.assertEqual(generator.interface_sample_indices["interface_0"], center_node)
+        self.assertLess(generator.interface_recovery_deviation["interface_0"], generator.interface_recovery_tolerance)
+        np.testing.assert_allclose(basis.sample_phi[center_node], modes[0:3].T, atol=1.0e-6)
+        np.testing.assert_allclose(basis.sample_psi[center_node], modes[3:6].T, atol=1.0e-6)
+        np.testing.assert_allclose(basis.frame_phi[0], modes[0:3].T, atol=1.0e-6)
+        np.testing.assert_allclose(basis.frame_psi[0], modes[3:6].T, atol=1.0e-6)
+
+    def test_modal_basis_attachment_frames(self):
+        """Store massless attachment frames that never enter interpolation or inertia integrals."""
+        points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+        phi = np.array([[[0.0, 0.0, 0.0]], [[0.0, 0.0, 1.0]]], dtype=np.float32)
+        basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=[1.0, 1.0])
+        self.assertEqual(basis.frame_count, 0)
+        self.assertEqual(basis.frame_phi.shape, (0, 1, 3))
+        coupling = basis.mode_coupling_linear.copy()
+
+        index = basis.add_frame([0.5, 0.0, 0.0], [[0.0, 3.0, 0.0]], [[1.0, 0.0, 0.0]], label="pad")
+        self.assertEqual(index, 0)
+        self.assertEqual(basis.find_frame([0.5, 0.0, 0.0]), 0)
+        self.assertEqual(basis.find_frame([0.6, 0.0, 0.0]), -1)
+        self.assertEqual(basis.frame_labels, ["pad"])
+        np.testing.assert_allclose(basis.evaluate([0.5, 0.0, 0.0])[0], [[0.0, 0.0, 0.5]], atol=1.0e-6)
+        np.testing.assert_allclose(basis.mode_coupling_linear, coupling, atol=0.0)
+        self.assertEqual(basis.sample_count, 2)
+
+        copied = basis.copy()
+        copied.add_frame([0.0, 1.0, 0.0], [[0.0, 0.0, 0.0]])
+        self.assertEqual(basis.frame_count, 1)
+        self.assertEqual(copied.frame_count, 2)
+        np.testing.assert_allclose(copied.frame_psi[1], 0.0, atol=0.0)
+        with self.assertRaises(ValueError):
+            basis.add_frame([0.0, 0.0, 0.0], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        with self.assertRaises(ValueError):
+            newton.ModalBasis(sample_points=points, sample_phi=phi, frame_points=[[0.0, 0.0, 0.0]])
+
+    def test_modal_basis_mass_orthonormalize(self):
+        """Transform coupled modes to unit modal mass without changing the physical displacement field."""
+        rng = np.random.default_rng(7)
+        points = rng.uniform(-0.5, 0.5, size=(12, 3)).astype(np.float32)
+        phi = rng.normal(size=(12, 3, 3)).astype(np.float32)
+        sample_mass = rng.uniform(0.5, 1.5, size=12).astype(np.float32)
+        basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=sample_mass)
+        basis.add_frame([0.0, 0.0, 0.0], phi[0], phi[1], label="mount")
+        self.assertGreater(basis.mode_mass_coupling_ratio, 0.1)
+
+        with self.assertWarnsRegex(UserWarning, "rescales the modal coordinates"):
+            unit = basis.mass_orthonormalize()
+
+        mass64 = sample_mass.astype(np.float64)
+        phi_unit = unit.sample_phi[:12].astype(np.float64)
+        np.testing.assert_allclose(np.einsum("s,sic,sjc->ij", mass64, phi_unit, phi_unit), np.eye(3), atol=1.0e-6)
+        np.testing.assert_allclose(unit.mode_mass, 1.0, atol=0.0)
+        np.testing.assert_allclose(unit.mode_mass_matrix, np.eye(3), atol=0.0)
+        np.testing.assert_allclose(np.einsum("ijcc->ij", unit.mode_coupling_quadratic), np.eye(3), atol=1.0e-5)
+        self.assertLess(unit.mode_mass_coupling_ratio, 1.0e-5)
+
+        factor = np.linalg.cholesky(basis.mode_mass_matrix.astype(np.float64))
+        q = rng.normal(size=3)
+        q_unit = factor.T @ q
+        np.testing.assert_allclose(
+            np.einsum("smc,m->sc", unit.sample_phi.astype(np.float64), q_unit),
+            np.einsum("smc,m->sc", phi.astype(np.float64), q),
+            rtol=1.0e-5,
+            atol=1.0e-5,
+        )
+        np.testing.assert_allclose(
+            np.einsum("mc,m->c", unit.frame_phi[0].astype(np.float64), q_unit),
+            np.einsum("mc,m->c", phi[0].astype(np.float64), q),
+            atol=1.0e-5,
+        )
+        np.testing.assert_allclose(unit.mode_coupling_linear.T @ q_unit, basis.mode_coupling_linear.T @ q, atol=1.0e-5)
+        self.assertEqual(unit.rigid_mass, basis.rigid_mass)
+
+        stiff = newton.ModalBasis(
+            sample_points=points, sample_phi=phi, sample_mass=sample_mass, mode_stiffness=[1.0, 2.0, 3.0]
+        )
+        with self.assertRaisesRegex(ValueError, "non-diagonal"):
+            stiff.mass_orthonormalize()
+
+        diagonal = newton.ModalBasis(
+            sample_points=points[:1], sample_phi=phi[:1, :1], mode_mass=[4.0], mode_stiffness=[8.0]
+        )
+        with self.assertWarnsRegex(UserWarning, "rescales"):
+            rescaled = diagonal.mass_orthonormalize()
+        np.testing.assert_allclose(rescaled.mode_stiffness, [2.0], rtol=1.0e-6)
+        np.testing.assert_allclose(rescaled.sample_phi, phi[:1, :1] / 2.0, rtol=1.0e-6)
 
 
 for device in devices:
@@ -6712,6 +6951,12 @@ for device in devices:
             test_elastic_chair_stick_slip_example,
             devices=[device],
         )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_endpoint_uses_attachment_frame",
+        test_elastic_endpoint_uses_attachment_frame,
+        devices=[device],
+    )
 
 
 # The elastic frame update rounds sub-ulp coupling displacements far from the origin (see the test docstring).

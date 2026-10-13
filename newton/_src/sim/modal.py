@@ -260,6 +260,20 @@ class ModalBasis:
         mode_coupling_tolerance: Relative off-diagonal modal mass coupling
             ``max_{i != j} |Mf_ij| / sqrt(Mf_ii Mf_jj)`` above which an explicit
             diagonal ``mode_mass`` emits a warning.
+        frame_points: Optional body-local attachment frame origins [m], shape
+            ``[frame_count, 3]``. Attachment frames are named connection points,
+            such as Craig-Bampton interface frames, whose mode values are
+            prescribed rather than interpolated. They carry no mass, never
+            enter the inertia integrals or the inverse-distance interpolation,
+            and take precedence over material samples for joint endpoints that
+            coincide with them.
+        frame_phi: Translational mode values of the attachment frames [m per
+            modal coordinate], shape ``[frame_count, mode_count, 3]``. Required
+            when ``frame_points`` is given.
+        frame_psi: Optional angular mode values of the attachment frames [rad per
+            modal coordinate], shape ``[frame_count, mode_count, 3]``. Defaults to
+            zeros.
+        frame_labels: Optional attachment frame labels, length ``frame_count``.
     """
 
     def __init__(
@@ -284,6 +298,10 @@ class ModalBasis:
         rigid_com: Sequence[float] | np.ndarray | None = None,
         rigid_inertia: Sequence[Sequence[float]] | np.ndarray | None = None,
         mode_coupling_tolerance: float = 1.0e-2,
+        frame_points: Sequence[Sequence[float]] | np.ndarray | None = None,
+        frame_phi: Sequence[Sequence[Sequence[float]]] | np.ndarray | None = None,
+        frame_psi: Sequence[Sequence[Sequence[float]]] | np.ndarray | None = None,
+        frame_labels: Sequence[str | None] | None = None,
     ):
         self.label = label
         self.interpolation_epsilon = float(interpolation_epsilon)
@@ -426,6 +444,35 @@ class ModalBasis:
         else:
             self.mode_mass_matrix = None
 
+        self.frame_points = np.zeros((0, 3), dtype=np.float32)
+        """Body-local attachment frame origins [m], shape ``[frame_count, 3]``."""
+        self.frame_phi = np.zeros((0, mode_count, 3), dtype=np.float32)
+        """Attachment frame translational mode values [m per modal coordinate], shape ``[frame_count, mode_count, 3]``."""
+        self.frame_psi = np.zeros((0, mode_count, 3), dtype=np.float32)
+        """Attachment frame angular mode values [rad per modal coordinate], shape ``[frame_count, mode_count, 3]``."""
+        self.frame_labels: list[str | None] = []
+        """Attachment frame labels, length ``frame_count``; ``None`` for unlabeled frames."""
+        if frame_points is not None:
+            frames = np.asarray(frame_points, dtype=np.float32).reshape((-1, 3))
+            if frame_phi is None:
+                raise ValueError("frame_phi is required when frame_points is given")
+            frame_count = int(frames.shape[0])
+            phi_values = np.asarray(frame_phi, dtype=np.float32)
+            if phi_values.shape != (frame_count, mode_count, 3):
+                raise ValueError(f"frame_phi must have shape ({frame_count}, {mode_count}, 3), got {phi_values.shape}")
+            psi_values = np.zeros_like(phi_values) if frame_psi is None else np.asarray(frame_psi, dtype=np.float32)
+            if psi_values.shape != (frame_count, mode_count, 3):
+                raise ValueError(f"frame_psi must have shape ({frame_count}, {mode_count}, 3), got {psi_values.shape}")
+            labels = [None] * frame_count if frame_labels is None else list(frame_labels)
+            if len(labels) != frame_count:
+                raise ValueError(f"frame_labels must have length {frame_count}, got {len(labels)}")
+            self.frame_points = np.array(frames, dtype=np.float32, copy=True)
+            self.frame_phi = np.array(phi_values, dtype=np.float32, copy=True)
+            self.frame_psi = np.array(psi_values, dtype=np.float32, copy=True)
+            self.frame_labels = [None if label is None else str(label) for label in labels]
+        elif frame_phi is not None or frame_psi is not None or frame_labels is not None:
+            raise ValueError("frame_phi, frame_psi, and frame_labels require frame_points")
+
     @property
     def mode_mass_coupling_ratio(self) -> float:
         """Largest relative off-diagonal modal mass coupling.
@@ -447,6 +494,11 @@ class ModalBasis:
     def sample_count(self) -> int:
         """Number of stored sample points."""
         return int(self.sample_points.shape[0])
+
+    @property
+    def frame_count(self) -> int:
+        """Number of attachment frames."""
+        return int(self.frame_points.shape[0])
 
     @staticmethod
     def _infer_mode_count(*arrays: Sequence[float] | np.ndarray | None) -> int:
@@ -585,7 +637,71 @@ class ModalBasis:
             rigid_com=self.rigid_com,
             rigid_inertia=self.rigid_inertia,
             mode_coupling_tolerance=self.mode_coupling_tolerance,
+            frame_points=self.frame_points,
+            frame_phi=self.frame_phi,
+            frame_psi=self.frame_psi,
+            frame_labels=self.frame_labels,
         )
+
+    def find_frame(self, point: Sequence[float] | np.ndarray, tolerance: float = 1.0e-7) -> int:
+        """Return the index of the attachment frame at ``point``, or ``-1`` if none exists.
+
+        When several frames lie within ``tolerance``, the nearest one is
+        returned, and the first of equally near frames.
+
+        Args:
+            point: Body-local point [m], shape ``[3]``.
+            tolerance: Matching tolerance [m].
+
+        Returns:
+            The attachment frame index, or ``-1``.
+        """
+        if self.frame_count == 0:
+            return -1
+        query = np.asarray(point, dtype=np.float32).reshape((3,))
+        dist2 = np.sum((self.frame_points - query.reshape((1, 3))) ** 2, axis=1)
+        nearest = int(np.argmin(dist2))
+        return nearest if float(dist2[nearest]) <= tolerance * tolerance else -1
+
+    def add_frame(
+        self,
+        point: Sequence[float] | np.ndarray,
+        phi: Sequence[Sequence[float]] | np.ndarray,
+        psi: Sequence[Sequence[float]] | np.ndarray | None = None,
+        label: str | None = None,
+    ) -> int:
+        """Add an attachment frame with prescribed mode values and return its index.
+
+        Attachment frames carry no mass and are never interpolated. Joint
+        endpoints that coincide with a frame use its ``phi`` and ``psi`` instead
+        of the interpolated material sample, so a frame can represent a
+        connection whose motion differs from the material point at the same
+        location, such as a distributing (RBE3-style) interface.
+
+        Args:
+            point: Body-local frame origin [m], shape ``[3]``.
+            phi: Translational mode values [m per modal coordinate], shape
+                ``[mode_count, 3]``.
+            psi: Angular mode values [rad per modal coordinate], shape
+                ``[mode_count, 3]``. Defaults to zeros.
+            label: Optional frame label.
+
+        Returns:
+            The attachment frame index.
+        """
+        point_value = np.asarray(point, dtype=np.float32).reshape((1, 3))
+        phi_value = np.asarray(phi, dtype=np.float32)
+        if phi_value.shape != (self.mode_count, 3):
+            raise ValueError(f"phi must have shape ({self.mode_count}, 3), got {phi_value.shape}")
+        psi_value = np.zeros_like(phi_value) if psi is None else np.asarray(psi, dtype=np.float32)
+        if psi_value.shape != (self.mode_count, 3):
+            raise ValueError(f"psi must have shape ({self.mode_count}, 3), got {psi_value.shape}")
+        frame_index = self.frame_count
+        self.frame_points = np.concatenate((self.frame_points, point_value), axis=0)
+        self.frame_phi = np.concatenate((self.frame_phi, phi_value[None]), axis=0)
+        self.frame_psi = np.concatenate((self.frame_psi, psi_value[None]), axis=0)
+        self.frame_labels.append(None if label is None else str(label))
+        return frame_index
 
     def find_sample(self, point: Sequence[float] | np.ndarray, tolerance: float = 1.0e-7) -> int:
         """Return the index of a matching sample point, or ``-1`` if none exists.
@@ -796,6 +912,114 @@ class ModalBasis:
         return (
             np.einsum("s,smc->mc", weights, self.sample_phi).astype(np.float32),
             np.einsum("s,smc->mc", weights, self.sample_psi).astype(np.float32),
+        )
+
+    def mass_orthonormalize(self, *, tolerance: float = 1.0e-6) -> ModalBasis:
+        """Return a copy whose modes are orthonormal under the modal mass matrix.
+
+        With the Cholesky factor ``Mf = L L^T`` of :attr:`mode_mass_matrix`
+        (``diag(mode_mass)`` when no full matrix is known), the new modes are
+        ``Phi' = Phi L^-T``. Sample, attachment-frame, and inertia-integral
+        values are transformed consistently, the new modal mass matrix is the
+        identity, and the physical displacement field is unchanged when the
+        modal coordinates are mapped as ``q' = L^T q``. Rigid mass properties and
+        sample masses are unchanged.
+
+        :class:`ModalBasis` stores diagonal stiffness and damping, while the
+        transformed matrices are ``L^-1 K L^-T`` and ``L^-1 D L^-T``. These stay
+        diagonal only when ``Mf`` is diagonal (a pure rescaling) or when the
+        stiffness and damping are proportional to ``Mf`` (including zero), so
+        any other combination raises :class:`ValueError`. The utility is
+        optional: the solver consumes a full :attr:`mode_mass_matrix` directly.
+
+        A :class:`UserWarning` is emitted when the modal coordinates change,
+        because initial ``mode_q``/``mode_qd`` values and any stored modal
+        trajectories must then be mapped with ``L^T``.
+
+        Args:
+            tolerance: Relative tolerance on the off-diagonal part of the
+                transformed stiffness and damping, measured against their
+                largest diagonal entry, and on the deviation of ``L`` from the
+                identity used to decide whether the coordinates change.
+
+        Returns:
+            A new mass-orthonormal basis. ``L`` is
+            ``numpy.linalg.cholesky(mode_mass_matrix)`` of this basis.
+        """
+        mode_count = self.mode_count
+        mass_matrix = (
+            np.diag(self.mode_mass.astype(np.float64))
+            if self.mode_mass_matrix is None
+            else np.asarray(self.mode_mass_matrix, dtype=np.float64)
+        )
+        mass_matrix = 0.5 * (mass_matrix + mass_matrix.T)
+        try:
+            factor = np.linalg.cholesky(mass_matrix) if mode_count > 0 else np.zeros((0, 0))
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("mass_orthonormalize requires a positive-definite modal mass matrix") from exc
+        # transform[i, j] = (L^-T)[i, j], so phi'_j = sum_i phi_i transform[i, j].
+        transform = np.linalg.inv(factor).T if mode_count > 0 else np.zeros((0, 0))
+
+        def congruent(values: np.ndarray, name: str) -> np.ndarray:
+            matrix = transform.T @ np.diag(values.astype(np.float64)) @ transform
+            diagonal = np.diag(matrix).copy()
+            scale = max(float(np.max(np.abs(diagonal), initial=0.0)), np.finfo(np.float64).tiny)
+            off_diagonal = float(np.max(np.abs(matrix - np.diag(diagonal)), initial=0.0))
+            if off_diagonal > tolerance * scale:
+                raise ValueError(
+                    f"mass_orthonormalize would make {name} non-diagonal (relative off-diagonal "
+                    f"{off_diagonal / scale:.3g} > tolerance {tolerance:.3g}); the diagonal {name} of "
+                    "ModalBasis cannot represent it. Use the full mode_mass_matrix instead."
+                )
+            return diagonal
+
+        stiffness = congruent(self.mode_stiffness, "mode_stiffness")
+        damping = congruent(self.mode_damping, "mode_damping")
+
+        def modes(values: np.ndarray) -> np.ndarray:
+            return np.einsum("smc,mn->snc", values.astype(np.float64), transform).astype(np.float32)
+
+        def single(values: np.ndarray | None) -> np.ndarray | None:
+            if values is None:
+                return None
+            return np.einsum("m...,mn->n...", values.astype(np.float64), transform).astype(np.float32)
+
+        def pairs(values: np.ndarray | None) -> np.ndarray | None:
+            if values is None:
+                return None
+            return np.einsum("ab...,ai,bj->ij...", values.astype(np.float64), transform, transform).astype(np.float32)
+
+        if mode_count > 0 and float(np.max(np.abs(factor - np.eye(mode_count)))) > tolerance:
+            warnings.warn(
+                "ModalBasis.mass_orthonormalize rescales the modal coordinates (q' = L^T q); map initial "
+                "mode_q/mode_qd and stored modal trajectories accordingly.",
+                stacklevel=2,
+            )
+
+        return ModalBasis(
+            sample_points=self.sample_points,
+            sample_phi=modes(self.sample_phi),
+            sample_psi=modes(self.sample_psi),
+            sample_mass=self.sample_mass,
+            mode_mass=np.ones(mode_count, dtype=np.float32),
+            mode_stiffness=stiffness,
+            mode_damping=damping,
+            mode_coupling_linear=single(self.mode_coupling_linear),
+            mode_coupling_angular=single(self.mode_coupling_angular),
+            mode_coupling_centrifugal=single(self.mode_coupling_centrifugal),
+            mode_coupling_coriolis=pairs(self.mode_coupling_coriolis),
+            label=self.label,
+            interpolation_epsilon=self.interpolation_epsilon,
+            mode_coupling_quadratic=pairs(self.mode_coupling_quadratic),
+            mode_mass_matrix=np.eye(mode_count, dtype=np.float32),
+            rigid_mass=self.rigid_mass,
+            rigid_com=self.rigid_com,
+            rigid_inertia=self.rigid_inertia,
+            mode_coupling_tolerance=self.mode_coupling_tolerance,
+            frame_points=self.frame_points,
+            frame_phi=modes(self.frame_phi),
+            frame_psi=modes(self.frame_psi),
+            frame_labels=self.frame_labels,
         )
 
 
@@ -1023,6 +1247,30 @@ class ModalGeneratorCraigBampton:
     Without ``sample_mass`` they remain unavailable, so the body's rotational
     inertia stays frozen at its rigid value (no deformation-dependent inertia).
 
+    Each interface becomes a named attachment frame of the returned basis
+    (``frame_points``, ``frame_phi``, ``frame_psi``, ``frame_labels``) whose mode
+    values are the interface DOF rows of the modal matrix; joint endpoints placed
+    at an interface position use these values. The material samples used for
+    contacts and rendering depend on how the interface relates to the recovery
+    samples:
+
+    - No recovery sample within ``interface_match_tolerance``: the interface is
+      also appended as a massless material sample with the interface values.
+    - A coincident recovery sample whose recovered translation matches the
+      interface translation within ``interface_recovery_tolerance`` (relative
+      to the largest modal matrix entry), as for a direct (RBE2-style)
+      interface node: the sample keeps its recovered ``phi`` and takes the
+      exact interface rotation as its ``psi``.
+    - A coincident recovery sample whose recovered motion differs, as for a
+      distributing (RBE3-style) interface whose reference point lies on a
+      physical node: the sample keeps its recovered motion unchanged and a
+      warning is emitted. Joints use the interface frame; contacts and
+      rendering use the physical sample.
+
+    :meth:`build` records the chosen sample index of each interface in
+    ``interface_sample_indices`` and the relative deviation of each coincident
+    interface in ``interface_recovery_deviation``.
+
     Args:
         interface_positions: Body-local interface-frame positions [m], shape
             ``[interface_count, 3]``. Their order defines the six-DOF blocks in
@@ -1055,6 +1303,12 @@ class ModalGeneratorCraigBampton:
             the diagonal damping stored by :class:`ModalBasis`. ``"diagonal"``
             discards off-diagonal terms, warning when their relative magnitude
             exceeds ``damping_coupling_tolerance``; ``"error"`` raises instead.
+        interface_match_tolerance: Distance [m] within which an interface
+            position coincides with a recovery sample point.
+        interface_recovery_tolerance: Largest relative deviation between the
+            interface translation rows and the recovered translation of a
+            coincident sample for which the interface is treated as direct
+            (RBE2-style) rather than distributing.
     """
 
     def __init__(
@@ -1072,6 +1326,8 @@ class ModalGeneratorCraigBampton:
         *,
         sample_mass: Sequence[float] | np.ndarray | None = None,
         damping_projection: str = "diagonal",
+        interface_match_tolerance: float = 1.0e-7,
+        interface_recovery_tolerance: float = 1.0e-6,
     ):
         self.interface_positions = np.asarray(interface_positions, dtype=np.float64)
         if self.interface_positions.ndim != 2 or self.interface_positions.shape[1] != 3:
@@ -1140,6 +1396,14 @@ class ModalGeneratorCraigBampton:
         if self.damping_coupling_tolerance < 0.0:
             raise ValueError(f"damping_coupling_tolerance must be non-negative, got {self.damping_coupling_tolerance}")
         self.damping_projection = _validate_damping_projection(damping_projection)
+        self.interface_match_tolerance = float(interface_match_tolerance)
+        if self.interface_match_tolerance < 0.0:
+            raise ValueError(f"interface_match_tolerance must be non-negative, got {self.interface_match_tolerance}")
+        self.interface_recovery_tolerance = float(interface_recovery_tolerance)
+        if self.interface_recovery_tolerance < 0.0:
+            raise ValueError(
+                f"interface_recovery_tolerance must be non-negative, got {self.interface_recovery_tolerance}"
+            )
         self.label = label
 
         self.fixed_interface_mode_count = self.reduced_dof_count - self.interface_dof_count
@@ -1155,6 +1419,7 @@ class ModalGeneratorCraigBampton:
         self.modal_matrix = np.zeros((self.reduced_dof_count, self.mode_count), dtype=np.float64)
         self.damping_off_diagonal_ratio = 0.0
         self.interface_sample_indices: dict[str, int] = {}
+        self.interface_recovery_deviation: dict[str, float] = {}
 
     @staticmethod
     def _coerce_square_matrix(
@@ -1295,24 +1560,49 @@ class ModalGeneratorCraigBampton:
         basis_mass = None if self.sample_mass is None else np.array(self.sample_mass, dtype=np.float32, copy=True)
 
         self.interface_sample_indices = {}
+        self.interface_recovery_deviation = {}
+        frames: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+        distributing: list[str] = []
+        mode_scale = max(float(np.max(np.abs(modal_matrix), initial=0.0)), np.finfo(np.float64).eps)
         for interface, (name, point) in enumerate(zip(self.interface_names, self.interface_positions, strict=True)):
             start = 6 * interface
-            interface_phi = modal_matrix[start : start + 3].T.astype(np.float32)
-            interface_psi = modal_matrix[start + 3 : start + 6].T.astype(np.float32)
-            distances = np.linalg.norm(basis_points.astype(np.float64) - point, axis=1)
-            matching = np.nonzero(distances <= 1.0e-7)[0]
+            interface_phi = modal_matrix[start : start + 3].T
+            interface_psi = modal_matrix[start + 3 : start + 6].T
+            frames.append((name, point, interface_phi, interface_psi))
+            distances = np.linalg.norm(self.sample_points - point, axis=1)
+            matching = np.nonzero(distances <= self.interface_match_tolerance)[0]
             if matching.shape[0] > 0:
-                sample_index = int(matching[0])
-                basis_phi[sample_index] = interface_phi
-                basis_psi[sample_index] = interface_psi
+                # The interface frame coincides with a recovery sample. A direct (RBE2-style)
+                # interface moves that material point exactly, so the sample reuses the exact
+                # interface rotation. A distributing (RBE3-style) interface follows a weighted
+                # average of other nodes, so the material sample keeps its recovered motion and
+                # joints use the attachment frame instead.
+                sample_index = int(matching[np.argmin(distances[matching])])
+                deviation = float(np.max(np.abs(interface_phi - sample_phi[sample_index]), initial=0.0)) / mode_scale
+                self.interface_recovery_deviation[name] = deviation
+                if deviation <= self.interface_recovery_tolerance:
+                    basis_psi[sample_index] = interface_psi.astype(np.float32)
+                else:
+                    distributing.append(name)
             else:
                 sample_index = int(basis_points.shape[0])
                 basis_points = np.vstack((basis_points, point.astype(np.float32)))
-                basis_phi = np.concatenate((basis_phi, interface_phi[None]), axis=0)
-                basis_psi = np.concatenate((basis_psi, interface_psi[None]), axis=0)
+                basis_phi = np.concatenate((basis_phi, interface_phi.astype(np.float32)[None]), axis=0)
+                basis_psi = np.concatenate((basis_psi, interface_psi.astype(np.float32)[None]), axis=0)
                 if basis_mass is not None:
                     basis_mass = np.append(basis_mass, np.float32(0.0))
             self.interface_sample_indices[name] = sample_index
+
+        if distributing:
+            worst = max(self.interface_recovery_deviation[name] for name in distributing)
+            warnings.warn(
+                f"Craig-Bampton interfaces {distributing} coincide with recovery samples whose recovered "
+                f"motion differs from the interface DOFs (maximum relative deviation {worst:.3g} > "
+                f"interface_recovery_tolerance {self.interface_recovery_tolerance:.3g}). Treating them as "
+                "distributing interfaces: joints attached here use the interface frame, contacts and "
+                "rendering use the physical recovery sample.",
+                stacklevel=2,
+            )
 
         spatial_mass = rigid.T @ mass @ rigid
         self._extract_rigid_properties(spatial_mass)
@@ -1340,6 +1630,10 @@ class ModalGeneratorCraigBampton:
             rigid_mass=self.mass,
             rigid_com=self.com,
             rigid_inertia=self.inertia,
+            frame_points=np.asarray([frame[1] for frame in frames], dtype=np.float32),
+            frame_phi=np.asarray([frame[2] for frame in frames], dtype=np.float32),
+            frame_psi=np.asarray([frame[3] for frame in frames], dtype=np.float32),
+            frame_labels=[frame[0] for frame in frames],
         )
 
 

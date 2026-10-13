@@ -13925,20 +13925,36 @@ class ModelBuilder:
     def _add_elastic_modal_sample(
         self, elastic_index: int, local_pos: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, int]:
-        """Return the translational and angular mode samples and basis sample index at a body-local point.
+        """Return the joint-endpoint mode samples and basis sample index at a body-local point.
 
         Angular samples are only available from a :class:`ModalBasis`; bodies driven by a
-        ``mode_shape_fn`` and unsampled bodies report zero angular coupling.
+        ``mode_shape_fn`` and unsampled bodies report zero angular coupling. Named
+        attachment frames of the basis take precedence over material samples.
         """
         phi, psi, sample_indices = self._add_elastic_modal_samples(
-            elastic_index, np.asarray(local_pos, dtype=np.float32).reshape((1, 3))
+            elastic_index, np.asarray(local_pos, dtype=np.float32).reshape((1, 3)), prefer_frames=True
         )
         return phi[0], psi[0], int(sample_indices[0])
 
     def _add_elastic_modal_samples(
-        self, elastic_index: int, local_positions: np.ndarray
+        self, elastic_index: int, local_positions: np.ndarray, *, prefer_frames: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return modal samples and basis indices for body-local points."""
+        """Return modal samples and basis indices for body-local points.
+
+        Args:
+            elastic_index: Elastic body index.
+            local_positions: Body-local points [m], shape ``[point_count, 3]``.
+            prefer_frames: Whether named attachment frames of the modal basis take
+                precedence over interpolated material samples. Joint endpoints set
+                this so that, e.g., a distributing Craig-Bampton interface uses its
+                interface mode values; surface (render and contact) samples do not.
+                The returned sample indices always refer to material samples, so
+                render and contact bookkeeping is unchanged.
+
+        Returns:
+            Translational and angular mode values, each shape
+            ``[point_count, mode_count, 3]``, and the basis sample indices.
+        """
         points = np.asarray(local_positions, dtype=np.float32).reshape((-1, 3))
         mode_count = self.elastic_mode_count[elastic_index]
         if mode_count == 0:
@@ -13952,6 +13968,12 @@ class ModelBuilder:
             sample_indices = basis.add_samples(points)
             phi = basis.sample_phi[sample_indices]
             psi = basis.sample_psi[sample_indices]
+            if prefer_frames and basis.frame_count > 0:
+                for point_index, point in enumerate(points):
+                    frame_index = basis.find_frame(point)
+                    if frame_index >= 0:
+                        phi[point_index] = basis.frame_phi[frame_index]
+                        psi[point_index] = basis.frame_psi[frame_index]
             if phi.shape != (points.shape[0], mode_count, 3):
                 raise ValueError(
                     f"modal_basis for elastic body {self.elastic_body[elastic_index]} must provide "
