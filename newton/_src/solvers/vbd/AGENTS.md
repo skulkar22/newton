@@ -135,6 +135,36 @@ Setting the pinned column reproduces 8afa14fc BDF2 bit for bit. All switches are
 - The same under-weighted rho exists in joint dry-friction rows (bounded by the friction limit), in the tendon ALM row on `dev/rigid-vbd-integration` (`tendon_alm=True`: rho from the lightest attachment, one-sided, retained multiplier, so slack-to-taut behaves like a limit hit), and in contact rows on free light bodies (10 kg box on a free 0.05 kg plate at 4 ms sinks 5.2 mm vs 0.5 mm static; articulated links are protected by the structural term). Contact logic was out of scope here.
 - Friction stick measured from the anchor pose, `eval_joint_forces` with the solver's rate reference and step, contact-row support from the subtree mass, theta = 0 for unconverged bodies, per-body theta (Stage B).
 
+## How to test this branch (external teams)
+
+Branch `vbd-bdf2-stability` is experimental and may receive one more commit before the final stamp. All configurations
+below use the block-sparse articulation solve and compliant ALM, as the G1 studies did:
+
+```python
+common = dict(rigid_articulation_solve="block_sparse_joints", rigid_compliant_alm=True)
+```
+
+Harnesses that clear `NEWTON_VBD_*` from the environment (for example the partner bundle's `solver_settings`) must pass
+the constructor kwargs below; the env variables are overrides for studies only.
+
+| Configuration | Constructor kwargs |
+|---|---|
+| 1. BDF1 default | `SolverVBD(model, **common)`. Bit-identical to 8afa14fc on CPU and GPU. |
+| 2. BDF1 + fixes | `SolverVBD(model, **common, rigid_external_force_mode="solve", rigid_axis_support_armature=True, rigid_limit_rho_floor=True)`. Warm start stays off for BDF1 (not measured). |
+| 3. BDF2 + fixes (build defaults) | `SolverVBD(model, **common, rigid_time_integration="bdf2")`. Equivalent to passing `rigid_bdf2_startup="gravity", rigid_bdf2_exact_rotation=True, rigid_bdf2_rotor_residual="composed", rigid_bdf2_theta_policy="event", rigid_external_force_mode="solve", rigid_axis_support_armature=True, rigid_limit_rho_floor=True, rigid_bdf2_kinematic_rate=True`. |
+| 4. BDF2 pinned prototype (reference) | `rigid_time_integration="bdf2", rigid_bdf2_theta_policy="off", rigid_external_force_mode="target", rigid_bdf2_startup="free_fall", rigid_bdf2_exact_rotation=False, rigid_bdf2_rotor_residual="linear", rigid_bdf2_kinematic_rate=False, rigid_axis_support_armature=False, rigid_limit_rho_floor=False`. Bit-identical to 8afa14fc BDF2. |
+
+What to expect (measured on the SONIC-free reproducers and the partner's recorded input):
+- The explicit-drive start-up (PD torques through `Control.joint_f`) no longer stops at 0.304 s with BDF2 (fixes: in-solve external force and the composed rotor residual).
+- The internal drive at 4 ms / 7 iterations no longer overshoots the waist_pitch limit (BDF2 0.003 rad, BDF1 with configuration 2 0.003 rad; before 0.29 / 0.35 rad; MuJoCo 0.019).
+- BDF1 default is unchanged bitwise.
+- `SolverVBD.bdf2_theta_stats()` reports the fraction of BDF2 steps and which event detector fired.
+
+Known trade-offs:
+- Theta `event` takes BDF1 steps around contact changes, limit changes, force and velocity jumps. In contact-rich motion it runs largely as BDF1 (Doctor Legs path_rms 0.112 m vs 0.090 with `off`; contact closure/penetration better). `off` keeps BDF2 everywhere and loses the impact handling (box-drop rebound 0.19 vs 0.004).
+- Fresh-world start-up: `event` starts fresh worlds with BDF1 steps (best on the D1 hinge and the pendulum, +12 % worst error on G1 air_cycle); `event_nofresh` uses the synthetic gravity history (better on air_cycle, a −½·dt·a velocity lag under a force present at the start).
+- `rigid_external_force_guess` (constrained initial guess) stays off: no effect on the G1 holds, where `solve` already converges.
+
 ## The one rule that matters: never difference rounded absolute poses
 
 Absolute positions and quaternions are float32. Their rounding (~1e-7 relative) is the same size as one step's motion at small dt.
