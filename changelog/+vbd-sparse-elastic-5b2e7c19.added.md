@@ -1,0 +1,1 @@
+Support reduced elastic links in `SolverVBD(rigid_articulation_solve="block_sparse_joints")`: each link's modal coordinates are eliminated onto its frame and joint-neighbour blocks of the articulation factorization, its joints use the deformed attachments, and its frame takes the displacement-form update.

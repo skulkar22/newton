@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
+from ...sim import JointType
+
 
 @dataclass
 class RigidArticulationSparseLayout:
@@ -37,6 +39,38 @@ class RigidArticulationSparseLayout:
     articulation_joint_count: int
     local_body_count: int
     block_count: int
+    elastic_bodies: wp.array[wp.int32]
+    """Reduced elastic bodies solved inside an articulation, shape [elastic_body_count]."""
+    elastic_body_row_start: wp.array[wp.int32]
+    """First sparse row of each elastic body's articulation, shape [elastic_body_count]."""
+    elastic_group_offsets: wp.array[wp.int32]
+    """Schur column groups of each elastic body, shape [elastic_body_count + 1].
+
+    The first group of a body is its own frame; every further group is one joint
+    that couples the body's modal coordinates to a neighbour frame.
+    """
+    elastic_group_joint: wp.array[wp.int32]
+    """Joint of each Schur column group, or ``-1`` for the own frame, shape [elastic_group_count]."""
+    elastic_group_local: wp.array[wp.int32]
+    """Articulation-local row of the frame each group couples to, shape [elastic_group_count]."""
+    elastic_group_owner: wp.array[wp.int32]
+    """Index into ``elastic_bodies`` of the body owning each group, shape [elastic_group_count]."""
+    elastic_group_body: wp.array[wp.int32]
+    """Body whose frame each group couples to, shape [elastic_group_count]."""
+    elastic_group_neighbour_elastic: wp.array[wp.int32]
+    """Whether a joint group's neighbour is itself a reduced elastic body, shape [elastic_group_count]."""
+    elastic_pair_left: wp.array[wp.int32]
+    """Row group of each modal Schur block, shape [elastic_pair_count]."""
+    elastic_pair_right: wp.array[wp.int32]
+    """Column group of each modal Schur block, shape [elastic_pair_count]."""
+    elastic_pair_slot: wp.array[wp.int32]
+    """Sparse block slot receiving each modal Schur block, shape [elastic_pair_count]."""
+    joint_cross_slot: wp.array[wp.int32]
+    """Scratch block slot capturing a joint's parent-child Hessian block, or ``-1``, shape [joint_count]."""
+    elastic_body_count: int
+    elastic_group_count: int
+    elastic_pair_count: int
+    cross_block_count: int
 
 
 def _symbolic_cholesky_pattern(body_count: int, edges: set[tuple[int, int]]) -> list[list[int]]:
@@ -91,6 +125,13 @@ def build_rigid_articulation_sparse_layout(
     :meth:`~newton.ModelBuilder.add_articulation` with ``allow_closed_loops=True``.
     Bodies outside every articulation remain in the regular local VBD solve.
     Joints outside articulation ranges must not touch articulation bodies.
+
+    Reduced elastic owner joints (:attr:`~newton.JointType.ELASTIC`) carry no
+    constraint, add no graph edge, and may lie inside or outside an articulation
+    range. An elastic body joins an articulation through its owner joint or any
+    physical joint in the range. Its modal coordinates are eliminated onto its
+    frame block, which couples every pair of the body's joint neighbours, so
+    those pairs are added to the fill pattern.
     """
 
     if model.body_count == 0:
@@ -98,6 +139,16 @@ def build_rigid_articulation_sparse_layout(
 
     joint_parent = np.asarray(model.joint_parent.to("cpu").numpy(), dtype=np.int32)
     joint_child = np.asarray(model.joint_child.to("cpu").numpy(), dtype=np.int32)
+    joint_type = np.asarray(model.joint_type.to("cpu").numpy(), dtype=np.int32)
+    elastic_owner = joint_type == int(JointType.ELASTIC)
+    if int(getattr(model, "elastic_body_count", 0)) > 0:
+        body_elastic_index = np.asarray(model.body_elastic_index.to("cpu").numpy(), dtype=np.int32)
+        parent_endpoint = np.asarray(model.joint_parent_elastic_endpoint.to("cpu").numpy(), dtype=np.int32)
+        child_endpoint = np.asarray(model.joint_child_elastic_endpoint.to("cpu").numpy(), dtype=np.int32)
+    else:
+        body_elastic_index = np.full((model.body_count,), -1, dtype=np.int32)
+        parent_endpoint = np.full((model.joint_count,), -1, dtype=np.int32)
+        child_endpoint = np.full((model.joint_count,), -1, dtype=np.int32)
     articulation_start = np.asarray(model.articulation_start.to("cpu").numpy(), dtype=np.int32)
     articulation_end = np.asarray(model.articulation_end.to("cpu").numpy(), dtype=np.int32)
 
@@ -160,7 +211,7 @@ def build_rigid_articulation_sparse_layout(
         return None
 
     for joint_idx in range(model.joint_count):
-        if joint_group[joint_idx] >= 0:
+        if joint_group[joint_idx] >= 0 or elastic_owner[joint_idx]:
             continue
         parent = int(joint_parent[joint_idx])
         child = int(joint_child[joint_idx])
@@ -184,6 +235,18 @@ def build_rigid_articulation_sparse_layout(
             local_body_color_groups.append(wp.array(local_bodies, dtype=wp.int32, device=device))
             local_body_count += int(local_bodies.size)
 
+    elastic_bodies_host: list[int] = []
+    elastic_body_row_start_host: list[int] = []
+    elastic_group_offsets_host = [0]
+    elastic_group_joint_host: list[int] = []
+    elastic_group_body_host: list[int] = []
+    joint_cross_slot_host = np.full((model.joint_count,), -1, dtype=np.int32)
+    elastic_group_owner_host: list[int] = []
+    elastic_pair_left_host: list[int] = []
+    elastic_pair_right_host: list[int] = []
+    elastic_pair_slot_host: list[int] = []
+    cross_joints: list[int] = []
+
     symbolic_cache: dict[
         tuple[int, tuple[tuple[int, int], ...]],
         tuple[list[int], list[list[int]]],
@@ -191,11 +254,34 @@ def build_rigid_articulation_sparse_layout(
     for bodies, joints in articulation_groups:
         local_index = {body: i for i, body in enumerate(bodies)}
         edges: set[tuple[int, int]] = set()
+        elastic_neighbours: dict[int, list[tuple[int, int]]] = {
+            body: [] for body in bodies if body_elastic_index[body] >= 0
+        }
         for joint_idx in joints:
             parent = int(joint_parent[joint_idx])
             child = int(joint_child[joint_idx])
+            if elastic_owner[joint_idx]:
+                continue
+            for body, is_parent in ((parent, True), (child, False)):
+                if body >= 0 and body in elastic_neighbours:
+                    endpoint = parent_endpoint[joint_idx] if is_parent else child_endpoint[joint_idx]
+                    if endpoint < 0:
+                        raise ValueError(
+                            f"Joint {joint_idx} touches reduced elastic body {body} without an elastic endpoint "
+                            f"sample, so the block-sparse VBD solve cannot couple it to the body's modes. "
+                            f"Use rigid_articulation_solve='local' for this model."
+                        )
+                    other = child if is_parent else parent
+                    if other >= 0 and other != body:
+                        elastic_neighbours[body].append((joint_idx, other))
             if parent >= 0 and child >= 0 and parent in local_index and child in local_index:
                 edges.add((local_index[parent], local_index[child]))
+        # Eliminating an elastic body's modes couples all of its neighbour frames.
+        for neighbours in elastic_neighbours.values():
+            others = sorted({local_index[other] for _joint, other in neighbours})
+            for i, a in enumerate(others):
+                for b in others[:i]:
+                    edges.add((a, b))
 
         topology_key = (
             len(bodies),
@@ -219,6 +305,7 @@ def build_rigid_articulation_sparse_layout(
         articulation_body_offsets_host.append(len(articulation_bodies_host))
         articulation_joint_offsets_host.append(len(articulation_joints_host))
 
+        local_index_ordered = {body: i for i, body in enumerate(ordered_bodies)}
         for local_body, body in enumerate(ordered_bodies):
             body_articulation_local_host[body] = local_body
 
@@ -234,6 +321,33 @@ def build_rigid_articulation_sparse_layout(
             row_start = block_row_offsets_host[local_row_offset_start + local_row]
             for local_col_index, local_col in enumerate(row_cols):
                 block_lookup[(local_row, local_col)] = row_start + local_col_index
+
+        for body in ordered_bodies:
+            if body not in elastic_neighbours:
+                continue
+            elastic_index = len(elastic_bodies_host)
+            elastic_bodies_host.append(body)
+            elastic_body_row_start_host.append(body_start)
+            group_begin = len(elastic_group_joint_host)
+            group_locals = [local_index_ordered[body]]
+            elastic_group_joint_host.append(-1)
+            elastic_group_body_host.append(body)
+            for joint_idx, other in elastic_neighbours[body]:
+                if joint_cross_slot_host[joint_idx] < 0:
+                    joint_cross_slot_host[joint_idx] = len(cross_joints)
+                    cross_joints.append(joint_idx)
+                elastic_group_joint_host.append(joint_idx)
+                elastic_group_body_host.append(other)
+                group_locals.append(local_index_ordered[other])
+            elastic_group_offsets_host.append(len(elastic_group_joint_host))
+            elastic_group_owner_host.extend([elastic_index] * len(group_locals))
+            # Schur blocks of the stored lower block triangle, one per ordered group pair.
+            for g, local_g in enumerate(group_locals):
+                for h, local_h in enumerate(group_locals):
+                    if local_g >= local_h:
+                        elastic_pair_left_host.append(group_begin + g)
+                        elastic_pair_right_host.append(group_begin + h)
+                        elastic_pair_slot_host.append(block_lookup[(local_g, local_h)])
 
         for local_col in range(len(ordered_bodies)):
             block_col_offsets_host.append(len(block_col_rows_host))
@@ -270,6 +384,12 @@ def build_rigid_articulation_sparse_layout(
     factor_update_left_slots_np = np.asarray(factor_update_left_slots_host, dtype=np.int32)
     factor_update_right_slots_np = np.asarray(factor_update_right_slots_host, dtype=np.int32)
     diag_slots_np = np.asarray(diag_slots_host, dtype=np.int32)
+    # Cross-capture blocks follow the factorized blocks in the same value array.
+    block_count = len(block_cols_host)
+    joint_cross_slot_host[joint_cross_slot_host >= 0] += block_count
+    elastic_group_local_np = np.asarray(
+        [body_articulation_local_host[body] for body in elastic_group_body_host], dtype=np.int32
+    )
 
     return RigidArticulationSparseLayout(
         articulation_body_offsets=wp.array(articulation_body_offsets_np, dtype=wp.int32, device=device),
@@ -293,5 +413,39 @@ def build_rigid_articulation_sparse_layout(
         articulation_body_count=len(articulation_bodies_host),
         articulation_joint_count=len(articulation_joints_host),
         local_body_count=local_body_count,
-        block_count=len(block_cols_host),
+        block_count=block_count,
+        elastic_bodies=wp.array(np.asarray(elastic_bodies_host, dtype=np.int32), dtype=wp.int32, device=device),
+        elastic_body_row_start=wp.array(
+            np.asarray(elastic_body_row_start_host, dtype=np.int32), dtype=wp.int32, device=device
+        ),
+        elastic_group_offsets=wp.array(
+            np.asarray(elastic_group_offsets_host, dtype=np.int32), dtype=wp.int32, device=device
+        ),
+        elastic_group_joint=wp.array(
+            np.asarray(elastic_group_joint_host, dtype=np.int32), dtype=wp.int32, device=device
+        ),
+        elastic_group_local=wp.array(elastic_group_local_np, dtype=wp.int32, device=device),
+        elastic_group_owner=wp.array(
+            np.asarray(elastic_group_owner_host, dtype=np.int32), dtype=wp.int32, device=device
+        ),
+        elastic_group_body=wp.array(np.asarray(elastic_group_body_host, dtype=np.int32), dtype=wp.int32, device=device),
+        elastic_group_neighbour_elastic=wp.array(
+            np.asarray(
+                [
+                    int(joint >= 0 and body_elastic_index[body] >= 0)
+                    for joint, body in zip(elastic_group_joint_host, elastic_group_body_host, strict=True)
+                ],
+                dtype=np.int32,
+            ),
+            dtype=wp.int32,
+            device=device,
+        ),
+        elastic_pair_left=wp.array(np.asarray(elastic_pair_left_host, dtype=np.int32), dtype=wp.int32, device=device),
+        elastic_pair_right=wp.array(np.asarray(elastic_pair_right_host, dtype=np.int32), dtype=wp.int32, device=device),
+        elastic_pair_slot=wp.array(np.asarray(elastic_pair_slot_host, dtype=np.int32), dtype=wp.int32, device=device),
+        joint_cross_slot=wp.array(joint_cross_slot_host, dtype=wp.int32, device=device),
+        elastic_body_count=len(elastic_bodies_host),
+        elastic_group_count=len(elastic_group_joint_host),
+        elastic_pair_count=len(elastic_pair_slot_host),
+        cross_block_count=len(cross_joints),
     )

@@ -1338,6 +1338,33 @@ constructed. Put a loop-closing joint inside a single articulation to include
 it in the direct factorization, or use the local solve for models whose joints
 must cross articulation boundaries.
 
+Reduced elastic links take part in the same factorization. Their owner joint
+(:attr:`~newton.JointType.ELASTIC`, created by
+:meth:`~newton.ModelBuilder.add_link_elastic`) carries no constraint, so it may
+stay outside the articulation; the link belongs to the articulation through its
+physical joints, or through the one-joint articulation that
+:meth:`~newton.ModelBuilder.add_body_elastic` creates. The solver eliminates
+each elastic link's modal coordinates onto its frame block and onto the frames
+of the bodies it is jointed to, so a loop through an elastic coupler is solved
+as one system:
+
+.. code-block:: python
+
+   crank = builder.add_link(...)
+   coupler = builder.add_link_elastic(..., modal_basis=basis)  # owner joint stays outside
+   rocker = builder.add_link(...)
+   j_drive = builder.add_joint_revolute(parent=-1, child=crank, ...)
+   j_a = builder.add_joint_revolute(parent=crank, child=coupler, ...)
+   j_b = builder.add_joint_revolute(parent=coupler, child=rocker, ...)
+   j_loop = builder.add_joint_revolute(parent=-1, child=rocker, ...)
+   builder.add_articulation([j_drive, j_a, j_b, j_loop], allow_closed_loops=True)
+
+A joint between two elastic links couples their modes directly; the sparse
+solve replaces that coupling by a conservative per-link term, which keeps the
+iteration stable but needs more iterations to converge. Joint mimics, and
+armature, passive damping, or friction on joints attached to an elastic link,
+are not supported in this mode.
+
 .. warning::
 
    An articulation built with ``allow_closed_loops=True`` is **not** a kinematic

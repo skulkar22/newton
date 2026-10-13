@@ -4134,22 +4134,52 @@ def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
         newton.solvers.SolverVBD(model, iterations=1, integrate_with_external_rigid_solver=True)
 
 
-def test_vbd_elastic_body_rejects_block_sparse_joints(test, device):
-    """The block-sparse articulation solve does not support reduced elastic bodies."""
+def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
+    """Solve articulated elastic bodies in the block-sparse solve and reject the unsupported cases.
+
+    An elastic body's joints must lie in its articulation, as for rigid bodies; its owner joint
+    may stay outside. Joint mimics are not combined with elastic articulation bodies.
+    """
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
         sample_mass=[1.0],
-        mode_stiffness=[0.0],
+        mode_stiffness=[50.0],
         mode_damping=[0.0],
     )
+
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis)
     builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
     model = builder.finalize(device=device)
+    with test.assertRaisesRegex(ValueError, "outside the declared articulation ranges"):
+        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
 
-    with test.assertRaisesRegex(NotImplementedError, "block_sparse_joints"):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    body = builder.add_link_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.01], modal_basis=basis)
+    builder.add_articulation([builder.add_joint_fixed(parent=-1, child=body)])
+    builder.color()
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(model, iterations=4, rigid_articulation_solve="block_sparse_joints")
+    test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 1)
+    state_0, state_1 = model.state(), model.state()
+    for _ in range(4):
+        solver.step(state_0, state_1, None, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    test.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
+    test.assertLess(float(np.linalg.norm(state_0.body_q.numpy()[body, :3])), 1.0e-3)
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis)
+    links = [builder.add_link(mass=1.0, inertia=_identity_inertia()) for _ in range(2)]
+    joints = [builder.add_joint_revolute(parent=-1, child=body, axis=(0.0, 0.0, 1.0))]
+    joints += [builder.add_joint_revolute(parent=body, child=link, axis=(0.0, 0.0, 1.0)) for link in links]
+    builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.0, 1.0))
+    builder.add_articulation(joints)
+    builder.color()
+    model = builder.finalize(device=device)
+    with test.assertRaisesRegex(NotImplementedError, "mimic"):
         newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
 
 
@@ -6053,8 +6083,8 @@ for device in devices:
     )
     add_function_test(
         TestReducedElasticBody,
-        "test_vbd_elastic_body_rejects_block_sparse_joints",
-        test_vbd_elastic_body_rejects_block_sparse_joints,
+        "test_vbd_elastic_body_block_sparse_joints_scope",
+        test_vbd_elastic_body_block_sparse_joints_scope,
         devices=[device],
     )
     add_function_test(
