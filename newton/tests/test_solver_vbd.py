@@ -34,6 +34,7 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     scatter_particle_body_contact_force_and_hessian,
 )
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
+    ElasticReducedMobility,
     JointFrictionData,
     RigidContactHistory,
     _alm_relaxed_ascent,
@@ -1370,6 +1371,17 @@ def _assert_rigid_compliant_alm_coefficients(device):
     np.testing.assert_array_equal(actual[positive_count:], [[0.0, 0.0, 1.0, 0.0]] * 2)
 
 
+def _empty_elastic_reduced_mobility(device) -> ElasticReducedMobility:
+    """Return reduced elastic mobility data for a model without reduced elastic bodies."""
+    mobility = ElasticReducedMobility()
+    mobility.frame_inv_schur = wp.empty(0, dtype=wp.spatial_matrix, device=device)
+    mobility.frame_modal_mass = wp.empty((0, 0), dtype=wp.spatial_vector, device=device)
+    mobility.modal_inv_mass = wp.empty((0, 0), dtype=float, device=device)
+    mobility.modal_inv_mass_dense = wp.empty((0, 0, 0), dtype=float, device=device)
+    mobility.modal_mass_is_dense = 0
+    return mobility
+
+
 def _rigid_contact_structural_support_conditions_tangent_rho(test, device):
     """Verify step setup caps tangent rho with structural support, not D+S."""
     with wp.ScopedDevice(device):
@@ -1410,7 +1422,7 @@ def _rigid_contact_structural_support_conditions_tangent_rho(test, device):
                 wp.empty(0, dtype=wp.int32, device=device),
                 wp.empty(0, dtype=wp.vec3, device=device),
                 wp.empty(0, dtype=wp.vec3, device=device),
-                wp.empty((0, 6, 6), dtype=float, device=device),
+                _empty_elastic_reduced_mobility(device),
                 0,
                 0,
                 1,

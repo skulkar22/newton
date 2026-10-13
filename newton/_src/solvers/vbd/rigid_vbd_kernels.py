@@ -267,6 +267,80 @@ def compliant_limit_row(g: float, g_prev: float, ke: float, kd: float, dt: float
 
 
 @wp.struct
+class ElasticReducedMobility:
+    """Inverse reduced mass of the elastic bodies in Schur-complement form.
+
+    With frame mass ``F`` (6x6), frame/modal cross block ``C`` (6 x modes) and modal mass
+    ``D``, the inverse of ``[[F, C], [C^T, D]]`` is represented by ``S^-1`` with
+    ``S = F - C D^-1 C^T``, by ``C`` and by ``D^-1``. Bodies without implicit frame/modal
+    coupling store the decoupled frame inverse as ``S^-1`` and ``C = 0``. Frame rows are
+    ordered linear then angular, in the body frame.
+    """
+
+    frame_inv_schur: wp.array[wp.spatial_matrix]
+    """``S^-1`` per elastic body, shape ``[elastic_body_count]``."""
+    frame_modal_mass: wp.array2d[wp.spatial_vector]
+    """Columns of ``C`` per elastic body and mode, shape ``[elastic_body_count, max_mode_count]``."""
+    modal_inv_mass: wp.array2d[float]
+    """Diagonal of ``D^-1`` when ``modal_mass_is_dense`` is 0, shape ``[elastic_body_count, max_mode_count]``."""
+    modal_inv_mass_dense: wp.array3d[float]
+    """``D^-1`` when ``modal_mass_is_dense`` is 1, shape ``[elastic_body_count, max_mode_count, max_mode_count]``."""
+    modal_mass_is_dense: int
+    """Whether any modal mass block has off-diagonal terms."""
+
+
+@wp.func
+def _elastic_reduced_mobility_pair(
+    mobility: ElasticReducedMobility,
+    elastic_index: int,
+    mode_count: int,
+    frame_jacobian_a: wp.spatial_vector,
+    frame_jacobian_b: wp.spatial_vector,
+    sample: int,
+    sample_phi: wp.array[wp.vec3],
+    sample_psi: wp.array[wp.vec3],
+    elastic_max_mode_count: int,
+    linear_a_local: wp.vec3,
+    angular_a_local: wp.vec3,
+    linear_b_local: wp.vec3,
+    angular_b_local: wp.vec3,
+):
+    """Return ``J_a M^-1 J_b^T`` for one reduced elastic body.
+
+    The modal Jacobian rows are ``phi_i . linear + psi_i . angular`` at ``sample``; pass zero
+    angular vectors (and any ``sample_psi``) for a point row. With ``w = D^-1 J_m^T`` and
+    ``t = J_f - C w``, the mobility is ``t_a^T S^-1 t_b + J_m,a . w_b``: O(modes) for a
+    diagonal modal mass and O(modes^2) for a dense one.
+    """
+    t_a = frame_jacobian_a
+    t_b = frame_jacobian_b
+    modal = float(0.0)
+    sample_start = sample * elastic_max_mode_count
+    for mode in range(mode_count):
+        phi = sample_phi[sample_start + mode]
+        psi = sample_psi[sample_start + mode]
+        jacobian_a = wp.dot(phi, linear_a_local) + wp.dot(psi, angular_a_local)
+        if mobility.modal_mass_is_dense == 0:
+            inv_mass = mobility.modal_inv_mass[elastic_index, mode]
+            w_a = inv_mass * jacobian_a
+            w_b = inv_mass * (wp.dot(phi, linear_b_local) + wp.dot(psi, angular_b_local))
+        else:
+            w_a = float(0.0)
+            w_b = float(0.0)
+            for other in range(mode_count):
+                phi_other = sample_phi[sample_start + other]
+                psi_other = sample_psi[sample_start + other]
+                inv_mass = mobility.modal_inv_mass_dense[elastic_index, mode, other]
+                w_a = w_a + inv_mass * (wp.dot(phi_other, linear_a_local) + wp.dot(psi_other, angular_a_local))
+                w_b = w_b + inv_mass * (wp.dot(phi_other, linear_b_local) + wp.dot(psi_other, angular_b_local))
+        cross = mobility.frame_modal_mass[elastic_index, mode]
+        t_a = t_a - cross * w_a
+        t_b = t_b - cross * w_b
+        modal = modal + jacobian_a * w_b
+    return wp.dot(t_a, mobility.frame_inv_schur[elastic_index] * t_b) + modal
+
+
+@wp.struct
 class RigidContactHistory:
     lambda_: wp.array[wp.vec3]
     penalty_k: wp.array[float]
@@ -1423,27 +1497,6 @@ def _contact_tangent_conditioning_scale(
 
 
 @wp.func
-def _elastic_contact_jacobian_component(
-    coordinate: int,
-    direction_local: wp.vec3,
-    lever_local: wp.vec3,
-    elastic_sample: int,
-    mode_count: int,
-    elastic_shape_vertex_phi: wp.array[wp.vec3],
-    elastic_max_mode_count: int,
-):
-    if coordinate < 3:
-        return direction_local[coordinate]
-    if coordinate < 6:
-        return wp.cross(lever_local, direction_local)[coordinate - 3]
-    mode = coordinate - 6
-    if mode < mode_count:
-        phi = elastic_shape_vertex_phi[elastic_sample * elastic_max_mode_count + mode]
-        return wp.dot(phi, direction_local)
-    return 0.0
-
-
-@wp.func
 def _elastic_contact_row_mobility_pair(
     body_id: int,
     elastic_sample: int,
@@ -1460,7 +1513,7 @@ def _elastic_contact_row_mobility_pair(
     joint_q_start: wp.array[wp.int32],
     elastic_shape_vertex_local: wp.array[wp.vec3],
     elastic_shape_vertex_phi: wp.array[wp.vec3],
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     elastic_max_mode_count: int,
 ):
     """Return ``J_a M_r^-1 J_b^T`` for one elastic contact endpoint."""
@@ -1483,32 +1536,21 @@ def _elastic_contact_row_mobility_pair(
     rotation = wp.transform_get_rotation(body_q[body_id])
     direction_a_local = wp.quat_rotate_inv(rotation, direction_a)
     direction_b_local = wp.quat_rotate_inv(rotation, direction_b)
-    width = elastic_max_mode_count + 6
-    mobility = float(0.0)
-    for row in range(width):
-        jacobian_a = _elastic_contact_jacobian_component(
-            row,
-            direction_a_local,
-            lever_local,
-            elastic_sample,
-            mode_count,
-            elastic_shape_vertex_phi,
-            elastic_max_mode_count,
-        )
-        projected = float(0.0)
-        for column in range(width):
-            jacobian_b = _elastic_contact_jacobian_component(
-                column,
-                direction_b_local,
-                lever_local,
-                elastic_sample,
-                mode_count,
-                elastic_shape_vertex_phi,
-                elastic_max_mode_count,
-            )
-            projected = projected + elastic_reduced_inv_mass[elastic_index, row, column] * jacobian_b
-        mobility = mobility + jacobian_a * projected
-    return mobility
+    return _elastic_reduced_mobility_pair(
+        elastic_reduced_mobility,
+        elastic_index,
+        mode_count,
+        wp.spatial_vector(direction_a_local, wp.cross(lever_local, direction_a_local)),
+        wp.spatial_vector(direction_b_local, wp.cross(lever_local, direction_b_local)),
+        elastic_sample,
+        elastic_shape_vertex_phi,
+        elastic_shape_vertex_phi,
+        elastic_max_mode_count,
+        direction_a_local,
+        wp.vec3(0.0),
+        direction_b_local,
+        wp.vec3(0.0),
+    )
 
 
 @wp.func
@@ -1530,7 +1572,7 @@ def _contact_body_conditioning_scale_elastic(
     joint_q_start: wp.array[wp.int32],
     elastic_shape_vertex_local: wp.array[wp.vec3],
     elastic_shape_vertex_phi: wp.array[wp.vec3],
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     elastic_max_mode_count: int,
     inv_dt_sq: float,
 ):
@@ -1557,7 +1599,7 @@ def _contact_body_conditioning_scale_elastic(
             joint_q_start,
             elastic_shape_vertex_local,
             elastic_shape_vertex_phi,
-            elastic_reduced_inv_mass,
+            elastic_reduced_mobility,
             elastic_max_mode_count,
         )
     else:
@@ -1589,7 +1631,7 @@ def _contact_conditioning_scale_elastic(
     joint_q_start: wp.array[wp.int32],
     elastic_shape_vertex_local: wp.array[wp.vec3],
     elastic_shape_vertex_phi: wp.array[wp.vec3],
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     elastic_max_mode_count: int,
     inv_dt_sq: float,
 ):
@@ -1611,7 +1653,7 @@ def _contact_conditioning_scale_elastic(
         joint_q_start,
         elastic_shape_vertex_local,
         elastic_shape_vertex_phi,
-        elastic_reduced_inv_mass,
+        elastic_reduced_mobility,
         elastic_max_mode_count,
         inv_dt_sq,
     )
@@ -1633,7 +1675,7 @@ def _contact_conditioning_scale_elastic(
         joint_q_start,
         elastic_shape_vertex_local,
         elastic_shape_vertex_phi,
-        elastic_reduced_inv_mass,
+        elastic_reduced_mobility,
         elastic_max_mode_count,
         inv_dt_sq,
     )
@@ -1665,7 +1707,7 @@ def _contact_tangent_conditioning_scale_elastic(
     joint_q_start: wp.array[wp.int32],
     elastic_shape_vertex_local: wp.array[wp.vec3],
     elastic_shape_vertex_phi: wp.array[wp.vec3],
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     elastic_max_mode_count: int,
     inv_dt_sq: float,
 ):
@@ -1703,7 +1745,7 @@ def _contact_tangent_conditioning_scale_elastic(
                         joint_q_start,
                         elastic_shape_vertex_local,
                         elastic_shape_vertex_phi,
-                        elastic_reduced_inv_mass,
+                        elastic_reduced_mobility,
                         elastic_max_mode_count,
                     ),
                     _elastic_contact_row_mobility_pair(
@@ -1722,7 +1764,7 @@ def _contact_tangent_conditioning_scale_elastic(
                         joint_q_start,
                         elastic_shape_vertex_local,
                         elastic_shape_vertex_phi,
-                        elastic_reduced_inv_mass,
+                        elastic_reduced_mobility,
                         elastic_max_mode_count,
                     ),
                     _elastic_contact_row_mobility_pair(
@@ -1741,7 +1783,7 @@ def _contact_tangent_conditioning_scale_elastic(
                         joint_q_start,
                         elastic_shape_vertex_local,
                         elastic_shape_vertex_phi,
-                        elastic_reduced_inv_mass,
+                        elastic_reduced_mobility,
                         elastic_max_mode_count,
                     ),
                 )
@@ -5325,34 +5367,6 @@ def _joint_coordinate_support(
 
 
 @wp.func
-def _elastic_endpoint_row_jacobian(
-    coordinate: int,
-    linear_local: wp.vec3,
-    angular_local: wp.vec3,
-    lever_local: wp.vec3,
-    endpoint: int,
-    mode_count: int,
-    elastic_endpoint_phi: wp.array[wp.vec3],
-    elastic_endpoint_psi: wp.array[wp.vec3],
-    elastic_max_mode_count: int,
-):
-    """One reduced-coordinate component of a joint row at an elastic endpoint.
-
-    Reduced coordinates follow ``elastic_reduced_inv_mass``: body-local COM translation,
-    body-local rotation, then modal coordinates.
-    """
-    if coordinate < 3:
-        return linear_local[coordinate]
-    if coordinate < 6:
-        return (wp.cross(lever_local, linear_local) + angular_local)[coordinate - 3]
-    mode = coordinate - 6
-    if mode < mode_count:
-        idx = endpoint * elastic_max_mode_count + mode
-        return wp.dot(elastic_endpoint_phi[idx], linear_local) + wp.dot(elastic_endpoint_psi[idx], angular_local)
-    return 0.0
-
-
-@wp.func
 def _joint_side_axis_mobility(
     joint: int,
     body: int,
@@ -5371,7 +5385,7 @@ def _joint_side_axis_mobility(
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
     elastic_max_mode_count: int,
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
 ):
     """Return one body's inverse-mass mobility ``J M^-1 J^T`` for a joint axis row.
 
@@ -5399,39 +5413,22 @@ def _joint_side_axis_mobility(
             moment, body_inv_inertia[body] * moment
         )
 
-    mode_count = elastic_mode_count[elastic_index]
-    width = elastic_max_mode_count + 6
-    mobility = float(0.0)
-    for row in range(width):
-        jacobian_row = _elastic_endpoint_row_jacobian(
-            row,
-            linear_local,
-            angular_local,
-            lever_local,
-            endpoint,
-            mode_count,
-            elastic_endpoint_phi,
-            elastic_endpoint_psi,
-            elastic_max_mode_count,
-        )
-        if jacobian_row != 0.0:
-            projected = float(0.0)
-            for column in range(width):
-                projected = projected + elastic_reduced_inv_mass[elastic_index, row, column] * (
-                    _elastic_endpoint_row_jacobian(
-                        column,
-                        linear_local,
-                        angular_local,
-                        lever_local,
-                        endpoint,
-                        mode_count,
-                        elastic_endpoint_phi,
-                        elastic_endpoint_psi,
-                        elastic_max_mode_count,
-                    )
-                )
-            mobility = mobility + jacobian_row * projected
-    return mobility
+    moment = wp.cross(lever_local, linear_local) + angular_local
+    return _elastic_reduced_mobility_pair(
+        elastic_reduced_mobility,
+        elastic_index,
+        elastic_mode_count[elastic_index],
+        wp.spatial_vector(linear_local, moment),
+        wp.spatial_vector(linear_local, moment),
+        endpoint,
+        elastic_endpoint_phi,
+        elastic_endpoint_psi,
+        elastic_max_mode_count,
+        linear_local,
+        angular_local,
+        linear_local,
+        angular_local,
+    )
 
 
 @wp.func
@@ -5455,7 +5452,7 @@ def _joint_axis_support_with_elastic_endpoints(
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
     elastic_max_mode_count: int,
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     inv_dt_sq: float,
 ):
     """Return the scalar inverse-Delassus support of a drive/limit axis with elastic endpoints.
@@ -5483,7 +5480,7 @@ def _joint_axis_support_with_elastic_endpoints(
         elastic_endpoint_phi,
         elastic_endpoint_psi,
         elastic_max_mode_count,
-        elastic_reduced_inv_mass,
+        elastic_reduced_mobility,
     )
     w = w + _joint_side_axis_mobility(
         joint,
@@ -5503,7 +5500,7 @@ def _joint_axis_support_with_elastic_endpoints(
         elastic_endpoint_phi,
         elastic_endpoint_psi,
         elastic_max_mode_count,
-        elastic_reduced_inv_mass,
+        elastic_reduced_mobility,
     )
     if w > 0.0:
         return inv_dt_sq / w
@@ -5536,7 +5533,7 @@ def step_joint_C0_lambda_rho(
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
     elastic_max_mode_count: int,
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     joint_constraint_start: wp.array[wp.int32],
     joint_constraint_dim: wp.array[wp.int32],
     joint_is_hard: wp.array[wp.int32],
@@ -5578,7 +5575,7 @@ def step_joint_C0_lambda_rho(
     Bilateral structural and drive auto-rho keep ``k_eff >= 0.9K`` in each local
     solve. Limits use their directional support directly as the ALM metric.
     Drive/limit supports of joints with reduced elastic endpoints include the
-    endpoint's modal mobility through ``elastic_reduced_inv_mass``.
+    endpoint's modal mobility through ``elastic_reduced_mobility``.
     """
     j = wp.tid()
     zero = wp.vec3(0.0)
@@ -5802,7 +5799,7 @@ def step_joint_C0_lambda_rho(
                             elastic_endpoint_phi,
                             elastic_endpoint_psi,
                             elastic_max_mode_count,
-                            elastic_reduced_inv_mass,
+                            elastic_reduced_mobility,
                             inv_dt_sq,
                         )
                     else:
@@ -5858,7 +5855,7 @@ def step_joint_C0_lambda_rho(
                                 elastic_endpoint_phi,
                                 elastic_endpoint_psi,
                                 elastic_max_mode_count,
-                                elastic_reduced_inv_mass,
+                                elastic_reduced_mobility,
                                 inv_dt_sq,
                             )
                         else:
@@ -6272,7 +6269,7 @@ def step_body_body_contact_C0_lambda(
     joint_q_start: wp.array[wp.int32],
     elastic_shape_vertex_local: wp.array[wp.vec3],
     elastic_shape_vertex_phi: wp.array[wp.vec3],
-    elastic_reduced_inv_mass: wp.array3d[float],
+    elastic_reduced_mobility: ElasticReducedMobility,
     elastic_max_mode_count: int,
     legacy_hard_contacts: int,
     contact_compliant_alm: int,
@@ -6385,7 +6382,7 @@ def step_body_body_contact_C0_lambda(
                 joint_q_start,
                 elastic_shape_vertex_local,
                 elastic_shape_vertex_phi,
-                elastic_reduced_inv_mass,
+                elastic_reduced_mobility,
                 elastic_max_mode_count,
                 inv_dt_sq,
             )
@@ -6412,7 +6409,7 @@ def step_body_body_contact_C0_lambda(
                 joint_q_start,
                 elastic_shape_vertex_local,
                 elastic_shape_vertex_phi,
-                elastic_reduced_inv_mass,
+                elastic_reduced_mobility,
                 elastic_max_mode_count,
                 inv_dt_sq,
             )

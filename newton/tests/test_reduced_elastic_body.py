@@ -18,7 +18,8 @@ from newton._src.solvers.vbd.reduced_elastic_kernels import (
     elastic_block_dense_width,
     launch_solve_elastic_body_dense,
 )
-from newton._src.solvers.vbd.solver_vbd import _max_elastic_block_solve_tiled_width
+from newton._src.solvers.vbd.rigid_vbd_kernels import ElasticReducedMobility, _elastic_reduced_mobility_pair
+from newton._src.solvers.vbd.solver_vbd import _elastic_schur_inverse_blocks, _max_elastic_block_solve_tiled_width
 from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
     beam_torsion_linear_modal_properties,
@@ -4584,6 +4585,109 @@ def test_vbd_elastic_block_capacity_steps_at_tiled_limit(test, device):
     test.assertTrue(bool(np.isfinite(solver.elastic_body_block_delta.numpy()).all()))
 
 
+@wp.kernel
+def _elastic_reduced_mobility_probe(
+    mobility: ElasticReducedMobility,
+    mode_count: int,
+    frame_jacobian_a: wp.array[wp.spatial_vector],
+    frame_jacobian_b: wp.array[wp.spatial_vector],
+    linear_a: wp.array[wp.vec3],
+    angular_a: wp.array[wp.vec3],
+    linear_b: wp.array[wp.vec3],
+    angular_b: wp.array[wp.vec3],
+    sample_phi: wp.array[wp.vec3],
+    sample_psi: wp.array[wp.vec3],
+    max_mode_count: int,
+    out: wp.array[float],
+):
+    i = wp.tid()
+    out[i] = _elastic_reduced_mobility_pair(
+        mobility,
+        0,
+        mode_count,
+        frame_jacobian_a[i],
+        frame_jacobian_b[i],
+        1,
+        sample_phi,
+        sample_psi,
+        max_mode_count,
+        linear_a[i],
+        angular_a[i],
+        linear_b[i],
+        angular_b[i],
+    )
+
+
+def test_vbd_elastic_reduced_mobility_matches_inverse(test, device):
+    """The Schur-form mobility equals ``J_a M^-1 J_b^T`` for diagonal and dense modal mass."""
+    rng = np.random.default_rng(29)
+    mode_count = 12
+    max_mode_count = 16
+    width = 6 + mode_count
+    pair_count = 32
+
+    # Sample 1 of two samples, so the per-sample offset into phi/psi is exercised.
+    phi = rng.standard_normal((mode_count, 3))
+    psi = rng.standard_normal((mode_count, 3))
+    sample_phi = np.zeros((2 * max_mode_count, 3))
+    sample_psi = np.zeros((2 * max_mode_count, 3))
+    sample_phi[max_mode_count : max_mode_count + mode_count] = phi
+    sample_psi[max_mode_count : max_mode_count + mode_count] = psi
+    frame_a = rng.standard_normal((pair_count, 6))
+    frame_b = rng.standard_normal((pair_count, 6))
+    linear_a, angular_a, linear_b, angular_b = (rng.standard_normal((pair_count, 3)) for _ in range(4))
+    angular_a[: pair_count // 2] = 0.0  # point rows, as used by contacts
+    angular_b[: pair_count // 2] = 0.0
+    jacobian_a = np.concatenate([frame_a, linear_a @ phi.T + angular_a @ psi.T], axis=1)
+    jacobian_b = np.concatenate([frame_b, linear_b @ phi.T + angular_b @ psi.T], axis=1)
+
+    for dense in (False, True):
+        basis = np.linalg.qr(rng.standard_normal((width, width)))[0]
+        reduced_mass = basis @ np.diag(rng.uniform(1.0, 4.0, width)) @ basis.T
+        if not dense:
+            # Make the modal block diagonal while keeping the matrix positive definite.
+            modal_block = reduced_mass[6:, 6:]
+            reduced_mass[6:, 6:] = np.diag(np.diag(modal_block)) + np.eye(mode_count) * np.abs(modal_block).sum()
+        frame_inv, modal_inv = _elastic_schur_inverse_blocks(
+            reduced_mass[:6, :6], reduced_mass[:6, 6:], reduced_mass[6:, 6:]
+        )
+        modal_inv_dense = np.zeros((1, max_mode_count, max_mode_count))
+        modal_inv_dense[0, :mode_count, :mode_count] = modal_inv
+        modal_inv_diagonal = np.zeros((1, max_mode_count))
+        modal_inv_diagonal[0, :mode_count] = np.diag(modal_inv)
+        cross = np.zeros((1, max_mode_count, 6))
+        cross[0, :mode_count] = reduced_mass[:6, 6:].T
+
+        mobility = ElasticReducedMobility()
+        mobility.frame_inv_schur = wp.array(frame_inv[None], dtype=wp.spatial_matrix, device=device)
+        mobility.frame_modal_mass = wp.array(cross, dtype=wp.spatial_vector, device=device)
+        mobility.modal_inv_mass = wp.array(modal_inv_diagonal, dtype=float, device=device)
+        mobility.modal_inv_mass_dense = wp.array(modal_inv_dense, dtype=float, device=device)
+        mobility.modal_mass_is_dense = int(dense)
+
+        out = wp.zeros(pair_count, dtype=float, device=device)
+        wp.launch(
+            _elastic_reduced_mobility_probe,
+            dim=pair_count,
+            inputs=[
+                mobility,
+                mode_count,
+                wp.array(frame_a, dtype=wp.spatial_vector, device=device),
+                wp.array(frame_b, dtype=wp.spatial_vector, device=device),
+                *(wp.array(v, dtype=wp.vec3, device=device) for v in (linear_a, angular_a, linear_b, angular_b)),
+                wp.array(sample_phi, dtype=wp.vec3, device=device),
+                wp.array(sample_psi, dtype=wp.vec3, device=device),
+                max_mode_count,
+            ],
+            outputs=[out],
+            device=device,
+        )
+
+        expected = np.einsum("pi,ij,pj->p", jacobian_a, np.linalg.inv(reduced_mass), jacobian_b)
+        scale = np.max(np.abs(expected))
+        np.testing.assert_allclose(out.numpy(), expected, rtol=1.0e-5, atol=1.0e-5 * scale, err_msg=f"dense={dense}")
+
+
 def test_vbd_elastic_block_metrics_cover_frame_rows(test, device):
     """Convergence metrics span the whole block, not just the modal rows."""
     width = 7
@@ -6419,6 +6523,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_elastic_block_dense_solve_falls_back_when_indefinite",
         test_vbd_elastic_block_dense_solve_falls_back_when_indefinite,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_reduced_mobility_matches_inverse",
+        test_vbd_elastic_reduced_mobility_matches_inverse,
         devices=[device],
     )
     add_function_test(

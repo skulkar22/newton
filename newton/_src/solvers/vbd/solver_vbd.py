@@ -114,6 +114,7 @@ from .rigid_sparse_articulation_kernels import (
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
     CONTACT_HISTORY_NO_BUFFER,
+    ElasticReducedMobility,
     JointFrictionData,
     RigidContactHistory,
     RigidForceElementAdjacencyInfo,
@@ -257,6 +258,19 @@ def _elastic_block_bucket_width(mode_count: int, max_block_width: int) -> int:
     while padded < mode_count:
         padded *= 2
     return min(6 + padded, max_block_width)
+
+
+def _elastic_schur_inverse_blocks(
+    frame_mass: np.ndarray, cross_mass: np.ndarray, modal_mass: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``S^-1 = (F - C D^-1 C^T)^-1`` and ``D^-1`` for a reduced mass ``[[F, C], [C^T, D]]``.
+
+    Together with ``C`` they give ``J M^-1 J^T = t^T S^-1 t + J_m D^-1 J_m^T`` with
+    ``t = J_f - C D^-1 J_m^T`` for a Jacobian ``J = [J_f, J_m]``.
+    """
+    modal_inv = np.linalg.inv(modal_mass)
+    schur = frame_mass - cross_mass @ modal_inv @ cross_mass.T
+    return np.linalg.inv(0.5 * (schur + schur.T)), modal_inv
 
 
 def _particle_contact_scatter_worker_count(soft_contact_max: int, particle_count: int, device) -> int:
@@ -1531,7 +1545,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             key: (group, [self._bind_elastic_block_bucket(bucket) for bucket in buckets])
             for key, (group, buckets) in self._elastic_block_solve_groups.items()
         }
-        self.elastic_implicit_mass_coupling, self.elastic_reduced_inv_mass = self._build_elastic_mass_solve_data(model)
+        self.elastic_implicit_mass_coupling, self.elastic_reduced_mobility = self._build_elastic_mass_solve_data(model)
         self._init_sparse_elastic_bodies(model)
         metric_count = model.elastic_body_count if self.elastic_solver_metrics else 0
         self.elastic_body_block_initial_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
@@ -1759,55 +1773,66 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
         return width, path, block_dim, body_ids, factor
 
-    def _build_elastic_mass_solve_data(self, model: Model) -> tuple[wp.array, wp.array]:
-        """Build coupled-mass flags and generalized inverse-mass blocks.
+    def _build_elastic_mass_solve_data(self, model: Model) -> tuple[wp.array, ElasticReducedMobility]:
+        """Build coupled-mass flags and the Schur-form inverse reduced mass.
 
         The reduced mass ``M(0)`` of a dynamic frame couples the rest-COM translation, the
         rotation, and the modes through ``S_i`` and ``-(G_i + c x S_i)`` and uses the full
         modal mass matrix :attr:`Model.elastic_mode_mass_matrix`. Bodies whose ``M(0)`` is
         not positive definite keep block-diagonal inverse masses and the explicitly coupled
         solve, and a :class:`UserWarning` names each of them.
+
+        The inverse serves the contact and joint drive/limit mobilities ``J M^-1 J^T``. It is
+        stored in Schur-complement form (see :class:`ElasticReducedMobility`): ``S^-1`` with
+        ``S = F - C D^-1 C^T``, the cross block ``C`` and ``D^-1``, so a mobility costs
+        O(modes) for a diagonal modal mass and O(modes^2) for a dense one instead of
+        O((6 + modes)^2), and the storage grows with ``modes^2`` only when a coupled body has
+        a dense modal mass. Decoupled bodies store the frame inverse as ``S^-1``, ``C = 0`` and
+        the inverse modal masses.
         """
         elastic_body_count = int(model.elastic_body_count)
-        if elastic_body_count == 0:
-            return (
-                wp.empty(0, dtype=bool, device=self.device),
-                wp.empty(
-                    (0, self.elastic_body_block_width, self.elastic_body_block_width), dtype=float, device=self.device
-                ),
-            )
-
-        elastic_body = model.elastic_body.numpy()
-        mode_start = model.elastic_mode_start.numpy()
-        mode_count = model.elastic_mode_count.numpy()
-        mode_mass = model.elastic_mode_mass.numpy()
         max_modes = int(model.elastic_max_mode_count)
-        mode_mass_matrix = model.elastic_mode_mass_matrix.numpy().reshape((elastic_body_count, max_modes, max_modes))
-        coupling_linear = model.elastic_mode_coupling_linear.numpy()
-        coupling_angular = model.elastic_mode_coupling_angular.numpy()
-        body_mass = model.body_mass.numpy()
-        body_inertia = model.body_inertia.numpy()
-        body_com = model.body_com.numpy()
-        body_inv_mass = self.body_inv_mass_effective.numpy()
-        body_inv_inertia = self.body_inv_inertia_effective.numpy()
-
+        stored_modes = max(max_modes, 1)
+        frame_inv_schur = np.zeros((elastic_body_count, 6, 6), dtype=np.float64)
+        frame_modal_mass = np.zeros((elastic_body_count, stored_modes, 6), dtype=np.float64)
+        modal_inv_mass = np.zeros((elastic_body_count, stored_modes), dtype=np.float64)
+        modal_inv_mass_dense = np.zeros((elastic_body_count, stored_modes, stored_modes), dtype=np.float64)
         flags = np.zeros(elastic_body_count, dtype=bool)
-        inverse_mass = np.zeros(
-            (elastic_body_count, self.elastic_body_block_width, self.elastic_body_block_width), dtype=np.float32
-        )
-        for elastic_index, body in enumerate(elastic_body):
+        modal_mass_is_dense = False
+
+        if elastic_body_count > 0:
+            elastic_body = model.elastic_body.numpy()
+            mode_start = model.elastic_mode_start.numpy()
+            mode_count = model.elastic_mode_count.numpy()
+            mode_mass = model.elastic_mode_mass.numpy()
+            mode_mass_matrix = model.elastic_mode_mass_matrix.numpy().reshape(
+                (elastic_body_count, max_modes, max_modes)
+            )
+            coupling_linear = model.elastic_mode_coupling_linear.numpy()
+            coupling_angular = model.elastic_mode_coupling_angular.numpy()
+            body_mass = model.body_mass.numpy()
+            body_inertia = model.body_inertia.numpy()
+            body_com = model.body_com.numpy()
+            body_inv_mass = self.body_inv_mass_effective.numpy()
+            body_inv_inertia = self.body_inv_inertia_effective.numpy()
+
+        for elastic_index in range(elastic_body_count):
+            body = int(elastic_body[elastic_index])
             count = int(mode_count[elastic_index])
             if count == 0:
                 continue
             start = int(mode_start[elastic_index])
+
+            # Decoupled inverse: the effective frame inverse and the inverse modal masses.
             frame_dynamic = float(body_inv_mass[body]) > 0.0
             if frame_dynamic:
-                inverse_mass[elastic_index, :3, :3] = float(body_inv_mass[body]) * np.eye(3, dtype=np.float32)
-                inverse_mass[elastic_index, 3:6, 3:6] = np.asarray(body_inv_inertia[body], dtype=np.float32)
+                frame_inv_schur[elastic_index, :3, :3] = float(body_inv_mass[body]) * np.eye(3)
+                frame_inv_schur[elastic_index, 3:, 3:] = np.asarray(body_inv_inertia[body], dtype=np.float64)
             for mode in range(count):
                 mass = float(mode_mass[start + mode])
                 if mass > 0.0:
-                    inverse_mass[elastic_index, 6 + mode, 6 + mode] = 1.0 / mass
+                    modal_inv_mass[elastic_index, mode] = 1.0 / mass
+                    modal_inv_mass_dense[elastic_index, mode, mode] = 1.0 / mass
 
             if not frame_dynamic:
                 continue
@@ -1842,15 +1867,27 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     stacklevel=3,
                 )
             if is_spd:
-                active_width = 6 + count
-                inverse_mass[elastic_index, :active_width, :active_width] = np.linalg.inv(reduced_mass).astype(
-                    np.float32
-                )
+                frame_inv, modal_inv = _elastic_schur_inverse_blocks(frame_mass, cross_mass, modal_mass)
+                frame_inv_schur[elastic_index] = frame_inv
+                frame_modal_mass[elastic_index, :count] = cross_mass.T
+                modal_inv_mass[elastic_index, :count] = np.diag(modal_inv)
+                modal_inv_mass_dense[elastic_index, :count, :count] = modal_inv
+                # Off-diagonal terms at round-off level (mass-orthonormal modes) keep the O(modes)
+                # diagonal path.
+                off_diagonal = np.max(np.abs(modal_mass - np.diag(np.diag(modal_mass))), initial=0.0)
+                if off_diagonal > 1.0e-10 * np.max(np.abs(np.diag(modal_mass))):
+                    modal_mass_is_dense = True
 
-        return (
-            wp.array(flags, dtype=bool, device=self.device),
-            wp.array(inverse_mass, dtype=float, device=self.device),
-        )
+        mobility = ElasticReducedMobility()
+        mobility.frame_inv_schur = wp.array(frame_inv_schur, dtype=wp.spatial_matrix, device=self.device)
+        mobility.frame_modal_mass = wp.array(frame_modal_mass, dtype=wp.spatial_vector, device=self.device)
+        mobility.modal_inv_mass = wp.array(modal_inv_mass, dtype=float, device=self.device)
+        mobility.modal_mass_is_dense = int(modal_mass_is_dense)
+        if modal_mass_is_dense:
+            mobility.modal_inv_mass_dense = wp.array(modal_inv_mass_dense, dtype=float, device=self.device)
+        else:
+            mobility.modal_inv_mass_dense = wp.zeros((0, 0, 0), dtype=float, device=self.device)
+        return wp.array(flags, dtype=bool, device=self.device), mobility
 
     def _init_particle_system(
         self,
@@ -2303,7 +2340,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
             if self.model.elastic_body_count > 0:
-                self.elastic_implicit_mass_coupling, self.elastic_reduced_inv_mass = (
+                self.elastic_implicit_mass_coupling, self.elastic_reduced_mobility = (
                     self._build_elastic_mass_solve_data(self.model)
                 )
         if (
@@ -4761,7 +4798,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.joint_q_start,
                 model.elastic_shape_vertex_local,
                 model.elastic_shape_vertex_phi,
-                self.elastic_reduced_inv_mass,
+                self.elastic_reduced_mobility,
                 model.elastic_max_mode_count,
                 self.rigid_contact_hard,
                 self.rigid_compliant_alm,
@@ -4967,7 +5004,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.elastic_endpoint_phi,
                         model.elastic_endpoint_psi,
                         model.elastic_max_mode_count,
-                        self.elastic_reduced_inv_mass,
+                        self.elastic_reduced_mobility,
                         self.joint_constraint_start,
                         self.joint_constraint_dim,
                         self.joint_is_hard,
