@@ -1472,20 +1472,20 @@ def _apply_elastic_block_delta(
         joint_qd[qd_idx] = (q_new - q_prev) * inv_dt
 
 
-def elastic_block_solve_tiled_block_dims(block_width: int) -> tuple[int, ...]:
-    """Return the CUDA block sizes to try for the tiled block solve, in order of preference.
+def elastic_block_solve_tiled_block_dim(block_width: int) -> int:
+    """Return the CUDA block size of the tiled block solve for ``block_width``.
 
     The tiled Cholesky slows down by one to two orders of magnitude once the block width
-    exceeds a few times the thread count, so wider blocks prefer larger thread blocks.
-    Smaller entries are fallbacks for when the static shared memory reserved per thread
-    leaves too little room for the block. Measured on an RTX PRO 6000 Blackwell GPU with
-    Warp 1.18; see the reduced elastic capacity notes.
+    exceeds a few times the thread count, so wider blocks use larger thread blocks. Measured
+    on an RTX PRO 6000 Blackwell GPU with Warp 1.18; a width whose block, at this size, does
+    not fit the shared memory left after the per-thread static reservation uses the dense
+    solve instead of a smaller, much slower thread block.
     """
     if block_width <= 70:
-        return (32,)
+        return 32
     if block_width <= 126:
-        return (128, 64, 32)
-    return (256, 128, 64, 32)
+        return 128
+    return 256
 
 
 @functools.cache
@@ -1584,6 +1584,324 @@ def create_solve_elastic_body_tiled(block_width: int):
     _solve_elastic_body_tiled.__name__ = f"solve_elastic_body_tiled_{width}"
     _solve_elastic_body_tiled.__qualname__ = f"solve_elastic_body_tiled_{width}"
     return wp.kernel(enable_backward=False, module="unique")(_solve_elastic_body_tiled)
+
+
+ELASTIC_BLOCK_DENSE_PANEL = 32
+"""Panel size of the dense reduced elastic block solve."""
+
+ELASTIC_BLOCK_DENSE_BLOCK_DIM = 128
+"""CUDA threads per block of the dense reduced elastic block-solve kernels."""
+
+
+def elastic_block_dense_width(block_width: int) -> int:
+    """Return ``block_width`` rounded up to whole dense-solve panels."""
+    panel = ELASTIC_BLOCK_DENSE_PANEL
+    return (int(block_width) + panel - 1) // panel * panel
+
+
+@wp.func
+def _elastic_dense_lower_panel(pair: int) -> wp.vec2i:
+    """Map a linear index to the ``(row, column)`` panel of a lower block triangle, row-major."""
+    remaining = int(pair)
+    row = int(0)
+    while remaining > row:
+        remaining -= row + 1
+        row += 1
+    return wp.vec2i(row, remaining)
+
+
+@wp.func
+def _elastic_dense_trailing_panel(pair: int, step: int, panel_count: int) -> wp.vec2i:
+    """Map a linear index to the ``(row, column)`` panel of the trailing lower triangle after ``step``."""
+    remaining = int(pair)
+    column = int(step + 1)
+    while remaining >= panel_count - column:
+        remaining -= panel_count - column
+        column += 1
+    return wp.vec2i(column + remaining, column)
+
+
+@wp.kernel(enable_backward=False)
+def copy_elastic_blocks_to_dense_factor(
+    body_ids: wp.array[wp.int32],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_body_block_matrix: wp.array3d[float],
+    factor: wp.array3d[float],
+):
+    """Copy the lower panel triangle of each body's block into its dense factor slot.
+
+    Launch tiled with ``dim=(len(body_ids), panel_count * (panel_count + 1) // 2)``.
+    """
+    slot, pair = wp.tid()
+    elastic_index = body_elastic_index[body_ids[slot]]
+    if elastic_index < 0:
+        return
+    panel = _elastic_dense_lower_panel(pair)
+    offset = (panel[0] * ELASTIC_BLOCK_DENSE_PANEL, panel[1] * ELASTIC_BLOCK_DENSE_PANEL)
+    block = wp.tile_load(
+        elastic_body_block_matrix[elastic_index],
+        shape=(ELASTIC_BLOCK_DENSE_PANEL, ELASTIC_BLOCK_DENSE_PANEL),
+        offset=offset,
+        storage="shared",
+    )
+    wp.tile_store(factor[slot], block, offset=offset)
+
+
+@wp.kernel(enable_backward=False)
+def factor_elastic_dense_panel_column(
+    body_ids: wp.array[wp.int32],
+    body_elastic_index: wp.array[wp.int32],
+    step: int,
+    panel_count: int,
+    factor: wp.array3d[float],
+):
+    """Factor diagonal panel ``step`` and solve the panels below it (one block per body).
+
+    Overwrites ``A[step, step]`` with ``L[step, step]`` and every ``A[i, step]`` below it with
+    ``L[i, step] = A[i, step] L[step, step]^-T``. The diagonal factor stays in shared memory,
+    so no panel is read back after being stored in the same launch.
+    """
+    slot = wp.tid()
+    if body_elastic_index[body_ids[slot]] < 0:
+        return
+    origin = step * ELASTIC_BLOCK_DENSE_PANEL
+    diagonal = wp.tile_load(
+        factor[slot],
+        shape=(ELASTIC_BLOCK_DENSE_PANEL, ELASTIC_BLOCK_DENSE_PANEL),
+        offset=(origin, origin),
+        storage="shared",
+    )
+    wp.tile_cholesky_inplace(diagonal)
+    wp.tile_store(factor[slot], diagonal, offset=(origin, origin))
+    for row in range(step + 1, panel_count):
+        below = wp.tile_load(
+            factor[slot],
+            shape=(ELASTIC_BLOCK_DENSE_PANEL, ELASTIC_BLOCK_DENSE_PANEL),
+            offset=(row * ELASTIC_BLOCK_DENSE_PANEL, origin),
+            storage="shared",
+        )
+        solved = wp.tile_lower_solve(diagonal, wp.tile_transpose(below))
+        wp.tile_store(factor[slot], wp.tile_transpose(solved), offset=(row * ELASTIC_BLOCK_DENSE_PANEL, origin))
+
+
+@wp.kernel(enable_backward=False)
+def update_elastic_dense_trailing_panels(
+    body_ids: wp.array[wp.int32],
+    body_elastic_index: wp.array[wp.int32],
+    step: int,
+    panel_count: int,
+    factor: wp.array3d[float],
+):
+    """Apply the rank-32 update of panel column ``step`` to one trailing lower panel.
+
+    Launch tiled with ``dim=(len(body_ids), trailing_panel_count)``; every block updates
+    ``A[i, j] -= L[i, step] L[j, step]^T`` for its own ``(i, j)`` with ``i >= j > step``.
+    """
+    slot, pair = wp.tid()
+    if body_elastic_index[body_ids[slot]] < 0:
+        return
+    panel = _elastic_dense_trailing_panel(pair, step, panel_count)
+    row = panel[0] * ELASTIC_BLOCK_DENSE_PANEL
+    column = panel[1] * ELASTIC_BLOCK_DENSE_PANEL
+    origin = step * ELASTIC_BLOCK_DENSE_PANEL
+    shape = (ELASTIC_BLOCK_DENSE_PANEL, ELASTIC_BLOCK_DENSE_PANEL)
+    target = wp.tile_load(factor[slot], shape=shape, offset=(row, column), storage="shared")
+    left = wp.tile_load(factor[slot], shape=shape, offset=(row, origin), storage="shared")
+    right = wp.tile_load(factor[slot], shape=shape, offset=(column, origin), storage="shared")
+    wp.tile_matmul(left, wp.tile_transpose(right), target, alpha=-1.0)
+    wp.tile_store(factor[slot], target, offset=(row, column))
+
+
+@functools.cache
+def create_solve_elastic_body_dense(block_width: int):
+    """Create the substitution and update kernel of the dense block solve for one block width.
+
+    The kernel reads the panel Cholesky factor produced by
+    :func:`copy_elastic_blocks_to_dense_factor`, :func:`factor_elastic_dense_panel_column` and
+    :func:`update_elastic_dense_trailing_panels`, solves for the block increment by forward and
+    backward substitution over 32x32 panels with the right-hand side held in shared memory, and
+    then applies the same Jacobi fallback, metrics and frame/modal update as the tiled solve.
+    Rows between ``block_width`` and the panel-rounded width must be identity rows of the
+    stored block.
+    """
+    width = int(block_width)
+    dense_width = elastic_block_dense_width(width)
+    panel = ELASTIC_BLOCK_DENSE_PANEL
+    panel_count = dense_width // panel
+
+    def _solve_elastic_body_dense(
+        dt: float,
+        solve_frame: bool,
+        body_ids: wp.array[wp.int32],
+        body_elastic_index: wp.array[wp.int32],
+        elastic_joint: wp.array[wp.int32],
+        elastic_mode_count: wp.array[wp.int32],
+        body_inv_mass: wp.array[float],
+        body_com: wp.array[wp.vec3],
+        body_q: wp.array[wp.transform],
+        joint_q_start: wp.array[wp.int32],
+        joint_qd_start: wp.array[wp.int32],
+        joint_q_prev: wp.array[float],
+        elastic_body_block_grad: wp.array2d[float],
+        elastic_body_block_delta: wp.array2d[float],
+        elastic_body_block_matrix: wp.array3d[float],
+        elastic_body_block_initial_residual_norm: wp.array[float],
+        elastic_body_block_solve_residual_norm: wp.array[float],
+        elastic_body_block_applied_residual_norm: wp.array[float],
+        elastic_body_block_update_norm: wp.array[float],
+        elastic_body_block_update_max: wp.array[float],
+        elastic_body_relaxation: float,
+        factor: wp.array3d[float],
+        elastic_body_block_grad_column: wp.array3d[float],
+        body_q_new: wp.array[wp.transform],
+        joint_q: wp.array[float],
+        joint_qd: wp.array[float],
+    ):
+        slot = wp.tid()
+        body = body_ids[slot]
+        elastic_index = body_elastic_index[body]
+        if elastic_index < 0:
+            return
+
+        solution = wp.tile_load(elastic_body_block_grad_column[elastic_index], shape=(dense_width, 1), storage="shared")
+        # Forward substitution L y = g.
+        for k in range(panel_count):
+            solution_k = wp.tile_view(solution, offset=(k * panel, 0), shape=(panel, 1))
+            for j in range(k):
+                factor_kj = wp.tile_load(
+                    factor[slot], shape=(panel, panel), offset=(k * panel, j * panel), storage="shared"
+                )
+                solution_j = wp.tile_view(solution, offset=(j * panel, 0), shape=(panel, 1))
+                wp.tile_matmul(factor_kj, solution_j, solution_k, alpha=-1.0)
+            factor_kk = wp.tile_load(
+                factor[slot], shape=(panel, panel), offset=(k * panel, k * panel), storage="shared"
+            )
+            wp.tile_lower_solve_inplace(factor_kk, solution_k)
+        # Backward substitution L^T x = y.
+        for step in range(panel_count):
+            k = panel_count - 1 - step
+            solution_k = wp.tile_view(solution, offset=(k * panel, 0), shape=(panel, 1))
+            for j in range(k + 1, panel_count):
+                factor_jk = wp.tile_load(
+                    factor[slot], shape=(panel, panel), offset=(j * panel, k * panel), storage="shared"
+                )
+                solution_j = wp.tile_view(solution, offset=(j * panel, 0), shape=(panel, 1))
+                wp.tile_matmul(wp.tile_transpose(factor_jk), solution_j, solution_k, alpha=-1.0)
+            factor_kk = wp.tile_load(
+                factor[slot], shape=(panel, panel), offset=(k * panel, k * panel), storage="shared"
+            )
+            wp.tile_upper_solve_inplace(wp.tile_transpose(factor_kk), solution_k)
+
+        solution_is_finite = bool(True)
+        for i in range(width):
+            if not wp.isfinite(solution[i, 0]):
+                solution_is_finite = False
+        for i in range(width):
+            _store_elastic_block_delta(
+                elastic_index,
+                solution_is_finite,
+                elastic_body_block_grad,
+                elastic_body_block_matrix,
+                i,
+                -solution[i, 0],
+                elastic_body_block_delta,
+            )
+
+        _apply_elastic_block_delta(
+            width,
+            dt,
+            solve_frame,
+            body,
+            elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            body_inv_mass,
+            body_com,
+            body_q,
+            joint_q_start,
+            joint_qd_start,
+            joint_q_prev,
+            elastic_body_block_grad,
+            elastic_body_block_delta,
+            elastic_body_block_matrix,
+            elastic_body_block_initial_residual_norm,
+            elastic_body_block_solve_residual_norm,
+            elastic_body_block_applied_residual_norm,
+            elastic_body_block_update_norm,
+            elastic_body_block_update_max,
+            elastic_body_relaxation,
+            body_q_new,
+            joint_q,
+            joint_qd,
+        )
+
+    _solve_elastic_body_dense.__name__ = f"solve_elastic_body_dense_{width}"
+    _solve_elastic_body_dense.__qualname__ = f"solve_elastic_body_dense_{width}"
+    # Keep the panel loops dynamic: Warp reserves shared memory for every tile expression, so
+    # unrolling them would allocate one set of panel tiles per iteration.
+    return wp.kernel(enable_backward=False, module="unique", module_options={"max_unroll": 1})(
+        _solve_elastic_body_dense
+    )
+
+
+def launch_solve_elastic_body_dense(
+    block_width: int,
+    body_ids: wp.array,
+    body_elastic_index: wp.array,
+    elastic_body_block_matrix: wp.array,
+    factor: wp.array,
+    solve_inputs: list,
+    solve_outputs: list,
+    device,
+    block_dim: int = ELASTIC_BLOCK_DENSE_BLOCK_DIM,
+):
+    """Launch the dense block solve for the bodies in ``body_ids``.
+
+    The block matrix must be symmetric and stored with at least
+    :func:`elastic_block_dense_width` rows and columns, with identity rows past
+    ``block_width``. ``factor`` is scratch storage of shape ``(len(body_ids), W_d, W_d)``
+    where ``W_d`` is the panel-rounded width. ``solve_inputs`` and ``solve_outputs`` are the
+    arguments of :func:`create_solve_elastic_body_dense`.
+    """
+    body_count = body_ids.shape[0]
+    if body_count == 0:
+        return
+    panel_count = elastic_block_dense_width(block_width) // ELASTIC_BLOCK_DENSE_PANEL
+    wp.launch_tiled(
+        copy_elastic_blocks_to_dense_factor,
+        dim=[body_count, panel_count * (panel_count + 1) // 2],
+        inputs=[body_ids, body_elastic_index, elastic_body_block_matrix],
+        outputs=[factor],
+        block_dim=block_dim,
+        device=device,
+    )
+    for step in range(panel_count):
+        wp.launch_tiled(
+            factor_elastic_dense_panel_column,
+            dim=[body_count],
+            inputs=[body_ids, body_elastic_index, step, panel_count],
+            outputs=[factor],
+            block_dim=block_dim,
+            device=device,
+        )
+        trailing_count = (panel_count - step - 1) * (panel_count - step) // 2
+        if trailing_count > 0:
+            wp.launch_tiled(
+                update_elastic_dense_trailing_panels,
+                dim=[body_count, trailing_count],
+                inputs=[body_ids, body_elastic_index, step, panel_count],
+                outputs=[factor],
+                block_dim=block_dim,
+                device=device,
+            )
+    wp.launch_tiled(
+        create_solve_elastic_body_dense(block_width),
+        dim=[body_count],
+        inputs=solve_inputs,
+        outputs=solve_outputs,
+        block_dim=block_dim,
+        device=device,
+    )
 
 
 @wp.kernel

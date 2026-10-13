@@ -15,6 +15,8 @@ from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pa
 from newton._src.solvers.vbd.reduced_elastic_kernels import (
     accumulate_elastic_frame_coupling,
     create_solve_elastic_body_tiled,
+    elastic_block_dense_width,
+    launch_solve_elastic_body_dense,
 )
 from newton._src.solvers.vbd.solver_vbd import _max_elastic_block_solve_tiled_width
 from newton.examples.basic._reduced_elastic import (
@@ -4358,7 +4360,7 @@ def test_vbd_elastic_block_solve_buckets_mixed_widths(test, device):
     model = _build_elastic_block_test_model(device, [2, 64])
     test.assertEqual(len(model.body_color_groups), 1)
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=1)
+    solver = newton.solvers.SolverVBD(model, iterations=1)
     test.assertEqual(solver.elastic_body_block_width, 70)
     test.assertEqual(sorted(solver._elastic_block_solve_launches), [(0, 14, 1, "tiled"), (0, 70, 1, "tiled")])
 
@@ -4399,16 +4401,176 @@ def test_vbd_elastic_block_width_rejects_oversized_basis(test, device):
     model = _elastic_block_capacity_model(device, max_width - 6 + 1)
 
     with test.assertRaises(ValueError) as raised:
-        newton.solvers.SolverVBD(model, iterations=1)
+        newton.solvers.SolverVBD(model, iterations=1, elastic_block_solver="tiled")
     test.assertIn("shared memory", str(raised.exception))
     test.assertIn(f"at most {max_width - 6} modes", str(raised.exception))
+
+
+def test_vbd_elastic_block_solver_rejects_unknown_mode(test, device):
+    model = _elastic_block_capacity_model(device, 2)
+    with test.assertRaisesRegex(ValueError, "elastic_block_solver"):
+        newton.solvers.SolverVBD(model, iterations=1, elastic_block_solver="lu")
+
+
+def _step_elastic_block_capacity_solver(test, model, solver, steps=2):
+    state_0 = model.state()
+    state_1 = model.state()
+    control = model.control()
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, 1.0e-2)
+        state_0, state_1 = state_1, state_0
+    test.assertTrue(bool(np.isfinite(state_0.joint_q.numpy()).all()))
+    test.assertTrue(bool(np.isfinite(solver.elastic_body_block_delta.numpy()).all()))
+
+
+def test_vbd_elastic_block_auto_falls_back_to_dense(test, device):
+    """Past the tiled limit, the default solver warns once and uses the dense block solve."""
+    max_width = _max_elastic_block_solve_tiled_width(wp.get_device(device))
+    model = _elastic_block_capacity_model(device, max_width - 6 + 1)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = newton.solvers.SolverVBD(model, iterations=1)
+    dense_warnings = [warning for warning in caught if "dense block solve" in str(warning.message)]
+    test.assertEqual(len(dense_warnings), 1, [str(warning.message) for warning in caught])
+    message = str(dense_warnings[0].message)
+    test.assertIn(f"[{max_width + 1}]", message)
+    test.assertIn("shared memory", message)
+    test.assertEqual(solver._elastic_block_solve_launches, [(0, max_width + 1, 1, "dense")])
+
+    _step_elastic_block_capacity_solver(test, model, solver)
+
+
+def test_vbd_elastic_block_capacity_dense_beyond_tiled_limit(test, device):
+    """Bases one mode past the tiled limit and with 256 modes construct and step with the dense solve."""
+    max_width = _max_elastic_block_solve_tiled_width(wp.get_device(device))
+    for mode_count in (max_width - 6 + 1, 256):
+        model = _elastic_block_capacity_model(device, mode_count)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            solver = newton.solvers.SolverVBD(model, iterations=2)
+        test.assertEqual(solver._elastic_block_solve_launches[0][3], "dense", f"mode_count={mode_count}")
+        _step_elastic_block_capacity_solver(test, model, solver)
+
+
+def test_vbd_elastic_block_dense_matches_tiled_step(test, device):
+    """Forcing the dense block solve reproduces the tiled solve's step."""
+    results = {}
+    for block_solver in ("tiled", "dense"):
+        model = _build_elastic_block_test_model(device, [2, 64])
+        solver = newton.solvers.SolverVBD(model, iterations=2, elastic_block_solver=block_solver)
+        test.assertEqual({entry[3] for entry in solver._elastic_block_solve_launches}, {block_solver})
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        for _ in range(3):
+            solver.step(state_0, state_1, control, None, 1.0e-2)
+            state_0, state_1 = state_1, state_0
+        results[block_solver] = (state_0.joint_q.numpy(), state_0.body_q.numpy())
+
+    np.testing.assert_allclose(results["dense"][0], results["tiled"][0], rtol=1.0e-4, atol=1.0e-6)
+    np.testing.assert_allclose(results["dense"][1], results["tiled"][1], rtol=1.0e-4, atol=1.0e-6)
+
+
+def _launch_elastic_block_solve_dense(device, width, matrix, grad, mode_counts):
+    """Run the dense block solve on symmetric ``matrix`` blocks and return the deltas."""
+    block_count = grad.shape[0]
+    dense_width = elastic_block_dense_width(width)
+    stored_matrix = np.tile(np.eye(dense_width, dtype=np.float32), (block_count, 1, 1))
+    stored_matrix[:, :width, :width] = matrix
+    stored_grad = np.zeros((block_count, dense_width), dtype=np.float32)
+    stored_grad[:, :width] = grad
+
+    body_ids = wp.array(np.arange(block_count), dtype=wp.int32, device=device)
+    grad_array = wp.array(stored_grad, dtype=float, device=device)
+    matrix_array = wp.array(stored_matrix, dtype=float, device=device)
+    delta = wp.zeros((block_count, dense_width), dtype=float, device=device)
+    factor = wp.zeros((block_count, dense_width, dense_width), dtype=float, device=device)
+    mode_dof_count = int(np.max(mode_counts)) + 1
+    launch_solve_elastic_body_dense(
+        width,
+        body_ids,
+        body_ids,
+        matrix_array,
+        factor,
+        [
+            0.01,
+            False,
+            body_ids,
+            body_ids,
+            wp.zeros(block_count, dtype=wp.int32, device=device),
+            wp.array(mode_counts, dtype=wp.int32, device=device),
+            wp.zeros(block_count, dtype=float, device=device),
+            wp.zeros(block_count, dtype=wp.vec3, device=device),
+            wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
+            wp.zeros(mode_dof_count + 7, dtype=float, device=device),
+            grad_array,
+            delta,
+            matrix_array,
+            *[wp.zeros(block_count, dtype=float, device=device) for _ in range(5)],
+            1.0,
+            factor,
+            grad_array.reshape((block_count, dense_width, 1)),
+        ],
+        [
+            wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
+            wp.zeros(mode_dof_count + 7, dtype=float, device=device),
+            wp.zeros(mode_dof_count + 6, dtype=float, device=device),
+        ],
+        device,
+    )
+    return delta.numpy()[:, :width]
+
+
+def test_vbd_elastic_block_dense_solve_matches_numpy(test, device):
+    """The panel Cholesky solve matches a dense reference past the tiled shared-memory limit."""
+    rng = np.random.default_rng(17)
+    widths = (262, 1030) if wp.get_device(device).is_cuda else (70, 262)
+    for width in widths:
+        a = rng.standard_normal((width, width))
+        matrix = (a @ a.T / width + np.eye(width)).astype(np.float32)[None]
+        grad = rng.standard_normal((1, width)).astype(np.float32)
+
+        delta = _launch_elastic_block_solve_dense(device, width, matrix, grad, [width - 6])
+
+        np.testing.assert_allclose(
+            delta[0],
+            np.linalg.solve(matrix[0].astype(np.float64), -grad[0]),
+            rtol=2.0e-4,
+            atol=2.0e-5,
+            err_msg=f"width={width}",
+        )
+
+
+def test_vbd_elastic_block_dense_solve_falls_back_when_indefinite(test, device):
+    """An indefinite block degrades to a Jacobi step in the dense solve as in the tiled one."""
+    width = 70
+    rng = np.random.default_rng(23)
+    matrix = np.zeros((2, width, width), dtype=np.float32)
+    grad = rng.standard_normal((2, width)).astype(np.float32)
+    for block in range(2):
+        a = rng.standard_normal((width, width))
+        matrix[block] = a @ a.T / width + np.eye(width)
+    matrix[1, 40, 40] = -5.0
+
+    delta = _launch_elastic_block_solve_dense(device, width, matrix, grad, [width - 6] * 2)
+
+    test.assertTrue(bool(np.isfinite(delta).all()))
+    np.testing.assert_allclose(
+        delta[0], np.linalg.solve(matrix[0].astype(np.float64), -grad[0]), rtol=2.0e-4, atol=2.0e-5
+    )
+    diagonal = np.diag(matrix[1])
+    expected_fallback = np.where(diagonal > 0.0, -grad[1] / np.where(diagonal > 0.0, diagonal, 1.0), 0.0)
+    np.testing.assert_allclose(delta[1], expected_fallback, rtol=1.0e-5, atol=1.0e-6)
 
 
 def test_vbd_elastic_block_capacity_steps_at_tiled_limit(test, device):
     """The widest basis that fits the measured shared memory budget constructs and steps."""
     max_width = _max_elastic_block_solve_tiled_width(wp.get_device(device))
     model = _elastic_block_capacity_model(device, max_width - 6)
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=False, iterations=1)
+    solver = newton.solvers.SolverVBD(model, iterations=1)
     test.assertEqual(solver.elastic_body_block_width, max_width)
     test.assertEqual(solver._elastic_block_solve_launches, [(0, max_width, 1, "tiled")])
 
@@ -6221,6 +6383,42 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_elastic_block_capacity_steps_at_tiled_limit",
         test_vbd_elastic_block_capacity_steps_at_tiled_limit,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_solver_rejects_unknown_mode",
+        test_vbd_elastic_block_solver_rejects_unknown_mode,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_auto_falls_back_to_dense",
+        test_vbd_elastic_block_auto_falls_back_to_dense,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_capacity_dense_beyond_tiled_limit",
+        test_vbd_elastic_block_capacity_dense_beyond_tiled_limit,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_dense_matches_tiled_step",
+        test_vbd_elastic_block_dense_matches_tiled_step,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_dense_solve_matches_numpy",
+        test_vbd_elastic_block_dense_solve_matches_numpy,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_dense_solve_falls_back_when_indefinite",
+        test_vbd_elastic_block_dense_solve_falls_back_when_indefinite,
         devices=[device],
     )
     add_function_test(
