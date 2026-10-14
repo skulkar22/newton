@@ -123,6 +123,8 @@ class Example:
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
+            # Compliant ALM's finite clamp compliance shifts the mode from its analytic clamped response
+            # (-0.00541 vs -0.00587 at the end of the test run), so this example keeps the legacy clamp.
             rigid_compliant_alm=False,
             iterations=8,
             rigid_joint_linear_k_start=1.0e5,

@@ -490,6 +490,8 @@ class Example:
         self.contacts = self.collision_pipeline.contacts()
         self.solver = newton.solvers.SolverVBD(
             self.model,
+            # Under compliant ALM the feet stay stuck (190 stick vs 2 slip contact frames over 240
+            # frames), so the stick-slip check of test_final fails; this example keeps legacy contacts.
             rigid_compliant_alm=False,
             iterations=self.solver_iterations,
             elastic_solver_metrics=True,
