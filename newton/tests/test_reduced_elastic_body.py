@@ -4205,7 +4205,7 @@ def test_elastic_uncoupled_body_matches_base_trajectory(test, device):
 
     With ``S = G = B = C = P = 0`` and a diagonal modal mass the frame and the modes are independent,
     so the deformation-dependent inertia terms must add exact zeros. The golden ``joint_q`` series
-    (180 steps) was recorded on the CPU with the frozen-inertia kernels (integration branch 930e01c1,
+    (180 steps) was recorded on the CPU with the frozen-inertia kernels (the integration base before this change,
     Warp 1.18.0); on the CPU its modal coordinates must be reproduced bit for bit (CUDA contracts
     floating-point operations differently: within 1e-6).
 

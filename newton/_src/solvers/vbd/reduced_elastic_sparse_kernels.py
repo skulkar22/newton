@@ -6,7 +6,7 @@
 Each elastic body ``b`` contributes a dense ``(6 + n)`` block assembled by
 :func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_joints`
 (frame rows in body axes about the rest COM, modal rows ``m``). Its joints
-``j`` couple the modal coordinates to neighbour frames ``c`` through
+``j`` couple the modal coordinates to neighbor frames ``c`` through
 ``K_mc = G_j^T H_bc``, where ``H_bc`` is the joint's frame-frame cross block in
 the sparse system and the columns of ``G_j`` are the body-frame twists that move
 the deformed attachment like mode ``i``:
@@ -195,7 +195,7 @@ def build_elastic_sparse_schur_columns(
     elastic_group_owner: wp.array[wp.int32],
     elastic_group_joint: wp.array[wp.int32],
     elastic_group_body: wp.array[wp.int32],
-    elastic_group_neighbour_elastic: wp.array[wp.int32],
+    elastic_group_neighbor_elastic: wp.array[wp.int32],
     body_elastic_index: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -308,16 +308,16 @@ def build_elastic_sparse_schur_columns(
         modal_b[row + col] = value
         b_row[col] = value
 
-    if elastic_group_neighbour_elastic[group] == 0:
+    if elastic_group_neighbor_elastic[group] == 0:
         return
-    # Twist of the neighbour that moves the shared attachment like mode ``other`` of this body.
-    neighbour = elastic_group_body[group]
+    # Twist of the neighbor that moves the shared attachment like mode ``other`` of this body.
+    neighbor = elastic_group_body[group]
     attachment = wp.transform_point(pose, wp.transform_get_translation(endpoint_xform))
-    r_neighbour = attachment - wp.transform_point(body_q[neighbour], body_com[neighbour])
+    r_neighbor = attachment - wp.transform_point(body_q[neighbor], body_com[neighbor])
     for other in range(mode_count):
         phi_o = R * elastic_endpoint_phi[endpoint * max_modes + other]
         psi_o = R * (_so3_left_jacobian(theta_local) * elastic_endpoint_psi[endpoint * max_modes + other])
-        twist_o = phi_o + wp.cross(r_neighbour, psi_o)
+        twist_o = phi_o + wp.cross(r_neighbor, psi_o)
         value = -(
             b_row[0] * twist_o[0]
             + b_row[1] * twist_o[1]

@@ -895,7 +895,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 blocks, rather than being added to the sparse factorization.
                 Reduced elastic bodies in an articulation are solved inside its factorization: each
                 body's modal coordinates are eliminated exactly onto its frame block and the frames
-                of its joint neighbours, and its joints use the deformed attachments. Two elastic
+                of its joint neighbors, and its joints use the deformed attachments. Two elastic
                 bodies joined directly converge more slowly because their mode-mode coupling is
                 replaced by a conservative per-body term. Joint mimics, and armature, passive damping,
                 or friction on joints attached to elastic articulation bodies, are rejected in this
@@ -909,9 +909,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contact manifolds between collision updates.
             rigid_articulation_diagonal_regularization: Non-negative value added to each
                 translational and angular diagonal Hessian entry before sparse factorization.
-            rigid_joint_adaptive_stiffness: Compatibility control for the reduced-elastic development branch.
-                Passing ``False`` disables legacy joint penalty ramping, equivalent to setting both linear and
-                angular beta values to zero. ``None`` and ``True`` leave the beta controls unchanged.
+            rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
+                and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
+                dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
+                controls unchanged.
             elastic_body_relaxation: Under-relaxation factor for reduced elastic body block updates. This scales the
                 coupled frame-and-mode update after inertia, joint, and contact terms are assembled. Must be finite and
                 in the range ``[0, 1]``. Elastic bodies solved inside a ``"block_sparse_joints"`` articulation use
@@ -7042,7 +7043,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         Runs after the sparse body-diagonal and joint assembly: each body's dense frame rows
         replace its sparse diagonal block and right-hand side, then its modal coordinates are
-        eliminated onto the frame blocks of the body and its joint neighbours.
+        eliminated onto the frame blocks of the body and its joint neighbors.
         """
         model = self.model
         layout = self.rigid_articulation_sparse_layout
@@ -7075,7 +7076,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 layout.elastic_group_owner,
                 layout.elastic_group_joint,
                 layout.elastic_group_body,
-                layout.elastic_group_neighbour_elastic,
+                layout.elastic_group_neighbor_elastic,
                 model.body_elastic_index,
                 state_in.body_q,
                 model.body_com,

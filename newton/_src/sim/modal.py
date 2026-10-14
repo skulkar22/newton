@@ -2615,10 +2615,6 @@ class ModalGeneratorBeam:
             phi[:, mode_index], psi[:, mode_index] = self._evaluate_mode_points(spec, points)
         return phi, psi
 
-    def _evaluate_mode(self, spec: dict[str, Any], point: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        phi, psi = self._evaluate_mode_points(spec, np.asarray(point, dtype=np.float64).reshape((1, 3)))
-        return phi[0].astype(np.float32), psi[0].astype(np.float32)
-
     def _evaluate_mode_points(self, spec: dict[str, Any], points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mode_type = str(spec["type"])
         order = int(spec.get("order", 1))

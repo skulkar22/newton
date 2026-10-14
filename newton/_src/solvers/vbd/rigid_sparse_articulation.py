@@ -47,7 +47,7 @@ class RigidArticulationSparseLayout:
     """Schur column groups of each elastic body, shape [elastic_body_count + 1].
 
     The first group of a body is its own frame; every further group is one joint
-    that couples the body's modal coordinates to a neighbour frame.
+    that couples the body's modal coordinates to a neighbor frame.
     """
     elastic_group_joint: wp.array[wp.int32]
     """Joint of each Schur column group, or ``-1`` for the own frame, shape [elastic_group_count]."""
@@ -57,8 +57,8 @@ class RigidArticulationSparseLayout:
     """Index into ``elastic_bodies`` of the body owning each group, shape [elastic_group_count]."""
     elastic_group_body: wp.array[wp.int32]
     """Body whose frame each group couples to, shape [elastic_group_count]."""
-    elastic_group_neighbour_elastic: wp.array[wp.int32]
-    """Whether a joint group's neighbour is itself a reduced elastic body, shape [elastic_group_count]."""
+    elastic_group_neighbor_elastic: wp.array[wp.int32]
+    """Whether a joint group's neighbor is itself a reduced elastic body, shape [elastic_group_count]."""
     elastic_pair_left: wp.array[wp.int32]
     """Row group of each modal Schur block, shape [elastic_pair_count]."""
     elastic_pair_right: wp.array[wp.int32]
@@ -130,7 +130,7 @@ def build_rigid_articulation_sparse_layout(
     constraint, add no graph edge, and may lie inside or outside an articulation
     range. An elastic body joins an articulation through its owner joint or any
     physical joint in the range. Its modal coordinates are eliminated onto its
-    frame block, which couples every pair of the body's joint neighbours, so
+    frame block, which couples every pair of the body's joint neighbors, so
     those pairs are added to the fill pattern.
     """
 
@@ -254,7 +254,7 @@ def build_rigid_articulation_sparse_layout(
     for bodies, joints in articulation_groups:
         local_index = {body: i for i, body in enumerate(bodies)}
         edges: set[tuple[int, int]] = set()
-        elastic_neighbours: dict[int, list[tuple[int, int]]] = {
+        elastic_neighbors: dict[int, list[tuple[int, int]]] = {
             body: [] for body in bodies if body_elastic_index[body] >= 0
         }
         for joint_idx in joints:
@@ -263,7 +263,7 @@ def build_rigid_articulation_sparse_layout(
             if elastic_owner[joint_idx]:
                 continue
             for body, is_parent in ((parent, True), (child, False)):
-                if body >= 0 and body in elastic_neighbours:
+                if body >= 0 and body in elastic_neighbors:
                     endpoint = parent_endpoint[joint_idx] if is_parent else child_endpoint[joint_idx]
                     if endpoint < 0:
                         raise ValueError(
@@ -273,12 +273,12 @@ def build_rigid_articulation_sparse_layout(
                         )
                     other = child if is_parent else parent
                     if other >= 0 and other != body:
-                        elastic_neighbours[body].append((joint_idx, other))
+                        elastic_neighbors[body].append((joint_idx, other))
             if parent >= 0 and child >= 0 and parent in local_index and child in local_index:
                 edges.add((local_index[parent], local_index[child]))
-        # Eliminating an elastic body's modes couples all of its neighbour frames.
-        for neighbours in elastic_neighbours.values():
-            others = sorted({local_index[other] for _joint, other in neighbours})
+        # Eliminating an elastic body's modes couples all of its neighbor frames.
+        for neighbors in elastic_neighbors.values():
+            others = sorted({local_index[other] for _joint, other in neighbors})
             for i, a in enumerate(others):
                 for b in others[:i]:
                     edges.add((a, b))
@@ -323,7 +323,7 @@ def build_rigid_articulation_sparse_layout(
                 block_lookup[(local_row, local_col)] = row_start + local_col_index
 
         for body in ordered_bodies:
-            if body not in elastic_neighbours:
+            if body not in elastic_neighbors:
                 continue
             elastic_index = len(elastic_bodies_host)
             elastic_bodies_host.append(body)
@@ -332,7 +332,7 @@ def build_rigid_articulation_sparse_layout(
             group_locals = [local_index_ordered[body]]
             elastic_group_joint_host.append(-1)
             elastic_group_body_host.append(body)
-            for joint_idx, other in elastic_neighbours[body]:
+            for joint_idx, other in elastic_neighbors[body]:
                 if joint_cross_slot_host[joint_idx] < 0:
                     joint_cross_slot_host[joint_idx] = len(cross_joints)
                     cross_joints.append(joint_idx)
@@ -429,7 +429,7 @@ def build_rigid_articulation_sparse_layout(
             np.asarray(elastic_group_owner_host, dtype=np.int32), dtype=wp.int32, device=device
         ),
         elastic_group_body=wp.array(np.asarray(elastic_group_body_host, dtype=np.int32), dtype=wp.int32, device=device),
-        elastic_group_neighbour_elastic=wp.array(
+        elastic_group_neighbor_elastic=wp.array(
             np.asarray(
                 [
                     int(joint >= 0 and body_elastic_index[body] >= 0)
