@@ -37,6 +37,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     ElasticReducedMobility,
     JointFrictionData,
     RigidContactHistory,
+    RigidStepSize,
     _alm_relaxed_ascent,
     _compliant_alm_coefficients,
     _contact_tangent_conditioning_scale,
@@ -74,6 +75,17 @@ from newton.tests.unittest_utils import (
     configure_sdf_for_collision_shapes,
     get_test_devices,
 )
+
+
+def _scalar_step_size(device) -> RigidStepSize:
+    """Return a solver-wide rigid step size, as the BDF1 integrator passes to the rigid kernels."""
+    step_size = RigidStepSize()
+    step_size.per_body = 0
+    step_size.h = wp.zeros(1, dtype=float, device=device)
+    step_size.inv_h2 = step_size.h
+    step_size.bdf2 = wp.zeros(1, dtype=wp.int32, device=device)
+    return step_size
+
 
 devices = get_test_devices()
 cpu_devices = [device for device in devices if device.is_cpu]
@@ -1395,6 +1407,7 @@ def _rigid_contact_structural_support_conditions_tangent_rho(test, device):
             step_body_body_contact_C0_lambda,
             dim=1,
             inputs=[
+                _scalar_step_size(device),
                 wp.array([1], dtype=int, device=device),
                 wp.array([0], dtype=int, device=device),
                 wp.array([1], dtype=int, device=device),
@@ -1815,6 +1828,7 @@ def _rigid_contact_dual_update_computes_lambda(test, device):
             update_duals_body_body_contacts,
             dim=2,
             inputs=[
+                _scalar_step_size(device),
                 contact_count,
                 shape0,
                 shape1,
@@ -1998,6 +2012,7 @@ def _joint_angular_dual_projects_free_axis_lambda(test, device):
             update_duals_joint,
             dim=1,
             inputs=[
+                _scalar_step_size(device),
                 joint_type,
                 joint_enabled,
                 joint_parent,
@@ -2114,6 +2129,7 @@ def _rod_soft_dual_slots_clear_preserved_lambda(test, device):
             update_duals_joint,
             dim=1,
             inputs=[
+                _scalar_step_size(device),
                 joint_type,
                 joint_enabled,
                 joint_parent,
