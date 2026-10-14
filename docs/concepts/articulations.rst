@@ -577,7 +577,8 @@ Joint types
      - 4
      - 4
    * - ``JointType.ELASTIC``
-     - Reduced elastic owner joint with a floating frame and modal deformation coordinates
+     - Reduced elastic owner joint with a floating frame and modal deformation
+       coordinates (see :ref:`Reduced Elastic Links`)
      - 7 + mode count (3D position + 4D quaternion + modal amplitudes)
      - 6 + mode count (twist + modal velocities)
 
@@ -590,8 +591,10 @@ floating frame and modal state; ordinary joints such as
 their existing parent and child transforms. A :class:`~newton.ModalBasis` stores
 sampled linear mode values that can be reused by multiple elastic body instances.
 Newton samples that basis at joint attachment frames for the VBD solve and at
-visible shape vertices for Viewer rendering. The legacy mode-shape callable path
-is still accepted for custom experiments.
+shape vertices for contacts and Viewer rendering. The legacy mode-shape callable
+path is still accepted for custom experiments. See :ref:`Reduced Elastic Links`
+for the state layout, inertia formulation, units, modal generators, and
+limitations.
 
 For ``JointType.ROD``, both counts represent allocated material slots, not
 generalized coordinates or velocity DOFs; see `Rod joints`_.
@@ -1338,7 +1341,8 @@ constructed. Put a loop-closing joint inside a single articulation to include
 it in the direct factorization, or use the local solve for models whose joints
 must cross articulation boundaries.
 
-Reduced elastic links take part in the same factorization. Their owner joint
+Reduced elastic links (see :ref:`Reduced Elastic Links`) take part in the
+same factorization. Their owner joint
 (:attr:`~newton.JointType.ELASTIC`, created by
 :meth:`~newton.ModelBuilder.add_link_elastic`) carries no constraint, so it may
 stay outside the articulation; the link belongs to the articulation through its

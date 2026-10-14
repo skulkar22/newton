@@ -30,6 +30,7 @@ Newton Physics
    
    Worlds <concepts/worlds>
    Articulations <concepts/articulations>
+   Reduced Elastic Links <concepts/reduced_elastic>
    Deformable Objects <concepts/deformable_objects>
    Mass and Inertia <concepts/mass_inertia>
    Sites <concepts/sites>
