@@ -6254,6 +6254,61 @@ class TestReducedElasticBody(unittest.TestCase):
         np.testing.assert_allclose(torsion_trace, 1000.0 * 4.0e-7 / 2.0, rtol=1.0e-5)
         np.testing.assert_allclose(section.mode_mass, [1000.0 * 2.0e-7 / 2.0], rtol=1.0e-6)
 
+    def test_add_link_elastic_defaults_inertia_from_basis(self):
+        """Default omitted elastic frame mass properties to the modal basis rigid properties."""
+        points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float32)
+        phi = np.zeros((3, 1, 3), dtype=np.float32)
+        phi[1, 0, 2] = 1.0
+        basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=[1.0, 2.0, 1.0])
+        builder = newton.ModelBuilder()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            body = builder.add_body_elastic(modal_basis=basis, label="defaults")
+            armature_body = builder.add_link_elastic(modal_basis=basis, armature=0.5)
+            explicit = builder.add_link_elastic(mass=4.0, modal_basis=basis)
+            kinematic = builder.add_link_elastic(mass=0.0, modal_basis=basis)
+            unsampled = builder.add_link_elastic(modal_basis=newton.ModalBasis(sample_points=points, sample_phi=phi))
+
+        self.assertAlmostEqual(builder.body_mass[body], basis.rigid_mass, places=6)
+        np.testing.assert_allclose(np.asarray(builder.body_com[body]), basis.rigid_com, atol=1.0e-7)
+        np.testing.assert_allclose(
+            np.asarray(builder.body_inertia[body]).reshape((3, 3)), basis.rigid_inertia, atol=1.0e-7
+        )
+        np.testing.assert_allclose(
+            np.asarray(builder.body_inertia[armature_body]).reshape((3, 3)),
+            basis.rigid_inertia + 0.5 * np.eye(3),
+            atol=1.0e-7,
+        )
+        self.assertEqual(builder.body_mass[explicit], 4.0)
+        np.testing.assert_allclose(
+            np.asarray(builder.body_inertia[explicit]).reshape((3, 3)), basis.rigid_inertia, atol=1.0e-7
+        )
+        self.assertEqual(builder.body_mass[kinematic], 0.0)
+        np.testing.assert_allclose(np.asarray(builder.body_inertia[kinematic]).reshape((3, 3)), 0.0, atol=0.0)
+        self.assertEqual(builder.body_mass[unsampled], 0.0)
+
+    def test_add_link_elastic_warns_on_inconsistent_inertia(self):
+        """Warn when explicit elastic frame mass properties disagree with the modal basis."""
+        points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float32)
+        phi = np.zeros((3, 1, 3), dtype=np.float32)
+        phi[1, 0, 2] = 1.0
+        basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=[0.25, 0.5, 0.25])
+        inertia = wp.mat33(*basis.rigid_inertia.ravel())
+        com = wp.vec3(*basis.rigid_com)
+        builder = newton.ModelBuilder()
+
+        # A 0.2 kg frame on a 1 kg lumped basis makes the reduced mass indefinite.
+        with self.assertWarnsRegex(UserWarning, r"'light'.*mass 0\.2 kg vs basis 1 kg"):
+            builder.add_body_elastic(mass=0.2, com=com, inertia=inertia, modal_basis=basis, label="light")
+        with self.assertWarnsRegex(UserWarning, "'offset'.*com"):
+            builder.add_body_elastic(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), modal_basis=basis, label="offset")
+        with self.assertWarnsRegex(UserWarning, "'spun'.*inertia"):
+            builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="spun")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            builder.add_body_elastic(mass=1.02, com=com, inertia=inertia, modal_basis=basis)
+            builder.add_body_elastic(mass=0.2, modal_basis=basis, inertia_tolerance=None)
+
 
 for device in devices:
     add_function_test(

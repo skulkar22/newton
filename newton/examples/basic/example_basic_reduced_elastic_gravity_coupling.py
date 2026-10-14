@@ -87,13 +87,15 @@ class Example:
             mode_mass=[modal_mass],
             mode_stiffness=[mode_stiffness],
             mode_damping=[mode_damping],
+            rigid_mass=coupled_basis.rigid_mass,
+            rigid_com=coupled_basis.rigid_com,
+            rigid_inertia=coupled_basis.rigid_inertia,
             label="gravity_uncoupled_basis",
         )
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -self.gravity))
         builder.add_ground_plane()
 
-        inertia = wp.mat33(0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01)
         shape_cfg = newton.ModelBuilder.ShapeConfig()
         shape_cfg.density = 0.0
         shape_cfg.has_shape_collision = False
@@ -115,8 +117,6 @@ class Example:
         ):
             beam = builder.add_body_elastic(
                 xform=wp.transform(wp.vec3(0.0, y, self.z), wp.quat_identity()),
-                mass=0.2,
-                inertia=inertia,
                 mode_q=[0.0],
                 modal_basis=basis,
                 label=f"gravity_{name}_beam",
@@ -153,10 +153,7 @@ class Example:
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
-            rigid_compliant_alm=False,
             iterations=24,
-            rigid_joint_linear_k_start=1.0e5,
-            rigid_joint_angular_k_start=1.0e5,
             rigid_joint_linear_ke=2.0e6,
             rigid_joint_angular_ke=2.0e6,
         )

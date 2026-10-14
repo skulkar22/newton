@@ -134,9 +134,6 @@ class Example:
                 wp.vec3(*(B + 0.5 * (self.b_rest + float(self.mode_q0[0])) * e3)),
                 _quat_from_angle_z(theta3),
             ),
-            mass=coupler_basis.rigid_mass,
-            com=wp.vec3(*coupler_basis.rigid_com),
-            inertia=wp.mat33(*coupler_basis.rigid_inertia.ravel()),
             mode_count=3,
             mode_stiffness=coupler_stiffness,
             mode_damping=[

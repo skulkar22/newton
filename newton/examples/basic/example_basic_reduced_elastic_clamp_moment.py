@@ -93,13 +93,15 @@ class Example:
             mode_mass=coupled_basis.mode_mass,
             mode_stiffness=coupled_basis.mode_stiffness,
             mode_damping=coupled_basis.mode_damping,
+            rigid_mass=coupled_basis.rigid_mass,
+            rigid_com=coupled_basis.rigid_com,
+            rigid_inertia=coupled_basis.rigid_inertia,
             label="clamp_moment_uncoupled_basis",
         )
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         builder.add_ground_plane()
 
-        inertia = wp.mat33(0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01)
         shape_cfg = newton.ModelBuilder.ShapeConfig()
         shape_cfg.density = 0.0
         shape_cfg.has_shape_collision = False
@@ -131,8 +133,6 @@ class Example:
 
             beam = builder.add_body_elastic(
                 xform=wp.transform(wp.vec3(0.0, y, self.z), wp.quat_identity()),
-                mass=1.0,
-                inertia=inertia,
                 mode_q=[0.0],
                 modal_basis=basis,
                 label=f"clamp_moment_{name}_beam",

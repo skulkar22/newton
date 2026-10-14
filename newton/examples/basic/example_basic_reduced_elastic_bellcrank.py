@@ -159,9 +159,6 @@ class Example:
 
         self.rod1 = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*(0.5 * (input_tip + bell_input_tip))), _quat_from_angle_z(rod1_theta)),
-            mass=rod1_basis.rigid_mass,
-            com=wp.vec3(*rod1_basis.rigid_com),
-            inertia=wp.mat33(*rod1_basis.rigid_inertia.ravel()),
             mode_q=[self.rod1_q0, 0.012],
             mode_stiffness=rod_stiffness,
             mode_damping=rod_damping(rod1_basis, (0.043, 0.22)),
@@ -170,9 +167,6 @@ class Example:
         )
         self.rod2 = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*(0.5 * (bell_output_tip + output_tip))), _quat_from_angle_z(rod2_theta)),
-            mass=rod2_basis.rigid_mass,
-            com=wp.vec3(*rod2_basis.rigid_com),
-            inertia=wp.mat33(*rod2_basis.rigid_inertia.ravel()),
             mode_q=[self.rod2_q0, -0.016],
             mode_stiffness=rod_stiffness,
             mode_damping=rod_damping(rod2_basis, (0.040, 0.22)),

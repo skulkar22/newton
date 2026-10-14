@@ -64,7 +64,6 @@ class Example:
         self.z_gap = 0.5
         self.beam_mass = 1.0
         self.mode_amplitude = 0.25
-        self.inertia_zz = 0.09
         mode_stiffness = 5.0
 
         centered_points = beam_render_sample_points(
@@ -95,9 +94,14 @@ class Example:
             mode_mass=[modal_mass],
             mode_stiffness=[mode_stiffness],
             mode_damping=[0.0],
+            rigid_mass=coupled_basis.rigid_mass,
+            rigid_com=coupled_basis.rigid_com,
+            rigid_inertia=coupled_basis.rigid_inertia,
             label="angular_frame_coupling_uncoupled_basis",
         )
 
+        # Both frames take the lumped rigid properties of the coupled basis.
+        self.inertia_zz = float(coupled_basis.rigid_inertia[2, 2])
         coupling_z = float(coupled_basis.mode_coupling_angular[0][2])
         coupled_modal_inertia = modal_mass - coupling_z**2 / self.inertia_zz
         self.mode_kick = {
@@ -109,7 +113,6 @@ class Example:
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         builder.add_ground_plane()
 
-        inertia = wp.mat33(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, self.inertia_zz)
         shape_cfg = newton.ModelBuilder.ShapeConfig()
         shape_cfg.density = 0.0
         shape_cfg.has_shape_collision = False
@@ -122,9 +125,6 @@ class Example:
         ):
             beam = builder.add_body_elastic(
                 xform=wp.transform(wp.vec3(0.0, 0.0, z), wp.quat_identity()),
-                com=wp.vec3(0.0, 0.0, 0.0),
-                mass=self.beam_mass,
-                inertia=inertia,
                 mode_q=[0.0],
                 modal_basis=basis,
                 label=f"angular_frame_coupling_{name}_beam",

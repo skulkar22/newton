@@ -88,9 +88,6 @@ class Example:
 
         self.beam = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(0.5 * self.length, 0.0, self.z), wp.quat_identity()),
-            mass=beam_basis.rigid_mass,
-            com=wp.vec3(*beam_basis.rigid_com),
-            inertia=wp.mat33(*beam_basis.rigid_inertia.ravel()),
             mode_q=[self.mode_q0],
             mode_qd=[self.mode_qd0],
             modal_basis=beam_basis,

@@ -211,9 +211,6 @@ class Example:
         actuator_inertia = wp.mat33(0.012, 0.0, 0.0, 0.0, 0.018, 0.0, 0.0, 0.0, 0.012)
         self.arm = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*self.arm_center), _quat_from_xz_angle(self.arm_theta0)),
-            mass=arm_basis.rigid_mass,
-            com=wp.vec3(*arm_basis.rigid_com),
-            inertia=wp.mat33(*arm_basis.rigid_inertia.ravel()),
             mode_q=[0.0, 0.0, 0.0, 0.0],
             mode_stiffness=arm_stiffness,
             mode_damping=[

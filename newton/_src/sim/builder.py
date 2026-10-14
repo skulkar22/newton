@@ -5882,13 +5882,75 @@ class ModelBuilder:
 
         return joint_id
 
+    def _resolve_elastic_rigid_properties(
+        self,
+        modal_basis: ModalBasis | None,
+        mass: float | None,
+        com: Vec3 | None,
+        inertia: Mat33 | None,
+        label: str | None,
+        inertia_tolerance: float | None,
+    ) -> tuple[float, Vec3 | None, Mat33 | None]:
+        """Default elastic frame mass properties to the basis's rigid properties and check explicit values.
+
+        Returns:
+            The resolved ``(mass, com, inertia)``; ``com`` and ``inertia`` stay
+            ``None`` when neither the caller nor the basis provides them.
+        """
+        basis_mass = None if modal_basis is None else modal_basis.rigid_mass
+        if basis_mass is not None and not basis_mass > 0.0:
+            basis_mass = None
+        basis_com = None if basis_mass is None else modal_basis.rigid_com
+        basis_inertia = None if basis_mass is None else modal_basis.rigid_inertia
+
+        if inertia_tolerance is not None and basis_mass is not None and (mass is None or mass > 0.0):
+            tolerance = float(inertia_tolerance)
+            mismatches = []
+            if mass is not None and abs(float(mass) - basis_mass) > tolerance * basis_mass:
+                mismatches.append(f"mass {float(mass):.6g} kg vs basis {basis_mass:.6g} kg")
+            if com is not None and basis_com is not None:
+                com_value = np.asarray(axis_to_vec3(com), dtype=np.float64)
+                radius = (
+                    math.sqrt(max(float(np.trace(basis_inertia)), 0.0) / basis_mass)
+                    if basis_inertia is not None
+                    else 0.0
+                )
+                if float(np.linalg.norm(com_value - basis_com)) > tolerance * radius:
+                    mismatches.append(f"com {com_value.tolist()} m vs basis {np.asarray(basis_com).tolist()} m")
+            if inertia is not None and basis_inertia is not None:
+                inertia_value = np.asarray(self._coerce_mat33(inertia), dtype=np.float64).reshape((3, 3))
+                scale = float(np.linalg.norm(basis_inertia))
+                if float(np.linalg.norm(inertia_value - basis_inertia)) > tolerance * scale:
+                    mismatches.append(
+                        f"inertia {inertia_value.round(9).tolist()} kg m^2 vs basis "
+                        f"{np.asarray(basis_inertia, dtype=np.float64).round(9).tolist()} kg m^2"
+                    )
+            if mismatches:
+                name = label if label else f"body {len(self.body_mass)}"
+                warnings.warn(
+                    f"Elastic body '{name}' mass properties differ from its modal basis rigid properties "
+                    f"(relative tolerance {tolerance:.3g}): {'; '.join(mismatches)}. An inconsistent frame mass "
+                    "or inertia can make the reduced mass matrix indefinite and disable the implicit "
+                    "frame/mode mass coupling; omit mass, com, and inertia to use the basis values.",
+                    stacklevel=3,
+                )
+
+        if mass is None:
+            mass = 0.0 if basis_mass is None else basis_mass
+        if mass > 0.0:
+            if com is None and basis_com is not None:
+                com = wp.vec3(*np.asarray(basis_com, dtype=np.float32).tolist())
+            if inertia is None and basis_inertia is not None:
+                inertia = wp.mat33(*np.asarray(basis_inertia, dtype=np.float32).ravel().tolist())
+        return float(mass), com, inertia
+
     def add_link_elastic(
         self,
         xform: Transform | None = None,
         armature: float | None = None,
         com: Vec3 | None = None,
         inertia: Mat33 | None = None,
-        mass: float = 0.0,
+        mass: float | None = None,
         label: str | None = None,
         mode_count: int = 0,
         mode_mass: Sequence[float] | None = None,
@@ -5901,6 +5963,8 @@ class ModelBuilder:
         lock_inertia: bool = False,
         is_kinematic: bool = False,
         custom_attributes: dict[str, Any] | None = None,
+        *,
+        inertia_tolerance: float | None = 0.05,
     ) -> int:
         """Add a reduced elastic link with a floating frame and modal DoFs.
 
@@ -5911,10 +5975,18 @@ class ModelBuilder:
 
         Args:
             xform: Initial world transform of the floating frame.
-            armature: Artificial inertia added to the body.
-            com: Center of mass in the body frame.
-            inertia: Inertia tensor relative to the center of mass.
-            mass: Body mass [kg].
+            armature: Artificial inertia [kg m^2] added to the body's
+                rotational inertia after the defaults below are resolved.
+            com: Center of mass [m] in the body frame. ``None`` uses the
+                basis's ``rigid_com`` when ``modal_basis`` provides rigid
+                properties and the resolved mass is positive, else the origin.
+            inertia: Rotational inertia [kg m^2] about the center of mass.
+                ``None`` uses the basis's ``rigid_inertia`` under the same
+                conditions as ``com``, else zero.
+            mass: Body mass [kg]. ``None`` uses the basis's ``rigid_mass`` when
+                ``modal_basis`` provides one, else ``0.0``. An explicit ``0.0``
+                keeps its usual meaning (no translational inertia) and is not
+                compared against the basis.
             label: Body label.
             mode_count: Number of reduced elastic modal coordinates.
             mode_mass: Modal masses [kg].
@@ -5929,6 +6001,16 @@ class ModelBuilder:
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.
+            inertia_tolerance: Relative tolerance for comparing an explicit
+                ``mass``, ``com``, and ``inertia`` with the rigid properties of
+                ``modal_basis``. A :class:`UserWarning` names the body and both
+                values when ``|mass - m_b| > tol * m_b``,
+                ``|com - c_b| > tol * sqrt(trace(I_b) / m_b)``, or
+                ``||inertia - I_b||_F > tol * ||I_b||_F``. ``None`` disables
+                the check. A frame mass or inertia inconsistent with the basis's
+                mass distribution can make the reduced mass matrix of the
+                frame and modes indefinite, which disables the solver's
+                implicit frame/mode mass coupling for the body.
 
         Returns:
             The body index.
@@ -5964,11 +6046,15 @@ class ModelBuilder:
             coupling_coriolis = modal_basis.mode_coupling_coriolis
             coupling_quadratic = modal_basis.mode_coupling_quadratic
 
+        mass, com, inertia = self._resolve_elastic_rigid_properties(
+            modal_basis, mass, com, inertia, label, inertia_tolerance
+        )
+
         if armature is not None:
             if armature < 0.0:
                 raise ValueError(f"armature must be non-negative, got {armature}")
             body_inertia = wp.mat33() if inertia is None else self._coerce_mat33(inertia)
-            inertia = body_inertia + wp.identity(3, dtype=float) * armature
+            inertia = body_inertia + wp.mat33(armature, 0.0, 0.0, 0.0, armature, 0.0, 0.0, 0.0, armature)
 
         body_id = self.add_link(
             xform=xform,
@@ -6027,7 +6113,7 @@ class ModelBuilder:
         armature: float | None = None,
         com: Vec3 | None = None,
         inertia: Mat33 | None = None,
-        mass: float = 0.0,
+        mass: float | None = None,
         label: str | None = None,
         mode_count: int = 0,
         mode_mass: Sequence[float] | None = None,
@@ -6040,6 +6126,8 @@ class ModelBuilder:
         lock_inertia: bool = False,
         is_kinematic: bool = False,
         custom_attributes: dict[str, Any] | None = None,
+        *,
+        inertia_tolerance: float | None = 0.05,
     ) -> int:
         """Add a stand-alone free-floating reduced elastic body.
 
@@ -6049,10 +6137,18 @@ class ModelBuilder:
 
         Args:
             xform: Initial world transform of the floating frame.
-            armature: Artificial inertia added to the body.
-            com: Center of mass in the body frame.
-            inertia: Inertia tensor relative to the center of mass.
-            mass: Body mass [kg].
+            armature: Artificial inertia [kg m^2] added to the body's
+                rotational inertia after the defaults below are resolved.
+            com: Center of mass [m] in the body frame. ``None`` uses the
+                basis's ``rigid_com`` when ``modal_basis`` provides rigid
+                properties and the resolved mass is positive, else the origin.
+            inertia: Rotational inertia [kg m^2] about the center of mass.
+                ``None`` uses the basis's ``rigid_inertia`` under the same
+                conditions as ``com``, else zero.
+            mass: Body mass [kg]. ``None`` uses the basis's ``rigid_mass`` when
+                ``modal_basis`` provides one, else ``0.0``. An explicit ``0.0``
+                keeps its usual meaning (no translational inertia) and is not
+                compared against the basis.
             label: Body label.
             mode_count: Number of reduced elastic modal coordinates.
             mode_mass: Modal masses [kg].
@@ -6067,6 +6163,16 @@ class ModelBuilder:
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.
+            inertia_tolerance: Relative tolerance for comparing an explicit
+                ``mass``, ``com``, and ``inertia`` with the rigid properties of
+                ``modal_basis``. A :class:`UserWarning` names the body and both
+                values when ``|mass - m_b| > tol * m_b``,
+                ``|com - c_b| > tol * sqrt(trace(I_b) / m_b)``, or
+                ``||inertia - I_b||_F > tol * ||I_b||_F``. ``None`` disables
+                the check. A frame mass or inertia inconsistent with the basis's
+                mass distribution can make the reduced mass matrix of the
+                frame and modes indefinite, which disables the solver's
+                implicit frame/mode mass coupling for the body.
 
         Returns:
             The body index.
@@ -6089,6 +6195,7 @@ class ModelBuilder:
             lock_inertia=lock_inertia,
             is_kinematic=is_kinematic,
             custom_attributes=custom_attributes,
+            inertia_tolerance=inertia_tolerance,
         )
         joint_id = self.body_elastic_joint[body_id]
         self.add_articulation([joint_id], label=f"{label}_articulation" if label else None)
