@@ -11,7 +11,7 @@ import warp as wp
 
 import newton
 import newton.solvers
-from newton.tests import test_reduced_elastic_body as elastic_tests
+from newton.tests import _reduced_elastic_fixtures as elastic_fixtures
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 devices = get_test_devices()
@@ -32,13 +32,13 @@ def _solver(model, mode: str, iterations: int = 24, relaxation: float = 1.0, **k
 
 def _run_standalone_rod(device, mode: str, steps: int = 192, dt: float = 1.0 / 960.0):
     """Step the spinning, boosted one-mode rod and record its joint state and momentum metrics."""
-    model, state_0, data = elastic_tests._rod_model(
+    model, state_0, data = elastic_fixtures.rod_model(
         device, mode="cos_offset", spin=(0.0, 0.0, 5.0), velocity=(0.3, -0.2, 0.1)
     )
     state_1 = model.state()
     control = model.control()
     solver = _solver(model, mode)
-    com_0, momentum_0, angular_0 = elastic_tests._rod_physical(state_0, data)
+    com_0, momentum_0, angular_0 = elastic_fixtures.rod_physical(state_0, data)
     total_mass = float(np.sum(data["mass"]))
     ballistic = 0.0
     angular_drift = 0.0
@@ -46,11 +46,11 @@ def _run_standalone_rod(device, mode: str, steps: int = 192, dt: float = 1.0 / 9
     for step in range(steps):
         solver.step(state_0, state_1, control, None, dt)
         state_0, state_1 = state_1, state_0
-        com, _momentum, angular = elastic_tests._rod_physical(state_0, data)
+        com, _momentum, angular = elastic_fixtures.rod_physical(state_0, data)
         expected = com_0 + (step + 1) * dt * momentum_0 / total_mass
         ballistic = max(ballistic, float(np.linalg.norm(com - expected)))
         angular_drift = max(angular_drift, float(np.linalg.norm(angular - angular_0)))
-        joint_q, _joint_qd = elastic_tests._rod_joint_state(state_0, data)
+        joint_q, _joint_qd = elastic_fixtures.rod_joint_state(state_0, data)
         series.append(joint_q)
     return np.asarray(series), ballistic, angular_drift, solver
 
@@ -238,7 +238,7 @@ def _make_elastic_fourbar_model(device):
     a, b_rest, c, d, z = 0.35, 0.65, 0.55, 0.75, 0.12
     theta2 = 0.75
     mode_q0 = np.array([0.08, 0.08, 0.0], dtype=np.float32)
-    theta3, theta4 = elastic_tests._solve_fourbar(theta2, a, b_rest + float(mode_q0[0]), c, d)
+    theta3, theta4 = elastic_fixtures.solve_fourbar(theta2, a, b_rest + float(mode_q0[0]), c, d)
     ground_a = np.array([0.0, 0.0, z])
     ground_d = np.array([d, 0.0, z])
     e2 = np.array([math.cos(theta2), math.sin(theta2), 0.0])
@@ -335,6 +335,142 @@ def _run_fourbar(device, mode: str, iterations: int, steps: int = 200, dt: float
     return np.asarray(gaps), np.asarray(series), solver
 
 
+def _beam_basis(mode_specs, length: float = 0.6, half_y: float = 0.03, half_z: float = 0.02):
+    """Return a soft beam basis with the given mode specifications."""
+    return newton.ModalGeneratorBeam(
+        length=length,
+        half_width_y=half_y,
+        half_width_z=half_z,
+        young_modulus=2.0e6,
+        density=1000.0,
+        mode_specs=mode_specs,
+    ).build()
+
+
+def _make_kinematic_elastic_parent_model(device):
+    """Build a kinematic elastic beam, spinning about its root hinge, carrying a hinged rigid child.
+
+    The beam's frame motion is prescribed while its modes respond to the child's hinge load.
+    """
+    length = 0.6
+    beam = newton.ModalGeneratorBeam
+    basis = _beam_basis(
+        [
+            {"type": beam.Mode.AXIAL},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+        ],
+        length=length,
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    link = builder.add_link_elastic(
+        xform=wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity()),
+        modal_basis=basis,
+        mode_q=[0.0, 0.01],
+        is_kinematic=True,
+    )
+    child = builder.add_link(
+        xform=wp.transform(wp.vec3(length + 0.2, 0.0, 0.0), wp.quat_identity()),
+        mass=0.5,
+        inertia=wp.mat33(*np.diag([0.001, 0.01, 0.01]).ravel()),
+    )
+    root = builder.add_joint_revolute(
+        parent=-1,
+        child=link,
+        axis=(0.0, 0.0, 1.0),
+        child_xform=wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity()),
+    )
+    hinge = builder.add_joint_revolute(
+        parent=link,
+        child=child,
+        axis=(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder.add_articulation([root, hinge])
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    joint_qd = state.joint_qd.numpy()
+    joint_qd[model.joint_qd_start.numpy()[root]] = 1.5
+    state.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _make_mixed_mode_count_model(device):
+    """Build a chain of a one-mode elastic link, a rigid link, and a three-mode elastic link.
+
+    Both elastic links have fewer modes than the model's widest basis would allow if padded, so the
+    sparse layout must handle per-body mode counts below ``elastic_max_mode_count``.
+    """
+    length = 0.5
+    beam = newton.ModalGeneratorBeam
+    one_mode = _beam_basis(
+        [{"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1}], length=length
+    )
+    three_modes = _beam_basis(
+        [
+            {"type": beam.Mode.AXIAL},
+            {"type": beam.Mode.BENDING_Y, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+        ],
+        length=length,
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    first = builder.add_link_elastic(
+        xform=wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity()),
+        modal_basis=one_mode,
+        mode_q=[0.01],
+    )
+    middle = builder.add_link(
+        xform=wp.transform(wp.vec3(length + 0.1, 0.0, 0.0), wp.quat_identity()),
+        mass=0.4,
+        inertia=wp.mat33(*np.diag([0.001, 0.004, 0.004]).ravel()),
+    )
+    last = builder.add_link_elastic(
+        xform=wp.transform(wp.vec3(1.5 * length + 0.2, 0.0, 0.0), wp.quat_identity()),
+        modal_basis=three_modes,
+        mode_q=[0.0, 0.0, -0.01],
+    )
+    half = wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity())
+    minus_half = wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity())
+    axis = (0.0, 0.0, 1.0)
+    joints = [
+        builder.add_joint_revolute(parent=-1, child=first, axis=axis, child_xform=minus_half),
+        builder.add_joint_revolute(
+            parent=first,
+            child=middle,
+            axis=axis,
+            parent_xform=half,
+            child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+        ),
+        builder.add_joint_revolute(
+            parent=middle,
+            child=last,
+            axis=axis,
+            parent_xform=wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity()),
+            child_xform=minus_half,
+        ),
+    ]
+    builder.add_articulation(joints)
+    builder.color()
+    model = builder.finalize(device=device)
+    return model, model.state()
+
+
+def _run_model(model, state_0, mode: str, iterations: int, steps: int, dt: float = 1.0 / 480.0, **kwargs):
+    """Step ``model`` and return the ``joint_q`` series and the solver."""
+    state_1 = model.state()
+    control = model.control()
+    solver = _solver(model, mode, iterations=iterations, **kwargs)
+    series = []
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, dt)
+        state_0, state_1 = state_1, state_0
+        series.append(state_0.joint_q.numpy().copy())
+    return np.asarray(series), solver
+
+
 def test_sparse_standalone_elastic_body_matches_local(test, device):
     """Match a free spinning, boosted elastic body between the sparse and local solves.
 
@@ -382,17 +518,19 @@ def test_sparse_elastic_coupler_closed_loop(test, device):
     """Close a four-bar with an elastic coupler in one sparse factorization.
 
     The coupler's modes are eliminated onto the crank and rocker frames, which the layout couples
-    through a fill block. The loop residual stays within 10 % of the local solve at the same
-    iteration count. (The local solve is far from converged at 24 iterations here; the sparse
-    trajectory instead matches a 384-iteration local reference to about 1e-4.)
+    through a fill block. At 24 iterations the sparse trajectory matches the converged local solve
+    (384 iterations) within 5e-4 in every joint coordinate (about 2e-4 measured), while the local
+    solve at 24 iterations is still about 0.12 rad away, and its loop residual stays within 5 % of
+    the converged one.
     """
-    local_gaps, _local_series, _ = _run_fourbar(device, "local", iterations=24)
+    reference_gaps, reference_series, _ = _run_fourbar(device, "local", iterations=384)
     sparse_gaps, sparse_series, solver = _run_fourbar(device, _SPARSE, iterations=24)
     layout = solver.rigid_articulation_sparse_layout
     test.assertEqual(layout.elastic_body_count, 1)
     test.assertEqual(layout.elastic_group_count, 3)
     test.assertTrue(np.isfinite(sparse_series).all())
-    test.assertLess(float(sparse_gaps.max()), 1.1 * float(local_gaps.max()))
+    np.testing.assert_allclose(sparse_series, reference_series, rtol=0.0, atol=5.0e-4)
+    test.assertLess(float(sparse_gaps.max()), 1.05 * float(reference_gaps.max()))
     test.assertLess(float(sparse_gaps[-1]), 1.0e-4)
     test.assertGreater(float(np.max(np.abs(sparse_series[-1] - sparse_series[0]))), 0.05)
 
@@ -402,16 +540,62 @@ def test_sparse_elastic_elastic_joint_stays_stable(test, device):
 
     The per-body elimination cannot represent the mode-mode coupling of the shared hinge; it adds
     the hinge's modal self term once more instead. Dropping the coupling alone makes the reduced
-    system indefinite and diverges; with the conservative term the loop gap stays close to the
-    local solve's at the same iteration count.
+    system indefinite and diverges. With the conservative term, compared with the converged local
+    solve (384 iterations), the peak hinge gap stays within 30 % (about 20 % measured), the final gap
+    within 5 % (0.2 % measured), and the joint coordinates within 1e-2 (4e-3 measured, the effect of
+    the extra modal term).
     """
-    local_gaps, _local_state, _ = _run_elastic_chain(device, "local")
+    reference_gaps, reference_state, _ = _run_elastic_chain(device, "local", iterations=384)
     sparse_gaps, state, solver = _run_elastic_chain(device, _SPARSE)
     test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 2)
     test.assertTrue(np.isfinite(state.joint_q.numpy()).all())
     test.assertTrue(np.isfinite(sparse_gaps).all())
-    test.assertLess(float(sparse_gaps.max()), 1.3 * float(local_gaps.max()))
-    test.assertLess(abs(float(sparse_gaps[-1]) - float(local_gaps[-1])), 0.05 * float(local_gaps[-1]))
+    test.assertLess(float(sparse_gaps.max()), 1.3 * float(reference_gaps.max()))
+    test.assertLess(abs(float(sparse_gaps[-1]) - float(reference_gaps[-1])), 0.05 * float(reference_gaps[-1]))
+    np.testing.assert_allclose(state.joint_q.numpy(), reference_state.joint_q.numpy(), rtol=0.0, atol=1.0e-2)
+
+
+def _elastic_mode_series(model, series: np.ndarray, elastic_index: int) -> np.ndarray:
+    """Return the modal coordinate columns of one elastic body from a ``joint_q`` series."""
+    owner = int(model.elastic_joint.numpy()[elastic_index])
+    start = int(model.joint_q_start.numpy()[owner]) + 7
+    return series[:, start : start + int(model.elastic_mode_count.numpy()[elastic_index])]
+
+
+def test_sparse_kinematic_elastic_parent_matches_local(test, device):
+    """Match a kinematic elastic beam carrying a hinged rigid child between the sparse and local solves.
+
+    The beam's frame motion is prescribed, so the sparse solve eliminates only its modes. At 128
+    iterations both solves agree within 2e-4 in every joint coordinate (about 8e-5 measured, the
+    local solve's own distance to 384 iterations is 2e-5), and the child's hinge load moves the modes.
+    """
+    model, state = _make_kinematic_elastic_parent_model(device)
+    local, _ = _run_model(model, state, "local", iterations=128, steps=240)
+    model, state = _make_kinematic_elastic_parent_model(device)
+    sparse, solver = _run_model(model, state, _SPARSE, iterations=128, steps=240)
+    test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 1)
+    test.assertTrue(np.isfinite(sparse).all())
+    np.testing.assert_allclose(sparse, local, rtol=0.0, atol=2.0e-4)
+    modes = _elastic_mode_series(model, sparse, 0)
+    test.assertGreater(float(np.ptp(modes[:, 0])), 1.0e-4)
+
+
+def test_sparse_mixed_mode_counts_match_local(test, device):
+    """Match a chain of one-mode and three-mode elastic links around a rigid link to the local solve.
+
+    At 128 iterations both solves agree within 2e-4 in every joint coordinate (about 3e-5 measured).
+    """
+    model, state = _make_mixed_mode_count_model(device)
+    test.assertEqual(model.elastic_mode_count.numpy().tolist(), [1, 3])
+    local, _ = _run_model(model, state, "local", iterations=128, steps=240)
+    model, state = _make_mixed_mode_count_model(device)
+    sparse, solver = _run_model(model, state, _SPARSE, iterations=128, steps=240)
+    test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 2)
+    test.assertTrue(np.isfinite(sparse).all())
+    np.testing.assert_allclose(sparse, local, rtol=0.0, atol=2.0e-4)
+    for elastic_index in range(2):
+        modes = _elastic_mode_series(model, sparse, elastic_index)
+        test.assertGreater(float(np.max(np.ptp(modes, axis=0))), 1.0e-4)
 
 
 def _assert_cpu_cuda_parity(test, device, run, label: str):
@@ -455,12 +639,34 @@ def test_sparse_elastic_leaf_link_graph_capture(test, device):
 
 
 def test_sparse_elastic_rejects_unsupported_joint_terms(test, device):
-    """Reject elastic-attached joint armature in the sparse solve and keep it in the local solve."""
-    model, _state, hinge = _make_leaf_link_model(device)
-    armature = model.joint_armature.numpy()
-    armature[model.joint_qd_start.numpy()[hinge]] = 0.01
-    model.joint_armature.assign(armature)
-    with test.assertRaisesRegex(ValueError, "joint_armature"):
+    """Reject elastic-attached joint armature, damping, and friction in the sparse solve.
+
+    The local solve keeps each of them.
+    """
+    for attribute in ("joint_armature", "joint_damping", "joint_friction"):
+        with test.subTest(attribute=attribute):
+            model, _state, hinge = _make_leaf_link_model(device)
+            values = getattr(model, attribute).numpy()
+            values[model.joint_qd_start.numpy()[hinge]] = 0.01
+            getattr(model, attribute).assign(values)
+            with test.assertRaisesRegex(ValueError, "joint_armature, joint_damping, or joint_friction"):
+                _solver(model, _SPARSE)
+            _solver(model, "local")
+
+
+def test_sparse_elastic_rejects_joint_mimics(test, device):
+    """Reject joint mimics together with elastic articulation bodies in the sparse solve only."""
+    basis = _beam_basis([{"type": newton.ModalGeneratorBeam.Mode.AXIAL}])
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    link = builder.add_link_elastic(modal_basis=basis)
+    followers = [builder.add_link(mass=1.0, inertia=wp.mat33(*np.eye(3).ravel())) for _ in range(2)]
+    joints = [builder.add_joint_revolute(parent=-1, child=link, axis=(0.0, 0.0, 1.0))]
+    joints += [builder.add_joint_revolute(parent=link, child=body, axis=(0.0, 0.0, 1.0)) for body in followers]
+    builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.0, 1.0))
+    builder.add_articulation(joints)
+    builder.color()
+    model = builder.finalize(device=device)
+    with test.assertRaisesRegex(NotImplementedError, "mimic"):
         _solver(model, _SPARSE)
     _solver(model, "local")
 
@@ -474,7 +680,10 @@ for _name, _test in (
     ("test_sparse_elastic_leaf_link_matches_local", test_sparse_elastic_leaf_link_matches_local),
     ("test_sparse_elastic_coupler_closed_loop", test_sparse_elastic_coupler_closed_loop),
     ("test_sparse_elastic_elastic_joint_stays_stable", test_sparse_elastic_elastic_joint_stays_stable),
+    ("test_sparse_kinematic_elastic_parent_matches_local", test_sparse_kinematic_elastic_parent_matches_local),
+    ("test_sparse_mixed_mode_counts_match_local", test_sparse_mixed_mode_counts_match_local),
     ("test_sparse_elastic_rejects_unsupported_joint_terms", test_sparse_elastic_rejects_unsupported_joint_terms),
+    ("test_sparse_elastic_rejects_joint_mimics", test_sparse_elastic_rejects_joint_mimics),
 ):
     add_function_test(TestReducedElasticSparseArticulation, _name, _test, devices=devices)
 
