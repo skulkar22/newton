@@ -359,6 +359,37 @@ def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
         solver.notify_model_changed(flags.CONSTRAINT_PROPERTIES)
 
 
+def _elastic_chain_series(device, mode: str, iterations: int, steps: int = 120):
+    """Return the per-step ``[body_q, joint_q]`` series of the two-link elastic chain."""
+    model = sparse_tests._make_elastic_chain_model(device)
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    solver = sparse_tests._solver(model, mode, iterations=iterations)
+    series = []
+    for _ in range(steps):
+        solver.step(state_0, state_1, control, None, _DT)
+        state_0, state_1 = state_1, state_0
+        series.append(np.concatenate((state_0.body_q.numpy().ravel(), state_0.joint_q.numpy())))
+    return np.asarray(series)
+
+
+def test_sparse_elastic_elastic_chain_converges_to_local(test, device):
+    """Converge to the local solve's fixed point for directly jointed elastic links, more slowly.
+
+    The per-body elimination cannot represent the mode-mode coupling of a hinge between two
+    elastic links and adds a conservative positive semidefinite term instead, which keeps the
+    fixed point but slows convergence. Over 0.25 s the sparse trajectory is about 8.5e-4 from a
+    converged 384-iteration local reference at 96 iterations, where the local solve is within
+    2e-5, and about 1e-5 at 384 iterations; the bounds assert 2e-3 and 5e-5.
+    """
+    reference = _elastic_chain_series(device, "local", 384)
+    for iterations, bound in ((96, 2.0e-3), (384, 5.0e-5)):
+        sparse = _elastic_chain_series(device, _SPARSE, iterations)
+        test.assertTrue(np.isfinite(sparse).all())
+        error = float(np.max(np.abs(sparse - reference)))
+        test.assertLess(error, bound, f"{iterations} iterations")
+
+
 def test_sparse_modal_fallback_warns_after_graph_replay(test, device):
     """Count fallback factorizations in a captured graph and report them outside capture."""
     with warnings.catch_warnings():
@@ -391,6 +422,7 @@ for _name, _test in (
     ("test_sparse_modal_fallback_keeps_frames_definite", test_sparse_modal_fallback_keeps_frames_definite),
     ("test_sparse_modal_fallback_checks_frame_schur", test_sparse_modal_fallback_checks_frame_schur),
     ("test_sparse_elastic_revalidates_narrow_model_flags", test_sparse_elastic_revalidates_narrow_model_flags),
+    ("test_sparse_elastic_elastic_chain_converges_to_local", test_sparse_elastic_elastic_chain_converges_to_local),
 ):
     add_function_test(TestReducedElasticSparsePerformance, _name, _test, devices=devices)
 

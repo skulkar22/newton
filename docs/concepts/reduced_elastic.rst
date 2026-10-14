@@ -347,6 +347,44 @@ neighbors. These links use ``rigid_articulation_relaxation`` and report no
 block metrics. See :ref:`Loop closure inside an articulation` for the joint
 features this mode does not support.
 
+Each iteration factors every link's ``n x n`` modal block once and solves all
+of its right-hand sides (the modal residual and six columns per neighbor
+frame) in the same pass, before the articulation's frame system is factored.
+The modal blocks of all links in articulations are padded to the largest mode
+count among them. ``elastic_block_solver`` selects the factorization as for
+the local solve: the tiled path keeps one modal block in shared memory (about
+``4 * (n**2 + 7 * n)`` bytes, so a device with 101,376 bytes per block fits
+about 150 modes), and the dense path factors it in global memory. The cost per
+step is then close to the local solve's. Measured on an RTX PRO 6000 Blackwell
+GPU (Warp 1.18, 8 iterations, CUDA graph replay) for a rigid base carrying
+elastic beam links, with the local solve in parentheses:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * - Modes per link
+     - 1 link [ms/step]
+     - 8 links [ms/step]
+   * - 32
+     - 1.6 (1.3)
+     - 2.2 (2.2)
+   * - 105
+     - 3.5 (2.9)
+     - 4.6 (4.9)
+   * - 151
+     - 5.2 (4.0)
+     - 6.9 (7.0)
+
+On the CPU the sparse step costs 0.8 to 1.4 times the local step for the same
+cases (for example 51 ms against 37 ms for eight 151-mode links).
+
+A link whose dense frame-and-mode block is not positive definite, typically
+because of an inconsistent modal mass or stiffness, cannot be eliminated. Its
+frame is then solved with its own frame rows only, and its modes take a
+diagonal (Jacobi) step after the frame solve, as the local block solve's
+fallback does; this converges slowly or not at all, and the solver warns once.
+
 Approximations and limits
 -------------------------
 
@@ -371,8 +409,9 @@ Approximations and limits
   armature on joints attached to elastic links, and rejects joint mimics
   anywhere in a model whose articulations contain elastic links.
 - **Elastic–elastic joints** in the block-sparse articulation solve replace the
-  mode–mode coupling by a conservative per-link term and need more iterations
-  than the local solve.
+  mode–mode coupling by a conservative per-link term, which keeps the
+  converged solution but needs about four times as many iterations as the
+  local solve; see :ref:`Loop closure inside an articulation`.
 - **Precision.** States are ``float32``. With the displacement-form frame
   update, an elastic link far from the origin is as accurate as a rigid body
   there; with the absolute-pose update (joint mimics or
@@ -418,3 +457,9 @@ Warnings
    * - Block widths use the dense block solve (:class:`~newton.solvers.SolverVBD`)
      - A modal basis exceeds the tiled solve's shared memory; the slower dense
        solve is used. Pass ``elastic_block_solver="dense"`` to silence it.
+   * - Could not Cholesky-factor the modal block (:class:`~newton.solvers.SolverVBD`)
+     - In the block-sparse articulation solve, an elastic link's frame-and-mode
+       block is not positive definite, so its modes take a diagonal step
+       instead of being eliminated. Check the modal mass, stiffness, and frame
+       inertia. Reported by the next ``step()`` or ``notify_model_changed()``
+       call outside CUDA graph capture.

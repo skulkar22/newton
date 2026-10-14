@@ -1363,11 +1363,29 @@ as one system:
    j_loop = builder.add_joint_revolute(parent=-1, child=rocker, ...)
    builder.add_articulation([j_drive, j_a, j_b, j_loop], allow_closed_loops=True)
 
-A joint between two elastic links couples their modes directly; the sparse
-solve replaces that coupling by a conservative per-link term, which keeps the
-iteration stable but needs more iterations to converge. Joint mimics, and
-armature, passive damping, or friction on joints attached to an elastic link,
-are not supported in this mode.
+An elastic link whose joints all connect it to rigid links (such as the
+coupler above) is eliminated exactly, so the loop converges in as many
+iterations as a rigid one. A joint between two elastic links couples their
+modes directly; the sparse solve replaces that coupling by a conservative
+per-link term, which keeps the iteration stable and the converged solution
+unchanged but slows convergence. For two hinged elastic beams the trajectory
+is about 1e-2 from the converged solution at 24 iterations, 1e-3 at 96, and
+1e-5 at 384, where the local solve reaches 5e-4 at 24 and 2e-5 at 96
+iterations. For chains of directly jointed elastic links, prefer the local
+solve or a rigid link between the elastic links.
+
+Every joint attached to an elastic link needs an elastic endpoint sample, the
+mode values at its attachment, so that the solve can couple the joint to the
+link's modes. :meth:`~newton.ModelBuilder.finalize` creates one for every
+joint of a link with modes; a joint without one is rejected when the solver is
+constructed. Joint mimics anywhere in the model, and armature, passive damping,
+or friction on joints attached to an elastic link, are not supported in this
+mode and are rejected, also when they are set later and reported with
+:meth:`~newton.solvers.SolverBase.notify_model_changed`.
+
+The modal factorization of each elastic link costs about as much as in the
+local solve; see :ref:`Reduced Elastic Links` for measured costs and mode-count
+limits.
 
 .. warning::
 
