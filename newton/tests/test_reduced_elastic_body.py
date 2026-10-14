@@ -3,6 +3,7 @@
 
 import contextlib
 import math
+import os
 import tracemalloc
 import unittest
 import warnings
@@ -1385,14 +1386,24 @@ def test_modal_basis_mode_mass_from_sample_mass(test, device):
 
 
 def test_modal_basis_mode_mass_explicit_wins(test, device):
-    """Check that an explicit mode_mass overrides the sampled modal mass."""
-    basis = newton.ModalBasis(
-        sample_points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
-        sample_mass=[1.0, 1.0],
-        mode_mass=[99.0],
-    )
+    """Check that an explicit mode_mass overrides the sampled modal mass and warns when it disagrees.
+
+    Also reject an asymmetric ``mode_mass_matrix`` and warn about an indefinite one.
+    """
+    points = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    phi = [[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]]
+    with test.assertWarnsRegex(UserWarning, "explicit mode_mass differs"):
+        basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=[1.0, 1.0], mode_mass=[99.0])
     np.testing.assert_allclose(basis.mode_mass, [99.0], atol=1.0e-6)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=[1.0, 1.0], mode_mass=[2.005])
+
+    two_modes = [[[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]], [[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]]]
+    with test.assertRaisesRegex(ValueError, "mode_mass_matrix must be symmetric"):
+        newton.ModalBasis(sample_points=points, sample_phi=two_modes, mode_mass_matrix=[[1.0, 0.5], [0.0, 1.0]])
+    with test.assertWarnsRegex(UserWarning, "mode_mass_matrix is indefinite"):
+        newton.ModalBasis(sample_points=points, sample_phi=two_modes, mode_mass_matrix=[[1.0, 2.0], [2.0, 1.0]])
 
 
 def test_elastic_mode_coupling_arrays(test, device):
@@ -4378,6 +4389,11 @@ def test_elastic_nonorthogonal_modes_use_full_mass_matrix(test, device):
     solver.step(state_0, state_1, control, None, dt)
     qdd = state_1.joint_qd.numpy()[qd_start + 6 : qd_start + 8] / dt
     np.testing.assert_allclose(qdd, [-1.0, 1.0], rtol=1.0e-4, atol=1.0e-4)
+    # The contact and drive mobility of the kinematic frame's modes uses the same full inverse.
+    mobility = solver.elastic_reduced_mobility
+    test.assertEqual(mobility.modal_mass_is_dense, 1)
+    np.testing.assert_allclose(mobility.modal_inv_mass_dense.numpy()[0], [[2.0, -1.0], [-1.0, 1.0]], atol=1.0e-5)
+    np.testing.assert_allclose(mobility.modal_inv_mass.numpy()[0], [2.0, 1.0], atol=1.0e-5)
 
 
 def test_vbd_revolute_uses_elastic_endpoint(test, device):
@@ -6786,7 +6802,7 @@ class TestReducedElasticBody(unittest.TestCase):
         self.assertEqual(basis.frame_phi.shape, (0, 1, 3))
         coupling = basis.mode_coupling_linear.copy()
 
-        index = basis.add_frame([0.5, 0.0, 0.0], [[0.0, 3.0, 0.0]], [[1.0, 0.0, 0.0]], label="pad")
+        index = basis.add_frame([0.5, 0.0, 0.0], [[0.0, 3.0, 0.0]], psi=[[1.0, 0.0, 0.0]], label="pad")
         self.assertEqual(index, 0)
         self.assertEqual(basis.find_frame([0.5, 0.0, 0.0]), 0)
         self.assertEqual(basis.find_frame([0.6, 0.0, 0.0]), -1)
@@ -6812,7 +6828,7 @@ class TestReducedElasticBody(unittest.TestCase):
         phi = rng.normal(size=(12, 3, 3)).astype(np.float32)
         sample_mass = rng.uniform(0.5, 1.5, size=12).astype(np.float32)
         basis = newton.ModalBasis(sample_points=points, sample_phi=phi, sample_mass=sample_mass)
-        basis.add_frame([0.0, 0.0, 0.0], phi[0], phi[1], label="mount")
+        basis.add_frame([0.0, 0.0, 0.0], phi[0], psi=phi[1], label="mount")
         self.assertGreater(basis.mode_mass_coupling_ratio, 0.1)
 
         with self.assertWarnsRegex(UserWarning, "rescales the modal coordinates"):
@@ -6977,8 +6993,13 @@ class TestReducedElasticBody(unittest.TestCase):
         builder = newton.ModelBuilder()
 
         # A 0.2 kg frame on a 1 kg lumped basis makes the reduced mass indefinite.
-        with self.assertWarnsRegex(UserWarning, r"'light'.*mass 0\.2 kg vs basis 1 kg"):
+        with self.assertWarnsRegex(UserWarning, r"'light'.*mass 0\.2 kg vs basis 1 kg") as caught:
             builder.add_body_elastic(mass=0.2, com=com, inertia=inertia, modal_basis=basis, label="light")
+        # The warning points at the caller of add_body_elastic, not into the builder.
+        self.assertEqual(os.path.normcase(caught.filename), os.path.normcase(__file__))
+        with self.assertWarnsRegex(UserWarning, "'light_link'.*mass") as caught:
+            builder.add_link_elastic(mass=0.2, com=com, inertia=inertia, modal_basis=basis, label="light_link")
+        self.assertEqual(os.path.normcase(caught.filename), os.path.normcase(__file__))
         with self.assertWarnsRegex(UserWarning, "'offset'.*com"):
             builder.add_body_elastic(mass=1.0, com=wp.vec3(0.0, 0.0, 0.0), modal_basis=basis, label="offset")
         with self.assertWarnsRegex(UserWarning, "'spun'.*inertia"):

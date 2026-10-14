@@ -5937,7 +5937,7 @@ class ModelBuilder:
                     f"(relative tolerance {tolerance:.3g}): {'; '.join(mismatches)}. An inconsistent frame mass "
                     "or inertia can make the reduced mass matrix indefinite and disable the implicit "
                     "frame/mode mass coupling; omit mass, com, and inertia to use the basis values.",
-                    stacklevel=3,
+                    stacklevel=self._external_warning_stacklevel(),
                 )
 
         if mass is None:

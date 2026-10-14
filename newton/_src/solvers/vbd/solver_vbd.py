@@ -210,15 +210,20 @@ def _measure_elastic_block_solve_shared_memory(device_alias: str, block_width: i
 
     The kernel is compiled and loaded for ``block_width`` and ``block_dim``, and the module's
     forward shared-memory requirement is checked against the budget left after the kernel's
-    static reservation.
+    static reservation. The measurement uses Warp's kernel hooks, which are not public API; if
+    they are unavailable, the pre-estimate against the device budget is used instead.
     """
     device = wp.get_device(device_alias)
     kernel = create_solve_elastic_body_tiled(block_width)
     # A request that does not fit only logs a Warp warning here; the caller reports it.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        hooks = kernel.module.load(device, block_dim).get_kernel_hooks(kernel)
-    return int(hooks.forward_smem_bytes), hooks.forward_smem_shortfall is None
+        try:
+            hooks = kernel.module.load(device, block_dim).get_kernel_hooks(kernel)
+            return int(hooks.forward_smem_bytes), hooks.forward_smem_shortfall is None
+        except (AttributeError, TypeError):
+            estimate = _elastic_block_solve_shared_memory_estimate(block_width)
+            return estimate, estimate <= _elastic_block_solve_shared_memory_limit(device)
 
 
 def _select_elastic_block_solve_tiled_launch(device: wp.Device, block_width: int) -> tuple[int, int, bool]:
@@ -242,13 +247,43 @@ def _select_elastic_block_solve_tiled_launch(device: wp.Device, block_width: int
 
 def _max_elastic_block_solve_tiled_width(device: wp.Device) -> int:
     """Return the largest block width whose tiled solve fits the shared memory of ``device``."""
+    return _max_elastic_block_solve_tiled_width_cached(device.alias)
+
+
+@functools.cache
+def _max_elastic_block_solve_tiled_width_cached(device_alias: str) -> int:
+    """Search the largest fitting tiled block width of a device once.
+
+    The fit is monotone in the width. Starting from the largest width whose pre-estimate fits,
+    the search steps down by doubling strides and then bisects, so on CUDA it compiles only a few
+    kernels even when the measured static reservation lowers the limit by several widths.
+    """
+    device = wp.get_device(device_alias)
     limit = _elastic_block_solve_shared_memory_limit(device)
     width = max(int((np.sqrt(1.0 + limit) - 1.0) / 2.0), 1)
     while width > 1 and _elastic_block_solve_shared_memory_estimate(width) > limit:
         width -= 1
-    while width > 1 and not _select_elastic_block_solve_tiled_launch(device, width)[2]:
-        width -= 1
-    return width
+
+    def fits(candidate: int) -> bool:
+        return _select_elastic_block_solve_tiled_launch(device, candidate)[2]
+
+    if width <= 1 or fits(width):
+        return width
+    # Invariant: ``high`` does not fit; find a fitting ``low`` below it.
+    high = width
+    stride = 1
+    low = max(high - stride, 1)
+    while low > 1 and not fits(low):
+        high = low
+        stride *= 2
+        low = max(high - stride, 1)
+    while high - low > 1:
+        middle = (low + high) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle
+    return low
 
 
 def _elastic_block_bucket_width(mode_count: int, max_block_width: int) -> int:
@@ -906,7 +941,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_articulation_relaxation: Under-relaxation factor for the experimental coupled
                 articulation position update. A value of ``1`` applies the full Newton update.
                 The default damps sparse articulation updates so they do not overstep stale
-                contact manifolds between collision updates.
+                contact manifolds between collision updates. It also scales the frame and modal
+                updates of reduced elastic bodies solved inside these articulations.
             rigid_articulation_diagonal_regularization: Non-negative value added to each
                 translational and angular diagonal Hessian entry before sparse factorization.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
@@ -1940,6 +1976,19 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     modal_inv_mass_dense[elastic_index, mode, mode] = 1.0 / mass
 
             if not frame_dynamic:
+                # A kinematic frame does not move, so the mobility is J_m Mf^-1 J_m^T with the
+                # full modal mass when it is dense and positive definite.
+                modal_mass = np.asarray(mode_mass_matrix[elastic_index, :count, :count], dtype=np.float64)
+                modal_mass = 0.5 * (modal_mass + modal_mass.T)
+                diagonal = np.diag(np.diag(modal_mass))
+                off_diagonal = np.max(np.abs(modal_mass - diagonal), initial=0.0)
+                if off_diagonal > 1.0e-10 * np.max(np.abs(np.diag(modal_mass)), initial=0.0):
+                    scale = max(float(np.max(np.abs(np.diag(modal_mass)))), 1.0)
+                    if float(np.linalg.eigvalsh(modal_mass)[0]) > 1.0e-8 * scale:
+                        modal_inv = np.linalg.inv(modal_mass)
+                        modal_inv_mass[elastic_index, :count] = np.diag(modal_inv)
+                        modal_inv_mass_dense[elastic_index, :count, :count] = modal_inv
+                        modal_mass_is_dense = True
                 continue
 
             frame_mass = np.zeros((6, 6), dtype=np.float64)
@@ -3899,13 +3948,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     def _launch_elastic_body_solve(
         self,
         body_ids: wp.array,
-        solve_frame: bool,
         state_in: State,
         state_out: State,
         relaxation: float,
         dt: float,
     ):
+        """Assemble and solve the frame and modal block of each elastic body in ``body_ids``."""
         model = self.model
+        # The kernels can also solve the modal rows alone with the frame held fixed; the solver
+        # always solves frame and modes together.
+        solve_frame = True
         common_inputs = [
             dt,
             solve_frame,
@@ -3914,7 +3966,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             model.elastic_joint,
             model.elastic_mode_count,
         ]
-        body_q_current = state_in.body_q if solve_frame else state_out.body_q
+        body_q_current = state_in.body_q
         trailing_inputs = [
             self.body_inv_mass_effective,
             model.body_com,
@@ -6145,7 +6197,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if model.elastic_body_count > 0:
                 self._launch_elastic_body_solve(
                     color_group,
-                    True,
                     state_in,
                     state_out,
                     elastic_body_relaxation,

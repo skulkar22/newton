@@ -367,8 +367,9 @@ Approximations and limits
   link, joint friction and passive joint damping are not assembled into the
   elastic block, so they act on the other (rigid) body only, and mimic
   reactions reach the elastic frame but not its modes. The block-sparse
-  articulation solve rejects these terms, and joint armature, on joints
-  attached to elastic links.
+  articulation solve rejects joint friction, passive joint damping, and joint
+  armature on joints attached to elastic links, and rejects joint mimics
+  anywhere in a model whose articulations contain elastic links.
 - **Elastic–elastic joints** in the block-sparse articulation solve replace the
   mode–mode coupling by a conservative per-link term and need more iterations
   than the local solve.

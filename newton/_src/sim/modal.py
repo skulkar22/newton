@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, Literal, NamedTuple
 
 import numpy as np
 
@@ -217,9 +217,11 @@ class ModalBasis:
             value always takes precedence; when omitted it is the diagonal of
             ``mode_mass_matrix``, i.e. ``sum_s mass_s |phi_i(x_s)|^2`` for lumped
             sample masses. An explicit diagonal also defines a diagonal
-            ``mode_mass_matrix`` unless ``mode_mass_matrix`` is given, and a
+            ``mode_mass_matrix`` unless ``mode_mass_matrix`` is given. A
             warning is emitted when the sampled integrals show off-diagonal
-            mass coupling above ``mode_coupling_tolerance``.
+            mass coupling, or a diagonal differing from the explicit value by
+            a relative amount from the lumped ``sample_mass`` integral, above
+            ``mode_coupling_tolerance``.
         mode_stiffness: Modal stiffness values [N/m], shape ``[mode_count]``.
         mode_damping: Modal damping values [N s/m], shape ``[mode_count]``.
         mode_coupling_linear: Optional linear coupling integral
@@ -252,7 +254,8 @@ class ModalBasis:
         mode_mass_matrix: Optional full modal mass matrix [kg], shape
             ``[mode_count, mode_count]``. When omitted it is the trace of
             ``mode_coupling_quadratic``, or diagonal when ``mode_mass`` is
-            explicit. Its diagonal must match an explicit ``mode_mass``.
+            explicit. It must be symmetric, its diagonal must match an explicit
+            ``mode_mass``, and an indefinite matrix emits a warning.
         rigid_mass: Optional rigid body mass [kg] represented by the basis.
             Defaults to ``sum(sample_mass)``.
         rigid_com: Optional rigid center of mass [m] in the basis frame, shape
@@ -433,6 +436,21 @@ class ModalBasis:
             self.mode_mass_matrix = explicit_mass_matrix
         elif mode_mass is not None:
             self.mode_mass_matrix = None if derived_mass_matrix is None else np.diag(self.mode_mass)
+            # Only lumped sample masses define the mass distribution here; explicit pair integrals
+            # come with their own (possibly analytic) modal masses from the caller.
+            if derived_mass_matrix is not None and lumped is not None and mode_coupling_quadratic is None:
+                derived = np.diag(derived_mass_matrix).astype(np.float64)
+                explicit = np.asarray(self.mode_mass, dtype=np.float64)
+                deviation = np.abs(explicit - derived) / np.maximum(np.abs(derived), 1.0e-30)
+                if derived.shape[0] > 0 and float(np.max(deviation)) > self.mode_coupling_tolerance:
+                    warnings.warn(
+                        "ModalBasis explicit mode_mass differs from the modal mass integrated from the samples "
+                        f"(largest relative difference {float(np.max(deviation)):.3g} > mode_coupling_tolerance "
+                        f"{self.mode_coupling_tolerance:.3g}). The inertia coupling integrals come from the samples, "
+                        "so an inconsistent modal mass can make the reduced mass indefinite; omit mode_mass to use "
+                        "the sampled value.",
+                        stacklevel=2,
+                    )
             if self._mode_mass_coupling_ratio > self.mode_coupling_tolerance:
                 warnings.warn(
                     "ModalBasis modes are not mass-orthogonal under the sampled mass distribution "
@@ -600,9 +618,26 @@ class ModalBasis:
     ) -> np.ndarray | None:
         if values is None:
             return None
-        array = np.asarray(values, dtype=np.float32)
+        array = np.asarray(values, dtype=np.float64)
         if array.shape != (mode_count, mode_count):
             raise ValueError(f"mode_mass_matrix must have shape ({mode_count}, {mode_count}), got {array.shape}")
+        scale = float(np.max(np.abs(array), initial=0.0))
+        asymmetry = float(np.max(np.abs(array - array.T), initial=0.0))
+        if asymmetry > 1.0e-5 * scale:
+            raise ValueError(
+                f"mode_mass_matrix must be symmetric; its largest asymmetry {asymmetry:.3g} exceeds 1e-5 of its "
+                f"largest entry {scale:.3g}"
+            )
+        array = 0.5 * (array + array.T)
+        if mode_count > 0:
+            min_eigenvalue = float(np.linalg.eigvalsh(array)[0])
+            if min_eigenvalue < -1.0e-6 * scale:
+                warnings.warn(
+                    f"mode_mass_matrix is indefinite (smallest eigenvalue {min_eigenvalue:.3g} kg); a modal mass "
+                    "matrix must be positive semidefinite, and an indefinite one disables the implicit "
+                    "frame/mode mass coupling of the elastic bodies that use it",
+                    stacklevel=3,
+                )
         return np.array(array, dtype=np.float32, copy=True)
 
     @staticmethod
@@ -670,6 +705,7 @@ class ModalBasis:
         self,
         point: Sequence[float] | np.ndarray,
         phi: Sequence[Sequence[float]] | np.ndarray,
+        *,
         psi: Sequence[Sequence[float]] | np.ndarray | None = None,
         label: str | None = None,
     ) -> int:
@@ -1171,6 +1207,10 @@ class ModalGeneratorSampled:
         )
 
 
+# ``damping_projection`` stays a closed set of strings rather than an enum: it is a setup-time
+# option shared by ModalGeneratorCraigBampton and ModalGeneratorFEM, and the categorical options of
+# the modal generator family (ModalGeneratorBeam.Mode and .Boundary) are string-valued as well. The
+# Literal annotation documents and type-checks the allowed values.
 _DAMPING_PROJECTIONS = ("diagonal", "error")
 
 
@@ -1339,7 +1379,7 @@ class ModalGeneratorCraigBampton:
         label: str | None = None,
         *,
         sample_mass: Sequence[float] | np.ndarray | None = None,
-        damping_projection: str = "diagonal",
+        damping_projection: Literal["diagonal", "error"] = "diagonal",
         interface_match_tolerance: float = 1.0e-7,
         interface_recovery_tolerance: float = 1.0e-6,
     ):
@@ -1914,7 +1954,7 @@ class ModalGeneratorFEM:
         label: str | None = None,
         *,
         free_free: bool | None = None,
-        damping_projection: str = "diagonal",
+        damping_projection: Literal["diagonal", "error"] = "diagonal",
         damping_coupling_tolerance: float = 1.0e-5,
     ):
         self._node_positions64 = np.asarray(node_positions, dtype=np.float64)

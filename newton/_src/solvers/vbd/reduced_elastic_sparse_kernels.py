@@ -4,7 +4,7 @@
 """Reduced elastic bodies inside the VBD block-sparse articulation solve.
 
 Each elastic body ``b`` contributes a dense ``(6 + n)`` block assembled by
-:func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_joints`
+:func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_blocks`
 (frame rows in body axes about the rest COM, modal rows ``m``). Its joints
 ``j`` couple the modal coordinates to neighbor frames ``c`` through
 ``K_mc = G_j^T H_bc``, where ``H_bc`` is the joint's frame-frame cross block in
@@ -225,8 +225,12 @@ def build_elastic_sparse_schur_columns(
     the per-body elimination cannot represent. Dropping ``X`` alone can make the system
     indefinite, so the joint's modal self term ``P_b = -a^T K_x a`` (``a`` the attachment motion
     of each mode, ``K_x`` the joint's attachment-space cross block, ``-K_x`` its self block) is
-    added once more to ``A_mm``. The modified matrix exceeds the exact one by the positive
-    semidefinite ``[[P_b, -X], [-X^T, P_c]]``, a conservative step with an unchanged fixed point.
+    added once more to ``A_mm``. For joint rows whose attachment-space block is a Gauss-Newton
+    penalty (the point and axis penalty rows and the coordinate rows), ``K_x`` is positive
+    semidefinite, and the modified matrix exceeds the exact one by the positive semidefinite
+    ``[[P_b, -X], [-X^T, P_c]]``: a conservative step with an unchanged fixed point. The diagonal
+    fallback of :func:`_modal_solve_inplace` used when ``A_mm`` is not positive definite is not such
+    a majorizer.
     """
     tid = wp.tid()
     max_modes = elastic_max_mode_count
@@ -287,8 +291,9 @@ def build_elastic_sparse_schur_columns(
         theta_local = theta_local + elastic_endpoint_psi[endpoint * max_modes + k] * joint_q[owner_q_start + k]
 
     # Body twist that moves the deformed attachment like this mode: [phi + r x psi, psi].
+    rotation_jacobian = R * _so3_left_jacobian(theta_local)
     phi = R * elastic_endpoint_phi[endpoint * max_modes + mode]
-    psi = R * (_so3_left_jacobian(theta_local) * elastic_endpoint_psi[endpoint * max_modes + mode])
+    psi = rotation_jacobian * elastic_endpoint_psi[endpoint * max_modes + mode]
     twist_linear = phi + wp.cross(r, psi)
     slot = joint_cross_slot[joint]
     b_row = vec6f(0.0)
@@ -316,7 +321,7 @@ def build_elastic_sparse_schur_columns(
     r_neighbor = attachment - wp.transform_point(body_q[neighbor], body_com[neighbor])
     for other in range(mode_count):
         phi_o = R * elastic_endpoint_phi[endpoint * max_modes + other]
-        psi_o = R * (_so3_left_jacobian(theta_local) * elastic_endpoint_psi[endpoint * max_modes + other])
+        psi_o = rotation_jacobian * elastic_endpoint_psi[endpoint * max_modes + other]
         twist_o = phi_o + wp.cross(r_neighbor, psi_o)
         value = -(
             b_row[0] * twist_o[0]
