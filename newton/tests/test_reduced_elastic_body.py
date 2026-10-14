@@ -315,6 +315,7 @@ def _assert_elastic_modal_projection_matches_joint_force(test, device, joint_kin
 
 
 def test_modal_basis_add_sample(test, device):
+    """Check that add_sample reuses a coincident point and stores explicit mode values for a new one."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 2.0, 3.0], [0.0, 1.0, 0.0]]],
@@ -332,6 +333,7 @@ def test_modal_basis_add_sample(test, device):
 
 
 def test_modal_basis_add_samples_preserves_mass_invariant(test, device):
+    """Check that add_samples deduplicates points, keeps existing values, and gives new samples zero mass."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -351,6 +353,7 @@ def test_modal_basis_add_samples_preserves_mass_invariant(test, device):
 
 
 def test_modal_generator_beam_samples(test, device):
+    """Check axial, pinned-pinned bending, and linear torsion beam mode values at an off-axis sample."""
     length = 1.0
     basis = newton.ModalGeneratorBeam(
         length=length,
@@ -379,6 +382,7 @@ def test_modal_generator_beam_samples(test, device):
 
 
 def test_modal_generator_pod_rank_one(test, device):
+    """Check that one POD snapshot gives a unit-peak mode with lumped modal mass and scaled stiffness."""
     points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     displacements = np.array([[[0.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=np.float32)
 
@@ -397,6 +401,7 @@ def test_modal_generator_pod_rank_one(test, device):
 
 
 def test_modal_generator_pod_explicit_zero_modes(test, device):
+    """Check that ``mode_count=0`` gives an empty POD basis."""
     points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     displacements = np.array([[[0.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=np.float32)
     basis = newton.ModalGeneratorPOD(points, displacements=displacements, mode_count=0).build()
@@ -406,6 +411,7 @@ def test_modal_generator_pod_explicit_zero_modes(test, device):
 
 
 def test_modal_generator_beam_linear_torsion_properties(test, device):
+    """Check the linear torsion modal stiffness formula and the rejection of order 0."""
     length = 2.0
     shear_modulus = 7.0
     polar_moment = 0.25
@@ -435,6 +441,7 @@ def test_modal_generator_beam_linear_torsion_properties(test, device):
 
 
 def test_modal_generator_fem_matrix_rom(test, device):
+    """Check FEM modes, frequencies, damping, and node sampling for a diagonal two-node model."""
     nodes = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     mass = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
     stiffness = np.zeros((6, 6), dtype=np.float64)
@@ -547,6 +554,7 @@ def _build_craig_bampton_test_data():
 
 
 def test_modal_generator_craig_bampton_interface_modes(test, device):
+    """Check Craig-Bampton mass-normalized modes, rigid properties, and interface sample values."""
     interface_positions, mass, stiffness, damping, sample_points, recovery, spatial_mass = (
         _build_craig_bampton_test_data()
     )
@@ -596,6 +604,7 @@ def test_modal_generator_craig_bampton_interface_modes(test, device):
 
 
 def test_modal_generator_craig_bampton_single_interface(test, device):
+    """Check a single-interface Craig-Bampton model with interface/internal mass coupling."""
     interface_positions = np.zeros((1, 3), dtype=np.float64)
     spatial_mass = np.diag([3.0, 3.0, 3.0, 0.2, 0.25, 0.3])
     mass = np.zeros((8, 8), dtype=np.float64)
@@ -640,6 +649,7 @@ def test_modal_generator_craig_bampton_single_interface(test, device):
 
 
 def test_modal_generator_craig_bampton_nonclassical_damping(test, device):
+    """Check that non-diagonal projected Craig-Bampton damping warns and keeps its diagonal."""
     interface_positions, mass, stiffness, _, sample_points, recovery, _ = _build_craig_bampton_test_data()
     undamped_generator = newton.ModalGeneratorCraigBampton(
         interface_positions=interface_positions,
@@ -1026,6 +1036,7 @@ def test_modal_generator_craig_bampton_negative_damping_warns(test, device):
 
 
 def test_modal_basis_lumped_inertia_coupling(test, device):
+    """Check the lumped linear and angular coupling integrals of a two-sample basis."""
     points = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     sample_phi = np.array(
         [
@@ -1041,6 +1052,7 @@ def test_modal_basis_lumped_inertia_coupling(test, device):
 
 
 def test_modal_basis_coupling_unavailable_without_mass(test, device):
+    """Check that a basis without sample masses has no coupling integrals and unit modal mass."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
@@ -1053,6 +1065,7 @@ def test_modal_basis_coupling_unavailable_without_mass(test, device):
 
 
 def test_modal_basis_coupling_explicit_override(test, device):
+    """Check that an explicit linear coupling overrides the lumped value and is shape-validated."""
     explicit = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
@@ -1071,6 +1084,7 @@ def test_modal_basis_coupling_explicit_override(test, device):
 
 
 def test_modal_generator_fem_inertia_coupling(test, device):
+    """Check FEM linear and angular coupling integrals against the lumped node masses."""
     nodes = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     mass = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
     stiffness = np.zeros((6, 6), dtype=np.float64)
@@ -1096,6 +1110,7 @@ def test_modal_generator_fem_inertia_coupling(test, device):
 
 
 def test_modal_generator_pod_inertia_coupling(test, device):
+    """Check that POD ``total_mass`` yields the lumped linear coupling integral."""
     points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     displacements = np.array([[[0.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=np.float32)
     basis = newton.ModalGeneratorPOD(
@@ -1112,6 +1127,7 @@ def test_modal_generator_pod_inertia_coupling(test, device):
 
 
 def test_modal_generator_pod_coupling_matches_lumped(test, device):
+    """Check POD linear, angular, centrifugal, and Coriolis integrals against a uniform lumped mass."""
     n = 9
     xs = np.linspace(0.0, 1.0, n, dtype=np.float32)
     points = np.column_stack([xs, 0.3 * xs, -0.2 * xs]).astype(np.float32)
@@ -1143,6 +1159,7 @@ def test_modal_generator_pod_coupling_matches_lumped(test, device):
 
 
 def test_estimate_sample_psi_rotation_and_translation(test, device):
+    """Check that psi estimation recovers a rigid rotation and ignores a rigid translation."""
     rng = np.random.default_rng(0)
     points = rng.normal(size=(40, 3)).astype(np.float32)
 
@@ -1157,6 +1174,7 @@ def test_estimate_sample_psi_rotation_and_translation(test, device):
 
 
 def test_estimate_sample_psi_degenerate_warns(test, device):
+    """Check that coplanar samples warn and still recover the in-plane rotation."""
     xs = np.linspace(-1.0, 1.0, 6, dtype=np.float32)
     points = np.array([[x, y, 0.0] for x in xs for y in xs], dtype=np.float32)
     phi = np.cross(np.tile([0.0, 0.0, 1.0], (points.shape[0], 1)), points)[:, None, :].astype(np.float32)
@@ -1167,6 +1185,7 @@ def test_estimate_sample_psi_degenerate_warns(test, device):
 
 
 def test_modal_generator_sampled_psi(test, device):
+    """Check that the sampled generator passes explicit psi through and defaults it to zero."""
     n = 5
     xs = np.linspace(-0.5, 0.5, n, dtype=np.float32)
     points = np.column_stack([xs, np.zeros(n), np.zeros(n)]).astype(np.float32)
@@ -1182,6 +1201,7 @@ def test_modal_generator_sampled_psi(test, device):
 
 
 def test_modal_generator_pod_derives_psi(test, device):
+    """Check that POD ``derive_psi`` recovers the rotation axis and is off by default."""
     rng = np.random.default_rng(1)
     points = rng.normal(size=(48, 3)).astype(np.float32)
     omega = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -1208,6 +1228,7 @@ def test_modal_generator_pod_derives_psi(test, device):
 
 
 def test_modal_generator_fem_derives_psi(test, device):
+    """Check that FEM ``derive_psi`` gives finite nonzero angular samples and zeros when disabled."""
     nodes = np.array([[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)], dtype=np.float32)
     dof = 3 * nodes.shape[0]
     mass = np.eye(dof)
@@ -1237,6 +1258,7 @@ def test_modal_generator_fem_derives_psi(test, device):
 
 
 def test_modal_basis_copy_preserves_coupling(test, device):
+    """Check that ModalBasis.copy preserves sample masses and coupling integrals."""
     n = 5
     xs = np.linspace(-0.5, 0.5, n, dtype=np.float32)
     sample_points = np.column_stack([xs, np.zeros(n), np.zeros(n)]).astype(np.float32)
@@ -1265,6 +1287,7 @@ def test_modal_basis_copy_preserves_coupling(test, device):
 
 
 def test_modal_basis_mode_mass_from_sample_mass(test, device):
+    """Check that modal masses are integrated from the sample masses."""
     basis = newton.ModalBasis(
         sample_points=[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         sample_phi=[
@@ -1277,6 +1300,7 @@ def test_modal_basis_mode_mass_from_sample_mass(test, device):
 
 
 def test_modal_basis_mode_mass_explicit_wins(test, device):
+    """Check that an explicit mode_mass overrides the sampled modal mass."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
@@ -1287,6 +1311,7 @@ def test_modal_basis_mode_mass_explicit_wins(test, device):
 
 
 def test_elastic_mode_coupling_arrays(test, device):
+    """Check that finalize stores basis coupling integrals and zeros for a body without a basis."""
     basis = newton.ModalBasis(
         sample_points=[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
@@ -1311,6 +1336,7 @@ def test_elastic_mode_coupling_arrays(test, device):
 
 
 def test_elastic_coriolis_array_padding(test, device):
+    """Check that per-body Coriolis blocks are zero-padded to the largest mode count."""
     basis_a = newton.ModalBasis(
         sample_points=[[1.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]]],
@@ -1334,6 +1360,7 @@ def test_elastic_coriolis_array_padding(test, device):
 
 
 def test_elastic_mode_coupling_arrays_merge(test, device):
+    """Check that add_builder copies the elastic coupling integrals of each instance."""
     basis = newton.ModalBasis(
         sample_points=[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
@@ -1353,6 +1380,7 @@ def test_elastic_mode_coupling_arrays_merge(test, device):
 
 
 def test_elastic_coriolis_array_merge_different_mode_count(test, device):
+    """Check the Coriolis block layout after merging builders with different mode counts."""
     basis_a = newton.ModalBasis(
         sample_points=[[1.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]]],
@@ -1471,6 +1499,7 @@ def _solve_fourbar(theta2: float, a: float, b: float, c: float, d: float) -> tup
 
 
 def test_elastic_link_layout(test, device):
+    """Check the elastic owner joint's coordinate layout and initial modal state."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body_elastic(
         mass=1.0,
@@ -1503,6 +1532,7 @@ def test_elastic_link_layout(test, device):
 
 
 def test_add_joint_elastic_initializes_relative_frame_coordinates(test, device):
+    """Check that add_joint_elastic stores the relative frame pose and FK restores the child pose."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     parent_xform_world = wp.transform(wp.vec3(0.4, -0.2, 0.1), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.35))
     child_xform_world = wp.transform(wp.vec3(-0.3, 0.6, 0.7), wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.25))
@@ -1531,6 +1561,7 @@ def test_add_joint_elastic_initializes_relative_frame_coordinates(test, device):
 
 
 def test_elastic_fk_sync(test, device):
+    """Check that eval_fk copies the elastic frame pose and twist to the body and keeps the modes."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), mode_count=1)
     builder.color()
@@ -1556,6 +1587,7 @@ def test_elastic_fk_sync(test, device):
 
 
 def test_elastic_fk_ik_com_velocity_round_trip(test, device):
+    """Check that FK and IK round-trip the frame velocity of an elastic body with an offset COM."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body_elastic(
         mass=1.0,
@@ -1589,6 +1621,8 @@ def test_elastic_fk_ik_com_velocity_round_trip(test, device):
 
 
 def test_elastic_endpoint_shape_sampling(test, device):
+    """Check that a mode_shape_fn is sampled at an elastic joint endpoint."""
+
     def shape_fn(x):
         return np.array([[2.0 * x[0], -x[1], 0.5]], dtype=np.float32)
 
@@ -1613,6 +1647,7 @@ def test_elastic_endpoint_shape_sampling(test, device):
 
 
 def test_elastic_endpoint_modal_basis_sampling(test, device):
+    """Check that a joint endpoint reuses a coincident basis sample and its mode values."""
     basis = newton.ModalBasis(
         sample_points=[[0.5, -0.25, 0.0]],
         sample_phi=[[[1.0, 0.25, 0.5]]],
@@ -1642,6 +1677,7 @@ def test_elastic_endpoint_modal_basis_sampling(test, device):
 
 
 def test_elastic_endpoint_angular_sampling(test, device):
+    """Check that endpoint angular mode values match the beam basis evaluation."""
     length = 2.0
     attach_local = (-0.5 * length, 0.0, 0.0)
     gen = newton.ModalGeneratorBeam(
@@ -1675,6 +1711,7 @@ def test_elastic_endpoint_angular_sampling(test, device):
 
 
 def test_elastic_endpoint_angular_zero_without_beam(test, device):
+    """Check that a basis without angular samples gives zero endpoint angular values."""
     basis = newton.ModalBasis(
         sample_points=[[0.5, -0.25, 0.0]],
         sample_phi=[[[1.0, 0.25, 0.5]]],
@@ -1945,6 +1982,7 @@ def test_elastic_clamp_moment_conserves_angular_momentum(test, device):
 
 
 def test_modal_basis_shared_by_elastic_bodies(test, device):
+    """Check that two bodies sharing a basis register it once."""
     basis = newton.ModalGeneratorBeam(
         length=1.0,
         half_width_y=0.05,
@@ -1975,6 +2013,8 @@ def test_modal_basis_shared_by_elastic_bodies(test, device):
 
 
 def test_elastic_render_shape_sampling(test, device):
+    """Check the render polyline points of an elastic box and their mode samples."""
+
     def shape_fn(x):
         xi = x[0] / 0.5
         return np.array([[0.0, 1.0 - xi * xi, 0.0]], dtype=np.float32)
@@ -2006,6 +2046,7 @@ def test_elastic_render_shape_sampling(test, device):
 
 
 def test_elastic_shape_mesh_sampling(test, device):
+    """Check the mode samples of the render-mesh vertices of an elastic box."""
     length = 1.0
     hy = 0.05
     hz = 0.03
@@ -2040,6 +2081,7 @@ def test_elastic_shape_mesh_sampling(test, device):
 
 
 def test_elastic_shape_box_winding(test, device):
+    """Check that the triangles of an elastic box mesh wind outward."""
     hx = 0.5
     hy = 0.05
     hz = 0.03
@@ -2064,6 +2106,7 @@ def test_elastic_shape_box_winding(test, device):
 
 
 def test_elastic_shape_box_exact_modal_samples(test, device):
+    """Check that elastic box mesh vertices map exactly to the beam render samples."""
     length = 0.8
     hy = 0.04
     hz = 0.03
@@ -2139,6 +2182,7 @@ def _build_elastic_ground_contact_model(device, z: float, q0: float = 0.0, is_ki
 
 
 def test_elastic_surface_contact_generation(test, device):
+    """Check that ground contacts on an elastic box carry the elastic shape's vertex sample."""
     model, body = _build_elastic_ground_contact_model(device, z=0.04)
     state = model.state()
     contacts = model.contacts()
@@ -2162,6 +2206,7 @@ def test_elastic_surface_contact_generation(test, device):
 
 
 def test_elastic_surface_contact_work_uses_pair_vertex_ranges(test, device):
+    """Check that elastic contact work counts only the vertices of each pair's elastic shape."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 1.0]]],
@@ -2201,6 +2246,7 @@ def test_elastic_surface_contact_work_uses_pair_vertex_ranges(test, device):
 
 
 def test_elastic_surface_contact_deterministic_sort_preserves_samples(test, device):
+    """Check that deterministic contact sorting keeps each elastic sample matched to its vertex."""
     model, _body = _build_elastic_ground_contact_model(device, z=0.04)
     state = model.state()
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
@@ -2218,6 +2264,7 @@ def test_elastic_surface_contact_deterministic_sort_preserves_samples(test, devi
 
 
 def test_elastic_surface_contact_reduction_preserves_modal_samples(test, device):
+    """Check that contact reduction keeps valid elastic vertex samples."""
     model, _body = _build_elastic_ground_contact_model(device, z=0.04)
     state = model.state()
 
@@ -2239,6 +2286,7 @@ def test_elastic_surface_contact_reduction_preserves_modal_samples(test, device)
 
 
 def test_elastic_surface_contact_uses_deformed_vertex(test, device):
+    """Check that a modal deflection brings a separated elastic box vertex into ground contact."""
     model, _body = _build_elastic_ground_contact_model(device, z=0.07)
     state = model.state()
     contacts = model.contacts()
@@ -2302,6 +2350,7 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
 
 
 def test_vbd_elastic_body_relaxation_is_general_and_validated(test, device):
+    """Check that elastic_body_relaxation is stored, metrics stay empty by default, and invalid values raise."""
     model, _body = _build_elastic_ground_contact_model(device, z=0.2)
     solver = newton.solvers.SolverVBD(model, elastic_body_relaxation=0.37)
 
@@ -2316,6 +2365,7 @@ def test_vbd_elastic_body_relaxation_is_general_and_validated(test, device):
 
 
 def test_vbd_elastic_compliant_contact_solves_modal_penetration(test, device):
+    """Check that compliant-ALM contact measures modal penetration and pushes the mode back."""
     initial_modal_q = 0.005
     model, _body = _build_elastic_ground_contact_model(device, z=0.05, q0=initial_modal_q)
     model.elastic_mode_mass.fill_(1.0)
@@ -2435,6 +2485,7 @@ def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
 
 
 def test_elastic_contact_local_mat33_projection_matches_world(test, device):
+    """Check that projecting a contact force and Hessian onto modes in the body frame matches the world frame."""
     del device
 
     quat = wp.quat_from_axis_angle(wp.vec3(0.3, -0.7, 0.2), 0.83)
@@ -2479,6 +2530,7 @@ def test_elastic_contact_local_mat33_projection_matches_world(test, device):
 
 
 def test_elastic_strain_visualization_colors(test, device):
+    """Check that strain colors of an elastic mesh change with modal amplitude and stay in [0, 1]."""
     length = 1.0
 
     def axial_gradient_shape(x):
@@ -2526,6 +2578,7 @@ def test_elastic_strain_visualization_colors(test, device):
 
 
 def test_elastic_rendering_respects_layer_transform_and_visibility(test, device):
+    """Check that elastic meshes follow the viewer layer transform and visibility."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[0.0, 0.0, 0.0]]],
@@ -2561,6 +2614,7 @@ def test_elastic_rendering_respects_layer_transform_and_visibility(test, device)
 
 
 def test_torsion_render_shape_sampling(test, device):
+    """Check the torsion mode values sampled at a tip vertex of an elastic box mesh."""
     length = 1.0
     hy = 0.06
     hz = 0.025
@@ -2585,6 +2639,7 @@ def test_torsion_render_shape_sampling(test, device):
 
 
 def test_finite_torsion_exemplar_preserves_volume(test, device):
+    """Check that the finite torsion exemplar preserves volume while linear torsion does not."""
     length = 1.0
     hy = 0.085
     hz = 0.05
@@ -2606,6 +2661,7 @@ def test_finite_torsion_exemplar_preserves_volume(test, device):
 
 
 def test_finite_torsion_pod_modes_project_exemplar(test, device):
+    """Check that POD modes of finite torsion snapshots reproduce the exemplar and its volume."""
     length = 1.0
     hy = 0.085
     hz = 0.05
@@ -2659,6 +2715,7 @@ def test_finite_torsion_pod_modes_project_exemplar(test, device):
 
 
 def test_cantilever_tip_load_solution(test, device):
+    """Check the static tip deflection of a massless cantilever mode under a modal tip load."""
     length = 0.8
     ei = 0.32
     tip_load = 0.2
@@ -2704,6 +2761,7 @@ def test_cantilever_tip_load_solution(test, device):
 
 
 def test_cantilever_modal_vibration_solution(test, device):
+    """Check a free cantilever mode against the implicit-Euler recurrence over 180 steps."""
     length = 0.9
     basis = newton.ModalGeneratorBeam(
         length=length,
@@ -2762,6 +2820,7 @@ def test_cantilever_modal_vibration_solution(test, device):
 
 
 def test_elastic_modal_implicit_solution_vbd(test, device):
+    """Check one implicit-Euler modal step with applied force, stiffness, and damping."""
     mode_mass = 2.0
     stiffness = 18.0
     damping = 0.5
@@ -2807,6 +2866,7 @@ def test_elastic_modal_implicit_solution_vbd(test, device):
 
 
 def test_elastic_gravity_modal_force(test, device):
+    """Check the modal gravity load on the modes of a kinematic elastic frame."""
     g = 9.81
     stiffness = 18.0
     dt = 0.01
@@ -2842,6 +2902,7 @@ def test_elastic_gravity_modal_force(test, device):
 
 
 def test_elastic_free_fall_no_modal_force(test, device):
+    """Check that free fall does not excite the modes of an elastic body."""
     g = 9.81
     dt = 0.005
     basis = newton.ModalBasis(
@@ -3038,6 +3099,7 @@ def test_elastic_centrifugal_modal_force(test, device):
 
 
 def test_elastic_coriolis_modal_force(test, device):
+    """Check that frame spin couples one mode's velocity into another through the Coriolis term."""
     length = 1.0
     n = 21
     xs = np.linspace(0.0, length, n, dtype=np.float32)
@@ -3098,6 +3160,7 @@ def test_elastic_coriolis_modal_force(test, device):
 
 
 def test_elastic_frame_coupling_conserves_com(test, device):
+    """Check that a released modal deflection moves the frame while the deformed COM stays fixed."""
     total_mass = 1.0
     stiffness = 50.0
     deflection = 0.1
@@ -4275,6 +4338,7 @@ def test_elastic_nonorthogonal_modes_use_full_mass_matrix(test, device):
 
 
 def test_vbd_revolute_uses_elastic_endpoint(test, device):
+    """Check that a revolute joint holds the deformed elastic endpoint rather than the rest anchor."""
     eta = 0.2
     rest_anchor = -0.5
 
@@ -4379,6 +4443,7 @@ def test_vbd_revolute_constraint_solves_elastic_mode(test, device):
 
 
 def test_vbd_fixed_joint_stiffness_pins_penalties(test, device):
+    """Check that ``rigid_joint_adaptive_stiffness=False`` pins joint penalties at the authored stiffness."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(
         xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
@@ -4418,6 +4483,7 @@ def test_vbd_fixed_joint_stiffness_pins_penalties(test, device):
 
 
 def test_vbd_elastic_modal_force_matches_joint_projection(test, device):
+    """Check that joint forces project onto modal forces for several joint types on either side."""
     for joint_kind in ("ball", "fixed", "revolute", "prismatic"):
         _assert_elastic_modal_projection_matches_joint_force(test, device, joint_kind, elastic_side="child")
     _assert_elastic_modal_projection_matches_joint_force(test, device, "revolute", elastic_side="parent")
@@ -4484,6 +4550,7 @@ def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
 
 
 def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
+    """Check that elastic bodies are rejected with ``integrate_with_external_rigid_solver``."""
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -4792,6 +4859,7 @@ def test_vbd_elastic_block_width_rejects_oversized_basis(test, device):
 
 
 def test_vbd_elastic_block_solver_rejects_unknown_mode(test, device):
+    """Check that an unknown ``elastic_block_solver`` value raises."""
     model = _elastic_block_capacity_model(device, 2)
     with test.assertRaisesRegex(ValueError, "elastic_block_solver"):
         newton.solvers.SolverVBD(model, iterations=1, elastic_block_solver="lu")
@@ -5692,6 +5760,7 @@ def test_vbd_rod_joint_uses_elastic_endpoint(test, device):
 
 
 def test_fourbar_elastic_coupler_geometry(test, device):
+    """Check that a four-bar with an axially stretched coupler closes at the deformed endpoints."""
     a, b_rest, c, d = 0.2, 0.5, 0.4, 0.5
     eta = 0.06
     b_eff = b_rest + eta
@@ -5827,6 +5896,7 @@ def test_vbd_prismatic_rotates_elastic_child(test, device):
 
 
 def test_crank_slider_elastic_analytic_geometry(test, device):
+    """Check crank-slider joint endpoints against the analytic geometry with a stretched elastic rod."""
     crank_length = 0.24
     rod_rest_length = 0.64
     axial_q = 0.05
@@ -5899,6 +5969,7 @@ def test_crank_slider_elastic_analytic_geometry(test, device):
 
 
 def test_elastic_multiple_attachment_samples(test, device):
+    """Check that three joints reuse their coincident basis samples and close at the deformed endpoints."""
     basis = newton.ModalBasis(
         sample_points=[[-0.5, 0.0, 0.0], [0.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
         sample_phi=[
@@ -5952,6 +6023,7 @@ def test_elastic_multiple_attachment_samples(test, device):
 
 
 def test_matrix_rom_example(test, device):
+    """Run the matrix ROM example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = MatrixROMExample(viewer, None)
@@ -5962,6 +6034,7 @@ def test_matrix_rom_example(test, device):
 
 
 def test_dipper_arm_example(test, device):
+    """Run the dipper arm example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = DipperExample(viewer, None)
@@ -5972,6 +6045,7 @@ def test_dipper_arm_example(test, device):
 
 
 def test_gravity_coupling_example(test, device):
+    """Run the gravity coupling example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = GravityCouplingExample(viewer, None)
@@ -5982,6 +6056,7 @@ def test_gravity_coupling_example(test, device):
 
 
 def test_base_excitation_example(test, device):
+    """Run the base excitation example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = BaseExcitationExample(viewer, None)
@@ -5992,6 +6067,7 @@ def test_base_excitation_example(test, device):
 
 
 def test_base_rotation_example(test, device):
+    """Run the base rotation example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = BaseRotationExample(viewer, None)
@@ -6002,6 +6078,7 @@ def test_base_rotation_example(test, device):
 
 
 def test_clamp_moment_example(test, device):
+    """Run the clamp moment example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = ClampMomentExample(viewer, None)
@@ -6012,6 +6089,7 @@ def test_clamp_moment_example(test, device):
 
 
 def test_centrifugal_example(test, device):
+    """Run the centrifugal example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = CentrifugalExample(viewer, None)
@@ -6022,6 +6100,7 @@ def test_centrifugal_example(test, device):
 
 
 def test_coriolis_example(test, device):
+    """Run the Coriolis example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = CoriolisExample(viewer, None)
@@ -6032,6 +6111,7 @@ def test_coriolis_example(test, device):
 
 
 def test_frame_coupling_example(test, device):
+    """Run the frame coupling example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = FrameCouplingExample(viewer, None)
@@ -6042,6 +6122,7 @@ def test_frame_coupling_example(test, device):
 
 
 def test_angular_frame_coupling_example(test, device):
+    """Run the angular frame coupling example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = AngularFrameCouplingExample(viewer, None)
@@ -6062,18 +6143,22 @@ def _run_reduced_elastic_contact_example(example_cls, frame_count: int, device):
 
 
 def test_elastic_wall_contact_example(test, device):
+    """Run the wall contact example headless and check its final state."""
     _run_reduced_elastic_contact_example(WallContactExample, 90, device)
 
 
 def test_elastic_gripper_contact_example(test, device):
+    """Run the gripper contact example headless and check its final state."""
     _run_reduced_elastic_contact_example(GripperContactExample, 120, device)
 
 
 def test_elastic_scraper_contact_example(test, device):
+    """Run the scraper contact example headless and check its final state."""
     _run_reduced_elastic_contact_example(ScraperContactExample, 120, device)
 
 
 def test_elastic_chair_stick_slip_example(test, device):
+    """Run the chair stick-slip example when its asset is cached and check its final state."""
     asset_dir = chair_asset_cache_dir()
     if not all((asset_dir / filename).is_file() for filename in (CHAIR_GLTF_NAME, CHAIR_BIN_NAME)):
         test.skipTest("Poly Haven chair asset is not cached; the offline unit suite does not download it")
@@ -6139,6 +6224,7 @@ def _lattice_craig_bampton(direct_interface: bool, fixed_mode_count: int = 8):
 
 
 def test_elastic_endpoint_uses_attachment_frame(test, device):
+    """Check that a joint at a distributing interface uses the frame values but keeps the material sample."""
     points, interface_position, center_node, reduced_mass, reduced_stiffness, recovery = _lattice_craig_bampton(
         direct_interface=False
     )
