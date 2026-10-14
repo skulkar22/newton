@@ -4,15 +4,18 @@
 """Modal factorization, fallbacks, and validation of reduced elastic bodies in the VBD block-sparse solve."""
 
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
 
 import newton
 import newton.solvers
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests import test_reduced_elastic_sparse_articulation as sparse_tests
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 devices = get_test_devices()
+cuda_devices = get_cuda_test_devices()
 
 _SPARSE = "block_sparse_joints"
 _DT = 1.0 / 480.0
@@ -86,6 +89,76 @@ def _make_beam_links_model(device, mode_counts):
     state = model.state()
     joint_qd = state.joint_qd.numpy()
     joint_qd[model.joint_qd_start.numpy()[joints[0]]] = 2.0
+    state.joint_qd.assign(joint_qd)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _make_inconsistent_leaf_link_model(device):
+    """Build a hinged elastic leaf link whose modal block has no Cholesky factor.
+
+    The basis holds three beam modes, a duplicate of the axial mode, and a decoupled mode with
+    a zero shape and negative modal stiffness, so ``A_mm`` is indefinite while every physical
+    coordinate keeps bounded dynamics. The duplicated axial mode moves the hinge attachment like
+    the axial mode, which makes ``A_ff - B^T diag(A_mm)^-1 B`` indefinite under stiff joints.
+    """
+    length = 0.6
+    beam = newton.ModalGeneratorBeam
+    base_basis = beam(
+        length=length,
+        half_width_y=0.03,
+        half_width_z=0.02,
+        young_modulus=2.0e6,
+        density=1000.0,
+        mode_specs=[
+            {"type": beam.Mode.AXIAL},
+            {"type": beam.Mode.BENDING_Y, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+        ],
+    ).build()
+    zero = np.zeros((base_basis.sample_count, 1, 3), dtype=np.float32)
+    basis = newton.ModalBasis(
+        sample_points=base_basis.sample_points,
+        sample_phi=np.concatenate((base_basis.sample_phi, base_basis.sample_phi[:, :1], zero), axis=1),
+        sample_psi=np.concatenate((base_basis.sample_psi, base_basis.sample_psi[:, :1], zero), axis=1),
+        sample_mass=base_basis.sample_mass,
+        mode_mass=[*base_basis.mode_mass, base_basis.mode_mass[0], 1.0e-3],
+        mode_stiffness=[*base_basis.mode_stiffness, base_basis.mode_stiffness[0], -1.0e4],
+        mode_damping=[*base_basis.mode_damping, 0.0, 0.0],
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    base = builder.add_link(
+        xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(*np.diag([0.002, 0.02, 0.02]).ravel()),
+    )
+    link = builder.add_link_elastic(
+        xform=wp.transform(wp.vec3(0.4 + 0.5 * length, 0.0, 0.0), wp.quat_identity()),
+        mass=base_basis.rigid_mass,
+        com=wp.vec3(*base_basis.rigid_com),
+        inertia=wp.mat33(*np.asarray(base_basis.rigid_inertia).ravel()),
+        modal_basis=basis,
+        mode_q=[0.0, 0.0, 0.01, 0.0, 0.0],
+    )
+    root = builder.add_joint_revolute(
+        parent=-1,
+        child=base,
+        axis=(0.0, 0.0, 1.0),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+    )
+    hinge = builder.add_joint_revolute(
+        parent=base,
+        child=link,
+        axis=(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder.add_articulation([root, hinge])
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    joint_qd = state.joint_qd.numpy()
+    joint_qd[model.joint_qd_start.numpy()[root]] = 2.0
     state.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     return model, state
@@ -181,6 +254,91 @@ def test_sparse_modal_dense_solve_matches_tiled(test, device):
     np.testing.assert_allclose(trajectories["dense"], trajectories["tiled"], atol=1.0e-5, rtol=0.0)
 
 
+def test_sparse_modal_fallback_keeps_frames_definite(test, device):
+    """Keep the sparse solve finite when an elastic body's modal block has no Cholesky factor.
+
+    Eliminating the modes with ``diag(A_mm)`` instead of ``A_mm`` makes the frame Schur
+    complement indefinite for this fixture, and the frame factorization then returned NaN for
+    the whole articulation. The fallback instead solves the frames without the modal Schur terms
+    and recovers the modes with a diagonal step afterwards, like the local block solve's Jacobi
+    fallback: both stay finite and close to each other, and the sparse solve warns once.
+    """
+    steps = 120
+    stiff = {"rigid_joint_linear_ke": 1.0e6, "rigid_joint_angular_ke": 1.0e6}
+    trajectories = {}
+    for mode in ("local", _SPARSE):
+        with warnings.catch_warnings():
+            # The fixture is deliberately inconsistent; its construction warnings are expected.
+            warnings.simplefilter("ignore")
+            model, state = _make_inconsistent_leaf_link_model(device)
+            solver = newton.solvers.SolverVBD(model, iterations=24, rigid_articulation_solve=mode, **stiff)
+        state_1 = model.state()
+        control = model.control()
+        series = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(steps):
+                solver.step(state, state_1, control, None, _DT)
+                state, state_1 = state_1, state
+                series.append(state.body_q.numpy().ravel().copy())
+        trajectories[mode] = np.asarray(series)
+        messages = [str(w.message) for w in caught if "could not Cholesky-factor" in str(w.message)]
+        if mode == _SPARSE:
+            test.assertEqual(solver._sparse_elastic_definite.numpy().tolist(), [0])
+            test.assertEqual(len(messages), 1)
+        else:
+            test.assertEqual(messages, [])
+        test.assertTrue(np.isfinite(trajectories[mode]).all(), mode)
+    test.assertGreater(float(np.max(np.abs(trajectories[_SPARSE][-1] - trajectories[_SPARSE][0]))), 0.1)
+    np.testing.assert_allclose(trajectories[_SPARSE], trajectories["local"], atol=2.0e-2, rtol=0.0)
+
+
+def test_sparse_modal_fallback_checks_frame_schur(test, device):
+    """Fall back when the modal block factors but the body's whole frame-and-mode block is indefinite.
+
+    An inconsistent dense modal mass leaves ``A_mm`` positive definite while the reduced mass is
+    indefinite, so the exact frame Schur complement ``A_ff - B^T A_mm^-1 B`` is indefinite too.
+    That body is solved with the fallback instead of returning NaN for the whole articulation.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model, state, _hinge = sparse_tests._make_leaf_link_model(device)
+        mode_count = model.elastic_max_mode_count
+        mass = model.elastic_mode_mass_matrix.numpy().reshape(mode_count, mode_count).copy()
+        mass[1, 2] = mass[2, 1] = 2.0 * np.sqrt(mass[1, 1] * mass[2, 2])
+        model.elastic_mode_mass_matrix.assign(mass.reshape(-1))
+        solver = newton.solvers.SolverVBD(model, iterations=24, rigid_articulation_solve=_SPARSE)
+    base_start = state.body_q.numpy()[0, :3].copy()
+    state_1 = model.state()
+    solver.step(state, state_1, model.control(), None, _DT)
+    test.assertEqual(solver._sparse_elastic_definite.numpy().tolist(), [0])
+    test.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
+    test.assertTrue(np.isfinite(state_1.joint_q.numpy()).all())
+    test.assertLess(float(np.max(np.abs(state_1.body_q.numpy()[0, :3] - base_start))), 0.05)
+
+
+def test_sparse_modal_fallback_warns_after_graph_replay(test, device):
+    """Count fallback factorizations in a captured graph and report them outside capture."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model, state_0 = _make_inconsistent_leaf_link_model(device)
+        solver = newton.solvers.SolverVBD(model, iterations=8, rigid_articulation_solve=_SPARSE)
+        state_1 = model.state()
+        control = model.control()
+        # Load the kernels before capture; this step's count is only mirrored to the host.
+        solver.step(state_0, state_1, control, None, _DT)
+    solver._sparse_elastic_indefinite_count.zero_()
+    with wp.ScopedCapture(device=device) as capture:
+        solver.step(state_1, state_0, control, None, _DT)
+        solver.step(state_0, state_1, control, None, _DT)
+    for _ in range(3):
+        wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+    with test.assertWarnsRegex(UserWarning, r"could not Cholesky-factor .* \(48 times so far\)"):
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+    test.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
+
+
 class TestReducedElasticSparsePerformance(unittest.TestCase):
     pass
 
@@ -188,8 +346,17 @@ class TestReducedElasticSparsePerformance(unittest.TestCase):
 for _name, _test in (
     ("test_sparse_modal_solve_matches_float64_reference", test_sparse_modal_solve_matches_float64_reference),
     ("test_sparse_modal_dense_solve_matches_tiled", test_sparse_modal_dense_solve_matches_tiled),
+    ("test_sparse_modal_fallback_keeps_frames_definite", test_sparse_modal_fallback_keeps_frames_definite),
+    ("test_sparse_modal_fallback_checks_frame_schur", test_sparse_modal_fallback_checks_frame_schur),
 ):
     add_function_test(TestReducedElasticSparsePerformance, _name, _test, devices=devices)
+
+add_function_test(
+    TestReducedElasticSparsePerformance,
+    "test_sparse_modal_fallback_warns_after_graph_replay",
+    test_sparse_modal_fallback_warns_after_graph_replay,
+    devices=cuda_devices,
+)
 
 
 if __name__ == "__main__":

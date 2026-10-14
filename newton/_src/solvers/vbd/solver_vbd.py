@@ -1759,6 +1759,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._sparse_elastic_w = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
         self._sparse_elastic_joint_data = None
         self._sparse_elastic_modal_solve = None
+        # Failed modal factorizations, counted on the device and mirrored to host memory once per
+        # step without synchronizing; see _warn_sparse_elastic_indefinite().
+        self._sparse_elastic_indefinite_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._sparse_elastic_indefinite_count_host = wp.zeros(
+            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+        )
+        self._sparse_elastic_indefinite_warned = False
         if layout is None:
             return
         if count > 0 and max_modes > 0:
@@ -1829,6 +1836,31 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             f"The block-sparse articulation solve factors each reduced elastic body's {width} x {width} modal "
             f"block in shared memory, which needs {required_bytes} bytes, but device '{self.device}' provides "
             f"{limit} bytes per block. Reduce the largest modal basis or use elastic_block_solver='auto' or 'dense'."
+        )
+
+    def _warn_sparse_elastic_indefinite(self) -> None:
+        """Warn once per solver if a sparse elastic modal block could not be Cholesky-factored.
+
+        The count is mirrored to host memory asynchronously at the end of each step, so the
+        warning is raised by the next :meth:`step` or :meth:`notify_model_changed` call made
+        outside CUDA graph capture, without a device synchronization. Steps replayed from a
+        captured graph keep counting and are reported at the next such call.
+        """
+        if self._sparse_elastic_indefinite_warned or self._sparse_elastic_modal_solve is None:
+            return
+        if self.device.is_capturing:
+            return
+        failures = int(self._sparse_elastic_indefinite_count_host.numpy()[0])
+        if failures == 0:
+            return
+        self._sparse_elastic_indefinite_warned = True
+        warnings.warn(
+            f"SolverVBD could not Cholesky-factor the modal block of a reduced elastic body in the "
+            f"block-sparse articulation solve ({failures} times so far). Those bodies' frames are solved "
+            f"without the modal elimination and their modes take a diagonal (Jacobi) step, which converges "
+            f"slowly. The modal mass, stiffness, or damping is likely inconsistent or indefinite.",
+            UserWarning,
+            stacklevel=3,
         )
 
     def _validate_sparse_elastic_support(self) -> None:
@@ -2564,6 +2596,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         self._apply_module_options()
+        self._warn_sparse_elastic_indefinite()
         if flags & ModelFlags.JOINT_PROPERTIES:
             self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(
                 self.model, "SolverVBD"
@@ -3829,6 +3862,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         contacts = self._resolve_step_contacts(contacts)
         self.validate_observables(observables, contacts)
         self._apply_module_options()
+        self._warn_sparse_elastic_indefinite()
         if self.tendon_material_direct != self._tendon_material_state.enabled:
             raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
         if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
@@ -4011,6 +4045,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         model = self.model
         if model.elastic_body_count == 0:
             return
+        if self._sparse_elastic_modal_solve is not None and not self._sparse_elastic_indefinite_warned:
+            wp.copy(self._sparse_elastic_indefinite_count_host, self._sparse_elastic_indefinite_count)
 
         wp.launch(
             kernel=copy_body_frame_to_elastic_joint,
@@ -7259,12 +7295,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.body_elastic_index,
                 model.elastic_mode_count,
                 layout.elastic_group_offsets,
+                state_in.body_q,
+                self.body_inv_mass_effective,
                 self.elastic_body_block_grad,
                 self.elastic_body_block_matrix,
                 self._sparse_elastic_modal_factor,
                 self._sparse_elastic_modal_rhs,
                 self._sparse_elastic_b_groups,
                 self._sparse_elastic_definite,
+                self._sparse_elastic_indefinite_count,
                 self._sparse_elastic_z_columns,
                 self._sparse_elastic_w_groups,
                 self.device,
@@ -7283,6 +7322,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.body_elastic_index,
                 model.elastic_mode_count,
                 int(model.elastic_max_mode_count),
+                self._sparse_elastic_definite,
                 self._sparse_elastic_z,
                 self._sparse_elastic_b,
                 self._sparse_elastic_w,

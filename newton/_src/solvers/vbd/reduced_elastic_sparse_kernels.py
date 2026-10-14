@@ -39,6 +39,7 @@ from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import (
     _scalar_vec_get,
     _scalar_vec_index,
     _scalar_vec_set,
+    mat66f,
     vec6f,
 )
 
@@ -325,6 +326,47 @@ def _modal_block_is_definite(modal_factor: wp.array3d[float], slot: int, mode_co
 
 
 @wp.func
+def _own_frame_schur_is_definite(
+    elastic_body_block_matrix: wp.array3d[float],
+    elastic_index: int,
+    pose: wp.transform,
+    correction: mat66f,
+) -> int:
+    """Return 1 when the frame Schur complement ``A_ff - B_own^T A_mm^-1 B_own`` has a Cholesky factor.
+
+    ``correction`` is ``B_own^T W_own`` in world axes. With a factored ``A_mm`` this decides
+    whether the body's whole dense frame-and-mode block is positive definite, the condition
+    under which the local block solve factors it.
+    """
+    R = wp.quat_to_matrix(wp.transform_get_rotation(pose))
+    frame = mat66f(0.0)
+    for bi in range(2):
+        for bj in range(2):
+            local = wp.mat33(0.0)
+            for i in range(3):
+                for j in range(3):
+                    local[i, j] = _dense_entry(elastic_body_block_matrix, elastic_index, 3 * bi + i, 3 * bj + j)
+            world = R * local * wp.transpose(R)
+            for i in range(3):
+                for j in range(3):
+                    frame[3 * bi + i, 3 * bj + j] = world[i, j] - correction[3 * bi + i, 3 * bj + j]
+    for j in range(6):
+        value = frame[j, j]
+        for k in range(j):
+            value = value - frame[j, k] * frame[j, k]
+        if not (value > 0.0) or not wp.isfinite(value):
+            return 0
+        diagonal = wp.sqrt(value)
+        frame[j, j] = diagonal
+        for i in range(j + 1, 6):
+            value_ij = frame[i, j]
+            for k in range(j):
+                value_ij = value_ij - frame[i, k] * frame[j, k]
+            frame[i, j] = value_ij / diagonal
+    return 1
+
+
+@wp.func
 def _modal_diagonal_solve(
     slot: int,
     lane: int,
@@ -339,10 +381,17 @@ def _modal_diagonal_solve(
     modal_z: wp.array3d[float],
     modal_w: wp.array3d[float],
 ):
-    """Solve with ``D = diag(A_mm)`` instead of ``A_mm``: ``z = D^-1 r_m`` and ``W = D^-1 B``.
+    """Store ``z = D^-1 r_m`` and ``W = D^-1 B`` with ``D = diag(A_mm)`` for a block without a factor.
 
-    The fallback for a modal block whose Cholesky factorization fails, as the Jacobi step of
-    the local block solve. Rows with a non-positive diagonal stay zero.
+    The fallback for a body whose modal block, or whose frame Schur complement, has no
+    Cholesky factor. Eliminating the modes
+    with ``D`` instead of ``A_mm`` could make the frame Schur complement ``A_ff - B^T D^-1 B``
+    indefinite, so :func:`scatter_elastic_sparse_schur` adds no Schur terms for this body
+    (``W = 0`` in the frame system) and the frames are solved with their positive definite
+    dense rows. :func:`update_elastic_sparse_modes` then applies ``z - sum_h W_h dx_h``, which
+    is the block Gauss-Seidel step ``dm = D^-1 (r_m - sum_h B_h dx_h)`` on the modes after the
+    frame solve, as the Jacobi step of the local block solve. Rows with a non-positive diagonal
+    stay zero.
     """
     for i in range(lane, mode_count, threads):
         diagonal = elastic_body_block_matrix[elastic_index, 6 + i, 6 + i]
@@ -363,9 +412,13 @@ def create_solve_elastic_sparse_modes_tiled(width: int):
     :func:`copy_elastic_sparse_modal_blocks` into shared memory, factors it in place, and
     solves every right-hand side of the body: ``z = A_mm^-1 r_m`` and, one ``width x 6``
     tile per Schur column group, ``W = A_mm^-1 B``. The kernel needs about
-    ``4 * (width**2 + 7 * width)`` bytes of dynamic shared memory. A block whose
-    factorization has a non-positive or non-finite pivot uses :func:`_modal_diagonal_solve`
-    and is flagged in ``modal_definite``.
+    ``4 * (width**2 + 7 * width)`` bytes of dynamic shared memory.
+
+    The body counts as definite when ``A_mm`` and the frame Schur complement of its own-frame
+    group, ``A_ff - B_own^T W_own``, both have a Cholesky factor, i.e. when its dense
+    frame-and-mode block is positive definite, as the local block solve requires. Otherwise
+    it uses :func:`_modal_diagonal_solve`, and is flagged in ``modal_definite`` and counted in
+    ``modal_indefinite_count``.
     """
     width = int(width)
 
@@ -374,16 +427,20 @@ def create_solve_elastic_sparse_modes_tiled(width: int):
         body_elastic_index: wp.array[wp.int32],
         elastic_mode_count: wp.array[wp.int32],
         elastic_group_offsets: wp.array[wp.int32],
+        body_q: wp.array[wp.transform],
+        body_inv_mass: wp.array[float],
         elastic_body_block_matrix: wp.array3d[float],
         modal_factor: wp.array3d[float],
         modal_rhs: wp.array3d[float],
         modal_b: wp.array3d[float],
         modal_definite: wp.array[wp.int32],
+        modal_indefinite_count: wp.array[wp.int32],
         modal_z: wp.array3d[float],
         modal_w: wp.array3d[float],
     ):
         slot, lane = wp.tid()
-        elastic_index = body_elastic_index[elastic_bodies[slot]]
+        body = elastic_bodies[slot]
+        elastic_index = body_elastic_index[body]
         mode_count = elastic_mode_count[elastic_index]
         group_begin = elastic_group_offsets[slot]
         group_end = elastic_group_offsets[slot + 1]
@@ -395,8 +452,35 @@ def create_solve_elastic_sparse_modes_tiled(width: int):
             pivot = factor[i, i]
             if not (pivot > 0.0) or not wp.isfinite(pivot):
                 definite = 0
+
+        if definite == 1:
+            rhs = wp.tile_load(modal_rhs[slot], shape=(width, 1), storage="shared")
+            wp.tile_cholesky_solve_inplace(factor, rhs)
+            wp.tile_store(modal_z[slot], rhs)
+            for group in range(group_begin, group_end):
+                columns = wp.tile_load(modal_b[group], shape=(width, 6), storage="shared")
+                wp.tile_cholesky_solve_inplace(factor, columns)
+                # The own-frame group comes first: check the frame Schur complement it forms.
+                if group == group_begin and body_inv_mass[body] > 0.0:
+                    # B_own^T W_own, with the modes split over the block's threads.
+                    partial = mat66f(0.0)
+                    for mode in range(lane, mode_count, wp.block_dim()):
+                        for i in range(6):
+                            b_value = modal_b[group, mode, i]
+                            for j in range(6):
+                                partial[i, j] = partial[i, j] + b_value * columns[mode, j]
+                    correction = wp.tile_sum(wp.tile(partial, preserve_type=True))[0]
+                    definite = _own_frame_schur_is_definite(
+                        elastic_body_block_matrix, elastic_index, body_q[body], correction
+                    )
+                if definite == 0:
+                    break
+                wp.tile_store(modal_w[group], columns)
+
         if lane == 0:
             modal_definite[slot] = definite
+            if definite == 0:
+                wp.atomic_add(modal_indefinite_count, 0, 1)
         if definite == 0:
             _modal_diagonal_solve(
                 slot,
@@ -412,15 +496,6 @@ def create_solve_elastic_sparse_modes_tiled(width: int):
                 modal_z,
                 modal_w,
             )
-            return
-
-        rhs = wp.tile_load(modal_rhs[slot], shape=(width, 1), storage="shared")
-        wp.tile_cholesky_solve_inplace(factor, rhs)
-        wp.tile_store(modal_z[slot], rhs)
-        for group in range(group_begin, group_end):
-            columns = wp.tile_load(modal_b[group], shape=(width, 6), storage="shared")
-            wp.tile_cholesky_solve_inplace(factor, columns)
-            wp.tile_store(modal_w[group], columns)
 
     _solve_elastic_sparse_modes_tiled.__name__ = f"solve_elastic_sparse_modes_tiled_{width}"
     _solve_elastic_sparse_modes_tiled.__qualname__ = f"solve_elastic_sparse_modes_tiled_{width}"
@@ -478,23 +553,53 @@ def create_solve_elastic_sparse_modes_dense(dense_width: int):
         body_elastic_index: wp.array[wp.int32],
         elastic_mode_count: wp.array[wp.int32],
         elastic_group_offsets: wp.array[wp.int32],
+        body_q: wp.array[wp.transform],
+        body_inv_mass: wp.array[float],
         elastic_body_block_matrix: wp.array3d[float],
         modal_factor: wp.array3d[float],
         modal_rhs: wp.array3d[float],
         modal_b: wp.array3d[float],
         modal_definite: wp.array[wp.int32],
+        modal_indefinite_count: wp.array[wp.int32],
         modal_z: wp.array3d[float],
         modal_w: wp.array3d[float],
     ):
         slot, lane = wp.tid()
-        elastic_index = body_elastic_index[elastic_bodies[slot]]
+        body = elastic_bodies[slot]
+        elastic_index = body_elastic_index[body]
         mode_count = elastic_mode_count[elastic_index]
         group_begin = elastic_group_offsets[slot]
         group_end = elastic_group_offsets[slot + 1]
 
         definite = _modal_block_is_definite(modal_factor, slot, mode_count)
+
+        if definite == 1:
+            rhs = wp.tile_load(modal_rhs[slot], shape=(dense_width, 1), storage="shared")
+            substitute_vector(modal_factor[slot], rhs)
+            wp.tile_store(modal_z[slot], rhs)
+            for group in range(group_begin, group_end):
+                columns = wp.tile_load(modal_b[group], shape=(dense_width, 6), storage="shared")
+                substitute_columns(modal_factor[slot], columns)
+                if group == group_begin and body_inv_mass[body] > 0.0:
+                    # B_own^T W_own, with the modes split over the block's threads.
+                    partial = mat66f(0.0)
+                    for mode in range(lane, mode_count, wp.block_dim()):
+                        for i in range(6):
+                            b_value = modal_b[group, mode, i]
+                            for j in range(6):
+                                partial[i, j] = partial[i, j] + b_value * columns[mode, j]
+                    correction = wp.tile_sum(wp.tile(partial, preserve_type=True))[0]
+                    definite = _own_frame_schur_is_definite(
+                        elastic_body_block_matrix, elastic_index, body_q[body], correction
+                    )
+                if definite == 0:
+                    break
+                wp.tile_store(modal_w[group], columns)
+
         if lane == 0:
             modal_definite[slot] = definite
+            if definite == 0:
+                wp.atomic_add(modal_indefinite_count, 0, 1)
         if definite == 0:
             _modal_diagonal_solve(
                 slot,
@@ -510,15 +615,6 @@ def create_solve_elastic_sparse_modes_dense(dense_width: int):
                 modal_z,
                 modal_w,
             )
-            return
-
-        rhs = wp.tile_load(modal_rhs[slot], shape=(dense_width, 1), storage="shared")
-        substitute_vector(modal_factor[slot], rhs)
-        wp.tile_store(modal_z[slot], rhs)
-        for group in range(group_begin, group_end):
-            columns = wp.tile_load(modal_b[group], shape=(dense_width, 6), storage="shared")
-            substitute_columns(modal_factor[slot], columns)
-            wp.tile_store(modal_w[group], columns)
 
     _solve_elastic_sparse_modes_dense.__name__ = f"solve_elastic_sparse_modes_dense_{dense_width}"
     _solve_elastic_sparse_modes_dense.__qualname__ = f"solve_elastic_sparse_modes_dense_{dense_width}"
@@ -536,12 +632,15 @@ def launch_solve_elastic_sparse_modes(
     body_elastic_index: wp.array,
     elastic_mode_count: wp.array,
     elastic_group_offsets: wp.array,
+    body_q: wp.array,
+    body_inv_mass: wp.array,
     elastic_body_block_grad: wp.array,
     elastic_body_block_matrix: wp.array,
     modal_factor: wp.array,
     modal_rhs: wp.array,
     modal_b: wp.array,
     modal_definite: wp.array,
+    modal_indefinite_count: wp.array,
     modal_z: wp.array,
     modal_w: wp.array,
     device,
@@ -552,7 +651,8 @@ def launch_solve_elastic_sparse_modes(
     width) or ``"dense"`` (panel Cholesky in ``modal_factor``, ``width`` rounded up to whole
     panels). ``modal_factor`` has shape ``(body_count, width, width)``, ``modal_rhs``
     ``(body_count, width, 1)``, ``modal_z`` ``(body_count, max_modes, 1)``, and ``modal_b`` and
-    ``modal_w`` ``(group_count, max_modes, 6)``. The block matrix is only read.
+    ``modal_w`` ``(group_count, max_modes, 6)``. The block matrix is only read. Every
+    factorization that fails increments ``modal_indefinite_count[0]``.
     """
     body_count = elastic_bodies.shape[0]
     if body_count == 0:
@@ -585,12 +685,14 @@ def launch_solve_elastic_sparse_modes(
             body_elastic_index,
             elastic_mode_count,
             elastic_group_offsets,
+            body_q,
+            body_inv_mass,
             elastic_body_block_matrix,
             modal_factor,
             modal_rhs,
             modal_b,
         ],
-        outputs=[modal_definite, modal_z, modal_w],
+        outputs=[modal_definite, modal_indefinite_count, modal_z, modal_w],
         block_dim=block_dim,
         device=device,
     )
@@ -608,6 +710,7 @@ def scatter_elastic_sparse_schur(
     body_elastic_index: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
     elastic_max_mode_count: int,
+    modal_definite: wp.array[wp.int32],
     modal_z: wp.array[float],
     modal_b: wp.array[float],
     modal_w: wp.array[float],
@@ -617,7 +720,8 @@ def scatter_elastic_sparse_schur(
     """Add the modal Schur terms ``-B_g^T W_h`` and ``-B_g^T z`` to the sparse frame system.
 
     One thread per entry: the first ``36 * pair_count`` threads update the stored lower block
-    triangle, the remaining ``6 * group_count`` threads the right-hand side.
+    triangle, the remaining ``6 * group_count`` threads the right-hand side. A body whose modal
+    block has no Cholesky factor adds nothing (see :func:`_modal_diagonal_solve`).
     """
     tid = wp.tid()
     max_modes = elastic_max_mode_count
@@ -630,6 +734,8 @@ def scatter_elastic_sparse_schur(
         left = elastic_pair_left[pair]
         right = elastic_pair_right[pair]
         owner = elastic_group_owner[left]
+        if modal_definite[owner] == 0:
+            return
         mode_count = elastic_mode_count[body_elastic_index[elastic_bodies[owner]]]
         accum = float(0.0)
         for mode in range(mode_count):
@@ -641,6 +747,8 @@ def scatter_elastic_sparse_schur(
     group = entry // 6
     col = entry - group * 6
     owner = elastic_group_owner[group]
+    if modal_definite[owner] == 0:
+        return
     mode_count = elastic_mode_count[body_elastic_index[elastic_bodies[owner]]]
     accum = float(0.0)
     for mode in range(mode_count):
