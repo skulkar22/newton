@@ -3446,6 +3446,9 @@ def _launch_frame_coupling(
             com_array,
             array([1.0 / float(basis.rigid_mass)], float),
             array([wp.spatial_vector()], wp.spatial_vector),
+            array([wp.vec3(0.0, 0.0, 0.0)], wp.vec3),
+            zero_index,
+            0,
             zero_index,
             zero_index,
             joint_q,
@@ -3606,8 +3609,9 @@ def _serial_elastic_block_reference(model, solver, state_in, state_out, control,
     """Assemble the coupled block of elastic body 0 serially in float64 from the documented formulas.
 
     Reads the iterate (``state_in.body_q``, ``state_out.joint_q``), the step-start state
-    (``solver.body_q_prev``, ``state_in.joint_q``, ``state_in.joint_qd``), the inertial target, the
-    accumulated body wrench, and the per-attachment joint terms of the solver, and returns the
+    (``solver.body_q_prev``, ``state_in.joint_q``, ``state_in.joint_qd``), the inertial target or the
+    tracked displacement from it, the accumulated body wrench, and the per-attachment joint terms of
+    the solver, and returns the
     upper triangle of the block and its gradient before contacts and symmetrization, and the
     rotation angle of every elastic attachment.
     """
@@ -3654,10 +3658,15 @@ def _serial_elastic_block_reference(model, solver, state_in, state_out, control,
     grad = np.zeros(width)
     com_current = pose[:3] + R @ com
     com_star = target[:3] + R_star @ com
-    force = (com_star - com_current) * mass * inv_dt_sq + f64(solver.body_forces)[body]
+    displacement = com_current - com_star
     rot_inv = np.r_[-pose[3:6], pose[6]]
-    theta_body = ref.rotvec_from_quat(ref.quat_multiply(rot_inv, target[3:7]))
-    torque = R @ (inertia @ theta_body) * inv_dt_sq + f64(solver.body_torques)[body]
+    rotation = -ref.rotvec_from_quat(ref.quat_multiply(rot_inv, target[3:7]))
+    if solver._use_body_displacement and solver._body_uses_displacement.numpy()[body]:
+        # The frame update tracks the displacement from the inertial target (d, phi in world axes).
+        displacement = f64(solver._body_disp)[body]
+        rotation = R.T @ f64(solver._body_disp_ang)[body]
+    force = -displacement * mass * inv_dt_sq + f64(solver.body_forces)[body]
+    torque = -R @ (inertia @ rotation) * inv_dt_sq + f64(solver.body_torques)[body]
     h_ll = f64(solver.body_hessian_ll)[body] + mass * inv_dt_sq * np.eye(3)
     h_al = f64(solver.body_hessian_al)[body]
     h_aa = f64(solver.body_hessian_aa)[body] + R @ inertia @ R.T * inv_dt_sq
@@ -3686,7 +3695,7 @@ def _serial_elastic_block_reference(model, solver, state_in, state_out, control,
     alpha_local = R.T @ (omega - omega_prev) * inv_dt
     omega_local = R.T @ omega
     omega_skew_sq = ref.skew(omega_local) @ ref.skew(omega_local)
-    accel_rel = (com_current - com_star) * inv_dt_sq + f64(solver._body_f_integrated)[body][:3] / mass
+    accel_rel = displacement * inv_dt_sq + f64(solver._body_f_integrated)[body][:3] / mass
     accel_local = R.T @ accel_rel
     q_dot = (q - q_prev) * inv_dt
     for i in range(mode_count):
@@ -3833,6 +3842,7 @@ def test_elastic_parallel_assembly_matches_serial_reference(test, device):
     body_q[body, 3:7] = elastic_reference.quat_multiply(turn, pose[3:7])
     body_q[body, :3] += (0.002, -0.001, 0.003)
     state_in.body_q.assign(body_q)
+    solver._init_body_displacement(state_in)
     joint_q = state_in.joint_q.numpy()
     joint_q[q_start : q_start + mode_count] += rng.uniform(-0.01, 0.01, mode_count)
     state_out.joint_q.assign(joint_q)
@@ -4104,15 +4114,52 @@ def test_elastic_large_coordinate_invariance(test, device):
 def test_elastic_large_coordinate_ballistic_com(test, device):
     """Keep a free elastic body's COM at a rigid body's float32 error level 100 m from the origin.
 
-    Known limitation: the frame's per-step response to the elastic coupling force,
-    ``dt^2 F / m`` (about 7e-7 m here), is below half the float32 spacing at 100 m (3.8e-6 m), so the
-    absolute-position frame update rounds it away and the COM drifts by about 34 mm in 0.2 s while a
-    rigid twin stays within 1 mm. Accumulating the frame displacement from the inertial target in a
-    separate buffer, as the block-sparse articulation solve does, would remove it.
+    The frame's per-step response to the elastic coupling force, ``dt^2 F / m`` (about 7e-7 m here),
+    is below half the float32 spacing at 100 m (3.8e-6 m). Applied to the absolute pose it was
+    rounded away and the COM drifted by about 34 mm in 0.2 s while a rigid twin stayed within 1 mm;
+    the frame update now accumulates the displacement from the inertial target separately.
     """
     elastic_error, rigid_error, _joint_q = _large_coordinate_run(device, 100.0, 192, 1.0 / 960.0)
     test.assertLessEqual(elastic_error, max(3.0 * rigid_error, 1.0e-6))
     test.assertLessEqual(elastic_error, 2.0e-3)
+
+
+def test_elastic_displacement_form_translation_invariance(test, device):
+    """Make the modes and attitude of a drifting free elastic body bitwise independent of a 100 m offset.
+
+    The frame update accumulates its displacement from the inertial target and the frame
+    velocity is the predicted velocity plus that displacement, so no absolute position enters the
+    frame, modal or coupling rows: the modal coordinate and the attitude series at y = 100 m must
+    equal those at y = 0 bit for bit, and the COM must stay within three times a rigid twin's error.
+    """
+    dt = 1.0 / 960.0
+    steps = 96
+    velocity = np.array([0.0, 0.0573, 0.0])
+    series = {}
+    for y in (0.0, 100.0):
+        model, state_0, data = _rod_model(device, "cos", position=(0.0, y, 0.0), velocity=velocity, rigid_control=True)
+        state_1 = model.state()
+        control = model.control()
+        solver = newton.solvers.SolverVBD(model, iterations=24)
+        test.assertEqual(solver._use_body_displacement, 1)
+        com_0, momentum_0, _ = _rod_physical(state_0, data)
+        total_mass = float(np.sum(data["mass"]))
+        rigid = data["rigid"]
+        rigid_0 = state_0.body_q.numpy()[rigid][:3].astype(np.float64)
+        attitude, elastic_error, rigid_error = [], 0.0, 0.0
+        for step in range(steps):
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+            t = (step + 1) * dt
+            joint_q = state_0.joint_q.numpy()
+            attitude.append(joint_q[data["q_start"] + 3 : data["q_start"] + 8].copy())
+            com = _rod_physical(state_0, data)[0]
+            elastic_error = max(elastic_error, float(np.linalg.norm(com - com_0 - t * momentum_0 / total_mass)))
+            rigid_pos = state_0.body_q.numpy()[rigid][:3].astype(np.float64)
+            rigid_error = max(rigid_error, float(np.linalg.norm(rigid_pos - rigid_0 - t * velocity)))
+        series[y] = np.asarray(attitude)
+        test.assertLessEqual(elastic_error, max(3.0 * rigid_error, 1.0e-6), msg=f"y={y}")
+    np.testing.assert_array_equal(series[100.0].view(np.uint32), series[0.0].view(np.uint32))
 
 
 def _uncoupled_elastic_model(device):
@@ -4154,30 +4201,46 @@ def _uncoupled_elastic_model(device):
 
 
 def test_elastic_uncoupled_body_matches_base_trajectory(test, device):
-    """Reproduce the pre-consistent-inertia trajectory when every coupling integral is zero.
+    """Reproduce the pre-consistent-inertia modes when every coupling integral is zero.
 
     With ``S = G = B = C = P = 0`` and a diagonal modal mass the frame and the modes are independent,
     so the deformation-dependent inertia terms must add exact zeros. The golden ``joint_q`` series
     (180 steps) was recorded on the CPU with the frozen-inertia kernels (integration branch 930e01c1,
-    Warp 1.18.0), and CPU results must match it bit for bit. CUDA kernels contract floating-point
-    operations differently, and the spinning frame amplifies that rounding over the trajectory: the
-    base kernels on CUDA end 2.9e-5 from the CPU recording, so CUDA is compared within 5e-5.
+    Warp 1.18.0); on the CPU its modal coordinates must be reproduced bit for bit (CUDA contracts
+    floating-point operations differently: within 1e-6).
+
+    The frame is a free rigid body under gravity, so its rest COM must follow the backward-Euler
+    ballistic path. The recording's absolute-position frame update rounded its velocity at the float32
+    spacing of its position and drifted 3.6e-5 m from that path; the displacement-form update stays
+    within 1.5e-6 m, so the frame is checked against the path, and its attitude against the
+    recording within 5e-5 (the base kernels' own CUDA-CPU spread is 2.9e-5).
     """
     model, state_0, control = _uncoupled_elastic_model(device)
     state_1 = model.state()
     solver = newton.solvers.SolverVBD(model, iterations=16)
+    dt = 1.0 / 240.0
     trajectory = []
     for _ in range(180):
-        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        solver.step(state_0, state_1, control, None, dt)
         state_0, state_1 = state_1, state_0
         trajectory.append(state_0.joint_q.numpy().copy())
     trajectory = np.asarray(trajectory, dtype=np.float32)
     golden_dir = os.path.join(os.path.dirname(__file__), "golden_data", "test_reduced_elastic_body")
     golden = np.load(os.path.join(golden_dir, "uncoupled_joint_q_cpu.npy"))
     if wp.get_device(device).is_cuda:
-        np.testing.assert_allclose(trajectory, golden, rtol=0.0, atol=5.0e-5)
+        np.testing.assert_allclose(trajectory[:, 7:], golden[:, 7:], rtol=0.0, atol=1.0e-6)
     else:
-        np.testing.assert_array_equal(trajectory.view(np.uint32), golden.view(np.uint32))
+        np.testing.assert_array_equal(trajectory[:, 7:].view(np.uint32), golden[:, 7:].view(np.uint32))
+    np.testing.assert_allclose(trajectory[:, 3:7], golden[:, 3:7], rtol=0.0, atol=5.0e-5)
+
+    com = np.array([0.05, -0.02, 0.03])
+    initial = model.state().joint_q.numpy().astype(np.float64)
+    initial_com = initial[:3] + quat_rotate(initial[3:7], com)
+    steps = np.arange(1, len(trajectory) + 1)[:, None]
+    gravity = np.array([0.0, 0.0, -9.81])
+    expected = initial_com + steps * dt * np.array([0.3, -0.2, 0.5]) + gravity * dt * dt * steps * (steps + 1) / 2.0
+    rest_com = np.array([row[:3] + quat_rotate(row[3:7], com) for row in trajectory.astype(np.float64)])
+    test.assertLess(float(np.max(np.linalg.norm(rest_com - expected, axis=1))), 3.0e-6)
 
 
 def test_elastic_nonorthogonal_modes_use_full_mass_matrix(test, device):
@@ -4487,6 +4550,17 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
         newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
 
 
+def _no_displacement_inputs(device, body_count: int) -> list:
+    """Return the displacement-form inputs of the block-solve kernels with displacement tracking off."""
+    return [
+        wp.array([wp.transform_identity()] * body_count, dtype=wp.transform, device=device),
+        wp.zeros(body_count, dtype=wp.vec3, device=device),
+        wp.zeros(body_count, dtype=wp.vec3, device=device),
+        wp.zeros(body_count, dtype=wp.int32, device=device),
+        0,
+    ]
+
+
 def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
     """An indefinite block degrades to a Jacobi step instead of writing NaN."""
     width = 7
@@ -4525,6 +4599,7 @@ def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
             wp.array(matrix, dtype=float, device=device),
             *metrics,
             1.0,
+            *_no_displacement_inputs(device, 2),
         ],
         outputs=[
             wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device),
@@ -4580,6 +4655,7 @@ def _launch_elastic_block_solve(device, width, matrix, grad, mode_counts, block_
             wp.array(matrix, dtype=float, device=device),
             *metrics,
             1.0,
+            *_no_displacement_inputs(device, block_count),
         ],
         outputs=[
             wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
@@ -4825,6 +4901,7 @@ def _launch_elastic_block_solve_dense(device, width, matrix, grad, mode_counts, 
             matrix_array,
             *[wp.zeros(block_count, dtype=float, device=device) for _ in range(5)],
             1.0,
+            *_no_displacement_inputs(device, block_count),
             factor,
             grad_array.reshape((block_count, dense_width, 1)),
         ],
@@ -5066,6 +5143,7 @@ def test_vbd_elastic_block_metrics_cover_frame_rows(test, device):
             wp.array(matrix, dtype=float, device=device),
             *metrics,
             1.0,
+            *_no_displacement_inputs(device, 1),
         ],
         outputs=[
             wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
@@ -6954,6 +7032,12 @@ for device in devices:
     )
     add_function_test(
         TestReducedElasticBody,
+        "test_elastic_displacement_form_translation_invariance",
+        test_elastic_displacement_form_translation_invariance,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
         "test_elastic_uncoupled_body_matches_base_trajectory",
         test_elastic_uncoupled_body_matches_base_trajectory,
         devices=[device],
@@ -7515,11 +7599,6 @@ for device in devices:
         devices=[device],
     )
 
-
-# The elastic frame update rounds sub-ulp coupling displacements far from the origin (see the test docstring).
-for _name in dir(TestReducedElasticBody):
-    if _name.startswith("test_elastic_large_coordinate_ballistic_com"):
-        setattr(TestReducedElasticBody, _name, unittest.expectedFailure(getattr(TestReducedElasticBody, _name)))
 
 if __name__ == "__main__":
     unittest.main()

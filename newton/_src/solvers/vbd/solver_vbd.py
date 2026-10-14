@@ -1491,14 +1491,22 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_articulation_sparse_rhs_scalar = self._rigid_articulation_sparse_rhs_scalar
                     self.rigid_articulation_sparse_delta_scalar = self._rigid_articulation_sparse_delta_scalar
 
-        # Per-body COM displacement from the inertial target, accumulated by the sparse
-        # articulation solve (see ``_init_body_displacement``).
+        # Per-body COM displacement and rotation vector from the inertial target, accumulated by the
+        # block-sparse articulation solve and by the reduced elastic block solve of every elastic
+        # frame (see ``_init_body_displacement``). Rigid-soft DAT truncation rewrites body poses after
+        # each color, which would desynchronize the displacement of a locally solved elastic frame,
+        # so those keep the absolute-pose update when it is enabled.
         self._body_disp = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
         self._body_disp_ang = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
-        body_in_sparse = np.zeros(model.body_count, dtype=np.int32)
+        body_uses_displacement = np.zeros(model.body_count, dtype=np.int32)
         if self.rigid_articulation_sparse_layout is not None:
-            body_in_sparse[self.rigid_articulation_sparse_layout.articulation_bodies.numpy()] = 1
-        self._body_in_sparse_articulation = wp.array(body_in_sparse, dtype=wp.int32, device=self.device)
+            body_uses_displacement[self.rigid_articulation_sparse_layout.articulation_bodies.numpy()] = 1
+        self._elastic_tracks_displacement = (
+            self._integrates_rigid_bodies and model.elastic_body_count > 0 and not self.rigid_soft_enable_dat
+        )
+        if self._elastic_tracks_displacement:
+            body_uses_displacement[model.elastic_body.numpy()] = 1
+        self._body_uses_displacement = wp.array(body_uses_displacement, dtype=wp.int32, device=self.device)
 
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
         self._update_displacement_mode()
@@ -3909,6 +3917,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.elastic_body_block_update_norm,
             self.elastic_body_block_update_max,
             relaxation,
+            self.body_inertia_q,
+            self._body_disp,
+            self._body_disp_ang,
+            self._body_uses_displacement,
+            self._use_body_displacement,
         ]
         outputs = [
             state_out.body_q,
@@ -6888,6 +6901,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.body_hessian_ll,
                 self.body_hessian_al,
                 self.body_hessian_aa,
+                self._body_disp,
+                self._body_disp_ang,
+                self._body_uses_displacement,
+                self._use_body_displacement,
                 model.joint_q_start,
                 model.joint_qd_start,
                 control.joint_f,
@@ -7000,6 +7017,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.body_com,
                 self.body_inv_mass_effective,
                 self._body_f_integrated,
+                self._body_disp,
+                self._body_uses_displacement,
+                self._use_body_displacement,
                 model.joint_q_start,
                 model.joint_qd_start,
                 state_out.joint_q,
@@ -7031,21 +7051,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             kernel=assemble_elastic_sparse_frame_blocks,
             dim=layout.elastic_body_count,
             inputs=[
-                dt,
                 elastic_bodies,
                 layout.elastic_body_row_start,
                 layout.body_articulation_local,
                 layout.articulation_diag_slots,
                 model.body_elastic_index,
                 state_in.body_q,
-                model.body_mass,
                 self.body_inv_mass_effective,
-                model.body_inertia,
-                self.body_inertia_q,
-                model.body_com,
-                self._body_disp,
-                self._body_disp_ang,
-                self._use_body_displacement,
                 self.elastic_body_block_grad,
                 self.elastic_body_block_matrix,
             ],
@@ -7597,16 +7609,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
 
     def _update_displacement_mode(self):
-        """Enable the displacement-form sparse update unless another solver writes body poses.
+        """Enable the displacement-form update unless another solver writes body poses.
 
-        The joint mimic solve moves body poses directly between sparse updates, so models
-        with mimics keep the absolute-position update. After a change, recapture any CUDA graph.
+        Block-sparse articulation bodies and reduced elastic frames accumulate their update as a
+        displacement from the inertial target. The joint mimic solve moves body poses directly
+        between updates, so models with mimics keep the absolute-position update for both. After a
+        change, recapture any CUDA graph.
         """
-        self._use_body_displacement = int(
-            self.rigid_articulation_solve == "block_sparse_joints"
-            and self.rigid_articulation_sparse_layout is not None
-            and not self._has_joint_mimics
+        sparse = (
+            self.rigid_articulation_solve == "block_sparse_joints" and self.rigid_articulation_sparse_layout is not None
         )
+        self._use_body_displacement = int((sparse or self._elastic_tracks_displacement) and not self._has_joint_mimics)
 
     def _init_body_displacement(self, state_in: State):
         """Start each step's displacement at the iteration start pose minus the inertial target."""
@@ -7641,7 +7654,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.body_com,
                 self._body_disp,
                 self._body_disp_ang,
-                self._body_in_sparse_articulation,
+                self._body_uses_displacement,
                 self.body_inv_mass_effective,
                 self._use_body_displacement,
             ],

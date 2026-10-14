@@ -50,21 +50,13 @@ def _dense_entry(matrix: wp.array3d[float], elastic_index: int, i: int, j: int) 
 
 @wp.kernel
 def assemble_elastic_sparse_frame_blocks(
-    dt: float,
     elastic_bodies: wp.array[wp.int32],
     elastic_body_row_start: wp.array[wp.int32],
     body_articulation_local: wp.array[wp.int32],
     articulation_diag_slots: wp.array[wp.int32],
     body_elastic_index: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
-    body_mass: wp.array[float],
     body_inv_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    body_inertia_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    body_disp: wp.array[wp.vec3],
-    body_disp_ang: wp.array[wp.vec3],
-    use_displacement: int,
     elastic_body_block_grad: wp.array2d[float],
     elastic_body_block_matrix: wp.array3d[float],
     values_scalar: wp.array[float],
@@ -75,8 +67,8 @@ def assemble_elastic_sparse_frame_blocks(
     The dense block already holds the frame inertia (including ``I(q)``), contact Hessians, and
     the self terms of every attached joint at the deformed attachments, so it supersedes the
     rigid inertia and joint self terms the sparse assembly wrote for this body. Frame rows are
-    rotated from body to world axes. Under the displacement-form update the inertial force is
-    taken from the accumulated displacement, as for rigid sparse bodies.
+    rotated from body to world axes. Under the displacement-form update the dense rows already
+    take the inertial force from the accumulated displacement, as for rigid sparse bodies.
     """
     tid = wp.tid()
     body = elastic_bodies[tid]
@@ -122,27 +114,6 @@ def assemble_elastic_sparse_frame_blocks(
     )
     force = R * force_local
     torque = R * torque_local
-
-    if use_displacement != 0:
-        # The dense rows difference absolute poses for the inertial force; swap in the
-        # displacement form so float32 rounding of absolute positions does not become momentum.
-        dt_inv_sqr = 1.0 / (dt * dt)
-        inertial_coeff = body_mass[body] * dt_inv_sqr
-        q_star = body_inertia_q[body]
-        rot_star = wp.transform_get_rotation(q_star)
-        com_local = body_com[body]
-        com_current = wp.transform_get_translation(pose) + wp.quat_rotate(rot, com_local)
-        com_star = wp.transform_get_translation(q_star) + wp.quat_rotate(rot_star, com_local)
-        force = force - (com_star - com_current) * inertial_coeff - body_disp[body] * inertial_coeff
-
-        q_delta = wp.mul(wp.quat_inverse(rot), rot_star)
-        if q_delta[3] < 0.0:
-            q_delta = wp.quat(-q_delta[0], -q_delta[1], -q_delta[2], -q_delta[3])
-        axis_body, angle_body = wp.quat_to_axis_angle(q_delta)
-        I_body = body_inertia[body]
-        torque_absolute = R * (I_body * (axis_body * angle_body * dt_inv_sqr))
-        I_world = R * I_body * wp.transpose(R)
-        torque = torque - torque_absolute - (I_world * body_disp_ang[body]) * dt_inv_sqr
 
     for i in range(3):
         _scalar_vec_set(rhs_scalar, row, i, force[i])

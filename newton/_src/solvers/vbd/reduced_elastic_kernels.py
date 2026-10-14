@@ -18,6 +18,8 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_rigid_contact_from_collision,
     get_body_adjacent_joint_id,
     get_body_num_adjacent_joints,
+    quat_from_rotation_vector,
+    rotation_vector_from_quat,
 )
 
 wp.set_module_options({"enable_backward": False})
@@ -732,14 +734,19 @@ def _elastic_frame_accel_rel(
     gravity: wp.array[wp.vec3],
     body_f: wp.array[wp.spatial_vector],
     joint_qd_prev: wp.array[float],
+    body_disp: wp.array[wp.vec3],
+    track_displacement: bool,
 ) -> wp.vec3:
     """Return the world acceleration of the rest COM relative to gravity, ``a_c - g``.
 
     A dynamic frame takes it from the rigid row's displacement from its inertial target, so absolute
-    positions cancel; a kinematic frame differences its prescribed poses.
+    positions cancel (with ``track_displacement``, from the accumulated displacement itself); a
+    kinematic frame differences its prescribed poses.
     """
     inv_dt = 1.0 / dt
     body_com_local = body_com[body]
+    if frame_dynamic and track_displacement:
+        return body_disp[body] * (inv_dt * inv_dt) + wp.spatial_top(body_f[body]) * body_inv_mass[body]
     if frame_dynamic:
         q_current = body_q[body]
         q_inertial = body_inertia_q[body]
@@ -775,8 +782,17 @@ def _elastic_frame_inertial_rows(
     external_hessian_ll: wp.array[wp.mat33],
     external_hessian_al: wp.array[wp.mat33],
     external_hessian_aa: wp.array[wp.mat33],
+    body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
+    track_displacement: bool,
 ):
-    """Return the rigid inertial and external force, torque and Hessian blocks of a dynamic frame in body axes."""
+    """Return the rigid inertial and external force, torque and Hessian blocks of a dynamic frame in body axes.
+
+    With ``track_displacement`` the inertial force and torque are ``-m d / dt^2`` and
+    ``-I_world phi / dt^2`` from the accumulated displacement ``d`` of the rest COM and rotation
+    vector ``phi`` from the inertial target, as in the block-sparse articulation solve; otherwise
+    they are differenced from the absolute current and target poses.
+    """
     inv_dt = 1.0 / dt
     inv_dt_sq = inv_dt * inv_dt
     body_R_T = wp.transpose(body_R)
@@ -799,6 +815,12 @@ def _elastic_frame_inertial_rows(
     axis_body, angle_body = wp.quat_to_axis_angle(q_delta)
     frame_torque_local = body_inertia[body] * (axis_body * angle_body * inv_dt_sq)
     frame_torque_world = wp.quat_rotate(rot_current, frame_torque_local) + external_torques[body]
+    if track_displacement:
+        # With rot_current = exp(phi) rot_star: the displacement is small, so it keeps full float32
+        # relative precision where the difference of two rounded absolute poses does not.
+        frame_force_world = -body_disp[body] * inertial_coeff + external_forces[body]
+        inertia_world = body_R * body_inertia[body] * body_R_T
+        frame_torque_world = -(inertia_world * body_disp_ang[body]) * inv_dt_sq + external_torques[body]
 
     h_ll_world = external_hessian_ll[body] + inertial_coeff * wp.identity(3, float)
     h_al_world = external_hessian_al[body]
@@ -855,6 +877,10 @@ def assemble_elastic_blocks(
     external_hessian_ll: wp.array[wp.mat33],
     external_hessian_al: wp.array[wp.mat33],
     external_hessian_aa: wp.array[wp.mat33],
+    body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
+    body_uses_displacement: wp.array[wp.int32],
+    use_displacement: int,
     joint_q_start: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_f: wp.array[float],
@@ -880,7 +906,9 @@ def assemble_elastic_blocks(
     - 2 w_b . sum_j C_ij qd_j``, where ``a_b`` is the rest-COM acceleration, ``Bc_i = B_i - S_i outer c``
     and ``G_i(q) = G_i + c x S_i - sum_j C_ij q_j``, all about the rest COM ``c``. The frame rows add the
     deformation-dependent inertia ``I(q) = I0 + sum_i q_i I1_i + tr(D) 1 - D`` with
-    ``D = sum_ij q_i q_j P_ij``.
+    ``D = sum_ij q_i q_j P_ij``. A dynamic frame flagged in ``body_uses_displacement`` (with
+    ``use_displacement``) takes its inertial force, torque and ``a_c - g`` from the accumulated
+    displacement from the inertial target (see :func:`_apply_elastic_block_delta`).
     """
     slot, column = wp.tid()
     body = body_ids[slot]
@@ -905,6 +933,7 @@ def assemble_elastic_blocks(
     body_com_local = body_com[body]
     frame_dynamic = solve_frame and body_inv_mass[body] > 0.0
     implicit_coupling = frame_dynamic and elastic_implicit_mass_coupling[elastic_index]
+    track_displacement = use_displacement != 0 and body_uses_displacement[body] != 0
 
     for row in range(block_width):
         elastic_body_block_matrix[elastic_index, row, column] = 0.0
@@ -931,6 +960,9 @@ def assemble_elastic_blocks(
                 external_hessian_ll,
                 external_hessian_al,
                 external_hessian_aa,
+                body_disp,
+                body_disp_ang,
+                track_displacement,
             )
             axis = column % 3
             if column < 3:
@@ -1052,6 +1084,8 @@ def assemble_elastic_blocks(
             gravity,
             body_f,
             joint_qd_prev,
+            body_disp,
+            track_displacement,
         )
 
         force = (
@@ -1235,6 +1269,9 @@ def accumulate_elastic_frame_coupling(
     body_com: wp.array[wp.vec3],
     body_inv_mass: wp.array[float],
     body_f: wp.array[wp.spatial_vector],
+    body_disp: wp.array[wp.vec3],
+    body_uses_displacement: wp.array[wp.int32],
+    use_displacement: int,
     joint_q_start: wp.array[wp.int32],
     joint_qd_start: wp.array[wp.int32],
     joint_q: wp.array[float],
@@ -1254,7 +1291,8 @@ def accumulate_elastic_frame_coupling(
     ``tau = -(h_e[n+1] - h_e[n]) / dt - s[n+1] x (a_c - g)``,
 
     see :func:`_elastic_excess_momentum`. ``a_c - g`` is taken from the same
-    displacement from the inertial target that the rigid row uses, so absolute
+    displacement from the inertial target that the rigid row uses (the accumulated
+    displacement for bodies flagged in ``body_uses_displacement``), so absolute
     positions and the frame translational velocity never enter. A free body
     therefore conserves its physical linear momentum and the result does not depend
     on a uniform velocity boost or on the choice of the frame origin.
@@ -1281,6 +1319,9 @@ def accumulate_elastic_frame_coupling(
         body_com: Rest center of mass ``c`` in the body frame [m].
         body_inv_mass: Effective inverse body masses [1/kg].
         body_f: Body wrenches applied by the rigid predictor (world, at ``c``) [N, N m].
+        body_disp: Accumulated world displacement of ``c`` from the inertial target [m].
+        body_uses_displacement: Per-body flag for bodies whose frame update tracks ``body_disp``.
+        use_displacement: Whether the solver tracks displacements at all.
         joint_q_start: Joint coordinate start indices.
         joint_qd_start: Joint velocity start indices.
         joint_q: Current iterate of the joint coordinates.
@@ -1354,7 +1395,10 @@ def accumulate_elastic_frame_coupling(
     q_inertial = body_inertia_q[body]
     com_current = wp.transform_point(q_current, com)
     com_star = wp.transform_point(q_inertial, com)
-    accel_rel = (com_current - com_star) * (inv_dt * inv_dt) + wp.spatial_top(body_f[body]) * inv_mass
+    displacement = com_current - com_star
+    if use_displacement != 0 and body_uses_displacement[body] != 0:
+        displacement = body_disp[body]
+    accel_rel = displacement * (inv_dt * inv_dt) + wp.spatial_top(body_f[body]) * inv_mass
 
     force = -(linear - linear_prev) * inv_dt
     torque = -(angular - angular_prev) * inv_dt - wp.cross(s_world, accel_rel)
@@ -1626,15 +1670,26 @@ def _apply_elastic_block_delta(
     elastic_body_block_update_norm: wp.array[float],
     elastic_body_block_update_max: wp.array[float],
     elastic_body_relaxation: float,
+    body_inertia_q: wp.array[wp.transform],
+    body_disp: wp.array[wp.vec3],
+    body_disp_ang: wp.array[wp.vec3],
+    body_uses_displacement: wp.array[wp.int32],
+    use_displacement: int,
     body_q_new: wp.array[wp.transform],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
 ):
     """Record optional metrics and apply a relaxed block increment to the frame and modes.
 
-    The modal update reads and writes ``joint_q``, so only one thread per body may execute
-    this. It reads the increment that the same thread wrote to ``elastic_body_block_delta``,
-    so no barrier is required.
+    A dynamic frame flagged in ``body_uses_displacement`` (with ``use_displacement``) accumulates
+    the increment in its displacement from the inertial target, ``d += R dx`` and
+    ``exp(phi) <- exp(R dw) exp(phi)``, and its pose is rebuilt as the target composed with the
+    displacement. Otherwise the increment is applied to the absolute pose, where float32 rounds
+    away increments below half the spacing of the world position.
+
+    The frame and modal updates read and write ``body_disp`` and ``joint_q``, so only one thread
+    per body may execute this. It reads the increment that the same thread wrote to
+    ``elastic_body_block_delta``, so no barrier is required.
     """
     owner_joint = elastic_joint[elastic_index]
     q_start = joint_q_start[owner_joint] + 7
@@ -1701,6 +1756,15 @@ def _apply_elastic_block_delta(
         rot_new = wp.normalize(dq_world * rot_current)
         com_current = wp.transform_point(q_current, body_com[body])
         com_new = com_current + x_inc_world
+        if use_displacement != 0 and body_uses_displacement[body] != 0:
+            disp = body_disp[body] + x_inc_world
+            body_disp[body] = disp
+            accumulated = wp.normalize(dq_world * quat_from_rotation_vector(body_disp_ang[body]))
+            body_disp_ang[body] = rotation_vector_from_quat(accumulated)
+            q_star = body_inertia_q[body]
+            rot_star = wp.transform_get_rotation(q_star)
+            rot_new = wp.normalize(accumulated * rot_star)
+            com_new = wp.transform_get_translation(q_star) + wp.quat_rotate(rot_star, body_com[body]) + disp
         pos_new = com_new - wp.quat_rotate(rot_new, body_com[body])
         body_q_new[body] = wp.transform(pos_new, rot_new)
     else:
@@ -1768,6 +1832,11 @@ def create_solve_elastic_body_tiled(block_width: int):
         elastic_body_block_update_norm: wp.array[float],
         elastic_body_block_update_max: wp.array[float],
         elastic_body_relaxation: float,
+        body_inertia_q: wp.array[wp.transform],
+        body_disp: wp.array[wp.vec3],
+        body_disp_ang: wp.array[wp.vec3],
+        body_uses_displacement: wp.array[wp.int32],
+        use_displacement: int,
         body_q_new: wp.array[wp.transform],
         joint_q: wp.array[float],
         joint_qd: wp.array[float],
@@ -1825,6 +1894,11 @@ def create_solve_elastic_body_tiled(block_width: int):
             elastic_body_block_update_norm,
             elastic_body_block_update_max,
             elastic_body_relaxation,
+            body_inertia_q,
+            body_disp,
+            body_disp_ang,
+            body_uses_displacement,
+            use_displacement,
             body_q_new,
             joint_q,
             joint_qd,
@@ -2000,6 +2074,11 @@ def create_solve_elastic_body_dense(block_width: int):
         elastic_body_block_update_norm: wp.array[float],
         elastic_body_block_update_max: wp.array[float],
         elastic_body_relaxation: float,
+        body_inertia_q: wp.array[wp.transform],
+        body_disp: wp.array[wp.vec3],
+        body_disp_ang: wp.array[wp.vec3],
+        body_uses_displacement: wp.array[wp.int32],
+        use_displacement: int,
         factor: wp.array3d[float],
         elastic_body_block_grad_column: wp.array3d[float],
         body_q_new: wp.array[wp.transform],
@@ -2082,6 +2161,11 @@ def create_solve_elastic_body_dense(block_width: int):
             elastic_body_block_update_norm,
             elastic_body_block_update_max,
             elastic_body_relaxation,
+            body_inertia_q,
+            body_disp,
+            body_disp_ang,
+            body_uses_displacement,
+            use_displacement,
             body_q_new,
             joint_q,
             joint_qd,
