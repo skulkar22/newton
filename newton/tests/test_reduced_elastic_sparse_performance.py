@@ -317,6 +317,48 @@ def test_sparse_modal_fallback_checks_frame_schur(test, device):
     test.assertLess(float(np.max(np.abs(state_1.body_q.numpy()[0, :3] - base_start))), 0.05)
 
 
+def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
+    """Reject unsupported elastic joint terms notified with the narrow model-change flags.
+
+    Armature is notified with ``JOINT_DOF_INERTIAL_PROPERTIES``, damping and friction with
+    ``JOINT_DOF_FORCE_PROPERTIES``, and mimic relationships with ``CONSTRAINT_PROPERTIES``; none of
+    these sets the broad ``JOINT_DOF_PROPERTIES`` or ``JOINT_PROPERTIES`` bit. The local solve keeps
+    accepting the same changes.
+    """
+    flags = newton.ModelFlags
+    for attribute, flag in (
+        ("joint_armature", flags.JOINT_DOF_INERTIAL_PROPERTIES),
+        ("joint_damping", flags.JOINT_DOF_FORCE_PROPERTIES),
+        ("joint_friction", flags.JOINT_DOF_FORCE_PROPERTIES),
+    ):
+        for mode in (_SPARSE, "local"):
+            model, _state, hinge = sparse_tests._make_leaf_link_model(device)
+            solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=mode)
+            values = getattr(model, attribute).numpy()
+            values[model.joint_qd_start.numpy()[hinge]] = 0.01
+            getattr(model, attribute).assign(values)
+            if mode == _SPARSE:
+                with test.assertRaisesRegex(ValueError, attribute, msg=f"{attribute}, {flag.name}"):
+                    solver.notify_model_changed(flag)
+            else:
+                solver.notify_model_changed(flag)
+
+    model, _state, hinge = sparse_tests._make_leaf_link_model(device)
+    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=_SPARSE)
+    joint_type = model.joint_type.numpy()
+    root = next(
+        joint
+        for joint, parent in enumerate(model.joint_parent.numpy())
+        if parent == -1 and joint_type[joint] == int(newton.JointType.REVOLUTE)
+    )
+    # The world hinge follows the elastic-attached hinge.
+    mimic = model.joint_mimic_joint.numpy()
+    mimic[root] = hinge
+    model.joint_mimic_joint.assign(mimic)
+    with test.assertRaisesRegex(NotImplementedError, "joint mimics"):
+        solver.notify_model_changed(flags.CONSTRAINT_PROPERTIES)
+
+
 def test_sparse_modal_fallback_warns_after_graph_replay(test, device):
     """Count fallback factorizations in a captured graph and report them outside capture."""
     with warnings.catch_warnings():
@@ -348,6 +390,7 @@ for _name, _test in (
     ("test_sparse_modal_dense_solve_matches_tiled", test_sparse_modal_dense_solve_matches_tiled),
     ("test_sparse_modal_fallback_keeps_frames_definite", test_sparse_modal_fallback_keeps_frames_definite),
     ("test_sparse_modal_fallback_checks_frame_schur", test_sparse_modal_fallback_checks_frame_schur),
+    ("test_sparse_elastic_revalidates_narrow_model_flags", test_sparse_elastic_revalidates_narrow_model_flags),
 ):
     add_function_test(TestReducedElasticSparsePerformance, _name, _test, devices=devices)
 

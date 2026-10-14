@@ -2597,7 +2597,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         self._apply_module_options()
         self._warn_sparse_elastic_indefinite()
-        if flags & ModelFlags.JOINT_PROPERTIES:
+        # Mimic relationships are notified with CONSTRAINT_PROPERTIES.
+        if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.CONSTRAINT_PROPERTIES):
             self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(
                 self.model, "SolverVBD"
             )
@@ -2605,7 +2606,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 JointMimicSolver(self.model, self._joint_coordinates.data) if self._has_joint_mimics else None
             )
             self._update_displacement_mode()
-        if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
+        # Armature, damping, and friction also arrive with the narrow DOF flags, which the broad
+        # JOINT_DOF_PROPERTIES bit does not include.
+        if flags & (
+            ModelFlags.JOINT_PROPERTIES
+            | ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+            | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+            | ModelFlags.CONSTRAINT_PROPERTIES
+        ):
             self._validate_sparse_elastic_support()
         refresh_structural_k = (
             bool(
