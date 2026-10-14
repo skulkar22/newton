@@ -11,6 +11,7 @@ import warp as wp
 
 import newton
 import newton.solvers
+from newton._src.solvers.vbd import reduced_elastic_kernels, reduced_elastic_sparse_kernels
 from newton.tests import _reduced_elastic_fixtures as elastic_fixtures
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
@@ -671,6 +672,29 @@ def test_sparse_elastic_rejects_joint_mimics(test, device):
     _solver(model, "local")
 
 
+def test_elastic_articulation_honors_deterministic_option(test, device):
+    """Forward the requested deterministic mode to the reduced elastic kernel modules.
+
+    The elastic block assembly, the frame coupling and the sparse Schur scatter accumulate with
+    atomics, so their modules must receive the solver's deterministic mode in both the local and the
+    block-sparse articulation solve.
+    """
+    modules = (reduced_elastic_kernels, reduced_elastic_sparse_kernels)
+    original = [wp.get_module_options(module=module) for module in modules]
+    try:
+        for mode in ("local", _SPARSE):
+            with test.subTest(mode=mode):
+                for module, options in zip(modules, original, strict=True):
+                    wp.set_module_options(options, module=module)
+                _solver(_make_elastic_chain_model(device), mode, deterministic=wp.DeterministicMode.RUN_TO_RUN)
+                for module in modules:
+                    options = wp.get_module_options(module=module)
+                    test.assertEqual(options["deterministic"], wp.DeterministicMode.RUN_TO_RUN)
+    finally:
+        for module, options in zip(modules, original, strict=True):
+            wp.set_module_options(options, module=module)
+
+
 class TestReducedElasticSparseArticulation(unittest.TestCase):
     pass
 
@@ -684,6 +708,7 @@ for _name, _test in (
     ("test_sparse_mixed_mode_counts_match_local", test_sparse_mixed_mode_counts_match_local),
     ("test_sparse_elastic_rejects_unsupported_joint_terms", test_sparse_elastic_rejects_unsupported_joint_terms),
     ("test_sparse_elastic_rejects_joint_mimics", test_sparse_elastic_rejects_joint_mimics),
+    ("test_elastic_articulation_honors_deterministic_option", test_elastic_articulation_honors_deterministic_option),
 ):
     add_function_test(TestReducedElasticSparseArticulation, _name, _test, devices=devices)
 

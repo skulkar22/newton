@@ -47,7 +47,14 @@ from ..tendon_material_cooperative_kernels import solve_tendon_material_cooperat
 from ..tendon_state import TendonStateMixin
 from ..xpbd import kernels as xpbd_kernels
 from ..xpbd.kernels import apply_joint_forces
-from . import particle_vbd_kernels, rigid_sparse_articulation_kernels, rigid_vbd_kernels, vbd_coupling_kernels
+from . import (
+    particle_vbd_kernels,
+    reduced_elastic_kernels,
+    reduced_elastic_sparse_kernels,
+    rigid_sparse_articulation_kernels,
+    rigid_vbd_kernels,
+    vbd_coupling_kernels,
+)
 from .joint_coordinates import JointCoordinates
 from .joint_forces import JointForceData, add_mimic_joint_forces, evaluate_joint_forces
 from .joint_mimic import JointMimicSolver
@@ -1310,6 +1317,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
+                reduced_elastic_kernels,
+                reduced_elastic_sparse_kernels,
                 accumulate_body_body_contacts_per_body.module,
                 compute_rigid_contact_forces.module,
                 update_duals_body_body_contacts.module,
