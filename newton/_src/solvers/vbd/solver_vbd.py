@@ -74,15 +74,18 @@ from .particle_vbd_kernels import (
 from .reduced_elastic_kernels import (
     _NUM_ELASTIC_CONTACT_THREADS_PER_BODY,
     ELASTIC_BLOCK_DENSE_BLOCK_DIM,
+    ElasticEndpointJointTerms,
     accumulate_elastic_frame_coupling,
+    assemble_elastic_blocks,
     assemble_elastic_contacts,
-    assemble_elastic_joints,
+    compute_elastic_mode_sums,
     copy_body_frame_to_elastic_joint,
     copy_elastic_body_transforms_back,
     copy_elastic_joint_frame_to_body,
     create_solve_elastic_body_tiled,
     elastic_block_dense_width,
     elastic_block_solve_tiled_block_dim,
+    evaluate_elastic_endpoint_joints,
     integrate_elastic_modes_implicit,
     launch_solve_elastic_body_dense,
     symmetrize_elastic_blocks,
@@ -1523,6 +1526,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._elastic_block_solve_launches: list[tuple[int, int, int, str]] = []
         self._elastic_block_dense_factor_scratch: wp.array | None = None
         self._elastic_block_solve_paths: dict[int, tuple[str, int]] = {}
+        self._elastic_color_bodies: dict[int, tuple[wp.array, wp.array]] = {}
         if elastic_body_count > 0:
             self._build_elastic_block_solve_plan(model)
         storage_width = self._elastic_body_block_storage_width
@@ -1546,6 +1550,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             for key, (group, buckets) in self._elastic_block_solve_groups.items()
         }
         self.elastic_implicit_mass_coupling, self.elastic_reduced_mobility = self._build_elastic_mass_solve_data(model)
+        self._init_elastic_assembly_scratch(model)
         self._init_sparse_elastic_bodies(model)
         metric_count = model.elastic_body_count if self.elastic_solver_metrics else 0
         self.elastic_body_block_initial_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
@@ -1578,6 +1583,88 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+    def _init_elastic_assembly_scratch(self, model: Model) -> None:
+        """Allocate the intermediates of the parallel reduced elastic block assembly.
+
+        The mode-pair sums of :func:`compute_elastic_mode_sums` take one entry per mode of every
+        elastic body, and the attachment terms of :func:`evaluate_elastic_endpoint_joints` one entry
+        per body and adjacent joint.
+        """
+        device = self.device
+        mode_total = int(model.elastic_mode_mass.shape[0]) if model.elastic_body_count > 0 else 0
+        mode_total = max(mode_total, 1)
+        self._elastic_mode_torque_q = wp.zeros(mode_total, dtype=wp.vec3, device=device)
+        self._elastic_mode_coriolis_q = wp.zeros(mode_total, dtype=wp.vec3, device=device)
+        self._elastic_mode_quadratic_q = wp.zeros(mode_total, dtype=wp.mat33, device=device)
+        self._elastic_mode_mass_offdiagonal = wp.zeros(mode_total, dtype=float, device=device)
+        self._elastic_mode_torque_q_prev = wp.zeros(mode_total, dtype=wp.vec3, device=device)
+        self._elastic_mode_quadratic_q_prev = wp.zeros(mode_total, dtype=wp.mat33, device=device)
+        # The step-start pass only needs the torque and quadratic sums; its other outputs go here.
+        self._elastic_mode_scratch_vec3 = wp.zeros(mode_total, dtype=wp.vec3, device=device)
+        self._elastic_mode_scratch_float = wp.zeros(mode_total, dtype=float, device=device)
+
+        adjacency = getattr(self, "rigid_adjacency", None)
+        entry_count = 0
+        has_endpoint_joints = False
+        if model.elastic_body_count > 0 and adjacency is not None:
+            entry_count = int(adjacency.body_adj_joints.shape[0])
+            has_endpoint_joints = bool(
+                np.any(model.joint_parent_elastic_endpoint.numpy() >= 0)
+                or np.any(model.joint_child_elastic_endpoint.numpy() >= 0)
+            )
+        entry_count = max(entry_count, 1)
+        terms = ElasticEndpointJointTerms()
+        terms.force = wp.zeros(entry_count, dtype=wp.vec3, device=device)
+        terms.torque = wp.zeros(entry_count, dtype=wp.vec3, device=device)
+        terms.endpoint_torque = wp.zeros(entry_count, dtype=wp.vec3, device=device)
+        terms.hessian_ll = wp.zeros(entry_count, dtype=wp.mat33, device=device)
+        terms.hessian_al = wp.zeros(entry_count, dtype=wp.mat33, device=device)
+        terms.hessian_aa = wp.zeros(entry_count, dtype=wp.mat33, device=device)
+        terms.endpoint_hessian_aa = wp.zeros(entry_count, dtype=wp.mat33, device=device)
+        terms.rotation_jacobian = wp.zeros(entry_count, dtype=wp.mat33, device=device)
+        self._elastic_endpoint_joint_terms = terms
+        self._elastic_has_endpoint_joints = has_endpoint_joints
+
+    def _launch_elastic_mode_sums(
+        self,
+        joint_q: wp.array[float],
+        joint_q_prev: wp.array[float],
+        joint_qd_prev: wp.array[float],
+        outputs: list[wp.array],
+        dt: float,
+    ) -> None:
+        """Launch :func:`compute_elastic_mode_sums` for every reduced elastic body."""
+        model = self.model
+        max_modes = int(model.elastic_max_mode_count)
+        if max_modes == 0:
+            return
+        wp.launch(
+            kernel=compute_elastic_mode_sums,
+            dim=(model.elastic_body_count, max_modes),
+            inputs=[
+                dt,
+                model.elastic_body,
+                model.body_elastic_index,
+                model.elastic_joint,
+                model.elastic_mode_start,
+                model.elastic_mode_count,
+                max_modes,
+                model.body_com,
+                model.elastic_mode_coupling_linear,
+                model.elastic_mode_coupling_angular,
+                model.elastic_mode_coupling_coriolis,
+                model.elastic_mode_coupling_quadratic,
+                model.elastic_mode_mass_matrix,
+                model.joint_q_start,
+                model.joint_qd_start,
+                joint_q,
+                joint_q_prev,
+                joint_qd_prev,
+            ],
+            outputs=outputs,
+            device=self.device,
+        )
 
     def _init_sparse_elastic_bodies(self, model: Model) -> None:
         """Allocate and validate reduced elastic bodies solved by the block-sparse articulation solve."""
@@ -1720,6 +1807,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         for body in elastic_bodies
                     ],
                     dtype=np.int64,
+                )
+                self._elastic_color_bodies[id(group)] = (
+                    group,
+                    wp.array(elastic_bodies.astype(np.int32), dtype=wp.int32, device=self.device),
                 )
                 buckets = []
                 for width in sorted({int(width) for width in body_widths}):
@@ -3741,6 +3832,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 state_out.joint_qd,
             ],
             device=self.device,
+        )
+
+        # Step-start mode-pair sums of the elastic excess momenta (see accumulate_elastic_frame_coupling).
+        self._launch_elastic_mode_sums(
+            state_in.joint_q,
+            state_in.joint_q,
+            state_in.joint_qd,
+            [
+                self._elastic_mode_torque_q_prev,
+                self._elastic_mode_scratch_vec3,
+                self._elastic_mode_quadratic_q_prev,
+                self._elastic_mode_scratch_float,
+            ],
+            dt,
         )
 
     def _finalize_elastic_bodies(self, state_out: State):
@@ -6655,12 +6760,92 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        """Assemble the dense frame/modal blocks of the reduced elastic bodies in ``body_ids``."""
+        """Assemble the dense frame/modal blocks of the reduced elastic bodies in ``body_ids``.
+
+        The joint terms at elastic attachments are formed first, then one thread per block
+        column assembles the blocks, so no thread loops over mode pairs. The mode-pair sums at the
+        iterate come from :meth:`_accumulate_elastic_frame_coupling`, which runs at the start of
+        every iteration before any elastic block of that iteration is solved; a body's modal
+        coordinates change only in its own block update, which follows its assembly.
+        """
         model = self.model
         rigid_contact_max, rigid_contact_count, _relaxation = self._elastic_solve_inputs(contacts)
+        color_entry = self._elastic_color_bodies.get(id(body_ids))
+        if color_entry is not None and color_entry[0] is body_ids:
+            # Launch over the color's elastic bodies only.
+            body_ids = color_entry[1]
+        body_count = body_ids.shape[0]
+        if body_count == 0:
+            return
+
+        if self._elastic_has_endpoint_joints:
+            wp.launch(
+                kernel=evaluate_elastic_endpoint_joints,
+                dim=body_count,
+                inputs=[
+                    dt,
+                    body_ids,
+                    model.elastic_joint,
+                    model.elastic_mode_count,
+                    self.rigid_adjacency,
+                    model.elastic_endpoint_phi,
+                    model.elastic_endpoint_psi,
+                    model.elastic_max_mode_count,
+                    model.body_elastic_index,
+                    state_in.body_q,
+                    self.body_q_prev,
+                    model.body_q,
+                    model.body_com,
+                    model.joint_type,
+                    model.joint_enabled,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    model.joint_axis,
+                    self.joint_rod_rest_kb_local,
+                    self.joint_rod_rest_twist,
+                    model.joint_qd_start,
+                    model.joint_target_q_start,
+                    self.joint_constraint_start,
+                    self.joint_penalty_k,
+                    self.joint_rho,
+                    self.joint_material_k,
+                    self.joint_penalty_kd,
+                    self.joint_sigma_start,
+                    self.joint_C_fric,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    control.joint_target_q,
+                    control.joint_target_qd,
+                    model.joint_limit_lower,
+                    model.joint_limit_upper,
+                    model.joint_limit_ke,
+                    model.joint_limit_kd,
+                    self.joint_drive_limit_support,
+                    self.joint_drive_lambda,
+                    self.joint_limit_lambda,
+                    self.joint_lambda_lin,
+                    self.joint_lambda_ang,
+                    self.joint_C0_lin,
+                    self.joint_C0_ang,
+                    self.joint_is_hard,
+                    self.rigid_joint_alpha,
+                    self.rigid_compliant_alm,
+                    model.joint_dof_dim,
+                    self._joint_coordinates.data,
+                    model.joint_parent_elastic_endpoint,
+                    model.joint_child_elastic_endpoint,
+                    model.joint_q_start,
+                    state_in.joint_q,
+                    state_out.joint_q,
+                ],
+                outputs=[self._elastic_endpoint_joint_terms],
+                device=self.device,
+            )
         wp.launch(
-            kernel=assemble_elastic_joints,
-            dim=body_ids.size,
+            kernel=assemble_elastic_blocks,
+            dim=(body_count, self.elastic_body_block_width),
             inputs=[
                 dt,
                 True,
@@ -6672,20 +6857,24 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.elastic_mode_stiffness,
                 model.elastic_mode_damping,
                 model.elastic_mode_coupling_linear,
-                model.elastic_mode_coupling_angular,
                 model.elastic_mode_coupling_centrifugal,
-                model.elastic_mode_coupling_coriolis,
-                model.elastic_mode_coupling_quadratic,
                 model.elastic_mode_mass_matrix,
+                self._elastic_mode_torque_q,
+                self._elastic_mode_coriolis_q,
+                self._elastic_mode_quadratic_q,
+                self._elastic_mode_mass_offdiagonal,
                 self.elastic_implicit_mass_coupling,
                 self.rigid_adjacency,
+                model.joint_parent,
+                model.joint_parent_elastic_endpoint,
+                model.joint_child_elastic_endpoint,
                 model.elastic_endpoint_phi,
                 model.elastic_endpoint_psi,
+                self._elastic_endpoint_joint_terms,
                 model.elastic_max_mode_count,
                 model.body_elastic_index,
                 state_in.body_q,
                 self.body_q_prev,
-                model.body_q,
                 model.body_mass,
                 self.body_inv_mass_effective,
                 model.body_inertia,
@@ -6699,47 +6888,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.body_hessian_ll,
                 self.body_hessian_al,
                 self.body_hessian_aa,
-                model.joint_type,
-                model.joint_enabled,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_X_p,
-                model.joint_X_c,
-                model.joint_axis,
-                self.joint_rod_rest_kb_local,
-                self.joint_rod_rest_twist,
-                model.joint_qd_start,
-                model.joint_target_q_start,
-                self.joint_constraint_start,
-                self.joint_penalty_k,
-                self.joint_rho,
-                self.joint_material_k,
-                self.joint_penalty_kd,
-                self.joint_sigma_start,
-                self.joint_C_fric,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                control.joint_target_q,
-                control.joint_target_qd,
-                model.joint_limit_lower,
-                model.joint_limit_upper,
-                model.joint_limit_ke,
-                model.joint_limit_kd,
-                self.joint_drive_limit_support,
-                self.joint_drive_lambda,
-                self.joint_limit_lambda,
-                self.joint_lambda_lin,
-                self.joint_lambda_ang,
-                self.joint_C0_lin,
-                self.joint_C0_ang,
-                self.joint_is_hard,
-                self.rigid_joint_alpha,
-                self.rigid_compliant_alm,
-                model.joint_dof_dim,
-                self._joint_coordinates.data,
-                model.joint_parent_elastic_endpoint,
-                model.joint_child_elastic_endpoint,
                 model.joint_q_start,
+                model.joint_qd_start,
                 control.joint_f,
                 state_in.joint_q,
                 state_in.joint_qd,
@@ -6812,8 +6962,23 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
 
     def _accumulate_elastic_frame_coupling(self, state_in: State, state_out: State, dt: float) -> None:
-        """Add the reduced elastic frame-coupling wrench of every elastic body to the body forces."""
+        """Add the reduced elastic frame-coupling wrench of every elastic body to the body forces.
+
+        Also forms the mode-pair sums at the current iterate that this iteration's block assembly uses.
+        """
         model = self.model
+        self._launch_elastic_mode_sums(
+            state_out.joint_q,
+            state_in.joint_q,
+            state_in.joint_qd,
+            [
+                self._elastic_mode_torque_q,
+                self._elastic_mode_coriolis_q,
+                self._elastic_mode_quadratic_q,
+                self._elastic_mode_mass_offdiagonal,
+            ],
+            dt,
+        )
         wp.launch(
             kernel=accumulate_elastic_frame_coupling,
             dim=model.elastic_body_count,
@@ -6823,12 +6988,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.elastic_joint,
                 model.elastic_mode_start,
                 model.elastic_mode_count,
-                model.elastic_max_mode_count,
                 model.elastic_mode_coupling_linear,
-                model.elastic_mode_coupling_angular,
                 model.elastic_mode_coupling_centrifugal,
-                model.elastic_mode_coupling_coriolis,
-                model.elastic_mode_coupling_quadratic,
+                self._elastic_mode_torque_q,
+                self._elastic_mode_quadratic_q,
+                self._elastic_mode_torque_q_prev,
+                self._elastic_mode_quadratic_q_prev,
                 state_in.body_q,
                 self.body_q_prev,
                 self.body_inertia_q,

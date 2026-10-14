@@ -425,24 +425,39 @@ def _accumulate_elastic_contact_modes(
             wp.atomic_add(elastic_body_block_matrix, elastic_index, 6 + i, 6 + j, h_ij)
 
 
+@wp.struct
+class ElasticEndpointJointTerms:
+    """Joint force and Hessian at each deformed elastic attachment, in the elastic body's axes.
+
+    Entries are indexed like ``RigidForceElementAdjacencyInfo.body_adj_joints`` (one per body and
+    adjacent joint) and written by :func:`evaluate_elastic_endpoint_joints` for the joints that attach
+    at an elastic endpoint of the body.
+    """
+
+    force: wp.array[wp.vec3]
+    """Joint force on the body [N]."""
+    torque: wp.array[wp.vec3]
+    """Joint torque on the body about its rest center of mass [N m]."""
+    endpoint_torque: wp.array[wp.vec3]
+    """Joint torque on the body about the deformed attachment [N m]."""
+    hessian_ll: wp.array[wp.mat33]
+    """Linear-linear joint Hessian block [N/m]."""
+    hessian_al: wp.array[wp.mat33]
+    """Angular-linear joint Hessian block about the rest center of mass [N]."""
+    hessian_aa: wp.array[wp.mat33]
+    """Angular-angular joint Hessian block about the rest center of mass [N m]."""
+    endpoint_hessian_aa: wp.array[wp.mat33]
+    """Angular-angular joint Hessian block about the deformed attachment [N m]."""
+    rotation_jacobian: wp.array[wp.mat33]
+    """Left Jacobian of the attachment's modal rotation vector."""
+
+
 @wp.kernel
-def assemble_elastic_joints(
+def evaluate_elastic_endpoint_joints(
     dt: float,
-    solve_frame: bool,
     body_ids: wp.array[wp.int32],
     elastic_joint: wp.array[wp.int32],
-    elastic_mode_start: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
-    elastic_mode_mass: wp.array[float],
-    elastic_mode_stiffness: wp.array[float],
-    elastic_mode_damping: wp.array[float],
-    elastic_mode_coupling_linear: wp.array[wp.vec3],
-    elastic_mode_coupling_angular: wp.array[wp.vec3],
-    elastic_mode_coupling_centrifugal: wp.array[wp.mat33],
-    elastic_mode_coupling_coriolis: wp.array[wp.vec3],
-    elastic_mode_coupling_quadratic: wp.array[wp.mat33],
-    elastic_mode_mass_matrix: wp.array[float],
-    elastic_implicit_mass_coupling: wp.array[bool],
     adjacency: RigidForceElementAdjacencyInfo,
     elastic_endpoint_phi: wp.array[wp.vec3],
     elastic_endpoint_psi: wp.array[wp.vec3],
@@ -451,19 +466,7 @@ def assemble_elastic_joints(
     body_q: wp.array[wp.transform],
     body_q_prev: wp.array[wp.transform],
     body_q_rest: wp.array[wp.transform],
-    body_mass: wp.array[float],
-    body_inv_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    body_inertia_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
-    body_world: wp.array[wp.int32],
-    gravity: wp.array[wp.vec3],
-    body_f: wp.array[wp.spatial_vector],
-    external_forces: wp.array[wp.vec3],
-    external_torques: wp.array[wp.vec3],
-    external_hessian_ll: wp.array[wp.mat33],
-    external_hessian_al: wp.array[wp.mat33],
-    external_hessian_aa: wp.array[wp.mat33],
     joint_type: wp.array[int],
     joint_enabled: wp.array[bool],
     joint_parent: wp.array[int],
@@ -505,214 +508,26 @@ def assemble_elastic_joints(
     joint_parent_elastic_endpoint: wp.array[wp.int32],
     joint_child_elastic_endpoint: wp.array[wp.int32],
     joint_q_start: wp.array[wp.int32],
-    joint_f: wp.array[float],
     joint_q_prev: wp.array[float],
-    joint_qd_prev: wp.array[float],
     joint_q: wp.array[float],
-    elastic_body_block_grad: wp.array2d[float],
-    elastic_body_block_delta: wp.array2d[float],
-    elastic_body_block_matrix: wp.array3d[float],
+    endpoint_terms: ElasticEndpointJointTerms,
 ):
+    """Evaluate every joint at a deformed elastic attachment once per body for the block assembly.
+
+    Launch with one thread per body of ``body_ids``. The joint force and Hessian are expressed in the
+    body's axes and also referred to the deformed attachment, which is how they enter the modal rows.
+    """
     body = body_ids[wp.tid()]
     elastic_index = body_elastic_index[body]
     if elastic_index < 0:
         return
 
-    owner_joint = elastic_joint[elastic_index]
-    q_start = joint_q_start[owner_joint] + 7
-    qd_start = joint_qd_start[owner_joint] + 6
-    body_qd_start = joint_qd_start[owner_joint]
-    mode_start = elastic_mode_start[elastic_index]
+    q_start = joint_q_start[elastic_joint[elastic_index]] + 7
     mode_count = elastic_mode_count[elastic_index]
-    max_modes = elastic_max_mode_count
-    block_width = max_modes + 6
-    mode_coupling_mat_start = elastic_index * max_modes * max_modes
-
-    inv_dt = 1.0 / dt
-    inv_dt_sq = inv_dt * inv_dt
-    body_rot = wp.transform_get_rotation(body_q[body])
-    body_R = wp.quat_to_matrix(body_rot)
+    body_R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
     body_R_T = wp.transpose(body_R)
-    body_com_local = body_com[body]
 
-    omega_prev = wp.vec3(
-        joint_qd_prev[body_qd_start + 3], joint_qd_prev[body_qd_start + 4], joint_qd_prev[body_qd_start + 5]
-    )
-    omega = quat_velocity(body_rot, wp.transform_get_rotation(body_q_prev[body]), dt)
-    alpha_local = body_R_T * ((omega - omega_prev) * inv_dt)
-    omega_local = body_R_T * omega
-    omega_skew = wp.skew(omega_local)
-    omega_skew_sq = omega_skew * omega_skew
-
-    for i in range(block_width):
-        elastic_body_block_grad[elastic_index, i] = 0.0
-        elastic_body_block_delta[elastic_index, i] = 0.0
-        for j in range(block_width):
-            elastic_body_block_matrix[elastic_index, i, j] = 0.0
-
-    # Acceleration of the rest COM relative to gravity, a_c - g. A dynamic frame takes it from
-    # the rigid row's displacement from its inertial target, so absolute positions cancel; a
-    # kinematic frame differences its prescribed poses.
-    accel_rel_world = wp.vec3(0.0)
-    frame_dynamic = solve_frame and body_inv_mass[body] > 0.0
-    if frame_dynamic:
-        q_current = body_q[body]
-        q_inertial = body_inertia_q[body]
-        pos_current = wp.transform_get_translation(q_current)
-        rot_current = wp.transform_get_rotation(q_current)
-        pos_star = wp.transform_get_translation(q_inertial)
-        rot_star = wp.transform_get_rotation(q_inertial)
-        com_current = pos_current + wp.quat_rotate(rot_current, body_com_local)
-        com_star = pos_star + wp.quat_rotate(rot_star, body_com_local)
-        accel_rel_world = (com_current - com_star) * inv_dt_sq + wp.spatial_top(body_f[body]) * body_inv_mass[body]
-
-        inertial_coeff = body_mass[body] * inv_dt_sq
-        frame_force_world = (com_star - com_current) * inertial_coeff + external_forces[body]
-
-        q_delta = wp.mul(wp.quat_inverse(rot_current), rot_star)
-        if q_delta[3] < 0.0:
-            q_delta = wp.quat(-q_delta[0], -q_delta[1], -q_delta[2], -q_delta[3])
-        axis_body, angle_body = wp.quat_to_axis_angle(q_delta)
-        frame_torque_local = body_inertia[body] * (axis_body * angle_body * inv_dt_sq)
-        frame_torque_world = wp.quat_rotate(rot_current, frame_torque_local) + external_torques[body]
-
-        h_ll_world = external_hessian_ll[body] + inertial_coeff * wp.identity(3, float)
-        h_al_world = external_hessian_al[body]
-        h_aa_world = external_hessian_aa[body] + body_R * (body_inertia[body] * inv_dt_sq) * body_R_T
-
-        force_local = body_R_T * frame_force_world
-        torque_local = body_R_T * frame_torque_world
-        h_ll_local = body_R_T * (h_ll_world * body_R)
-        h_al_local = body_R_T * (h_al_world * body_R)
-        h_aa_local = body_R_T * (h_aa_world * body_R)
-
-        for i in range(3):
-            elastic_body_block_grad[elastic_index, i] = -force_local[i]
-            elastic_body_block_grad[elastic_index, 3 + i] = -torque_local[i]
-            for j in range(3):
-                elastic_body_block_matrix[elastic_index, i, j] = h_ll_local[i, j]
-                elastic_body_block_matrix[elastic_index, 3 + i, j] = h_al_local[i, j]
-                elastic_body_block_matrix[elastic_index, i, 3 + j] = h_al_local[j, i]
-                elastic_body_block_matrix[elastic_index, 3 + i, 3 + j] = h_aa_local[i, j]
-    else:
-        for i in range(6):
-            elastic_body_block_matrix[elastic_index, i, i] = 1.0
-        com_v_prev = wp.vec3(
-            joint_qd_prev[body_qd_start + 0], joint_qd_prev[body_qd_start + 1], joint_qd_prev[body_qd_start + 2]
-        )
-        com_v = (
-            wp.transform_point(body_q[body], body_com_local) - wp.transform_point(body_q_prev[body], body_com_local)
-        ) * inv_dt
-        accel_rel_world = (com_v - com_v_prev) * inv_dt - gravity[wp.max(body_world[body], 0)]
-    accel_rel_local = body_R_T * accel_rel_world
-
-    for mode in range(mode_count, max_modes):
-        elastic_body_block_matrix[elastic_index, 6 + mode, 6 + mode] = 1.0
-
-    # Modal rows: sum_j Mf_ij qdd_j + d_i qd_i + k_i q_i = Q_i with
-    # Q_i = f_i + S_i . (g_b - a_b) + G_i(q) . alpha_b - Omega^2 : (Bc_i + sum_j q_j P_ij)
-    #       - 2 w_b . sum_j C_ij qd_j,
-    # where a_b is the rest-COM acceleration, Bc_i = B_i - S_i outer c and
-    # G_i(q) = G_i + c x S_i - sum_j C_ij q_j, all about the rest COM c. The same
-    # pair sums give the deformation-dependent frame inertia
-    # I(q) = I0 + sum_i q_i I1_i + tr(D) 1 - D with D = sum_ij q_i q_j P_ij.
-    implicit_coupling = frame_dynamic and elastic_implicit_mass_coupling[elastic_index]
-    s_q = wp.vec3(0.0)
-    inertia_delta = wp.mat33(0.0)
-    quadratic = wp.mat33(0.0)
-    for mode in range(mode_count):
-        mode_data = mode_start + mode
-        q_idx = q_start + mode
-        qd_idx = qd_start + mode
-
-        q = joint_q[q_idx]
-        q_prev = joint_q_prev[q_idx]
-        v_prev = joint_qd_prev[qd_idx]
-        mass = elastic_mode_mass[mode_data]
-        stiffness = elastic_mode_stiffness[mode_data]
-        damping = elastic_mode_damping[mode_data]
-        coupling_linear = elastic_mode_coupling_linear[mode_data]
-        coupling_torque = elastic_mode_coupling_angular[mode_data] + wp.cross(body_com_local, coupling_linear)
-        coupling_centrifugal = elastic_mode_coupling_centrifugal[mode_data] - wp.outer(coupling_linear, body_com_local)
-
-        coriolis = wp.vec3(0.0, 0.0, 0.0)
-        pair_q = wp.mat33(0.0)
-        mass_offdiagonal = float(0.0)
-        for j in range(mode_count):
-            pair = mode_coupling_mat_start + mode * max_modes + j
-            q_j = joint_q[q_start + j]
-            q_prev_j = joint_q_prev[q_start + j]
-            coriolis_ij = elastic_mode_coupling_coriolis[pair]
-            coriolis = coriolis + coriolis_ij * ((q_j - q_prev_j) * inv_dt)
-            coupling_torque = coupling_torque - coriolis_ij * q_j
-            pair_q = pair_q + elastic_mode_coupling_quadratic[pair] * q_j
-            if j != mode:
-                mass_ij = elastic_mode_mass_matrix[pair]
-                mass_offdiagonal = mass_offdiagonal + mass_ij * (q_j - q_prev_j - dt * joint_qd_prev[qd_start + j])
-                if j > mode:
-                    elastic_body_block_matrix[elastic_index, 6 + mode, 6 + j] = (
-                        elastic_body_block_matrix[elastic_index, 6 + mode, 6 + j] + mass_ij * inv_dt_sq
-                    )
-
-        s_q = s_q + coupling_linear * q
-        quadratic = quadratic + pair_q * q
-        centrifugal_trace = coupling_centrifugal[0, 0] + coupling_centrifugal[1, 1] + coupling_centrifugal[2, 2]
-        inertia_delta = inertia_delta + q * (
-            2.0 * centrifugal_trace * wp.identity(3, float) - coupling_centrifugal - wp.transpose(coupling_centrifugal)
-        )
-
-        force = (
-            joint_f[qd_idx]
-            - wp.dot(coupling_linear, accel_rel_local)
-            + wp.dot(coupling_torque, alpha_local)
-            - wp.ddot(omega_skew_sq, coupling_centrifugal + pair_q)
-            - 2.0 * wp.dot(omega_local, coriolis)
-        )
-
-        h = stiffness
-        grad = stiffness * q - force
-        if mass > 0.0:
-            h = h + mass * inv_dt_sq
-            grad = grad + mass * inv_dt_sq * (q - q_prev - dt * v_prev)
-        if damping > 0.0:
-            h = h + damping * inv_dt
-            grad = grad + damping * inv_dt * (q - q_prev)
-        grad = grad + mass_offdiagonal * inv_dt_sq
-
-        elastic_body_block_grad[elastic_index, 6 + mode] = grad
-        elastic_body_block_matrix[elastic_index, 6 + mode, 6 + mode] = h
-
-        if implicit_coupling:
-            for axis in range(3):
-                elastic_body_block_matrix[elastic_index, axis, 6 + mode] = (
-                    elastic_body_block_matrix[elastic_index, axis, 6 + mode] + coupling_linear[axis] * inv_dt_sq
-                )
-                elastic_body_block_matrix[elastic_index, 3 + axis, 6 + mode] = (
-                    elastic_body_block_matrix[elastic_index, 3 + axis, 6 + mode] - coupling_torque[axis] * inv_dt_sq
-                )
-
-    if frame_dynamic:
-        # Frame mass at the iterate: I(q) - I0 on the rotation block (I0 is assembled above)
-        # and the translation-rotation coupling -skew(S q) from y = (r - c) + Phi q.
-        quadratic_trace = quadratic[0, 0] + quadratic[1, 1] + quadratic[2, 2]
-        inertia_delta = inertia_delta + (
-            quadratic_trace * wp.identity(3, float) - 0.5 * (quadratic + wp.transpose(quadratic))
-        )
-        inertia_delta_hessian = inertia_delta * inv_dt_sq
-        linear_angular_hessian = -wp.skew(s_q) * inv_dt_sq
-        for i in range(3):
-            for j in range(3):
-                elastic_body_block_matrix[elastic_index, 3 + i, 3 + j] = (
-                    elastic_body_block_matrix[elastic_index, 3 + i, 3 + j] + inertia_delta_hessian[i, j]
-                )
-                if implicit_coupling:
-                    elastic_body_block_matrix[elastic_index, i, 3 + j] = (
-                        elastic_body_block_matrix[elastic_index, i, 3 + j] + linear_angular_hessian[i, j]
-                    )
-                    elastic_body_block_matrix[elastic_index, 3 + j, i] = (
-                        elastic_body_block_matrix[elastic_index, 3 + j, i] + linear_angular_hessian[i, j]
-                    )
-
+    adjacent_offset = adjacency.body_adj_joints_offsets[body]
     adjacent_joint_count = get_body_num_adjacent_joints(adjacency, body)
     for adjacent_joint in range(adjacent_joint_count):
         joint = get_body_adjacent_joint_id(adjacency, body, adjacent_joint)
@@ -806,75 +621,518 @@ def assemble_elastic_joints(
         angular_torque = joint_torque - wp.cross(r_world, joint_force)
         angular_H_aa = joint_H_aa - linear_H_aa
 
-        force_local = body_R_T * joint_force
-        H_ll_local = body_R_T * (joint_H_ll * body_R)
-        H_al_local = body_R_T * (joint_H_al * body_R)
-        torque_local = body_R_T * joint_torque
-        H_aa_local = body_R_T * (joint_H_aa * body_R)
-        angular_torque_local = body_R_T * angular_torque
-        angular_H_aa_local = body_R_T * (angular_H_aa * body_R)
-
-        if frame_dynamic:
-            for i in range(3):
-                elastic_body_block_grad[elastic_index, i] = elastic_body_block_grad[elastic_index, i] - force_local[i]
-                elastic_body_block_grad[elastic_index, 3 + i] = (
-                    elastic_body_block_grad[elastic_index, 3 + i] - torque_local[i]
-                )
-                for j in range(3):
-                    elastic_body_block_matrix[elastic_index, i, j] = (
-                        elastic_body_block_matrix[elastic_index, i, j] + H_ll_local[i, j]
-                    )
-                    elastic_body_block_matrix[elastic_index, 3 + i, j] = (
-                        elastic_body_block_matrix[elastic_index, 3 + i, j] + H_al_local[i, j]
-                    )
-                    elastic_body_block_matrix[elastic_index, i, 3 + j] = (
-                        elastic_body_block_matrix[elastic_index, i, 3 + j] + H_al_local[j, i]
-                    )
-                    elastic_body_block_matrix[elastic_index, 3 + i, 3 + j] = (
-                        elastic_body_block_matrix[elastic_index, 3 + i, 3 + j] + H_aa_local[i, j]
-                    )
-
         theta_local = wp.vec3(0.0)
         for mode in range(mode_count):
             theta_local = (
                 theta_local + elastic_endpoint_psi[endpoint * elastic_max_mode_count + mode] * joint_q[q_start + mode]
             )
-        endpoint_rotation_jacobian = _so3_left_jacobian(theta_local)
 
-        for i in range(mode_count):
-            phi_i_local = elastic_endpoint_phi[endpoint * elastic_max_mode_count + i]
-            psi_i_local = endpoint_rotation_jacobian * elastic_endpoint_psi[endpoint * elastic_max_mode_count + i]
-            mode_i = 6 + i
-            elastic_body_block_grad[elastic_index, mode_i] = (
-                elastic_body_block_grad[elastic_index, mode_i]
-                - wp.dot(force_local, phi_i_local)
-                - wp.dot(angular_torque_local, psi_i_local)
+        entry = adjacent_offset + adjacent_joint
+        endpoint_terms.force[entry] = body_R_T * joint_force
+        endpoint_terms.torque[entry] = body_R_T * joint_torque
+        endpoint_terms.endpoint_torque[entry] = body_R_T * angular_torque
+        endpoint_terms.hessian_ll[entry] = body_R_T * (joint_H_ll * body_R)
+        endpoint_terms.hessian_al[entry] = body_R_T * (joint_H_al * body_R)
+        endpoint_terms.hessian_aa[entry] = body_R_T * (joint_H_aa * body_R)
+        endpoint_terms.endpoint_hessian_aa[entry] = body_R_T * (angular_H_aa * body_R)
+        endpoint_terms.rotation_jacobian[entry] = _so3_left_jacobian(theta_local)
+
+
+@wp.kernel
+def compute_elastic_mode_sums(
+    dt: float,
+    body_ids: wp.array[wp.int32],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_joint: wp.array[wp.int32],
+    elastic_mode_start: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    elastic_max_mode_count: int,
+    body_com: wp.array[wp.vec3],
+    elastic_mode_coupling_linear: wp.array[wp.vec3],
+    elastic_mode_coupling_angular: wp.array[wp.vec3],
+    elastic_mode_coupling_coriolis: wp.array[wp.vec3],
+    elastic_mode_coupling_quadratic: wp.array[wp.mat33],
+    elastic_mode_mass_matrix: wp.array[float],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_q: wp.array[float],
+    joint_q_prev: wp.array[float],
+    joint_qd_prev: wp.array[float],
+    elastic_mode_torque_q: wp.array[wp.vec3],
+    elastic_mode_coriolis_q: wp.array[wp.vec3],
+    elastic_mode_quadratic_q: wp.array[wp.mat33],
+    elastic_mode_mass_offdiagonal: wp.array[float],
+):
+    """Form the mode-pair sums of the reduced elastic inertia, one thread per body and mode ``i``.
+
+    Launch with ``dim=(len(body_ids), elastic_max_mode_count)``. About the rest center of mass
+    ``c``, with the modal coordinates ``q`` of ``joint_q`` and the step-start ``q_n``, ``qd_n``,
+    writes per mode:
+
+    - ``elastic_mode_torque_q``: ``G_i(q) = G_i + c x S_i - sum_j C_ij q_j`` [kg m],
+    - ``elastic_mode_coriolis_q``: ``sum_j C_ij (q_j - q_n,j) / dt`` [kg/s],
+    - ``elastic_mode_quadratic_q``: ``sum_j P_ij q_j`` [kg],
+    - ``elastic_mode_mass_offdiagonal``: ``sum_{j != i} Mf_ij (q_j - q_n,j - dt qd_n,j)`` [kg].
+
+    Each thread sums over ``j`` in the order of the per-body loops these sums replace.
+    """
+    slot, mode = wp.tid()
+    body = body_ids[slot]
+    elastic_index = body_elastic_index[body]
+    if elastic_index < 0:
+        return
+    mode_count = elastic_mode_count[elastic_index]
+    if mode >= mode_count:
+        return
+
+    owner_joint = elastic_joint[elastic_index]
+    q_start = joint_q_start[owner_joint] + 7
+    qd_start = joint_qd_start[owner_joint] + 6
+    max_modes = elastic_max_mode_count
+    pair_start = (elastic_index * max_modes + mode) * max_modes
+    mode_data = elastic_mode_start[elastic_index] + mode
+    inv_dt = 1.0 / dt
+
+    coupling_linear = elastic_mode_coupling_linear[mode_data]
+    torque = elastic_mode_coupling_angular[mode_data] + wp.cross(body_com[body], coupling_linear)
+    coriolis = wp.vec3(0.0)
+    quadratic = wp.mat33(0.0)
+    mass_offdiagonal = float(0.0)
+    for j in range(mode_count):
+        pair = pair_start + j
+        q_j = joint_q[q_start + j]
+        q_prev_j = joint_q_prev[q_start + j]
+        coriolis_ij = elastic_mode_coupling_coriolis[pair]
+        coriolis = coriolis + coriolis_ij * ((q_j - q_prev_j) * inv_dt)
+        torque = torque - coriolis_ij * q_j
+        quadratic = quadratic + elastic_mode_coupling_quadratic[pair] * q_j
+        if j != mode:
+            mass_offdiagonal = mass_offdiagonal + elastic_mode_mass_matrix[pair] * (
+                q_j - q_prev_j - dt * joint_qd_prev[qd_start + j]
             )
 
-            if frame_dynamic:
-                linear_cross = H_ll_local * phi_i_local
-                angular_cross = H_al_local * phi_i_local + angular_H_aa_local * psi_i_local
-                for axis in range(3):
-                    elastic_body_block_matrix[elastic_index, axis, mode_i] = (
-                        elastic_body_block_matrix[elastic_index, axis, mode_i] + linear_cross[axis]
-                    )
-                    elastic_body_block_matrix[elastic_index, 3 + axis, mode_i] = (
-                        elastic_body_block_matrix[elastic_index, 3 + axis, mode_i] + angular_cross[axis]
-                    )
+    elastic_mode_torque_q[mode_data] = torque
+    elastic_mode_coriolis_q[mode_data] = coriolis
+    elastic_mode_quadratic_q[mode_data] = quadratic
+    elastic_mode_mass_offdiagonal[mode_data] = mass_offdiagonal
 
-            for j in range(i, mode_count):
-                phi_j_local = elastic_endpoint_phi[endpoint * elastic_max_mode_count + j]
-                psi_j_local = endpoint_rotation_jacobian * elastic_endpoint_psi[endpoint * elastic_max_mode_count + j]
-                mode_j = 6 + j
-                elastic_body_block_matrix[elastic_index, mode_i, mode_j] = (
-                    elastic_body_block_matrix[elastic_index, mode_i, mode_j]
-                    + wp.dot(phi_i_local, H_ll_local * phi_j_local)
-                    + wp.dot(psi_i_local, angular_H_aa_local * psi_j_local)
+
+@wp.func
+def _elastic_frame_accel_rel(
+    dt: float,
+    frame_dynamic: bool,
+    body: int,
+    body_qd_start: int,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_inertia_q: wp.array[wp.transform],
+    body_inv_mass: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    body_f: wp.array[wp.spatial_vector],
+    joint_qd_prev: wp.array[float],
+) -> wp.vec3:
+    """Return the world acceleration of the rest COM relative to gravity, ``a_c - g``.
+
+    A dynamic frame takes it from the rigid row's displacement from its inertial target, so absolute
+    positions cancel; a kinematic frame differences its prescribed poses.
+    """
+    inv_dt = 1.0 / dt
+    body_com_local = body_com[body]
+    if frame_dynamic:
+        q_current = body_q[body]
+        q_inertial = body_inertia_q[body]
+        com_current = wp.transform_get_translation(q_current) + wp.quat_rotate(
+            wp.transform_get_rotation(q_current), body_com_local
+        )
+        com_star = wp.transform_get_translation(q_inertial) + wp.quat_rotate(
+            wp.transform_get_rotation(q_inertial), body_com_local
+        )
+        return (com_current - com_star) * (inv_dt * inv_dt) + wp.spatial_top(body_f[body]) * body_inv_mass[body]
+
+    com_v_prev = wp.vec3(
+        joint_qd_prev[body_qd_start + 0], joint_qd_prev[body_qd_start + 1], joint_qd_prev[body_qd_start + 2]
+    )
+    com_v = (
+        wp.transform_point(body_q[body], body_com_local) - wp.transform_point(body_q_prev[body], body_com_local)
+    ) * inv_dt
+    return (com_v - com_v_prev) * inv_dt - gravity[wp.max(body_world[body], 0)]
+
+
+@wp.func
+def _elastic_frame_inertial_rows(
+    dt: float,
+    body: int,
+    body_R: wp.mat33,
+    body_q: wp.array[wp.transform],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    body_inertia_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    external_forces: wp.array[wp.vec3],
+    external_torques: wp.array[wp.vec3],
+    external_hessian_ll: wp.array[wp.mat33],
+    external_hessian_al: wp.array[wp.mat33],
+    external_hessian_aa: wp.array[wp.mat33],
+):
+    """Return the rigid inertial and external force, torque and Hessian blocks of a dynamic frame in body axes."""
+    inv_dt = 1.0 / dt
+    inv_dt_sq = inv_dt * inv_dt
+    body_R_T = wp.transpose(body_R)
+    body_com_local = body_com[body]
+    q_current = body_q[body]
+    q_inertial = body_inertia_q[body]
+    pos_current = wp.transform_get_translation(q_current)
+    rot_current = wp.transform_get_rotation(q_current)
+    pos_star = wp.transform_get_translation(q_inertial)
+    rot_star = wp.transform_get_rotation(q_inertial)
+    com_current = pos_current + wp.quat_rotate(rot_current, body_com_local)
+    com_star = pos_star + wp.quat_rotate(rot_star, body_com_local)
+
+    inertial_coeff = body_mass[body] * inv_dt_sq
+    frame_force_world = (com_star - com_current) * inertial_coeff + external_forces[body]
+
+    q_delta = wp.mul(wp.quat_inverse(rot_current), rot_star)
+    if q_delta[3] < 0.0:
+        q_delta = wp.quat(-q_delta[0], -q_delta[1], -q_delta[2], -q_delta[3])
+    axis_body, angle_body = wp.quat_to_axis_angle(q_delta)
+    frame_torque_local = body_inertia[body] * (axis_body * angle_body * inv_dt_sq)
+    frame_torque_world = wp.quat_rotate(rot_current, frame_torque_local) + external_torques[body]
+
+    h_ll_world = external_hessian_ll[body] + inertial_coeff * wp.identity(3, float)
+    h_al_world = external_hessian_al[body]
+    h_aa_world = external_hessian_aa[body] + body_R * (body_inertia[body] * inv_dt_sq) * body_R_T
+
+    force_local = body_R_T * frame_force_world
+    torque_local = body_R_T * frame_torque_world
+    h_ll_local = body_R_T * (h_ll_world * body_R)
+    h_al_local = body_R_T * (h_al_world * body_R)
+    h_aa_local = body_R_T * (h_aa_world * body_R)
+    return force_local, torque_local, h_ll_local, h_al_local, h_aa_local
+
+
+@wp.kernel
+def assemble_elastic_blocks(
+    dt: float,
+    solve_frame: bool,
+    body_ids: wp.array[wp.int32],
+    elastic_joint: wp.array[wp.int32],
+    elastic_mode_start: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    elastic_mode_mass: wp.array[float],
+    elastic_mode_stiffness: wp.array[float],
+    elastic_mode_damping: wp.array[float],
+    elastic_mode_coupling_linear: wp.array[wp.vec3],
+    elastic_mode_coupling_centrifugal: wp.array[wp.mat33],
+    elastic_mode_mass_matrix: wp.array[float],
+    elastic_mode_torque_q: wp.array[wp.vec3],
+    elastic_mode_coriolis_q: wp.array[wp.vec3],
+    elastic_mode_quadratic_q: wp.array[wp.mat33],
+    elastic_mode_mass_offdiagonal: wp.array[float],
+    elastic_implicit_mass_coupling: wp.array[bool],
+    adjacency: RigidForceElementAdjacencyInfo,
+    joint_parent: wp.array[int],
+    joint_parent_elastic_endpoint: wp.array[wp.int32],
+    joint_child_elastic_endpoint: wp.array[wp.int32],
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    endpoint_terms: ElasticEndpointJointTerms,
+    elastic_max_mode_count: int,
+    body_elastic_index: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_mass: wp.array[float],
+    body_inv_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    body_inertia_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    body_f: wp.array[wp.spatial_vector],
+    external_forces: wp.array[wp.vec3],
+    external_torques: wp.array[wp.vec3],
+    external_hessian_ll: wp.array[wp.mat33],
+    external_hessian_al: wp.array[wp.mat33],
+    external_hessian_aa: wp.array[wp.mat33],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_f: wp.array[float],
+    joint_q_prev: wp.array[float],
+    joint_qd_prev: wp.array[float],
+    joint_q: wp.array[float],
+    elastic_body_block_grad: wp.array2d[float],
+    elastic_body_block_delta: wp.array2d[float],
+    elastic_body_block_matrix: wp.array3d[float],
+):
+    """Assemble the coupled frame/modal block of each reduced elastic body, one thread per column.
+
+    Launch with ``dim=(len(body_ids), elastic_max_mode_count + 6)`` after
+    :func:`compute_elastic_mode_sums` at the current iterate and :func:`evaluate_elastic_endpoint_joints`
+    for the same bodies.
+    Column ``k`` owns ``grad[k]`` and every stored entry ``[r, k]``: the full ``6 x 6`` frame block
+    and, for the modal columns, the frame/modal coupling and the upper modal triangle. The lower
+    triangle outside the frame block is left zero (see :func:`symmetrize_elastic_blocks`). Rows past
+    a body's mode count are identity rows.
+
+    Modal rows: ``sum_j Mf_ij qdd_j + d_i qd_i + k_i q_i = Q_i`` with
+    ``Q_i = f_i + S_i . (g_b - a_b) + G_i(q) . alpha_b - Omega^2 : (Bc_i + sum_j q_j P_ij)
+    - 2 w_b . sum_j C_ij qd_j``, where ``a_b`` is the rest-COM acceleration, ``Bc_i = B_i - S_i outer c``
+    and ``G_i(q) = G_i + c x S_i - sum_j C_ij q_j``, all about the rest COM ``c``. The frame rows add the
+    deformation-dependent inertia ``I(q) = I0 + sum_i q_i I1_i + tr(D) 1 - D`` with
+    ``D = sum_ij q_i q_j P_ij``.
+    """
+    slot, column = wp.tid()
+    body = body_ids[slot]
+    elastic_index = body_elastic_index[body]
+    if elastic_index < 0:
+        return
+
+    max_modes = elastic_max_mode_count
+    block_width = max_modes + 6
+    owner_joint = elastic_joint[elastic_index]
+    q_start = joint_q_start[owner_joint] + 7
+    body_qd_start = joint_qd_start[owner_joint]
+    qd_start = body_qd_start + 6
+    mode_start = elastic_mode_start[elastic_index]
+    mode_count = elastic_mode_count[elastic_index]
+
+    inv_dt = 1.0 / dt
+    inv_dt_sq = inv_dt * inv_dt
+    body_rot = wp.transform_get_rotation(body_q[body])
+    body_R = wp.quat_to_matrix(body_rot)
+    body_R_T = wp.transpose(body_R)
+    body_com_local = body_com[body]
+    frame_dynamic = solve_frame and body_inv_mass[body] > 0.0
+    implicit_coupling = frame_dynamic and elastic_implicit_mass_coupling[elastic_index]
+
+    for row in range(block_width):
+        elastic_body_block_matrix[elastic_index, row, column] = 0.0
+    elastic_body_block_delta[elastic_index, column] = 0.0
+    grad = float(0.0)
+
+    adjacent_offset = adjacency.body_adj_joints_offsets[body]
+    adjacent_joint_count = get_body_num_adjacent_joints(adjacency, body)
+    mode = column - 6
+
+    if column < 6:
+        if frame_dynamic:
+            force_local, torque_local, h_ll_local, h_al_local, h_aa_local = _elastic_frame_inertial_rows(
+                dt,
+                body,
+                body_R,
+                body_q,
+                body_mass,
+                body_inertia,
+                body_inertia_q,
+                body_com,
+                external_forces,
+                external_torques,
+                external_hessian_ll,
+                external_hessian_al,
+                external_hessian_aa,
+            )
+            axis = column % 3
+            if column < 3:
+                grad = -force_local[axis]
+                for i in range(3):
+                    elastic_body_block_matrix[elastic_index, i, column] = h_ll_local[i, axis]
+                    elastic_body_block_matrix[elastic_index, 3 + i, column] = h_al_local[i, axis]
+            else:
+                grad = -torque_local[axis]
+                for i in range(3):
+                    elastic_body_block_matrix[elastic_index, i, column] = h_al_local[axis, i]
+                    elastic_body_block_matrix[elastic_index, 3 + i, column] = h_aa_local[i, axis]
+
+            # Frame mass at the iterate: I(q) - I0 on the rotation block (I0 is assembled above) and
+            # the translation-rotation coupling -skew(S q) from y = (r - c) + Phi q.
+            s_q = wp.vec3(0.0)
+            inertia_delta = wp.mat33(0.0)
+            quadratic = wp.mat33(0.0)
+            for i in range(mode_count):
+                mode_data = mode_start + i
+                q = joint_q[q_start + i]
+                coupling_linear = elastic_mode_coupling_linear[mode_data]
+                coupling_centrifugal = elastic_mode_coupling_centrifugal[mode_data] - wp.outer(
+                    coupling_linear, body_com_local
+                )
+                s_q = s_q + coupling_linear * q
+                quadratic = quadratic + elastic_mode_quadratic_q[mode_data] * q
+                centrifugal_trace = coupling_centrifugal[0, 0] + coupling_centrifugal[1, 1] + coupling_centrifugal[2, 2]
+                inertia_delta = inertia_delta + q * (
+                    2.0 * centrifugal_trace * wp.identity(3, float)
+                    - coupling_centrifugal
+                    - wp.transpose(coupling_centrifugal)
+                )
+            quadratic_trace = quadratic[0, 0] + quadratic[1, 1] + quadratic[2, 2]
+            inertia_delta = inertia_delta + (
+                quadratic_trace * wp.identity(3, float) - 0.5 * (quadratic + wp.transpose(quadratic))
+            )
+            inertia_delta_hessian = inertia_delta * inv_dt_sq
+            linear_angular_hessian = -wp.skew(s_q) * inv_dt_sq
+            if column >= 3:
+                for i in range(3):
+                    elastic_body_block_matrix[elastic_index, 3 + i, column] = (
+                        elastic_body_block_matrix[elastic_index, 3 + i, column] + inertia_delta_hessian[i, axis]
+                    )
+            if implicit_coupling:
+                for i in range(3):
+                    if column >= 3:
+                        elastic_body_block_matrix[elastic_index, i, column] = (
+                            elastic_body_block_matrix[elastic_index, i, column] + linear_angular_hessian[i, axis]
+                        )
+                    else:
+                        elastic_body_block_matrix[elastic_index, 3 + i, column] = (
+                            elastic_body_block_matrix[elastic_index, 3 + i, column] + linear_angular_hessian[axis, i]
+                        )
+
+            for adjacent_joint in range(adjacent_joint_count):
+                joint = adjacency.body_adj_joints[adjacent_offset + adjacent_joint]
+                is_parent = joint_parent[joint] == body
+                endpoint = joint_parent_elastic_endpoint[joint] if is_parent else joint_child_elastic_endpoint[joint]
+                if endpoint < 0:
+                    continue
+                entry = adjacent_offset + adjacent_joint
+                H_ll_local = endpoint_terms.hessian_ll[entry]
+                H_al_local = endpoint_terms.hessian_al[entry]
+                if column < 3:
+                    grad = grad - endpoint_terms.force[entry][axis]
+                    for i in range(3):
+                        elastic_body_block_matrix[elastic_index, i, column] = (
+                            elastic_body_block_matrix[elastic_index, i, column] + H_ll_local[i, axis]
+                        )
+                        elastic_body_block_matrix[elastic_index, 3 + i, column] = (
+                            elastic_body_block_matrix[elastic_index, 3 + i, column] + H_al_local[i, axis]
+                        )
+                else:
+                    H_aa_local = endpoint_terms.hessian_aa[entry]
+                    grad = grad - endpoint_terms.torque[entry][axis]
+                    for i in range(3):
+                        elastic_body_block_matrix[elastic_index, i, column] = (
+                            elastic_body_block_matrix[elastic_index, i, column] + H_al_local[axis, i]
+                        )
+                        elastic_body_block_matrix[elastic_index, 3 + i, column] = (
+                            elastic_body_block_matrix[elastic_index, 3 + i, column] + H_aa_local[i, axis]
+                        )
+        else:
+            elastic_body_block_matrix[elastic_index, column, column] = 1.0
+    elif mode < mode_count:
+        mode_data = mode_start + mode
+        q_idx = q_start + mode
+        qd_idx = qd_start + mode
+        q = joint_q[q_idx]
+        q_prev = joint_q_prev[q_idx]
+        v_prev = joint_qd_prev[qd_idx]
+        mass = elastic_mode_mass[mode_data]
+        stiffness = elastic_mode_stiffness[mode_data]
+        damping = elastic_mode_damping[mode_data]
+        coupling_linear = elastic_mode_coupling_linear[mode_data]
+        coupling_torque = elastic_mode_torque_q[mode_data]
+        coupling_centrifugal = elastic_mode_coupling_centrifugal[mode_data] - wp.outer(coupling_linear, body_com_local)
+
+        omega_prev = wp.vec3(
+            joint_qd_prev[body_qd_start + 3], joint_qd_prev[body_qd_start + 4], joint_qd_prev[body_qd_start + 5]
+        )
+        omega = quat_velocity(body_rot, wp.transform_get_rotation(body_q_prev[body]), dt)
+        alpha_local = body_R_T * ((omega - omega_prev) * inv_dt)
+        omega_local = body_R_T * omega
+        omega_skew = wp.skew(omega_local)
+        omega_skew_sq = omega_skew * omega_skew
+        accel_rel_local = body_R_T * _elastic_frame_accel_rel(
+            dt,
+            frame_dynamic,
+            body,
+            body_qd_start,
+            body_q,
+            body_q_prev,
+            body_inertia_q,
+            body_inv_mass,
+            body_com,
+            body_world,
+            gravity,
+            body_f,
+            joint_qd_prev,
+        )
+
+        force = (
+            joint_f[qd_idx]
+            - wp.dot(coupling_linear, accel_rel_local)
+            + wp.dot(coupling_torque, alpha_local)
+            - wp.ddot(omega_skew_sq, coupling_centrifugal + elastic_mode_quadratic_q[mode_data])
+            - 2.0 * wp.dot(omega_local, elastic_mode_coriolis_q[mode_data])
+        )
+
+        h = stiffness
+        grad = stiffness * q - force
+        if mass > 0.0:
+            h = h + mass * inv_dt_sq
+            grad = grad + mass * inv_dt_sq * (q - q_prev - dt * v_prev)
+        if damping > 0.0:
+            h = h + damping * inv_dt
+            grad = grad + damping * inv_dt * (q - q_prev)
+        grad = grad + elastic_mode_mass_offdiagonal[mode_data] * inv_dt_sq
+        elastic_body_block_matrix[elastic_index, column, column] = h
+
+        pair_column = elastic_index * max_modes * max_modes + mode
+        for i in range(mode):
+            elastic_body_block_matrix[elastic_index, 6 + i, column] = (
+                elastic_body_block_matrix[elastic_index, 6 + i, column]
+                + elastic_mode_mass_matrix[pair_column + i * max_modes] * inv_dt_sq
+            )
+
+        if implicit_coupling:
+            for axis in range(3):
+                elastic_body_block_matrix[elastic_index, axis, column] = (
+                    elastic_body_block_matrix[elastic_index, axis, column] + coupling_linear[axis] * inv_dt_sq
+                )
+                elastic_body_block_matrix[elastic_index, 3 + axis, column] = (
+                    elastic_body_block_matrix[elastic_index, 3 + axis, column] - coupling_torque[axis] * inv_dt_sq
                 )
 
-    for i in range(block_width):
-        diagonal = elastic_body_block_matrix[elastic_index, i, i]
-        elastic_body_block_matrix[elastic_index, i, i] = diagonal + 1.0e-9 * (wp.abs(diagonal) + 1.0)
+        for adjacent_joint in range(adjacent_joint_count):
+            joint = adjacency.body_adj_joints[adjacent_offset + adjacent_joint]
+            is_parent = joint_parent[joint] == body
+            endpoint = joint_parent_elastic_endpoint[joint] if is_parent else joint_child_elastic_endpoint[joint]
+            if endpoint < 0:
+                continue
+            entry = adjacent_offset + adjacent_joint
+            force_local = endpoint_terms.force[entry]
+            angular_torque_local = endpoint_terms.endpoint_torque[entry]
+            H_ll_local = endpoint_terms.hessian_ll[entry]
+            angular_H_aa_local = endpoint_terms.endpoint_hessian_aa[entry]
+            endpoint_rotation_jacobian = endpoint_terms.rotation_jacobian[entry]
+            endpoint_mode_start = endpoint * max_modes
+            phi_j_local = elastic_endpoint_phi[endpoint_mode_start + mode]
+            psi_j_local = endpoint_rotation_jacobian * elastic_endpoint_psi[endpoint_mode_start + mode]
+            grad = grad - wp.dot(force_local, phi_j_local) - wp.dot(angular_torque_local, psi_j_local)
+
+            if frame_dynamic:
+                linear_cross = H_ll_local * phi_j_local
+                angular_cross = endpoint_terms.hessian_al[entry] * phi_j_local + angular_H_aa_local * psi_j_local
+                for axis in range(3):
+                    elastic_body_block_matrix[elastic_index, axis, column] = (
+                        elastic_body_block_matrix[elastic_index, axis, column] + linear_cross[axis]
+                    )
+                    elastic_body_block_matrix[elastic_index, 3 + axis, column] = (
+                        elastic_body_block_matrix[elastic_index, 3 + axis, column] + angular_cross[axis]
+                    )
+
+            linear_j = H_ll_local * phi_j_local
+            angular_j = angular_H_aa_local * psi_j_local
+            for i in range(mode + 1):
+                phi_i_local = elastic_endpoint_phi[endpoint_mode_start + i]
+                psi_i_local = endpoint_rotation_jacobian * elastic_endpoint_psi[endpoint_mode_start + i]
+                elastic_body_block_matrix[elastic_index, 6 + i, column] = (
+                    elastic_body_block_matrix[elastic_index, 6 + i, column]
+                    + wp.dot(phi_i_local, linear_j)
+                    + wp.dot(psi_i_local, angular_j)
+                )
+    else:
+        elastic_body_block_matrix[elastic_index, column, column] = 1.0
+
+    elastic_body_block_grad[elastic_index, column] = grad
+    diagonal = elastic_body_block_matrix[elastic_index, column, column]
+    elastic_body_block_matrix[elastic_index, column, column] = diagonal + 1.0e-9 * (wp.abs(diagonal) + 1.0)
 
 
 @wp.func
@@ -886,13 +1144,10 @@ def _elastic_excess_momentum(
     qd_start: int,
     mode_start: int,
     mode_count: int,
-    pair_start: int,
-    max_modes: int,
     elastic_mode_coupling_linear: wp.array[wp.vec3],
-    elastic_mode_coupling_angular: wp.array[wp.vec3],
     elastic_mode_coupling_centrifugal: wp.array[wp.mat33],
-    elastic_mode_coupling_coriolis: wp.array[wp.vec3],
-    elastic_mode_coupling_quadratic: wp.array[wp.mat33],
+    elastic_mode_torque_q: wp.array[wp.vec3],
+    elastic_mode_quadratic_q: wp.array[wp.mat33],
     joint_q: wp.array[float],
     joint_q_ref: wp.array[float],
     joint_qd_ref: wp.array[float],
@@ -913,13 +1168,11 @@ def _elastic_excess_momentum(
         qd_start: Index of the first modal velocity in ``joint_qd_ref``.
         mode_start: First per-mode coupling index of the body.
         mode_count: Number of modes of the body.
-        pair_start: First mode-pair index of the body, ``elastic_index * max_modes^2``.
-        max_modes: Padded mode count of the pair arrays.
         elastic_mode_coupling_linear: ``S_i`` [kg].
-        elastic_mode_coupling_angular: ``G_i`` about the frame origin [kg m].
         elastic_mode_coupling_centrifugal: ``B_i`` about the frame origin [kg m].
-        elastic_mode_coupling_coriolis: ``C_ij`` [kg].
-        elastic_mode_coupling_quadratic: ``P_ij`` [kg].
+        elastic_mode_torque_q: ``G_i(q) = G_i + c x S_i - sum_j C_ij q_j`` at ``joint_q`` [kg m]
+            (see :func:`compute_elastic_mode_sums`).
+        elastic_mode_quadratic_q: ``sum_j P_ij q_j`` at ``joint_q`` [kg].
         joint_q: Modal coordinates of this time level.
         joint_q_ref: Modal coordinates of the step start (used when ``use_difference``).
         joint_qd_ref: Stored modal velocities (used otherwise).
@@ -951,14 +1204,8 @@ def _elastic_excess_momentum(
         centrifugal = elastic_mode_coupling_centrifugal[mode_data] - wp.outer(coupling_linear, com)
         trace = centrifugal[0, 0] + centrifugal[1, 1] + centrifugal[2, 2]
         inertia_delta += q_i * (2.0 * trace * wp.identity(3, float) - centrifugal - wp.transpose(centrifugal))
-
-        coupling_angular = elastic_mode_coupling_angular[mode_data] + wp.cross(com, coupling_linear)
-        for j in range(mode_count):
-            pair = pair_start + i * max_modes + j
-            q_j = joint_q[q_start + j]
-            coupling_angular -= elastic_mode_coupling_coriolis[pair] * q_j
-            quadratic += (q_i * q_j) * elastic_mode_coupling_quadratic[pair]
-        g_qd += coupling_angular * qd_i
+        quadratic += elastic_mode_quadratic_q[mode_data] * q_i
+        g_qd += elastic_mode_torque_q[mode_data] * qd_i
 
     quadratic_trace = quadratic[0, 0] + quadratic[1, 1] + quadratic[2, 2]
     inertia_delta += quadratic_trace * wp.identity(3, float) - 0.5 * (quadratic + wp.transpose(quadratic))
@@ -976,12 +1223,12 @@ def accumulate_elastic_frame_coupling(
     elastic_joint: wp.array[wp.int32],
     elastic_mode_start: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
-    elastic_max_mode_count: int,
     elastic_mode_coupling_linear: wp.array[wp.vec3],
-    elastic_mode_coupling_angular: wp.array[wp.vec3],
     elastic_mode_coupling_centrifugal: wp.array[wp.mat33],
-    elastic_mode_coupling_coriolis: wp.array[wp.vec3],
-    elastic_mode_coupling_quadratic: wp.array[wp.mat33],
+    elastic_mode_torque_q: wp.array[wp.vec3],
+    elastic_mode_quadratic_q: wp.array[wp.mat33],
+    elastic_mode_torque_q_prev: wp.array[wp.vec3],
+    elastic_mode_quadratic_q_prev: wp.array[wp.mat33],
     body_q: wp.array[wp.transform],
     body_q_prev: wp.array[wp.transform],
     body_inertia_q: wp.array[wp.transform],
@@ -1012,18 +1259,22 @@ def accumulate_elastic_frame_coupling(
     therefore conserves its physical linear momentum and the result does not depend
     on a uniform velocity boost or on the choice of the frame origin.
 
+    Launch with one thread per reduced elastic body after :func:`compute_elastic_mode_sums` at the
+    iterate and at the step start (``joint_q = joint_q_prev``), which supply the mode-pair sums, so
+    this kernel is linear in the mode count.
+
     Args:
         dt: Time step [s].
         elastic_body: Body index of each reduced elastic body.
         elastic_joint: Owner joint of each reduced elastic body.
         elastic_mode_start: First per-mode coupling index of each body.
         elastic_mode_count: Number of modes of each body.
-        elastic_max_mode_count: Padded mode count of the pair arrays.
         elastic_mode_coupling_linear: ``S_i`` [kg].
-        elastic_mode_coupling_angular: ``G_i`` about the frame origin [kg m].
         elastic_mode_coupling_centrifugal: ``B_i`` about the frame origin [kg m].
-        elastic_mode_coupling_coriolis: ``C_ij`` [kg].
-        elastic_mode_coupling_quadratic: ``P_ij`` [kg].
+        elastic_mode_torque_q: ``G_i(q)`` at the iterate [kg m].
+        elastic_mode_quadratic_q: ``sum_j P_ij q_j`` at the iterate [kg].
+        elastic_mode_torque_q_prev: ``G_i(q)`` at the step start [kg m].
+        elastic_mode_quadratic_q_prev: ``sum_j P_ij q_j`` at the step start [kg].
         body_q: Current iterate of the body poses.
         body_q_prev: Body poses at the step start.
         body_inertia_q: Inertial target poses of the rigid predictor.
@@ -1050,8 +1301,6 @@ def accumulate_elastic_frame_coupling(
     qd_start = body_qd_start + 6
     mode_start = elastic_mode_start[elastic_index]
     mode_count = elastic_mode_count[elastic_index]
-    max_modes = elastic_max_mode_count
-    pair_start = elastic_index * max_modes * max_modes
 
     inv_dt = 1.0 / dt
     com = body_com[body]
@@ -1072,13 +1321,10 @@ def accumulate_elastic_frame_coupling(
         qd_start,
         mode_start,
         mode_count,
-        pair_start,
-        max_modes,
         elastic_mode_coupling_linear,
-        elastic_mode_coupling_angular,
         elastic_mode_coupling_centrifugal,
-        elastic_mode_coupling_coriolis,
-        elastic_mode_coupling_quadratic,
+        elastic_mode_torque_q,
+        elastic_mode_quadratic_q,
         joint_q,
         joint_q_prev,
         joint_qd_prev,
@@ -1093,13 +1339,10 @@ def accumulate_elastic_frame_coupling(
         qd_start,
         mode_start,
         mode_count,
-        pair_start,
-        max_modes,
         elastic_mode_coupling_linear,
-        elastic_mode_coupling_angular,
         elastic_mode_coupling_centrifugal,
-        elastic_mode_coupling_coriolis,
-        elastic_mode_coupling_quadratic,
+        elastic_mode_torque_q_prev,
+        elastic_mode_quadratic_q_prev,
         joint_q_prev,
         joint_q_prev,
         joint_qd_prev,

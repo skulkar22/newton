@@ -14,6 +14,7 @@ import newton
 from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pairs
 from newton._src.solvers.vbd.reduced_elastic_kernels import (
     accumulate_elastic_frame_coupling,
+    compute_elastic_mode_sums,
     create_solve_elastic_body_tiled,
     elastic_block_dense_width,
     launch_solve_elastic_body_dense,
@@ -3370,7 +3371,8 @@ def _launch_frame_coupling(
 ):
     """Launch ``accumulate_elastic_frame_coupling`` for one body and return ``(rot, force, torque)``.
 
-    The iterate rotation is ``exp(dt omega) rot_prev``, the frame origin moves by ``dt velocity``, and the
+    The mode-pair sums come from ``compute_elastic_mode_sums``, as in the solver. The iterate
+    rotation is ``exp(dt omega) rot_prev``, the frame origin moves by ``dt velocity``, and the
     inertial target is displaced so that ``(x_c - x_c*) / dt^2`` equals ``accel_rel``.
     """
     mode_count = basis.mode_count
@@ -3384,6 +3386,45 @@ def _launch_frame_coupling(
     target = position - dt * dt * np.asarray(accel_rel, dtype=np.float64)
     forces = wp.zeros(1, dtype=wp.vec3, device=device)
     torques = wp.zeros(1, dtype=wp.vec3, device=device)
+    coupling_linear = array(basis.mode_coupling_linear, wp.vec3)
+    coupling_centrifugal = array(basis.mode_coupling_centrifugal, wp.mat33)
+    com_array = array([wp.vec3(*com)], wp.vec3)
+    joint_q = array(np.r_[position, rot, q], float)
+    joint_q_prev = array(np.r_[np.zeros(3), rot_prev, q_prev], float)
+    joint_qd_prev = array(np.r_[velocity, omega_prev, qd_prev], float)
+    sums = []
+    for q_sum in (joint_q, joint_q_prev):
+        outputs = [array(np.zeros((mode_count, 3)), wp.vec3), array(np.zeros((mode_count, 3)), wp.vec3)]
+        outputs += [array(np.zeros((mode_count, 3, 3)), wp.mat33), array(np.zeros(mode_count), float)]
+        wp.launch(
+            compute_elastic_mode_sums,
+            dim=(1, mode_count),
+            inputs=[
+                dt,
+                zero_index,
+                zero_index,
+                zero_index,
+                zero_index,
+                array([mode_count], wp.int32),
+                mode_count,
+                com_array,
+                coupling_linear,
+                array(basis.mode_coupling_angular, wp.vec3),
+                array(basis.mode_coupling_coriolis.reshape((-1, 3)), wp.vec3),
+                array(basis.mode_coupling_quadratic.reshape((-1, 3, 3)), wp.mat33),
+                array(basis.mode_mass_matrix.ravel(), float),
+                zero_index,
+                zero_index,
+                q_sum,
+                joint_q_prev,
+                joint_qd_prev,
+            ],
+            outputs=outputs,
+            device=device,
+        )
+        sums.append(outputs)
+    (torque_q, _coriolis_q, quadratic_q, _mass_offdiagonal), (torque_q_prev, _, quadratic_q_prev, _) = sums
+
     wp.launch(
         accumulate_elastic_frame_coupling,
         dim=1,
@@ -3393,23 +3434,23 @@ def _launch_frame_coupling(
             zero_index,
             zero_index,
             array([mode_count], wp.int32),
-            mode_count,
-            array(basis.mode_coupling_linear, wp.vec3),
-            array(basis.mode_coupling_angular, wp.vec3),
-            array(basis.mode_coupling_centrifugal, wp.mat33),
-            array(basis.mode_coupling_coriolis.reshape((-1, 3)), wp.vec3),
-            array(basis.mode_coupling_quadratic.reshape((-1, 3, 3)), wp.mat33),
+            coupling_linear,
+            coupling_centrifugal,
+            torque_q,
+            quadratic_q,
+            torque_q_prev,
+            quadratic_q_prev,
             array([wp.transform(wp.vec3(*position), wp.quat(*rot))], wp.transform),
             array([wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat(*rot_prev))], wp.transform),
             array([wp.transform(wp.vec3(*target), wp.quat(*rot))], wp.transform),
-            array([wp.vec3(*com)], wp.vec3),
+            com_array,
             array([1.0 / float(basis.rigid_mass)], float),
             array([wp.spatial_vector()], wp.spatial_vector),
             zero_index,
             zero_index,
-            array(np.r_[position, rot, q], float),
-            array(np.r_[np.zeros(3), rot_prev, q_prev], float),
-            array(np.r_[velocity, omega_prev, qd_prev], float),
+            joint_q,
+            joint_q_prev,
+            joint_qd_prev,
         ],
         outputs=[forces, torques],
         device=device,
@@ -3559,6 +3600,266 @@ def test_elastic_reduced_mass_matches_brute_force(test, device):
     scale = float(np.max(np.abs(np.diag(expected))))
     # The solve reads the upper triangle.
     np.testing.assert_allclose(np.triu(assembled), np.triu(expected), rtol=0.0, atol=1.0e-5 * scale)
+
+
+def _serial_elastic_block_reference(model, solver, state_in, state_out, control, dt):
+    """Assemble the coupled block of elastic body 0 serially in float64 from the documented formulas.
+
+    Reads the iterate (``state_in.body_q``, ``state_out.joint_q``), the step-start state
+    (``solver.body_q_prev``, ``state_in.joint_q``, ``state_in.joint_qd``), the inertial target, the
+    accumulated body wrench, and the per-attachment joint terms of the solver, and returns the
+    upper triangle of the block and its gradient before contacts and symmetrization, and the
+    rotation angle of every elastic attachment.
+    """
+    ref = elastic_reference
+    max_modes = int(model.elastic_max_mode_count)
+    width = max_modes + 6
+    body = int(model.elastic_body.numpy()[0])
+    mode_count = int(model.elastic_mode_count.numpy()[0])
+    owner = int(model.elastic_joint.numpy()[0])
+    q_start = int(model.joint_q_start.numpy()[owner]) + 7
+    body_qd_start = int(model.joint_qd_start.numpy()[owner])
+    qd_start = body_qd_start + 6
+
+    def f64(array):
+        return array.numpy().astype(np.float64)
+
+    S = f64(model.elastic_mode_coupling_linear)[:mode_count]
+    G = f64(model.elastic_mode_coupling_angular)[:mode_count]
+    B = f64(model.elastic_mode_coupling_centrifugal)[:mode_count]
+    C = f64(model.elastic_mode_coupling_coriolis).reshape(-1, max_modes, max_modes, 3)[0, :mode_count, :mode_count]
+    P = f64(model.elastic_mode_coupling_quadratic).reshape(-1, max_modes, max_modes, 3, 3)[0, :mode_count, :mode_count]
+    Mf = f64(model.elastic_mode_mass_matrix).reshape(-1, max_modes, max_modes)[0, :mode_count, :mode_count]
+    mode_mass = f64(model.elastic_mode_mass)[:mode_count]
+    stiffness = f64(model.elastic_mode_stiffness)[:mode_count]
+    damping = f64(model.elastic_mode_damping)[:mode_count]
+    com = f64(model.body_com)[body]
+    mass = float(model.body_mass.numpy()[body])
+    inertia = f64(model.body_inertia)[body]
+
+    pose = f64(state_in.body_q)[body]
+    pose_prev = f64(solver.body_q_prev)[body]
+    target = f64(solver.body_inertia_q)[body]
+    R = ref.quat_to_matrix(pose[3:7])
+    R_star = ref.quat_to_matrix(target[3:7])
+    q = f64(state_out.joint_q)[q_start : q_start + mode_count]
+    q_prev = f64(state_in.joint_q)[q_start : q_start + mode_count]
+    qd_prev = f64(state_in.joint_qd)[qd_start : qd_start + mode_count]
+    omega_prev = f64(state_in.joint_qd)[body_qd_start + 3 : body_qd_start + 6]
+    joint_f = f64(control.joint_f)[qd_start : qd_start + mode_count]
+    inv_dt = 1.0 / dt
+    inv_dt_sq = inv_dt * inv_dt
+
+    matrix = np.zeros((width, width))
+    grad = np.zeros(width)
+    com_current = pose[:3] + R @ com
+    com_star = target[:3] + R_star @ com
+    force = (com_star - com_current) * mass * inv_dt_sq + f64(solver.body_forces)[body]
+    rot_inv = np.r_[-pose[3:6], pose[6]]
+    theta_body = ref.rotvec_from_quat(ref.quat_multiply(rot_inv, target[3:7]))
+    torque = R @ (inertia @ theta_body) * inv_dt_sq + f64(solver.body_torques)[body]
+    h_ll = f64(solver.body_hessian_ll)[body] + mass * inv_dt_sq * np.eye(3)
+    h_al = f64(solver.body_hessian_al)[body]
+    h_aa = f64(solver.body_hessian_aa)[body] + R @ inertia @ R.T * inv_dt_sq
+    matrix[:3, :3] = R.T @ h_ll @ R
+    matrix[3:6, :3] = R.T @ h_al @ R
+    matrix[:3, 3:6] = (R.T @ h_al @ R).T
+    matrix[3:6, 3:6] = R.T @ h_aa @ R
+    grad[:3] = -R.T @ force
+    grad[3:6] = -R.T @ torque
+
+    # Deformation-dependent inertia about the rest COM.
+    Bc = B - np.einsum("ia,b->iab", S, com)
+    D = np.einsum("i,j,ijab->ab", q, q, P)
+    inertia_delta = sum(q[i] * (2.0 * np.trace(Bc[i]) * np.eye(3) - Bc[i] - Bc[i].T) for i in range(mode_count))
+    inertia_delta = inertia_delta + np.trace(D) * np.eye(3) - 0.5 * (D + D.T)
+    matrix[3:6, 3:6] += inertia_delta * inv_dt_sq
+    linear_angular = -ref.skew(S.T @ q) * inv_dt_sq
+    matrix[:3, 3:6] += linear_angular
+    matrix[3:6, :3] += linear_angular.T
+    G_q = G + np.cross(com, S) - np.einsum("ija,j->ia", C, q)
+    matrix[:3, 6 : 6 + mode_count] += S.T * inv_dt_sq
+    matrix[3:6, 6 : 6 + mode_count] -= G_q.T * inv_dt_sq
+
+    # Modal rows.
+    omega = ref.rotvec_from_quat(ref.quat_multiply(pose[3:7], np.r_[-pose_prev[3:6], pose_prev[6]])) * inv_dt
+    alpha_local = R.T @ (omega - omega_prev) * inv_dt
+    omega_local = R.T @ omega
+    omega_skew_sq = ref.skew(omega_local) @ ref.skew(omega_local)
+    accel_rel = (com_current - com_star) * inv_dt_sq + f64(solver._body_f_integrated)[body][:3] / mass
+    accel_local = R.T @ accel_rel
+    q_dot = (q - q_prev) * inv_dt
+    for i in range(mode_count):
+        modal_force = (
+            joint_f[i]
+            - S[i] @ accel_local
+            + G_q[i] @ alpha_local
+            - np.sum(omega_skew_sq * (Bc[i] + np.einsum("jab,j->ab", P[i], q)))
+            - 2.0 * omega_local @ (C[i].T @ q_dot)
+        )
+        offdiagonal = sum(Mf[i, j] * (q[j] - q_prev[j] - dt * qd_prev[j]) for j in range(mode_count) if j != i)
+        grad[6 + i] = (
+            stiffness[i] * q[i]
+            - modal_force
+            + mode_mass[i] * inv_dt_sq * (q[i] - q_prev[i] - dt * qd_prev[i])
+            + damping[i] * inv_dt * (q[i] - q_prev[i])
+            + offdiagonal * inv_dt_sq
+        )
+        matrix[6 + i, 6 + i] = stiffness[i] + mode_mass[i] * inv_dt_sq + damping[i] * inv_dt
+        for j in range(i + 1, mode_count):
+            matrix[6 + i, 6 + j] = Mf[i, j] * inv_dt_sq
+    for row in range(6 + mode_count, width):
+        matrix[row, row] = 1.0
+
+    # Joints at deformed elastic attachments, from the solver's per-attachment terms.
+    terms = solver._elastic_endpoint_joint_terms
+    adjacency = solver.rigid_adjacency
+    offsets = adjacency.body_adj_joints_offsets.numpy()
+    adjacent = adjacency.body_adj_joints.numpy()
+    parent = model.joint_parent.numpy()
+    parent_endpoint = model.joint_parent_elastic_endpoint.numpy()
+    child_endpoint = model.joint_child_elastic_endpoint.numpy()
+    endpoint_phi = f64(model.elastic_endpoint_phi)
+    endpoint_psi = f64(model.elastic_endpoint_psi)
+    endpoint_angles = []
+    for entry in range(offsets[body], offsets[body + 1]):
+        joint = adjacent[entry]
+        endpoint = parent_endpoint[joint] if parent[joint] == body else child_endpoint[joint]
+        if endpoint < 0:
+            continue
+        F = f64(terms.force)[entry]
+        T = f64(terms.torque)[entry]
+        T_end = f64(terms.endpoint_torque)[entry]
+        H_ll = f64(terms.hessian_ll)[entry]
+        H_al = f64(terms.hessian_al)[entry]
+        H_aa = f64(terms.hessian_aa)[entry]
+        H_end = f64(terms.endpoint_hessian_aa)[entry]
+        theta = endpoint_psi[endpoint * max_modes : endpoint * max_modes + mode_count].T @ q
+        angle = np.linalg.norm(theta)
+        K = ref.skew(theta)
+        jacobian = np.eye(3) + (1.0 - np.cos(angle)) / angle**2 * K + (angle - np.sin(angle)) / angle**3 * K @ K
+        endpoint_angles.append(angle)
+        np.testing.assert_allclose(f64(terms.rotation_jacobian)[entry], jacobian, rtol=0.0, atol=1.0e-6)
+        grad[:3] -= F
+        grad[3:6] -= T
+        matrix[:3, :3] += H_ll
+        matrix[3:6, :3] += H_al
+        matrix[:3, 3:6] += H_al.T
+        matrix[3:6, 3:6] += H_aa
+        phi = endpoint_phi[endpoint * max_modes : endpoint * max_modes + mode_count]
+        psi = endpoint_psi[endpoint * max_modes : endpoint * max_modes + mode_count] @ jacobian.T
+        grad[6 : 6 + mode_count] -= phi @ F + psi @ T_end
+        matrix[:3, 6 : 6 + mode_count] += H_ll @ phi.T
+        matrix[3:6, 6 : 6 + mode_count] += H_al @ phi.T + H_end @ psi.T
+        matrix[6 : 6 + mode_count, 6 : 6 + mode_count] += np.triu(phi @ H_ll @ phi.T + psi @ H_end @ psi.T)
+
+    diagonal = np.diag(matrix).copy()
+    matrix[np.diag_indices(width)] = diagonal + 1.0e-9 * (np.abs(diagonal) + 1.0)
+    return np.triu(matrix), grad, endpoint_angles
+
+
+def test_elastic_parallel_assembly_matches_serial_reference(test, device):
+    """Match the column-parallel block assembly to a serial float64 assembly of the same state.
+
+    A free five-mode body with non-orthogonal modes, an offset rest COM, spin, modal forcing, a fixed
+    joint at one deformed end and a revolute joint to a rigid body at the other is assembled at a
+    random iterate. Every frame, coupling and modal entry of the upper triangle and the gradient must
+    match ``M(q)``, ``I(q)``, ``G(q)``, the modal force and the projected joint terms computed serially.
+    """
+    rng = np.random.default_rng(31)
+    sample_count, mode_count = 24, 5
+    points = rng.uniform((-0.5, -0.1, -0.1), (0.5, 0.1, 0.1), (sample_count, 3)).astype(np.float32)
+    points[0], points[1] = (-0.5, 0.0, 0.0), (0.5, 0.0, 0.0)
+    mass = rng.uniform(0.02, 0.06, sample_count).astype(np.float32)
+    phi = (0.3 * rng.normal(size=(sample_count, mode_count, 3))).astype(np.float32)
+    psi = (0.8 * rng.normal(size=(sample_count, mode_count, 3))).astype(np.float32)
+    basis = newton.ModalBasis(
+        sample_points=points,
+        sample_phi=phi,
+        sample_psi=psi,
+        sample_mass=mass,
+        mode_stiffness=list(rng.uniform(5.0, 50.0, mode_count)),
+        mode_damping=list(rng.uniform(0.0, 0.2, mode_count)),
+    )
+    test.assertGreater(basis.mode_mass_coupling_ratio, 0.05)
+    com = np.asarray(basis.rigid_com, dtype=np.float64)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    body = builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(0.2, -0.1, 0.3), wp.quat_from_axis_angle(wp.vec3(0.3, 0.8, -0.5), 0.7)),
+        com=wp.vec3(*com),
+        mass=float(mass.sum()),
+        inertia=wp.mat33(*elastic_reference.lumped_inertia(points, mass, com).ravel()),
+        modal_basis=basis,
+        mode_q=list(rng.uniform(-0.05, 0.05, mode_count)),
+        mode_qd=list(rng.uniform(-0.5, 0.5, mode_count)),
+    )
+    builder.add_joint_fixed(
+        parent=-1,
+        child=body,
+        parent_xform=wp.transform(wp.vec3(-0.25, -0.1, 0.3), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.5, 0.0, 0.0), wp.quat_identity()),
+    )
+    tip = builder.add_body(xform=wp.transform(wp.vec3(0.7, -0.1, 0.3), wp.quat_identity()), mass=0.3)
+    builder.add_shape_sphere(tip, radius=0.05)
+    builder.add_joint_revolute(
+        parent=body,
+        child=tip,
+        axis=(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.5, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+    )
+    builder.color()
+    model = builder.finalize(device=device)
+    control = model.control()
+    owner = int(model.elastic_joint.numpy()[0])
+    q_start = int(model.joint_q_start.numpy()[owner]) + 7
+    qd_start = int(model.joint_qd_start.numpy()[owner])
+    joint_f = control.joint_f.numpy()
+    joint_f[qd_start + 6 : qd_start + 6 + mode_count] = rng.uniform(-1.0, 1.0, mode_count)
+    control.joint_f.assign(joint_f)
+
+    solver = newton.solvers.SolverVBD(model, iterations=2)
+    state_in, state_out = model.state(), model.state()
+    dt = 1.0 / 120.0
+    solver.step(state_in, state_out, control, None, dt)
+    state_in, state_out = state_out, state_in
+    # A random iterate away from the step start: rotated and displaced frame, perturbed modes.
+    joint_qd = state_in.joint_qd.numpy()
+    joint_qd[qd_start + 3 : qd_start + 6] = (1.5, -2.0, 2.5)
+    state_in.joint_qd.assign(joint_qd)
+    body_q = state_in.body_q.numpy()
+    pose = body_q[body].astype(np.float64)
+    turn = elastic_reference.quat_from_rotvec(dt * np.array([1.4, -2.2, 2.7]))
+    body_q[body, 3:7] = elastic_reference.quat_multiply(turn, pose[3:7])
+    body_q[body, :3] += (0.002, -0.001, 0.003)
+    state_in.body_q.assign(body_q)
+    joint_q = state_in.joint_q.numpy()
+    joint_q[q_start : q_start + mode_count] += rng.uniform(-0.01, 0.01, mode_count)
+    state_out.joint_q.assign(joint_q)
+
+    solver.body_forces.zero_()
+    solver.body_torques.zero_()
+    solver.body_hessian_ll.zero_()
+    solver.body_hessian_al.zero_()
+    solver.body_hessian_aa.zero_()
+    solver._accumulate_elastic_frame_coupling(state_in, state_out, dt)
+    color = next(group for group in model.body_color_groups if body in group.numpy())
+    solver._launch_assemble_elastic_bodies(color, state_in, state_out, control, None, dt)
+
+    width = solver.elastic_body_block_width
+    assembled = np.triu(solver.elastic_body_block_matrix.numpy()[0, :width, :width].astype(np.float64))
+    assembled_grad = solver.elastic_body_block_grad.numpy()[0, :width].astype(np.float64)
+    expected, expected_grad, endpoint_angles = _serial_elastic_block_reference(
+        model, solver, state_in, state_out, control, dt
+    )
+    test.assertEqual(len(endpoint_angles), 2)
+    test.assertGreater(min(endpoint_angles), 1.0e-2)
+    test.assertGreater(np.abs(expected[:6, 6:]).max(), 1.0)
+    # Float32 assembly: the largest deviations are about 1.4e-7 (block) and 9e-8 (gradient) of the scale.
+    scale = float(np.abs(np.diag(expected)).max())
+    np.testing.assert_allclose(assembled, expected, rtol=0.0, atol=5.0e-7 * scale)
+    grad_scale = float(np.abs(expected_grad).max())
+    np.testing.assert_allclose(assembled_grad, expected_grad, rtol=0.0, atol=1.0e-6 * grad_scale)
 
 
 def test_elastic_spinning_com_is_ballistic(test, device):
@@ -3857,10 +4158,10 @@ def test_elastic_uncoupled_body_matches_base_trajectory(test, device):
 
     With ``S = G = B = C = P = 0`` and a diagonal modal mass the frame and the modes are independent,
     so the deformation-dependent inertia terms must add exact zeros. The golden ``joint_q`` series
-    (180 steps) was recorded with the frozen-inertia kernels (integration branch 930e01c1, Warp 1.18.0).
-    CPU results must match bit for bit. CUDA matches bit for bit when FMA contraction is disabled
-    (``fuse_fp=False``); with the default contraction the recompiled kernels may round differently, so
-    CUDA is compared to the CUDA recording within 1e-5.
+    (180 steps) was recorded on the CPU with the frozen-inertia kernels (integration branch 930e01c1,
+    Warp 1.18.0), and CPU results must match it bit for bit. CUDA kernels contract floating-point
+    operations differently, and the spinning frame amplifies that rounding over the trajectory: the
+    base kernels on CUDA end 2.9e-5 from the CPU recording, so CUDA is compared within 5e-5.
     """
     model, state_0, control = _uncoupled_elastic_model(device)
     state_1 = model.state()
@@ -3872,11 +4173,10 @@ def test_elastic_uncoupled_body_matches_base_trajectory(test, device):
         trajectory.append(state_0.joint_q.numpy().copy())
     trajectory = np.asarray(trajectory, dtype=np.float32)
     golden_dir = os.path.join(os.path.dirname(__file__), "golden_data", "test_reduced_elastic_body")
+    golden = np.load(os.path.join(golden_dir, "uncoupled_joint_q_cpu.npy"))
     if wp.get_device(device).is_cuda:
-        golden = np.load(os.path.join(golden_dir, "uncoupled_joint_q_cuda.npy"))
-        np.testing.assert_allclose(trajectory, golden, rtol=0.0, atol=1.0e-5)
+        np.testing.assert_allclose(trajectory, golden, rtol=0.0, atol=5.0e-5)
     else:
-        golden = np.load(os.path.join(golden_dir, "uncoupled_joint_q_cpu.npy"))
         np.testing.assert_array_equal(trajectory.view(np.uint32), golden.view(np.uint32))
 
 
@@ -6602,6 +6902,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_reduced_mass_matches_brute_force",
         test_elastic_reduced_mass_matches_brute_force,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_parallel_assembly_matches_serial_reference",
+        test_elastic_parallel_assembly_matches_serial_reference,
         devices=[device],
     )
     add_function_test(
