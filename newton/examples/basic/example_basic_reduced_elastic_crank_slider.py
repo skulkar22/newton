@@ -126,8 +126,9 @@ class Example:
         )
         self.rod = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*rod_center), _quat_from_angle_z(rod_theta)),
-            mass=0.6,
-            inertia=inertia,
+            mass=rod_basis.rigid_mass,
+            com=wp.vec3(*rod_basis.rigid_com),
+            inertia=wp.mat33(*rod_basis.rigid_inertia.ravel()),
             mode_q=[self.initial_axial_q, 0.025, -0.015],
             modal_basis=rod_basis,
             label="elastic_connecting_rod",

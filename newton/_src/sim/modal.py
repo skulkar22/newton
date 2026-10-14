@@ -2258,6 +2258,21 @@ class ModalGeneratorBeam:
     stiffnesses are the exact Euler-Bernoulli centerline integrals of each shape
     for the uniform section; cross-section rotary inertia is neglected.
 
+    The floating-frame inertia integrals of the returned basis
+    (``mode_coupling_linear``, ``_angular``, ``_centrifugal``, ``_coriolis``,
+    and ``_quadratic``) and its rigid mass, center of mass (the origin), and
+    inertia are integrated over the beam volume by Gauss quadrature, independent
+    of the sample points passed to :meth:`build`. The section is represented by
+    the rectangle with the same area and second moments ``area_moment_y`` and
+    ``area_moment_z``. Like the modal mass, these integrals neglect the rotary
+    inertia of bending (a relative effect of order ``(h / L)^2`` for section
+    height ``h``), so the trace of each mode-pair integral ``P_ii`` equals
+    ``mode_mass``. Torsion modal mass uses ``polar_moment``, whereas the volume
+    integrals use ``area_moment_y + area_moment_z``; the two differ when an
+    explicit ``polar_moment`` (e.g. a torsion constant of a non-circular
+    section) is given, and a ``polar_moment`` below ``area_moment_y +
+    area_moment_z`` can make the reduced mass matrix indefinite.
+
     Mode specifications are dictionaries with a ``type`` from :class:`Mode` and
     optional ``order`` (1-based, default ``1``) and ``boundary`` from
     :class:`Boundary`. Supported combinations:
@@ -2421,6 +2436,20 @@ class ModalGeneratorBeam:
                     * math.sqrt(max(float(mode_mass[i]), 0.0) * max(float(mode_stiffness[i]), 0.0))
                 )
 
+        inertia = self._reduced_inertia()
+        coupling: dict[str, Any] = {}
+        if inertia is not None:
+            coupling = {
+                "mode_coupling_linear": inertia.mode_coupling_linear,
+                "mode_coupling_angular": inertia.mode_coupling_angular,
+                "mode_coupling_centrifugal": inertia.mode_coupling_centrifugal,
+                "mode_coupling_coriolis": inertia.mode_coupling_coriolis,
+                "mode_coupling_quadratic": inertia.mode_coupling_quadratic,
+                "rigid_mass": inertia.rigid_mass,
+                "rigid_com": inertia.rigid_com,
+                "rigid_inertia": inertia.rigid_inertia,
+            }
+
         return ModalBasis(
             sample_points=points,
             sample_phi=sample_phi.astype(np.float32),
@@ -2429,6 +2458,85 @@ class ModalGeneratorBeam:
             mode_stiffness=mode_stiffness,
             mode_damping=mode_damping,
             label=self.label,
+            **coupling,
+        )
+
+    def _section_quadrature(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return 2x2 Gauss points and weights over the equivalent rectangular section.
+
+        The rectangle ``[-hy, hy] x [-hz, hz]`` with ``hy = sqrt(3 I_z / A)`` and
+        ``hz = sqrt(3 I_y / A)`` has the section's area ``A`` and second moments
+        ``I_y = int z^2 dA`` and ``I_z = int y^2 dA``, so the rule integrates
+        ``1``, ``y``, ``z``, ``y^2``, ``z^2``, and ``y z`` exactly. For the default
+        rectangular section it is the section itself.
+
+        Returns:
+            Section coordinates ``y`` and ``z`` [m] and area weights [m^2], each
+            shape ``[4]``.
+        """
+        y_offset = math.sqrt(max(self.area_moment_z, 0.0) / self.area)
+        z_offset = math.sqrt(max(self.area_moment_y, 0.0) / self.area)
+        y = np.array([-y_offset, y_offset, -y_offset, y_offset], dtype=np.float64)
+        z = np.array([-z_offset, -z_offset, z_offset, z_offset], dtype=np.float64)
+        return y, z, np.full(4, 0.25 * self.area, dtype=np.float64)
+
+    def _reduced_inertia(self) -> _ReducedInertia | None:
+        """Integrate the reduced floating-frame inertia of the beam volume.
+
+        Uses composite 4-point Gauss-Legendre quadrature on ``4 * sample_count``
+        equal panels along the beam and the 2x2 rule of
+        :meth:`_section_quadrature` over the section, with point masses
+        ``density * w_x * w_yz``. The integrals therefore do not depend on the
+        sample points passed to :meth:`build`, which typically describe a render
+        or contact surface rather than the beam volume. Bending modes enter
+        with their transverse deflection only (no section rotation), matching
+        the centerline modal mass that neglects rotary inertia, so ``trace(P_ii)``
+        equals the modal mass and the reduced mass matrix stays positive
+        definite for a frame with the rigid properties of the basis. Rigid
+        properties are the exact values of the uniform prism centered at the
+        origin.
+
+        Returns:
+            The reduced inertia integrals, or ``None`` when the beam has no mass.
+        """
+        if self.density <= 0.0 or self.area <= 0.0:
+            return None
+        nodes, weights = np.polynomial.legendre.leggauss(4)
+        panel_count = 4 * self.sample_count
+        panel_length = self.length / panel_count
+        panel_centers = -0.5 * self.length + panel_length * (np.arange(panel_count, dtype=np.float64) + 0.5)
+        x = (panel_centers[:, None] + 0.5 * panel_length * nodes[None, :]).reshape((-1,))
+        x_weights = np.tile(0.5 * panel_length * weights, panel_count)
+        y, z, section_weights = self._section_quadrature()
+
+        points = np.empty((x.shape[0], y.shape[0], 3), dtype=np.float64)
+        points[..., 0] = x[:, None]
+        points[..., 1] = y[None, :]
+        points[..., 2] = z[None, :]
+        points = points.reshape((-1, 3))
+        mass = (self.density * x_weights[:, None] * section_weights[None, :]).reshape((-1,))
+        phi, _ = self._evaluate_modes(points)
+        # Drop the section-rotation (axial) part of bending modes so the inertial field neglects
+        # rotary inertia exactly like the centerline modal mass. Otherwise the coupling integrals
+        # would carry inertia that the modal mass lacks and the reduced mass could turn indefinite.
+        for mode_index, spec in enumerate(self.mode_specs):
+            if spec["type"] in (self.Mode.BENDING_Y, self.Mode.BENDING_Z):
+                phi[:, mode_index, 0] = 0.0
+        integrals = _reduced_inertia_from_pairs(points, phi, mass=mass)
+
+        rigid_mass = self.density * self.area * self.length
+        axial = self.density * self.area * self.length**3 / 12.0
+        rigid_inertia = np.diag(
+            [
+                self.density * self.length * (self.area_moment_y + self.area_moment_z),
+                axial + self.density * self.length * self.area_moment_y,
+                axial + self.density * self.length * self.area_moment_z,
+            ]
+        )
+        return integrals._replace(
+            rigid_mass=float(rigid_mass),
+            rigid_com=np.zeros(3, dtype=np.float32),
+            rigid_inertia=rigid_inertia.astype(np.float32),
         )
 
     def _sample_points(self) -> np.ndarray:

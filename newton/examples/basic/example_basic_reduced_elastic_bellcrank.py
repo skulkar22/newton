@@ -45,7 +45,7 @@ def _angle_from_quat_z(q: np.ndarray) -> float:
     return 2.0 * math.atan2(float(q[2]), float(q[3]))
 
 
-def _beam_basis(length: float, half_width_y: float, half_width_z: float, label: str):
+def _beam_basis(length: float, half_width_y: float, half_width_z: float, mass: float, label: str):
     sample_points = beam_render_sample_points(
         length,
         half_width_y,
@@ -64,7 +64,7 @@ def _beam_basis(length: float, half_width_y: float, half_width_z: float, label: 
                 "order": 1,
             },
         ],
-        density=300.0,
+        density=mass / (4.0 * half_width_y * half_width_z * length),
         young_modulus=8.0e5,
         damping_ratio=0.03,
         label=label,
@@ -145,27 +145,37 @@ class Example:
         rod2_axis = output_tip - bell_output_tip
         rod1_theta = math.atan2(float(rod1_axis[1]), float(rod1_axis[0]))
         rod2_theta = math.atan2(float(rod2_axis[1]), float(rod2_axis[0]))
-        rod1_basis = _beam_basis(self.rod1_rest_length, self.rod_hy, self.rod_hz, "bellcrank_pushrod_1")
-        rod2_basis = _beam_basis(self.rod2_rest_length, self.rod_hy, self.rod_hz, "bellcrank_pushrod_2")
+        rod1_basis = _beam_basis(self.rod1_rest_length, self.rod_hy, self.rod_hz, 0.35, "bellcrank_pushrod_1")
+        rod2_basis = _beam_basis(self.rod2_rest_length, self.rod_hy, self.rod_hz, 0.45, "bellcrank_pushrod_2")
+        # The pushrods take their frame and modal inertia from the beam basis; the damping keeps
+        # the axial and bending damping ratios of the tuned modal stiffness.
+        rod_stiffness = [18000.0, 60.0]
+
+        def rod_damping(basis, ratios):
+            return [
+                2.0 * r * math.sqrt(k * float(m))
+                for r, k, m in zip(ratios, rod_stiffness, basis.mode_mass, strict=True)
+            ]
+
         self.rod1 = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*(0.5 * (input_tip + bell_input_tip))), _quat_from_angle_z(rod1_theta)),
-            mass=0.35,
-            inertia=inertia,
+            mass=rod1_basis.rigid_mass,
+            com=wp.vec3(*rod1_basis.rigid_com),
+            inertia=wp.mat33(*rod1_basis.rigid_inertia.ravel()),
             mode_q=[self.rod1_q0, 0.012],
-            mode_mass=[0.03, 0.025],
-            mode_stiffness=[18000.0, 60.0],
-            mode_damping=[2.0, 0.55],
+            mode_stiffness=rod_stiffness,
+            mode_damping=rod_damping(rod1_basis, (0.043, 0.22)),
             modal_basis=rod1_basis,
             label="elastic_input_pushrod",
         )
         self.rod2 = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*(0.5 * (bell_output_tip + output_tip))), _quat_from_angle_z(rod2_theta)),
-            mass=0.45,
-            inertia=inertia,
+            mass=rod2_basis.rigid_mass,
+            com=wp.vec3(*rod2_basis.rigid_com),
+            inertia=wp.mat33(*rod2_basis.rigid_inertia.ravel()),
             mode_q=[self.rod2_q0, -0.016],
-            mode_mass=[0.035, 0.025],
-            mode_stiffness=[18000.0, 60.0],
-            mode_damping=[2.0, 0.55],
+            mode_stiffness=rod_stiffness,
+            mode_damping=rod_damping(rod2_basis, (0.040, 0.22)),
             modal_basis=rod2_basis,
             label="elastic_output_pushrod",
         )

@@ -5753,6 +5753,70 @@ def test_elastic_endpoint_uses_attachment_frame(test, device):
     test.assertGreater(float(np.max(np.abs(basis.sample_phi[center_node] - basis.frame_phi[0]))), 0.1)
 
 
+def test_modal_generator_beam_gravity_sag_matches_sampled_mass(test, device):
+    """Sag a clamped beam-generator cantilever under gravity like the same shapes with lumped masses."""
+    generator = newton.ModalGeneratorBeam(
+        length=1.0, half_width_y=0.02, half_width_z=0.02, density=1000.0, young_modulus=2.0e8
+    )
+    beam = generator.build()
+    rigid_mass = generator.density * generator.area * generator.length
+    # Midpoint-rule centerline masses plus massless exact root and tip samples, so the clamped
+    # endpoint is not inverse-distance interpolated.
+    count = 64
+    x = np.concatenate((-0.5 + (np.arange(count) + 0.5) / count, [-0.5, 0.5]))
+    centerline = np.stack((x, np.zeros_like(x), np.zeros_like(x)), axis=1).astype(np.float32)
+    phi, psi = generator._evaluate_modes(centerline)
+    sampled = newton.ModalBasis(
+        sample_points=centerline,
+        sample_phi=phi,
+        sample_psi=psi,
+        sample_mass=np.concatenate((np.full(count, rigid_mass / count), [0.0, 0.0])),
+        mode_mass=beam.mode_mass,
+        mode_stiffness=beam.mode_stiffness,
+    )
+    test.assertIsNotNone(beam.mode_coupling_linear)
+    beam_s = float(beam.mode_coupling_linear[0, 2])
+    sampled_s = float(sampled.mode_coupling_linear[0, 2])
+    test.assertLess(abs(beam_s - sampled_s), 2.0e-2 * abs(sampled_s))
+
+    stiffness = float(beam.mode_stiffness[0])
+    damping = [2.0 * 0.5 * math.sqrt(stiffness * float(beam.mode_mass[0]))]
+    inertia = wp.mat33(*np.diag([1.0e-4, rigid_mass / 12.0, rigid_mass / 12.0]).ravel())
+
+    def sag(basis):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_link_elastic(
+            xform=wp.transform(wp.vec3(0.5, 0.0, 1.0), wp.quat_identity()),
+            mass=rigid_mass,
+            inertia=inertia,
+            modal_basis=basis,
+            mode_damping=damping,
+        )
+        joint = builder.add_joint_fixed(
+            parent=-1,
+            child=body,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.5, 0.0, 0.0), wp.quat_identity()),
+        )
+        builder.add_articulation([builder.body_elastic_joint[body], joint])
+        builder.color()
+        model = builder.finalize(device=device)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        solver = newton.solvers.SolverVBD(model, iterations=16)
+        q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])]) + 7
+        for _ in range(300):
+            solver.step(state_0, state_1, control, None, 1.0 / 600.0)
+            state_0, state_1 = state_1, state_0
+        return float(state_0.joint_q.numpy()[q_start])
+
+    beam_q = sag(beam)
+    sampled_q = sag(sampled)
+    static_q = -9.81 * sampled_s / stiffness
+    test.assertLess(sampled_q, 0.0)
+    test.assertLess(abs(beam_q - sampled_q), 5.0e-2 * abs(sampled_q))
+    test.assertLess(abs(beam_q - static_q), 5.0e-2 * abs(static_q))
+
+
 class TestReducedElasticBody(unittest.TestCase):
     def test_reduced_inertia_pairs_match_brute_force(self):
         """Match the GEMM pair tensor and derived integrals to brute-force sums for lumped and consistent mass."""
@@ -6113,6 +6177,82 @@ class TestReducedElasticBody(unittest.TestCase):
             rescaled = diagonal.mass_orthonormalize()
         np.testing.assert_allclose(rescaled.mode_stiffness, [2.0], rtol=1.0e-6)
         np.testing.assert_allclose(rescaled.sample_phi, phi[:1, :1] / 2.0, rtol=1.0e-6)
+
+    def test_modal_generator_beam_rigid_properties(self):
+        """Integrate beam rigid properties and inertia couplings over the volume, not the sample points."""
+        generator = newton.ModalGeneratorBeam(
+            length=1.2,
+            half_width_y=0.03,
+            half_width_z=0.05,
+            density=800.0,
+            mode_specs=[
+                {"type": "bending_z"},
+                {"type": "bending_z", "order": 2},
+                {"type": "bending_y"},
+                {"type": "torsion"},
+                {"type": "axial", "boundary": "fixed-free"},
+            ],
+        )
+        surface = np.array([[-0.6, 0.03, 0.05], [0.6, -0.03, 0.05], [0.0, 0.03, -0.05]], dtype=np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            basis = generator.build(sample_points=surface)
+        self.assertIsNone(basis.sample_mass)
+
+        density, area, length = generator.density, generator.area, generator.length
+        i_y, i_z = generator.area_moment_y, generator.area_moment_z
+        self.assertAlmostEqual(basis.rigid_mass, density * area * length, places=5)
+        np.testing.assert_allclose(basis.rigid_com, 0.0, atol=0.0)
+        expected_inertia = density * np.diag(
+            [
+                length * (i_y + i_z),
+                area * length**3 / 12.0 + length * i_y,
+                area * length**3 / 12.0 + length * i_z,
+            ]
+        )
+        np.testing.assert_allclose(basis.rigid_inertia, expected_inertia, rtol=1.0e-6)
+
+        # Like the centerline modal mass, the pair integrals neglect bending rotary inertia.
+        trace = np.einsum("iicc->i", basis.mode_coupling_quadratic.astype(np.float64))
+        np.testing.assert_allclose(trace, basis.mode_mass, rtol=1.0e-5)
+        self.assertLess(basis.mode_mass_coupling_ratio, 1.0e-5)
+
+        # The reduced mass matrix of a frame with the basis's rigid properties is positive definite.
+        frame_mass = np.zeros((6, 6))
+        frame_mass[:3, :3] = basis.rigid_mass * np.eye(3)
+        frame_mass[3:, 3:] = basis.rigid_inertia
+        cross = np.hstack((basis.mode_coupling_linear, basis.mode_coupling_angular)).T
+        reduced_mass = np.block([[frame_mass, cross], [cross.T, basis.mode_mass_matrix]])
+        self.assertGreater(float(np.linalg.eigvalsh(reduced_mass.astype(np.float64))[0]), 0.0)
+
+        # Linear coupling matches a fine centerline line-mass integral.
+        count = 4000
+        x = -0.5 * length + length * (np.arange(count) + 0.5) / count
+        line = np.stack((x, np.zeros(count), np.zeros(count)), axis=1)
+        line_phi, _ = generator._evaluate_modes(line)
+        expected_linear = density * area * length / count * line_phi.sum(axis=0)
+        np.testing.assert_allclose(basis.mode_coupling_linear, expected_linear, rtol=1.0e-4, atol=1.0e-6)
+        self.assertGreater(abs(float(basis.mode_coupling_linear[0, 2])), 0.1)
+
+        # A section given by its area and second moments uses the equivalent rectangle; the torsion
+        # pair integral uses I_y + I_z even when an explicit polar_moment differs.
+        section = newton.ModalGeneratorBeam(
+            length=1.0,
+            mode_specs=[{"type": "torsion"}],
+            density=1000.0,
+            area=2.0e-3,
+            area_moment_y=3.0e-7,
+            area_moment_z=1.0e-7,
+            polar_moment=2.0e-7,
+        ).build()
+        np.testing.assert_allclose(
+            np.diag(section.rigid_inertia),
+            1000.0 * np.array([4.0e-7, 2.0e-3 / 12.0 + 3.0e-7, 2.0e-3 / 12.0 + 1.0e-7]),
+            rtol=1.0e-6,
+        )
+        torsion_trace = float(np.einsum("cc->", section.mode_coupling_quadratic[0, 0]))
+        np.testing.assert_allclose(torsion_trace, 1000.0 * 4.0e-7 / 2.0, rtol=1.0e-5)
+        np.testing.assert_allclose(section.mode_mass, [1000.0 * 2.0e-7 / 2.0], rtol=1.0e-6)
 
 
 for device in devices:
@@ -6955,6 +7095,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_endpoint_uses_attachment_frame",
         test_elastic_endpoint_uses_attachment_frame,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_beam_gravity_sag_matches_sampled_mass",
+        test_modal_generator_beam_gravity_sag_matches_sampled_mass,
         devices=[device],
     )
 

@@ -251,12 +251,19 @@ def _make_elastic_fourbar_model(device):
         length=b_rest,
         half_width_y=0.05,
         half_width_z=0.03,
+        density=1.0 / (4.0 * 0.05 * 0.03 * b_rest),
         mode_specs=[
             {"type": beam.Mode.AXIAL},
             {"type": beam.Mode.BENDING_Y, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
             {"type": beam.Mode.BENDING_Y, "boundary": beam.Boundary.PINNED_PINNED, "order": 2},
         ],
     ).build()
+    # As in the four-bar example, the 1 kg coupler takes its frame and modal inertia from the basis.
+    stiffness = [10.0, 18.0, 288.0]
+    damping = [
+        2.0 * r * math.sqrt(k * float(m))
+        for r, k, m in zip((0.24, 0.19, 0.10), stiffness, basis.mode_mass, strict=True)
+    ]
 
     def rotation_z(angle):
         return wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle)
@@ -271,12 +278,12 @@ def _make_elastic_fourbar_model(device):
     )
     coupler = builder.add_link_elastic(
         xform=wp.transform(wp.vec3(*(crank_tip + 0.5 * (b_rest + float(mode_q0[0])) * e3)), rotation_z(theta3)),
-        mass=1.0,
-        inertia=inertia,
+        mass=basis.rigid_mass,
+        com=wp.vec3(*basis.rigid_com),
+        inertia=wp.mat33(*basis.rigid_inertia.ravel()),
         mode_count=3,
-        mode_mass=[0.04, 0.035, 0.035],
-        mode_stiffness=[10.0, 18.0, 288.0],
-        mode_damping=[0.3, 0.3, 0.65],
+        mode_stiffness=stiffness,
+        mode_damping=damping,
         mode_q=mode_q0,
         modal_basis=basis,
     )
