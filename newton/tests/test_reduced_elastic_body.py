@@ -4245,14 +4245,20 @@ def test_vbd_elastic_block_solve_falls_back_when_indefinite(test, device):
     np.testing.assert_allclose(solved[1], expected_fallback, rtol=1.0e-5, atol=1.0e-6)
 
 
-def _launch_elastic_block_solve(device, width, matrix, grad, mode_counts):
-    """Launch the tiled block solve on symmetric ``matrix`` blocks and return the deltas."""
+def _launch_elastic_block_solve(device, width, matrix, grad, mode_counts, block_dim=32, modal_outputs=None):
+    """Launch the tiled block solve on symmetric ``matrix`` blocks and return the deltas.
+
+    Every body shares one zero-initialized modal coordinate range; ``modal_outputs``, when given, is a
+    list that receives the updated ``joint_q`` and ``joint_qd`` arrays.
+    """
     block_count, stored_width = grad.shape
     kernel = create_solve_elastic_body_tiled(width)
     delta = wp.zeros((block_count, stored_width), dtype=float, device=device)
     metrics = [wp.zeros(block_count, dtype=float, device=device) for _ in range(5)]
     body_ids = wp.array(np.arange(block_count), dtype=wp.int32, device=device)
     mode_dof_count = int(np.max(mode_counts)) + 1
+    joint_q = wp.zeros(mode_dof_count + 7, dtype=float, device=device)
+    joint_qd = wp.zeros(mode_dof_count + 6, dtype=float, device=device)
     wp.launch_tiled(
         kernel=kernel,
         dim=[block_count],
@@ -4277,12 +4283,14 @@ def _launch_elastic_block_solve(device, width, matrix, grad, mode_counts):
         ],
         outputs=[
             wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
-            wp.zeros(mode_dof_count + 7, dtype=float, device=device),
-            wp.zeros(mode_dof_count + 6, dtype=float, device=device),
+            joint_q,
+            joint_qd,
         ],
-        block_dim=32,
+        block_dim=block_dim,
         device=device,
     )
+    if modal_outputs is not None:
+        modal_outputs.extend((joint_q.numpy(), joint_qd.numpy()))
     return delta.numpy()
 
 
@@ -4473,8 +4481,11 @@ def test_vbd_elastic_block_dense_matches_tiled_step(test, device):
     np.testing.assert_allclose(results["dense"][1], results["tiled"][1], rtol=1.0e-4, atol=1.0e-6)
 
 
-def _launch_elastic_block_solve_dense(device, width, matrix, grad, mode_counts):
-    """Run the dense block solve on symmetric ``matrix`` blocks and return the deltas."""
+def _launch_elastic_block_solve_dense(device, width, matrix, grad, mode_counts, modal_outputs=None):
+    """Run the dense block solve on symmetric ``matrix`` blocks and return the deltas.
+
+    ``modal_outputs`` is handled as in :func:`_launch_elastic_block_solve`.
+    """
     block_count = grad.shape[0]
     dense_width = elastic_block_dense_width(width)
     stored_matrix = np.tile(np.eye(dense_width, dtype=np.float32), (block_count, 1, 1))
@@ -4488,6 +4499,8 @@ def _launch_elastic_block_solve_dense(device, width, matrix, grad, mode_counts):
     delta = wp.zeros((block_count, dense_width), dtype=float, device=device)
     factor = wp.zeros((block_count, dense_width, dense_width), dtype=float, device=device)
     mode_dof_count = int(np.max(mode_counts)) + 1
+    joint_q = wp.zeros(mode_dof_count + 7, dtype=float, device=device)
+    joint_qd = wp.zeros(mode_dof_count + 6, dtype=float, device=device)
     launch_solve_elastic_body_dense(
         width,
         body_ids,
@@ -4517,11 +4530,13 @@ def _launch_elastic_block_solve_dense(device, width, matrix, grad, mode_counts):
         ],
         [
             wp.array([wp.transform_identity()] * block_count, dtype=wp.transform, device=device),
-            wp.zeros(mode_dof_count + 7, dtype=float, device=device),
-            wp.zeros(mode_dof_count + 6, dtype=float, device=device),
+            joint_q,
+            joint_qd,
         ],
         device,
     )
+    if modal_outputs is not None:
+        modal_outputs.extend((joint_q.numpy(), joint_qd.numpy()))
     return delta.numpy()[:, :width]
 
 
@@ -4565,6 +4580,35 @@ def test_vbd_elastic_block_dense_solve_falls_back_when_indefinite(test, device):
     diagonal = np.diag(matrix[1])
     expected_fallback = np.where(diagonal > 0.0, -grad[1] / np.where(diagonal > 0.0, diagonal, 1.0), 0.0)
     np.testing.assert_allclose(delta[1], expected_fallback, rtol=1.0e-5, atol=1.0e-6)
+
+
+def test_vbd_elastic_block_solve_applies_update_once(test, device):
+    """Increment every modal coordinate exactly once in multi-warp tiled and dense block solves.
+
+    The modal update reads and writes ``joint_q`` in place. Executed by every thread of a CUDA block
+    with more than one warp, threads that read a coordinate after another warp updated it applied
+    the increment twice (about 40 % of the maximum increment at widths 126 and 157 with 128 and
+    256 threads).
+    """
+    rng = np.random.default_rng(29)
+    cases = [("tiled", 70, 32), ("tiled", 126, 128), ("tiled", 157, 256), ("dense", 262, 0)]
+    for path, width, block_dim in cases:
+        a = rng.standard_normal((width, width))
+        matrix = (a @ a.T / width + np.eye(width)).astype(np.float32)[None]
+        grad = rng.standard_normal((1, width)).astype(np.float32)
+        outputs = []
+        if path == "tiled":
+            delta = _launch_elastic_block_solve(
+                device, width, matrix, grad, [width - 6], block_dim=block_dim, modal_outputs=outputs
+            )[0]
+        else:
+            delta = _launch_elastic_block_solve_dense(device, width, matrix, grad, [width - 6], modal_outputs=outputs)[
+                0
+            ]
+        joint_q, joint_qd = outputs
+        modes = delta[6:width]
+        np.testing.assert_array_equal(joint_q[7 : 7 + width - 6], modes, err_msg=f"{path} width={width}")
+        np.testing.assert_allclose(joint_qd[6:width], modes / 0.01, rtol=1.0e-6, err_msg=f"{path} width={width}")
 
 
 def test_vbd_elastic_block_capacity_steps_at_tiled_limit(test, device):
@@ -6957,6 +7001,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_elastic_block_dense_solve_falls_back_when_indefinite",
         test_vbd_elastic_block_dense_solve_falls_back_when_indefinite,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_block_solve_applies_update_once",
+        test_vbd_elastic_block_solve_applies_update_once,
         devices=[device],
     )
     add_function_test(

@@ -1389,8 +1389,9 @@ def _apply_elastic_block_delta(
 ):
     """Record optional metrics and apply a relaxed block increment to the frame and modes.
 
-    Every thread of the block executes this redundantly and reads the increment it wrote
-    itself to ``elastic_body_block_delta``, so no barrier is required.
+    The modal update reads and writes ``joint_q``, so only one thread per body may execute
+    this. It reads the increment that the same thread wrote to ``elastic_body_block_delta``,
+    so no barrier is required.
     """
     owner_joint = elastic_joint[elastic_index]
     q_start = joint_q_start[owner_joint] + 7
@@ -1528,7 +1529,8 @@ def create_solve_elastic_body_tiled(block_width: int):
         joint_q: wp.array[float],
         joint_qd: wp.array[float],
     ):
-        body = body_ids[wp.tid()]
+        slot, lane = wp.tid()
+        body = body_ids[slot]
         elastic_index = body_elastic_index[body]
         if elastic_index < 0:
             return
@@ -1538,6 +1540,10 @@ def create_solve_elastic_body_tiled(block_width: int):
         wp.tile_cholesky_inplace(factor)
         wp.tile_cholesky_solve_inplace(factor, solution)
 
+        # The update increments joint_q in place: one thread per body, or threads of a
+        # multi-warp block that read an already updated coordinate would apply it twice.
+        if lane != 0:
+            return
         solution_is_finite = bool(True)
         for i in range(width):
             if not wp.isfinite(solution[i]):
@@ -1757,7 +1763,7 @@ def create_solve_elastic_body_dense(block_width: int):
         joint_q: wp.array[float],
         joint_qd: wp.array[float],
     ):
-        slot = wp.tid()
+        slot, lane = wp.tid()
         body = body_ids[slot]
         elastic_index = body_elastic_index[body]
         if elastic_index < 0:
@@ -1792,6 +1798,9 @@ def create_solve_elastic_body_dense(block_width: int):
             )
             wp.tile_upper_solve_inplace(wp.tile_transpose(factor_kk), solution_k)
 
+        # Single-thread update, as in the tiled solve.
+        if lane != 0:
+            return
         solution_is_finite = bool(True)
         for i in range(width):
             if not wp.isfinite(solution[i, 0]):
