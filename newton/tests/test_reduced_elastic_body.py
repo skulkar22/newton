@@ -983,6 +983,57 @@ def test_modal_generator_fem_rejects_mechanism(test, device):
     with test.assertRaisesRegex(ValueError, "does not preserve rigid-body motion"):
         newton.ModalGeneratorFEM(points, mass, broken, mode_count=4).build()
 
+    # The fixed DOFs admit no rigid motion here, so the bar sliding along x away from the fixed node
+    # is a mechanism, not remaining rigid-body motion, although it translates every free DOF.
+    line = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+    loose = _truss_stiffness(line, [(1, 2)], [1.0])
+    with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
+        newton.ModalGeneratorFEM(line, np.eye(9), loose, fixed_dof_indices=[0, 1, 2, 4, 5, 7, 8]).build()
+
+
+def _truss_stiffness(points, bars, bar_stiffness):
+    """Assemble the stiffness matrix [N/m] of axial bars between ``points``."""
+    points = np.asarray(points, dtype=np.float64)
+    stiffness = np.zeros((3 * points.shape[0], 3 * points.shape[0]), dtype=np.float64)
+    for (a, b), k in zip(bars, bar_stiffness, strict=True):
+        direction = points[b] - points[a]
+        direction /= np.linalg.norm(direction)
+        block = k * np.outer(direction, direction)
+        for i, j, sign in ((a, a, 1.0), (b, b, 1.0), (a, b, -1.0), (b, a, -1.0)):
+            stiffness[3 * i : 3 * i + 3, 3 * j : 3 * j + 3] += sign * block
+    return stiffness
+
+
+def test_modal_generator_fem_wide_spectrum_keeps_soft_modes(test, device):
+    """Keep every elastic mode of models whose spectrum spans many decades.
+
+    A soft mount (k = 1 N/m) in series with a stiff bar (k = 1e9 N/m) has modes at about 0.11 Hz and
+    7.1 kHz, an eigenvalue ratio of 4e9; a free-free tetrahedron with one soft bar has a ratio of
+    about 1e10. Both are valid elastic models and must build at the default settings.
+    """
+    line = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+    stiffness = _truss_stiffness(line, [(0, 1), (1, 2)], [1.0, 1.0e9])
+    mass = np.eye(9)
+    fixed = [0, 1, 2, 4, 5, 7, 8]
+    free = [3, 6]
+    reference = _generalized_eigenvalues(mass[np.ix_(free, free)], stiffness[np.ix_(free, free)])
+    generator = newton.ModalGeneratorFEM(line, mass, stiffness, fixed_dof_indices=fixed)
+    basis = generator.build()
+    test.assertEqual(basis.mode_count, 2)
+    test.assertEqual(generator.rigid_mode_count, 0)
+    np.testing.assert_allclose(generator.eigenvalues, reference, rtol=1.0e-6)
+    test.assertGreater(float(reference[1] / reference[0]), 1.0e9)
+
+    tet = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    bars = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    stiffness = _truss_stiffness(tet, bars, [1.0e10] * 5 + [1.0])
+    reference = _generalized_eigenvalues(np.eye(12), stiffness)
+    generator = newton.ModalGeneratorFEM(tet, np.eye(12), stiffness)
+    basis = generator.build()
+    test.assertEqual(generator.rigid_mode_count, 6)
+    test.assertEqual(basis.mode_count, 6)
+    np.testing.assert_allclose(generator.eigenvalues, reference[6:], rtol=1.0e-6)
+
 
 def test_modal_generator_fem_damping_projection(test, device):
     """Record, warn about, or reject non-diagonal projected FEM damping."""
@@ -7638,6 +7689,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_implicit_mass_coupling_requires_spd_block",
         test_vbd_implicit_mass_coupling_requires_spd_block,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_modal_generator_fem_wide_spectrum_keeps_soft_modes",
+        test_modal_generator_fem_wide_spectrum_keeps_soft_modes,
         devices=[device],
     )
     add_function_test(

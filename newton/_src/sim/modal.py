@@ -1830,6 +1830,16 @@ class ModalGeneratorFEM:
     mode. Remaining zero-energy mechanisms are rejected unless they are skipped
     deliberately with ``discard_mode_count``.
 
+    An eigenvalue counts as zero energy when it is at most
+    ``eigenvalue_tolerance`` times the largest eigenvalue magnitude, so models
+    whose elastic spectrum spans many decades, such as a soft mount in series
+    with a stiff member, keep all their elastic modes. The threshold never drops
+    below the accuracy of the double-precision eigensolver,
+    ``8 * free_dof_count * eps`` relative to the largest eigenvalue. For a
+    constrained model, an unconstrained mechanism is reported as remaining
+    rigid-body motion only when it overlaps a rigid motion that the fixed DOFs
+    admit.
+
     Damping is not part of the eigenproblem. ``damping_matrix`` is projected onto
     the selected modes and only its diagonal is stored; see
     ``damping_projection``. Unlike :class:`ModalGeneratorCraigBampton`, the
@@ -1863,9 +1873,11 @@ class ModalGeneratorFEM:
         discard_mode_count: Number of lowest elastic modes to skip after
             rigid-body modes have been removed; rigid modes of free-free models
             are detected automatically.
-        eigenvalue_tolerance: Relative eigenvalue threshold, scaled by
-            ``max(max |lambda|, 1)``, below which a non-rigid mode is treated as
-            a zero-energy mechanism.
+        eigenvalue_tolerance: Eigenvalue threshold relative to the largest
+            eigenvalue magnitude, at or below which a non-rigid mode is treated
+            as a zero-energy mechanism. The default is set by the accuracy of
+            the double-precision eigensolver; values below
+            ``8 * free_dof_count * eps`` are raised to that floor.
         damping_ratio: Modal damping ratio used when ``damping_matrix`` is not
             provided.
         derive_psi: Whether to estimate angular mode samples from the
@@ -1896,7 +1908,7 @@ class ModalGeneratorFEM:
         fixed_node_indices: Sequence[int] | np.ndarray | None = None,
         fixed_dof_indices: Sequence[int] | np.ndarray | None = None,
         discard_mode_count: int = 0,
-        eigenvalue_tolerance: float = 1.0e-8,
+        eigenvalue_tolerance: float = 1.0e-12,
         damping_ratio: float = 0.0,
         derive_psi: bool = False,
         label: str | None = None,
@@ -1989,6 +2001,23 @@ class ModalGeneratorFEM:
             raise ValueError(f"{name} must have shape ({size}, {size}), got {array.shape}")
         return 0.5 * (array + array.T)
 
+    def _admissible_rigid_vectors(self) -> np.ndarray:
+        """Return the rigid motions that leave every fixed DOF at rest, shape ``[dof_count, k]``.
+
+        For a free model these are all rigid translations and rotations. For a
+        constrained model they span the null space of the rigid vectors
+        restricted to the fixed DOFs, which is empty when the constraints
+        remove all rigid-body motion.
+        """
+        rigid = self._rigid_vectors()
+        if self.fixed_dof_indices.shape[0] == 0:
+            return rigid
+        # Normalize the columns so the rank test does not depend on the body size.
+        rigid = rigid / np.maximum(np.linalg.norm(rigid, axis=0), np.finfo(np.float64).tiny)
+        _, singular_values, right = np.linalg.svd(rigid[self.fixed_dof_indices], full_matrices=True)
+        rank = int(np.count_nonzero(singular_values > 1.0e-10))
+        return rigid @ right[rank:].T
+
     def _rigid_vectors(self) -> np.ndarray:
         """Return nodal rigid translations and rotations about the mass center, shape ``[dof_count, 6]``."""
         positions = self._node_positions64
@@ -2009,6 +2038,8 @@ class ModalGeneratorFEM:
     @staticmethod
     def _mass_orthonormal_columns(vectors: np.ndarray, mass: np.ndarray) -> np.ndarray:
         """Return an ``M``-orthonormal basis of the column span of ``vectors``, dropping dependent directions."""
+        if vectors.shape[1] == 0:
+            return vectors
         gram = vectors.T @ mass @ vectors
         gram = 0.5 * (gram + gram.T)
         values, rotation = np.linalg.eigh(gram)
@@ -2049,13 +2080,16 @@ class ModalGeneratorFEM:
         eigenvalues = eigenvalues[order]
         eigenvectors = eigenvectors[:, order]
         eigen_modes = np.linalg.solve(chol.T, eigenvectors)
-        eigenvalue_scale = max(float(np.max(np.abs(eigenvalues))), 1.0)
-        zero_threshold = self.eigenvalue_tolerance * eigenvalue_scale
+        # Relative to the largest eigenvalue: a genuine elastic mode far below a stiff one stays
+        # elastic, while eigenvalues within the eigensolver's roundoff of zero are zero energy.
+        eigenvalue_scale = float(np.max(np.abs(eigenvalues)))
+        relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * free.shape[0] * np.finfo(np.float64).eps)
+        zero_threshold = relative_tolerance * eigenvalue_scale
 
-        rigid_free = self._rigid_vectors()[free]
+        rigid_free = self._admissible_rigid_vectors()[free]
         rigid_basis = self._mass_orthonormal_columns(rigid_free, mass)
         zero_indices = np.nonzero(eigenvalues <= zero_threshold)[0]
-        if zero_indices.shape[0] > 1:
+        if zero_indices.shape[0] > 1 and rigid_basis.shape[1] > 0:
             # Rigid modes and mechanisms share one degenerate zero-energy eigenspace, in which the
             # eigensolver returns arbitrary mixtures. Rotate that subspace so leading vectors align
             # with rigid-body motion before the per-mode overlap test.
@@ -2100,7 +2134,7 @@ class ModalGeneratorFEM:
                 )
             raise ValueError(
                 f"The model has {mechanism_count} zero-energy mechanism modes with eigenvalues at or below "
-                f"{zero_threshold:.3g} 1/s^2 (relative tolerance {self.eigenvalue_tolerance:.3g}); fix the "
+                f"{zero_threshold:.3g} 1/s^2 (relative tolerance {relative_tolerance:.3g}); fix the "
                 f"stiffness model, or set discard_mode_count >= {mechanism_count} to drop them deliberately"
             )
 
