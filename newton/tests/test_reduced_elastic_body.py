@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import math
 import os
 import tracemalloc
@@ -106,6 +107,28 @@ _RIGID_ALM_MODES = (False, True)
 _ALM_CONVERGED_ITERATIONS = 16
 
 
+@contextlib.contextmanager
+def _legacy_alm_allowed():
+    """Suppress only the ``rigid_compliant_alm=False`` deprecation warning.
+
+    Used where the deprecated legacy AVBD path is exercised deliberately: the rigid-ALM sweeps and
+    examples that stay on the legacy path.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="rigid_compliant_alm=False is deprecated", category=DeprecationWarning
+        )
+        yield
+
+
+def _make_vbd_solver(model, *, compliant: bool, **kwargs):
+    """Create a VBD solver on the compliant ALM path or on the legacy AVBD path."""
+    if compliant:
+        return newton.solvers.SolverVBD(model, rigid_compliant_alm=True, **kwargs)
+    with _legacy_alm_allowed():
+        return newton.solvers.SolverVBD(model, rigid_compliant_alm=False, **kwargs)
+
+
 def _vbd_fixed_joint_solver(
     model,
     *,
@@ -129,10 +152,10 @@ def _vbd_fixed_joint_solver(
         "rigid_joint_angular_kd": angular_kd,
     }
     if compliant:
-        return newton.solvers.SolverVBD(model, rigid_compliant_alm=True, iterations=iterations, **stiffness, **kwargs)
-    return newton.solvers.SolverVBD(
+        return _make_vbd_solver(model, compliant=True, iterations=iterations, **stiffness, **kwargs)
+    return _make_vbd_solver(
         model,
-        rigid_compliant_alm=False,
+        compliant=False,
         iterations=iterations,
         rigid_joint_linear_k_start=linear_k,
         rigid_joint_angular_k_start=angular_k,
@@ -153,6 +176,11 @@ def _first_solve_joint_k(solver, joint: int, slot: int, material_k: float, compl
     row = int(solver.joint_constraint_start.numpy()[joint]) + slot
     rho = float(solver.joint_rho.numpy()[row])
     return material_k * rho / (material_k + rho)
+
+
+# Nominal frame mass properties for layout tests whose few-sample bases have a degenerate rigid
+# inertia. These tests never step a solver, so the frame need not match the basis.
+_NOMINAL_FRAME = {"mass": 1.0, "inertia": _identity_inertia(), "inertia_tolerance": None}
 
 
 def _quat_from_angle_z(theta: float):
@@ -1318,7 +1346,7 @@ def test_elastic_mode_coupling_arrays(test, device):
         sample_mass=[1.0, 1.0],
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="coupled")
+    builder.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis, label="coupled")
     builder.add_body_elastic(
         mass=1.0, inertia=_identity_inertia(), mode_count=1, mode_mass=[1.0], mode_stiffness=[1.0], label="plain"
     )
@@ -1348,8 +1376,8 @@ def test_elastic_coriolis_array_padding(test, device):
         sample_mass=[2.0],
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_a, label="a")
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_b, label="b")
+    builder.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis_a, label="a")
+    builder.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis_b, label="b")
     builder.color()
     model = builder.finalize(device=device)
 
@@ -1367,7 +1395,7 @@ def test_elastic_mode_coupling_arrays_merge(test, device):
         sample_mass=[1.0, 1.0],
     )
     sub = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    sub.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="e")
+    sub.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis, label="e")
     main = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     main.add_builder(sub)
     main.add_builder(sub)
@@ -1392,9 +1420,9 @@ def test_elastic_coriolis_array_merge_different_mode_count(test, device):
         sample_mass=[2.0],
     )
     sub_a = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    sub_a.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_a, label="a")
+    sub_a.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis_a, label="a")
     sub_b = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    sub_b.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_b, label="b")
+    sub_b.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis_b, label="b")
     main = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     main.add_builder(sub_a)
     main.add_builder(sub_b)
@@ -1430,9 +1458,9 @@ def test_elastic_mode_pair_arrays_padding(test, device):
         sample_mass=[1.0, 2.0],
     )
     sub = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    sub.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_b, label="b")
+    sub.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis_b, label="b")
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis_a, label="a")
+    builder.add_body_elastic(**_NOMINAL_FRAME, modal_basis=basis_a, label="a")
     builder.add_builder(sub)
     builder.add_body_elastic(
         mass=1.0, inertia=_identity_inertia(), mode_count=2, mode_mass=[3.0, 4.0], mode_stiffness=[1.0, 1.0]
@@ -1693,7 +1721,7 @@ def test_elastic_endpoint_angular_sampling(test, device):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     parent = builder.add_body(mass=1.0, inertia=_identity_inertia())
-    child = builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis)
+    child = builder.add_body_elastic(modal_basis=basis)
     joint = builder.add_joint_fixed(
         parent=parent,
         child=child,
@@ -1792,7 +1820,7 @@ def _check_elastic_clamp_moment_reaction(test, device, compliant: bool):
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=24)
+    solver = _make_vbd_solver(model, compliant=compliant, iterations=24)
 
     identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
     max_angle = dict.fromkeys(rigid_bodies, 0.0)
@@ -1872,7 +1900,7 @@ def _check_elastic_clamp_moment_reaction_parent_side(test, device, compliant: bo
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=24)
+    solver = _make_vbd_solver(model, compliant=compliant, iterations=24)
 
     identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
     max_angle = dict.fromkeys(rigid_bodies, 0.0)
@@ -1944,7 +1972,7 @@ def _check_elastic_clamp_moment_conserves_angular_momentum(test, device, complia
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=128)
+    solver = _make_vbd_solver(model, compliant=compliant, iterations=128)
 
     max_spin = 0.0
     max_imbalance = 0.0
@@ -1994,14 +2022,10 @@ def test_modal_basis_shared_by_elastic_bodies(test, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.add_body_elastic(
         xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-        mass=1.0,
-        inertia=_identity_inertia(),
         modal_basis=basis,
     )
     builder.add_body_elastic(
         xform=wp.transform(wp.vec3(0.0, 0.4, 0.0), wp.quat_identity()),
-        mass=1.0,
-        inertia=_identity_inertia(),
         modal_basis=basis,
     )
     builder.color()
@@ -2137,7 +2161,7 @@ def test_elastic_shape_box_exact_modal_samples(test, device):
     )
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    body = builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis)
+    body = builder.add_body_elastic(modal_basis=basis)
     builder.add_shape_box(body, hx=0.5 * length, hy=hy, hz=hz)
     builder.color()
     model = builder.finalize(device=device)
@@ -2185,8 +2209,9 @@ def test_elastic_surface_contact_generation(test, device):
     """Check that ground contacts on an elastic box carry the elastic shape's vertex sample."""
     model, body = _build_elastic_ground_contact_model(device, z=0.04)
     state = model.state()
-    contacts = model.contacts()
-    model.collide(state, contacts)
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
 
     count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(count, 0)
@@ -2289,9 +2314,10 @@ def test_elastic_surface_contact_uses_deformed_vertex(test, device):
     """Check that a modal deflection brings a separated elastic box vertex into ground contact."""
     model, _body = _build_elastic_ground_contact_model(device, z=0.07)
     state = model.state()
-    contacts = model.contacts()
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
 
-    model.collide(state, contacts)
+    pipeline.collide(state, contacts)
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
     owner_joint = int(model.elastic_joint.numpy()[0])
@@ -2300,7 +2326,7 @@ def test_elastic_surface_contact_uses_deformed_vertex(test, device):
     q[q_start + 7] = 0.03
     state.joint_q.assign(q)
 
-    model.collide(state, contacts)
+    pipeline.collide(state, contacts)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
 
@@ -2315,15 +2341,16 @@ def test_vbd_elastic_contact_solves_modal_penetration(test, device):
     model, _body = _build_elastic_ground_contact_model(device, z=0.05, q0=q0)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
     control = model.control()
 
-    model.collide(state_0, contacts)
+    pipeline.collide(state_0, contacts)
     test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
-    solver = newton.solvers.SolverVBD(
+    solver = _make_vbd_solver(
         model,
-        rigid_compliant_alm=False,
+        compliant=False,
         iterations=1,
         rigid_contact_k_start=1000.0,
         rigid_avbd_contact_alpha=0.0,
@@ -2371,8 +2398,9 @@ def test_vbd_elastic_compliant_contact_solves_modal_penetration(test, device):
     model.elastic_mode_mass.fill_(1.0)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
-    model.collide(state_0, contacts)
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
+    pipeline.collide(state_0, contacts)
 
     solver = newton.solvers.SolverVBD(
         model,
@@ -2406,8 +2434,9 @@ def test_vbd_elastic_compliant_contact_uses_modal_mobility_for_rho_and_forces(te
     model.elastic_mode_mass.fill_(1.0)
     state_0 = model.state()
     state_1 = model.state()
-    contacts = model.contacts()
-    model.collide(state_0, contacts)
+    pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = pipeline.contacts()
+    pipeline.collide(state_0, contacts)
     body_q_prev = wp.clone(state_0.body_q)
     joint_q_prev = wp.clone(state_0.joint_q)
 
@@ -2455,9 +2484,9 @@ def _check_vbd_elastic_contact_overflow_assembles_consistent_block(test, device,
         test.assertGreater(contact_count, 1)
 
         legacy_contact = {} if compliant else {"rigid_contact_k_start": 1000.0}
-        solver = newton.solvers.SolverVBD(
+        solver = _make_vbd_solver(
             model,
-            rigid_compliant_alm=compliant,
+            compliant=compliant,
             iterations=1,
             rigid_body_contact_buffer_size=contact_buffer_size,
             elastic_body_relaxation=1.0,
@@ -2788,8 +2817,6 @@ def test_cantilever_modal_vibration_solution(test, device):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body_elastic(
-        mass=1.0,
-        inertia=_identity_inertia(),
         mode_q=[q_expected],
         mode_qd=[qd_expected],
         modal_basis=basis,
@@ -2878,9 +2905,7 @@ def test_elastic_gravity_modal_force(test, device):
         mode_damping=[0.0],
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -g))
-    body = builder.add_body_elastic(
-        mass=1.0, inertia=_identity_inertia(), modal_basis=basis, mode_q=[0.0], mode_qd=[0.0], is_kinematic=True
-    )
+    body = builder.add_body_elastic(modal_basis=basis, mode_q=[0.0], mode_qd=[0.0], is_kinematic=True)
     builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
     builder.color()
     model = builder.finalize(device=device)
@@ -2902,20 +2927,24 @@ def test_elastic_gravity_modal_force(test, device):
 
 
 def test_elastic_free_fall_no_modal_force(test, device):
-    """Check that free fall does not excite the modes of an elastic body."""
+    """Check that free fall does not excite the modes of an elastic body.
+
+    The mode bends the outer samples relative to the inner ones, so it carries a nonzero linear
+    coupling (its gravity load) without being a rigid-body motion, and the frame uses the basis
+    rigid properties so the reduced mass is positive definite and the coupled solve is exercised.
+    """
     g = 9.81
     dt = 0.005
     basis = newton.ModalBasis(
-        sample_points=[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
-        sample_mass=[1.0, 1.0],
+        sample_points=[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, -0.5, 0.0], [0.0, 0.5, 0.0]],
+        sample_phi=[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]]],
+        sample_mass=[1.0, 1.0, 1.0, 1.0],
         mode_stiffness=[18.0],
         mode_damping=[0.0],
     )
+    test.assertGreater(float(np.linalg.norm(basis.mode_coupling_linear[0])), 1.0)
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -g))
-    body = builder.add_body_elastic(
-        mass=1.0, inertia=_identity_inertia(), modal_basis=basis, mode_q=[0.0], mode_qd=[0.0]
-    )
+    body = builder.add_body_elastic(modal_basis=basis, mode_q=[0.0], mode_qd=[0.0])
     builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
     builder.color()
     model = builder.finalize(device=device)
@@ -2927,6 +2956,7 @@ def test_elastic_free_fall_no_modal_force(test, device):
     q_start = int(model.joint_q_start.numpy()[owner_joint])
 
     solver = newton.solvers.SolverVBD(model, iterations=16)
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     max_abs_q = 0.0
     for _ in range(40):
         solver.step(state_0, state_1, control, None, dt)
@@ -2952,8 +2982,11 @@ def _check_elastic_euler_modal_force(test, device, compliant: bool):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
+    # The samples lie on the x axis, so the basis has no inertia about x; the frame keeps the basis
+    # mass and COM and carries a nominal inertia at least as large as the samples' to keep the
+    # reduced mass positive definite.
     beam = builder.add_body_elastic(
-        xform=wp.transform_identity(), mass=0.2, inertia=_identity_inertia(), modal_basis=basis
+        xform=wp.transform_identity(), inertia=_identity_inertia(), modal_basis=basis, inertia_tolerance=None
     )
     builder.add_joint_fixed(
         parent=base, child=beam, parent_xform=wp.transform_identity(), child_xform=wp.transform_identity()
@@ -2980,6 +3013,7 @@ def _check_elastic_euler_modal_force(test, device, compliant: bool):
 
     joint_k = 1.0e7
     solver = _vbd_fixed_joint_solver(model, compliant=compliant, iterations=24, linear_k=joint_k, angular_k=joint_k)
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     dt = 1.0 / 480.0
     alpha = 2.0
 
@@ -3045,14 +3079,15 @@ def _check_elastic_centrifugal_modal_force(test, device, compliant: bool):
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
-    # The frame mass must match the basis's lumped sample mass (1 kg). A lighter frame makes the reduced
-    # mass matrix indefinite; the solver then couples frame and modes explicitly, which diverges unless the
-    # clamp is effectively rigid (legacy hard joints hid this).
+    # The frame takes the basis mass and COM. The samples lie on the x axis, so the basis has no inertia
+    # about x; the frame carries a nominal inertia at least as large as the samples' to keep the reduced
+    # mass positive definite. A frame lighter than the samples would make it indefinite and leave the
+    # frame and modes coupled explicitly, which diverges unless the clamp is effectively rigid.
     beam = builder.add_body_elastic(
         xform=wp.transform_identity(),
-        mass=float(np.sum(basis.sample_mass)),
         inertia=_identity_inertia(),
         modal_basis=basis,
+        inertia_tolerance=None,
     )
     builder.add_joint_fixed(
         parent=base, child=beam, parent_xform=wp.transform_identity(), child_xform=wp.transform_identity()
@@ -3067,7 +3102,8 @@ def _check_elastic_centrifugal_modal_force(test, device, compliant: bool):
     owner = int(model.elastic_joint.numpy()[0])
     q_index = int(model.joint_q_start.numpy()[owner]) + 7
 
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=24)
+    solver = _make_vbd_solver(model, compliant=compliant, iterations=24)
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     dt = 1.0 / 240.0
     omega = 4.0
     velocities = {base: (wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, omega))}
@@ -3118,12 +3154,14 @@ def test_elastic_coriolis_modal_force(test, device):
     def max_abs_mode0(omega):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         base = builder.add_body(xform=wp.transform_identity(), mass=2.0, inertia=_identity_inertia(), is_kinematic=True)
+        # Basis mass and COM; a nominal inertia at least as large as the samples' (which have
+        # none about x) keeps the reduced mass positive definite.
         beam = builder.add_body_elastic(
             xform=wp.transform_identity(),
-            mass=0.2,
             inertia=_identity_inertia(),
             modal_basis=basis,
             mode_qd=[0.0, 1.0],
+            inertia_tolerance=None,
         )
         builder.add_joint_fixed(
             parent=base, child=beam, parent_xform=wp.transform_identity(), child_xform=wp.transform_identity()
@@ -3137,6 +3175,7 @@ def test_elastic_coriolis_modal_force(test, device):
         owner = int(model.elastic_joint.numpy()[0])
         q0_index = int(model.joint_q_start.numpy()[owner]) + 7
         solver = newton.solvers.SolverVBD(model, iterations=24)
+        test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
         dt = 1.0 / 240.0
         velocities = {base: (wp.vec3(0.0, 0.0, 0.0), wp.vec3(omega, 0.0, 0.0))}
         peak = 0.0
@@ -3179,6 +3218,8 @@ def test_elastic_frame_coupling_conserves_com(test, device):
     )
     com_factor = float(basis.mode_coupling_linear[0][2]) / total_mass
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    # The samples lie on the x axis and have no inertia about it, so the frame carries a nominal
+    # inertia at least as large as the samples' to keep the reduced mass positive definite.
     beam = builder.add_body_elastic(
         xform=wp.transform_identity(),
         com=wp.vec3(0.0, 0.0, 0.0),
@@ -3186,6 +3227,7 @@ def test_elastic_frame_coupling_conserves_com(test, device):
         inertia=_identity_inertia(),
         mode_q=[deflection],
         modal_basis=basis,
+        inertia_tolerance=None,
     )
     builder.color()
     model = builder.finalize(device=device)
@@ -3197,6 +3239,7 @@ def test_elastic_frame_coupling_conserves_com(test, device):
     mode_index = q_start + 7
 
     solver = newton.solvers.SolverVBD(model, iterations=24)
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     dt = 1.0 / 240.0
 
     def frame_and_com():
@@ -3222,7 +3265,9 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
     """Conserve the full angular momentum of a free beam whose bending mode rotates its frame.
 
     With ``S = 0`` the angular momentum about the rest COM is ``I(q) w - G(q) qdot``; for this planar
-    motion its y component is ``(I_yy + Mf q^2) w_y - G_y qdot``.
+    motion its y component is ``(I_yy + Mf q^2) w_y - G_y qdot``. The linear mode shape is a rotation
+    of the sample line, so the frame carries an inertia ``I_yy`` larger than the samples' to keep the
+    reduced mass positive definite; the explicit inertia is therefore not compared with the basis.
     """
     total_mass = 1.0
     stiffness = 10.0
@@ -3251,6 +3296,7 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
         inertia=wp.mat33(inertia_yy, 0.0, 0.0, 0.0, inertia_yy, 0.0, 0.0, 0.0, inertia_yy),
         mode_q=[deflection],
         modal_basis=basis,
+        inertia_tolerance=None,
     )
     builder.color()
     model = builder.finalize(device=device)
@@ -3263,6 +3309,7 @@ def test_elastic_frame_coupling_conserves_angular_momentum(test, device):
     mode_index = q_start + 7
 
     solver = newton.solvers.SolverVBD(model, iterations=24)
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     dt = 1.0 / 240.0
     max_total_h = 0.0
     max_frame_spin = 0.0
@@ -3940,7 +3987,9 @@ def test_elastic_spinning_com_is_ballistic(test, device):
 
     The initial physical momentum ``P0 = w x (R S q0)`` is nonzero although the stored rest-COM
     velocity is zero, so the sampled COM must travel ``t P0 / m`` (about 0.33 m in 1 s); conserving
-    ``m v_c + R S qdot`` instead leaves it near its start.
+    ``m v_c + R S qdot`` instead leaves it near its start. The samples lie on the y axis and have no
+    inertia about it, so the frame carries a nominal isotropic inertia, which the COM path does not
+    depend on.
     """
     total_mass = 1.0
     stiffness = 60.0
@@ -3970,6 +4019,7 @@ def test_elastic_spinning_com_is_ballistic(test, device):
             inertia=wp.mat33(0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2),
             mode_q=[deflection],
             modal_basis=basis,
+            inertia_tolerance=None,
         )
         builder.color()
         model = builder.finalize(device=device)
@@ -3982,6 +4032,7 @@ def test_elastic_spinning_com_is_ballistic(test, device):
         qd0[qd_start + 5] = spin
         state_0.joint_qd.assign(qd0)
         solver = newton.solvers.SolverVBD(model, iterations=24)
+        test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
 
         def true_com():
             bq = state_0.body_q.numpy()[beam].astype(np.float64)
@@ -4320,7 +4371,10 @@ def test_elastic_nonorthogonal_modes_use_full_mass_matrix(test, device):
     )
     np.testing.assert_allclose(basis.mode_mass_matrix, [[1.0, 1.0], [1.0, 2.0]], atol=1.0e-7)
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    body = builder.add_body_elastic(mass=2.0, inertia=_identity_inertia(), modal_basis=basis, is_kinematic=True)
+    # The kinematic frame's inertia does not enter; two samples on a line have none about it.
+    body = builder.add_body_elastic(
+        inertia=_identity_inertia(), modal_basis=basis, is_kinematic=True, inertia_tolerance=None
+    )
     builder.color()
     model = builder.finalize(device=device)
     state_0 = model.state()
@@ -4420,9 +4474,9 @@ def _check_vbd_revolute_constraint_solves_elastic_mode(test, device, compliant: 
     q_start = int(model.joint_q_start.numpy()[owner_joint])
 
     legacy = {} if compliant else {"rigid_joint_linear_k_start": 1.0e6}
-    solver = newton.solvers.SolverVBD(
+    solver = _make_vbd_solver(
         model,
-        rigid_compliant_alm=compliant,
+        compliant=compliant,
         iterations=4,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_linear_kd=0.0,
@@ -4461,9 +4515,6 @@ def test_vbd_fixed_joint_stiffness_pins_penalties(test, device):
     solver = newton.solvers.SolverVBD(
         model,
         iterations=2,
-        rigid_compliant_alm=True,
-        rigid_joint_linear_k_start=10.0,
-        rigid_joint_angular_k_start=5.0,
         rigid_joint_linear_ke=1234.0,
         rigid_joint_angular_ke=567.0,
         rigid_joint_adaptive_stiffness=False,
@@ -4509,6 +4560,7 @@ def _check_vbd_elastic_joint_assembles_one_coupled_block(test, device, compliant
         inertia=_identity_inertia(),
         mode_q=[mode_q],
         modal_basis=basis,
+        inertia_tolerance=None,
     )
     builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
@@ -4543,14 +4595,22 @@ def _check_vbd_elastic_joint_assembles_one_coupled_block(test, device, compliant
 
 
 def test_vbd_elastic_joint_assembles_one_coupled_block(test, device):
-    """Assemble frame, modal, and frame-mode coupling rows of an elastic joint in one block."""
+    """Assemble frame, modal, and frame-mode coupling rows of an elastic joint in one block.
+
+    The frame carries 2 kg of rigid mass beyond the single 1 kg sample, so the frame and modal
+    diagonals differ while the reduced mass stays positive definite.
+    """
     for compliant in _RIGID_ALM_MODES:
         with test.subTest(rigid_compliant_alm=compliant):
             _check_vbd_elastic_joint_assembles_one_coupled_block(test, device, compliant)
 
 
 def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
-    """Check that elastic bodies are rejected with ``integrate_with_external_rigid_solver``."""
+    """Check that elastic bodies are rejected with ``integrate_with_external_rigid_solver``.
+
+    A single sample has no rotational inertia, so the frame carries extra rigid mass and a nominal
+    inertia rather than the basis rigid properties.
+    """
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -4559,7 +4619,9 @@ def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
         mode_damping=[0.0],
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    body = builder.add_body_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis)
+    body = builder.add_body_elastic(
+        mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis, inertia_tolerance=None
+    )
     builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
     model = builder.finalize(device=device)
@@ -4572,7 +4634,9 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     """Solve articulated elastic bodies in the block-sparse solve and reject the unsupported cases.
 
     An elastic body's joints must lie in its articulation, as for rigid bodies; its owner joint
-    may stay outside. Joint mimics are not combined with elastic articulation bodies.
+    may stay outside. Joint mimics are not combined with elastic articulation bodies. A single
+    sample has no rotational inertia, so the frames carry extra rigid mass and a nominal inertia
+    rather than the basis rigid properties.
     """
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
@@ -4583,7 +4647,9 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     )
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    body = builder.add_body_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis)
+    body = builder.add_body_elastic(
+        mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis, inertia_tolerance=None
+    )
     builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
     model = builder.finalize(device=device)
@@ -4591,7 +4657,9 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
         newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    body = builder.add_link_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.01], modal_basis=basis)
+    body = builder.add_link_elastic(
+        mass=3.0, inertia=_identity_inertia(), mode_q=[0.01], modal_basis=basis, inertia_tolerance=None
+    )
     builder.add_articulation([builder.add_joint_fixed(parent=-1, child=body)])
     builder.color()
     model = builder.finalize(device=device)
@@ -4605,7 +4673,9 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     test.assertLess(float(np.linalg.norm(state_0.body_q.numpy()[body, :3])), 1.0e-3)
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    body = builder.add_link_elastic(mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis)
+    body = builder.add_link_elastic(
+        mass=3.0, inertia=_identity_inertia(), mode_q=[0.0], modal_basis=basis, inertia_tolerance=None
+    )
     links = [builder.add_link(mass=1.0, inertia=_identity_inertia()) for _ in range(2)]
     joints = [builder.add_joint_revolute(parent=-1, child=body, axis=(0.0, 0.0, 1.0))]
     joints += [builder.add_joint_revolute(parent=body, child=link, axis=(0.0, 0.0, 1.0)) for link in links]
@@ -4779,13 +4849,18 @@ def test_vbd_elastic_block_solve_reads_leading_sub_block(test, device):
 
 
 def _elastic_block_test_basis(mode_count: int, seed: int) -> newton.ModalBasis:
-    """Return a random lumped modal basis with ``mode_count`` modes."""
+    """Return a random lumped modal basis with ``mode_count`` modes.
+
+    The samples have more displacement DOFs than the frame and the modes together, so the random
+    modes are independent of each other and of rigid-body motion, and the reduced mass with the
+    basis rigid properties is positive definite.
+    """
     rng = np.random.default_rng(seed)
-    sample_count = 4
+    sample_count = mode_count // 3 + 4
     return newton.ModalBasis(
         sample_points=rng.uniform(-0.5, 0.5, (sample_count, 3)),
         sample_phi=0.1 * rng.standard_normal((sample_count, mode_count, 3)),
-        sample_mass=[0.25] * sample_count,
+        sample_mass=[1.0 / sample_count] * sample_count,
         mode_stiffness=list(np.linspace(10.0, 100.0, mode_count)),
         mode_damping=[0.0] * mode_count,
     )
@@ -4797,8 +4872,6 @@ def _build_elastic_block_test_model(device, mode_counts):
     for index, mode_count in enumerate(mode_counts):
         builder.add_body_elastic(
             xform=wp.transform((2.0 * index, 0.0, 0.0), wp.quat_identity()),
-            mass=1.0,
-            inertia=_identity_inertia(),
             mode_q=[0.01] * mode_count,
             modal_basis=_elastic_block_test_basis(mode_count, seed=index),
             label=f"elastic_{index}",
@@ -4813,6 +4886,7 @@ def test_vbd_elastic_block_solve_buckets_mixed_widths(test, device):
     test.assertEqual(len(model.body_color_groups), 1)
 
     solver = newton.solvers.SolverVBD(model, iterations=1)
+    test.assertTrue(bool(np.all(solver.elastic_implicit_mass_coupling.numpy())))
     test.assertEqual(solver.elastic_body_block_width, 70)
     test.assertEqual(sorted(solver._elastic_block_solve_launches), [(0, 14, 1, "tiled"), (0, 70, 1, "tiled")])
 
@@ -4835,14 +4909,26 @@ def test_vbd_elastic_block_solve_buckets_mixed_widths(test, device):
 
 
 def _elastic_block_capacity_model(device, mode_count):
+    """Build one elastic body with ``mode_count`` independent nodal modes.
+
+    Mode ``i`` moves sample ``i // 3`` along axis ``i % 3``. Three extra unmoved samples anchor the
+    rigid-body motion, so the modal mass is diagonal and the reduced mass with the basis rigid
+    properties is positive definite.
+    """
+    moving_count = (mode_count + 2) // 3
+    anchors = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    sample_points = [[0.1 * (s + 1), 0.05 * (s % 7), 0.03 * (s % 5) + 0.2] for s in range(moving_count)] + anchors
+    sample_phi = np.zeros((len(sample_points), mode_count, 3))
+    for mode in range(mode_count):
+        sample_phi[mode // 3, mode, mode % 3] = 1.0
     basis = newton.ModalBasis(
-        sample_points=[[0.0, 0.0, 0.0]],
-        sample_phi=np.tile(np.array([[1.0, 0.0, 0.0]]), (1, mode_count, 1)),
-        sample_mass=[1.0],
+        sample_points=sample_points,
+        sample_phi=sample_phi,
+        sample_mass=[1.0 / len(sample_points)] * len(sample_points),
         mode_stiffness=[1.0] * mode_count,
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="capacity")
+    builder.add_body_elastic(modal_basis=basis, label="capacity")
     builder.color()
     return builder.finalize(device=device)
 
@@ -4872,6 +4958,7 @@ def _step_elastic_block_capacity_solver(test, model, solver, steps=2):
     for _ in range(steps):
         solver.step(state_0, state_1, control, None, 1.0e-2)
         state_0, state_1 = state_1, state_0
+    test.assertTrue(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
     test.assertTrue(bool(np.isfinite(state_0.joint_q.numpy()).all()))
     test.assertTrue(bool(np.isfinite(solver.elastic_body_block_delta.numpy()).all()))
 
@@ -4912,6 +4999,7 @@ def test_vbd_elastic_block_dense_matches_tiled_step(test, device):
     for block_solver in ("tiled", "dense"):
         model = _build_elastic_block_test_model(device, [2, 64])
         solver = newton.solvers.SolverVBD(model, iterations=2, elastic_block_solver=block_solver)
+        test.assertTrue(bool(np.all(solver.elastic_implicit_mass_coupling.numpy())))
         test.assertEqual({entry[3] for entry in solver._elastic_block_solve_launches}, {block_solver})
         state_0 = model.state()
         state_1 = model.state()
@@ -5235,7 +5323,11 @@ def test_vbd_elastic_block_metrics_cover_frame_rows(test, device):
 
 
 def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
-    """Disable implicit frame/mode coupling and warn when the reduced mass matrix is indefinite."""
+    """Disable implicit frame/mode coupling and warn when the reduced mass matrix is indefinite.
+
+    The frames deliberately differ from the 2 kg sample: a lighter frame makes the reduced mass
+    indefinite and a heavier one keeps it positive definite.
+    """
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -5243,8 +5335,9 @@ def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
         mode_stiffness=[1.0],
     )
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), modal_basis=basis, label="indefinite")
-    builder.add_body_elastic(mass=3.0, inertia=_identity_inertia(), modal_basis=basis, label="positive_definite")
+    frame = {"inertia": _identity_inertia(), "modal_basis": basis, "inertia_tolerance": None}
+    builder.add_body_elastic(mass=1.0, label="indefinite", **frame)
+    builder.add_body_elastic(mass=3.0, label="positive_definite", **frame)
     builder.color()
     model = builder.finalize(device=device)
 
@@ -5256,6 +5349,47 @@ def test_vbd_implicit_mass_coupling_requires_spd_block(test, device):
     test.assertEqual(len(messages), 1)
     test.assertIn("'indefinite'", messages[0])
     test.assertIn("smallest eigenvalue", messages[0])
+
+
+def test_vbd_massless_mode_keeps_decoupled_solve_without_warning(test, device):
+    """Keep a massless mode in the decoupled solve without the indefinite reduced mass warning.
+
+    A mode with zero modal mass and no inertia coupling leaves the reduced mass singular rather than
+    indefinite. A massless mode that still couples to the frame makes it indefinite and warns.
+    """
+
+    def build(coupled: bool):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        frame = {"mass": 1.0, "inertia": _identity_inertia(), "mode_mass": [0.0], "mode_stiffness": [10.0]}
+        if coupled:
+            basis = newton.ModalBasis(
+                sample_points=[[0.0, 0.0, 0.0]], sample_phi=[[[1.0, 0.0, 0.0]]], sample_mass=[1.0]
+            )
+            builder.add_body_elastic(modal_basis=basis, inertia_tolerance=None, label="coupled", **frame)
+        else:
+            builder.add_body_elastic(
+                mode_count=1,
+                mode_shape_fn=lambda _x: np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+                label="massless",
+                **frame,
+            )
+        builder.color()
+        return builder.finalize(device=device)
+
+    model = build(coupled=False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = newton.solvers.SolverVBD(model, iterations=1)
+    test.assertEqual([str(w.message) for w in caught if "indefinite" in str(w.message)], [])
+    test.assertFalse(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
+    state_0, state_1 = model.state(), model.state()
+    solver.step(state_0, state_1, model.control(), None, 0.01)
+    test.assertTrue(bool(np.isfinite(state_1.joint_q.numpy()).all()))
+
+    model = build(coupled=True)
+    with test.assertWarnsRegex(UserWarning, "'coupled'.*indefinite reduced mass"):
+        solver = newton.solvers.SolverVBD(model, iterations=1)
+    test.assertFalse(bool(solver.elastic_implicit_mass_coupling.numpy()[0]))
 
 
 def _craig_bampton_clamped_trajectory(device, *, iterations: int, compliant: bool) -> np.ndarray:
@@ -5722,7 +5856,7 @@ def _rod_elastic_endpoint_frame_rows(device, *, compliant: bool, mode: str) -> t
     state_0 = model.state()
     state_1 = model.state()
     legacy = {} if compliant else {"rigid_joint_adaptive_stiffness": False}
-    solver = newton.solvers.SolverVBD(model, rigid_compliant_alm=compliant, iterations=1, **legacy)
+    solver = _make_vbd_solver(model, compliant=compliant, iterations=1, **legacy)
     # Rest bend/twist invariants were cached from the undeformed frame; keep them for every variant.
     if mode != "elastic":
         model.elastic_endpoint_phi.zero_()
@@ -5868,9 +6002,9 @@ def _check_vbd_prismatic_rotates_elastic_child(test, device, compliant: bool):
     control.joint_f.assign(joint_f)
 
     legacy = {} if compliant else {"rigid_joint_linear_k_start": 1.0e5, "rigid_joint_angular_k_start": 1.0e5}
-    solver = newton.solvers.SolverVBD(
+    solver = _make_vbd_solver(
         model,
-        rigid_compliant_alm=compliant,
+        compliant=compliant,
         iterations=20,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_angular_ke=1.0e6,
@@ -5928,8 +6062,6 @@ def test_crank_slider_elastic_analytic_geometry(test, device):
     )
     rod = builder.add_body_elastic(
         xform=wp.transform(wp.vec3(*(0.5 * (crank_pin + slider_pin))), _quat_from_angle_z(rod_theta)),
-        mass=1.0,
-        inertia=_identity_inertia(),
         mode_q=[axial_q],
         modal_basis=basis,
     )
@@ -6037,7 +6169,11 @@ def test_dipper_arm_example(test, device):
     """Run the dipper arm example headless and check its final state."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
-        example = DipperExample(viewer, None)
+        # The kinematic actuator barrel keeps its free root joint, since kinematic bodies must be
+        # roots; its base revolute duplicates it only to record the pivot.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Adding a REVOLUTE joint", category=UserWarning)
+            example = DipperExample(viewer, None)
         for _ in range(120):
             example.step()
             example.render()
@@ -6135,7 +6271,8 @@ def test_angular_frame_coupling_example(test, device):
 def _run_reduced_elastic_contact_example(example_cls, frame_count: int, device):
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
-        example = example_cls(viewer, None)
+        with _legacy_alm_allowed():
+            example = example_cls(viewer, None)
         for _ in range(frame_count):
             example.step()
             example.render()
@@ -7501,6 +7638,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_vbd_implicit_mass_coupling_requires_spd_block",
         test_vbd_implicit_mass_coupling_requires_spd_block,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_massless_mode_keeps_decoupled_solve_without_warning",
+        test_vbd_massless_mode_keeps_decoupled_solve_without_warning,
         devices=[device],
     )
     add_function_test(

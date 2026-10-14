@@ -1882,7 +1882,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rotation, and the modes through ``S_i`` and ``-(G_i + c x S_i)`` and uses the full
         modal mass matrix :attr:`Model.elastic_mode_mass_matrix`. Bodies whose ``M(0)`` is
         not positive definite keep block-diagonal inverse masses and the explicitly coupled
-        solve, and a :class:`UserWarning` names each of them.
+        solve, and a :class:`UserWarning` names each of them. Massless modes, with zero modal
+        mass and no inertia coupling, leave ``M(0)`` singular rather than indefinite; such
+        bodies keep the decoupled solve without a warning unless their other rows are not
+        positive definite.
 
         The inverse serves the contact and joint drive/limit mobilities ``J M^-1 J^T``. It is
         stored in Schur-complement form (see :class:`ElasticReducedMobility`): ``S^-1`` with
@@ -1952,10 +1955,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             modal_mass = 0.5 * (modal_mass + modal_mass.T)
             reduced_mass = np.block([[frame_mass, cross_mass], [cross_mass.T, modal_mass]])
             diagonal_scale = max(float(np.max(np.abs(np.diag(reduced_mass)))), 1.0)
-            min_eigenvalue = float(np.linalg.eigvalsh(reduced_mass)[0])
-            is_spd = min_eigenvalue > 1.0e-8 * diagonal_scale
+            spd_tolerance = 1.0e-8 * diagonal_scale
+            # A massless mode (zero modal mass row and no inertia coupling) makes M(0) singular but
+            # not indefinite. Such a body keeps the decoupled solve; only the remaining rows decide
+            # whether the frame mass properties are inconsistent.
+            massless = np.logical_and(
+                np.max(np.abs(modal_mass), axis=1) <= spd_tolerance,
+                np.max(np.abs(cross_mass), axis=0) <= spd_tolerance,
+            )
+            active = np.concatenate((np.ones(6, dtype=bool), ~massless))
+            min_eigenvalue = float(np.linalg.eigvalsh(reduced_mass[np.ix_(active, active)])[0])
+            is_definite = min_eigenvalue > spd_tolerance
+            is_spd = is_definite and not bool(np.any(massless))
             flags[elastic_index] = is_spd
-            if not is_spd:
+            if not is_definite:
                 labels = getattr(model, "body_label", None)
                 name = labels[body] if labels is not None and body < len(labels) and labels[body] else f"body {body}"
                 warnings.warn(

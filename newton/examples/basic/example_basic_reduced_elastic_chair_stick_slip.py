@@ -473,11 +473,8 @@ class Example:
             roughness=0.62,
             metallic=0.0,
         )
-        inertia = wp.mat33(0.22, 0.0, 0.0, 0.0, 0.24, 0.0, 0.0, 0.0, 0.18)
         self.chair = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*initial_world), self.chair_rot),
-            mass=self.chair_mass,
-            inertia=inertia,
             modal_basis=self.basis,
             label="polyhaven_monobloc_chair",
         )
@@ -489,7 +486,8 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model, broad_phase="explicit")
+        self.contacts = self.collision_pipeline.contacts()
         self.solver = newton.solvers.SolverVBD(
             self.model,
             rigid_compliant_alm=False,
@@ -814,7 +812,7 @@ class Example:
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
             self._apply_ramp_pose(t, max(t - self.sim_dt, 0.0))
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self._update_metrics()

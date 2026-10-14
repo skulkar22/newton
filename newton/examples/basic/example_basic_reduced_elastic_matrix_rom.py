@@ -440,8 +440,6 @@ class Example:
         self.j_wrist = len(builder.joint_type) - 1
         self.panel = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*self.panel_origin), wp.quat_identity()),
-            mass=2.2,
-            inertia=inertia,
             modal_basis=matrix_basis,
             label="matrix_rom_handling_beam",
         )
@@ -619,10 +617,6 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=36,
-            rigid_compliant_alm=True,
-            rigid_avbd_beta=1.0e5,
-            rigid_joint_linear_k_start=1.0e5,
-            rigid_joint_angular_k_start=1.0e4,
             rigid_joint_linear_ke=2.5e6,
             rigid_joint_angular_ke=7.5e5,
             elastic_body_relaxation=0.6,

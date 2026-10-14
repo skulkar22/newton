@@ -106,12 +106,11 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model, broad_phase="explicit")
+        self.contacts = self.collision_pipeline.contacts()
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=self.solver_iterations,
-            rigid_compliant_alm=True,
-            rigid_contact_k_start=8.0e4,
             rigid_body_contact_buffer_size=64,
             friction_epsilon=2.0e-3,
             elastic_body_relaxation=0.30,
@@ -170,7 +169,7 @@ class Example:
             previous_targets = self._drive_targets(max(t - self.sim_dt, 0.0))
             velocities = finite_difference_target_velocities(targets, previous_targets, self.sim_dt)
             apply_kinematic_targets(self.state_0, self._owner_q_starts, targets, velocities, self._owner_qd_starts)
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self._update_metrics()
