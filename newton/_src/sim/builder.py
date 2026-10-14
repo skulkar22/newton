@@ -5749,11 +5749,16 @@ class ModelBuilder:
     ) -> int:
         """Add a reduced elastic state-owner joint.
 
+        .. experimental::
+
         The joint stores a free floating frame followed by reduced elastic modal
         coordinates. Its coordinate layout is ``[pos, quat, modes...]`` and its
-        velocity layout is ``[linear, angular, mode_dot...]``. The joint is a state
-        owner and contributes no bilateral constraints by itself; physical
-        connectivity should be added with ordinary joints.
+        velocity layout is ``[linear, angular, mode_dot...]``, where ``linear`` is
+        the world velocity of the body's rest center of mass and ``angular`` the
+        world angular velocity. The joint is a state owner and contributes no
+        bilateral constraints by itself; physical connectivity should be added
+        with ordinary joints. :meth:`add_link_elastic` adds this joint together
+        with the elastic body record and is the usual entry point.
 
         Args:
             child: Child body index owned by this reduced elastic joint.
@@ -5762,8 +5767,8 @@ class ModelBuilder:
             parent_xform: Transform from parent body to the owner joint frame.
             child_xform: Transform from child body to the owner joint frame.
             label: Joint label.
-            mode_q: Initial modal amplitudes.
-            mode_qd: Initial modal velocities.
+            mode_q: Initial modal coordinates [m for displacement-valued modes].
+            mode_qd: Initial modal velocities [m/s for displacement-valued modes].
             enabled: Whether the owner joint is enabled.
             custom_attributes: Custom joint attributes.
 
@@ -5968,10 +5973,16 @@ class ModelBuilder:
     ) -> int:
         """Add a reduced elastic link with a floating frame and modal DoFs.
 
-        The returned body has a normal body slot and a reduced elastic owner joint.
-        Ordinary joints use their existing parent/child transforms as endpoint
-        material frames; if the endpoint body is elastic, ``mode_shape_fn`` is
-        sampled at that transform during finalization.
+        .. experimental::
+
+        The returned body has a normal body slot and a reduced elastic owner joint
+        (:attr:`~newton.JointType.ELASTIC`). Ordinary joints use their existing
+        parent/child transforms as endpoint material frames. At finalization, an
+        endpoint on an elastic link takes its mode values from a coincident
+        attachment frame of ``modal_basis``, else from a coincident sample, else
+        from a new sample interpolated by inverse distance; with
+        ``mode_shape_fn``, the callable is evaluated at the endpoint. See
+        :ref:`Reduced Elastic Links`.
 
         Args:
             xform: Initial world transform of the floating frame.
@@ -5988,16 +5999,29 @@ class ModelBuilder:
                 keeps its usual meaning (no translational inertia) and is not
                 compared against the basis.
             label: Body label.
-            mode_count: Number of reduced elastic modal coordinates.
-            mode_mass: Modal masses [kg].
-            mode_stiffness: Modal stiffness values [N/m].
-            mode_damping: Modal damping values [N s/m].
-            mode_q: Initial modal amplitudes.
-            mode_qd: Initial modal velocities.
-            mode_shape_fn: Callable receiving a local endpoint position ``np.ndarray(3,)``
-                and returning translational mode samples with shape ``(mode_count, 3)``.
-            modal_basis: Sampled linear modal basis used to evaluate attachment and
-                surface deformation samples.
+            mode_count: Number of reduced elastic modal coordinates. ``0``
+                uses ``modal_basis.mode_count``.
+            mode_mass: Modal masses [kg] for displacement-valued modal
+                coordinates. ``None`` uses the basis's ``mode_mass`` and full
+                ``mode_mass_matrix``; an explicit value replaces the basis's
+                modal mass matrix by this diagonal. Defaults to ``1`` without
+                a basis.
+            mode_stiffness: Modal stiffness values [N/m]. ``None`` uses the
+                basis values, else ``0``.
+            mode_damping: Modal damping values [N s/m]. ``None`` uses the basis
+                values, else ``0``.
+            mode_q: Initial modal coordinates [m for displacement-valued modes].
+            mode_qd: Initial modal velocities [m/s for displacement-valued modes].
+            mode_shape_fn: Legacy callable receiving a local endpoint position
+                ``np.ndarray(3,)`` and returning translational mode samples with
+                shape ``(mode_count, 3)``. It provides joint attachment values
+                only, with zero angular values and no inertia coupling.
+                Mutually exclusive with ``modal_basis``.
+            modal_basis: Sampled linear modal basis providing the attachment,
+                contact, and rendering samples, the modal mass, stiffness, and
+                damping, and the inertia coupling integrals. The basis is
+                shared by reference; finalization appends massless samples at
+                joint endpoints and shape vertices to it.
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.
@@ -6131,6 +6155,8 @@ class ModelBuilder:
     ) -> int:
         """Add a stand-alone free-floating reduced elastic body.
 
+        .. experimental::
+
         This is the reduced-elastic equivalent of :meth:`add_body`: it creates
         an elastic link, adds its floating-frame owner joint to a one-joint
         articulation, and returns the body index.
@@ -6150,16 +6176,29 @@ class ModelBuilder:
                 keeps its usual meaning (no translational inertia) and is not
                 compared against the basis.
             label: Body label.
-            mode_count: Number of reduced elastic modal coordinates.
-            mode_mass: Modal masses [kg].
-            mode_stiffness: Modal stiffness values [N/m].
-            mode_damping: Modal damping values [N s/m].
-            mode_q: Initial modal amplitudes.
-            mode_qd: Initial modal velocities.
-            mode_shape_fn: Callable receiving a local endpoint position ``np.ndarray(3,)``
-                and returning translational mode samples with shape ``(mode_count, 3)``.
-            modal_basis: Sampled linear modal basis used to evaluate attachment and
-                surface deformation samples.
+            mode_count: Number of reduced elastic modal coordinates. ``0``
+                uses ``modal_basis.mode_count``.
+            mode_mass: Modal masses [kg] for displacement-valued modal
+                coordinates. ``None`` uses the basis's ``mode_mass`` and full
+                ``mode_mass_matrix``; an explicit value replaces the basis's
+                modal mass matrix by this diagonal. Defaults to ``1`` without
+                a basis.
+            mode_stiffness: Modal stiffness values [N/m]. ``None`` uses the
+                basis values, else ``0``.
+            mode_damping: Modal damping values [N s/m]. ``None`` uses the basis
+                values, else ``0``.
+            mode_q: Initial modal coordinates [m for displacement-valued modes].
+            mode_qd: Initial modal velocities [m/s for displacement-valued modes].
+            mode_shape_fn: Legacy callable receiving a local endpoint position
+                ``np.ndarray(3,)`` and returning translational mode samples with
+                shape ``(mode_count, 3)``. It provides joint attachment values
+                only, with zero angular values and no inertia coupling.
+                Mutually exclusive with ``modal_basis``.
+            modal_basis: Sampled linear modal basis providing the attachment,
+                contact, and rendering samples, the modal mass, stiffness, and
+                damping, and the inertia coupling integrals. The basis is
+                shared by reference; finalization appends massless samples at
+                joint endpoints and shape vertices to it.
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.

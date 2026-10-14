@@ -181,11 +181,14 @@ def _reduced_inertia_from_pairs(
 class ModalBasis:
     """Sampled linear modal basis for a reduced elastic body.
 
+    .. experimental::
+
     The basis stores displacement samples ``phi`` at body-local material points.
     A deformation at point ``X`` is evaluated linearly as ``sum_i phi_i(X) q_i``.
     Unknown points are evaluated by inverse-distance interpolation from the
     stored samples, keeping the runtime representation independent of how the
-    modes were generated.
+    modes were generated. The inertia integrals below define the reduced mass
+    matrix of the floating frame and modes; see :ref:`Reduced Elastic Links`.
 
     Units below assume displacement-valued modal coordinates ``q`` [m], so
     ``phi`` is dimensionless [m/m]. Other normalizations are equivalent: the
@@ -1101,6 +1104,12 @@ def _estimate_sample_psi(
 class ModalGeneratorSampled:
     """Build a :class:`ModalBasis` from externally supplied sampled modes.
 
+    .. experimental::
+
+    The modes are used as supplied, in any normalization. Without
+    ``sample_mass`` the basis has no inertia coupling integrals and no rigid
+    mass properties.
+
     Args:
         sample_points: Body-local sample points [m], shape ``[sample_count, 3]``.
         sample_phi: Translational mode samples [m per modal coordinate], shape
@@ -1108,15 +1117,18 @@ class ModalGeneratorSampled:
         sample_psi: Optional angular mode samples [rad per modal coordinate],
             shape ``[sample_count, mode_count, 3]``. Pass these when known;
             otherwise set ``derive_psi`` to estimate them from ``sample_phi``.
-        mode_mass: Optional per-mode modal mass [kg].
+        mode_mass: Optional per-mode modal mass [kg]. Defaults to the diagonal
+            of the sampled modal mass matrix when ``sample_mass`` is given,
+            else ``1``.
         mode_stiffness: Optional per-mode modal stiffness [N/m].
-        mode_damping: Optional per-mode modal damping [N·s/m].
+        mode_damping: Optional per-mode modal damping [N s/m].
         derive_psi: When ``True`` and ``sample_psi`` is not given, estimate the
             angular samples from the displacement gradient of ``sample_phi``.
         label: Optional basis label.
         sample_mass: Optional per-sample lumped mass [kg], shape
             ``[sample_count]``, forwarded to :class:`ModalBasis` to compute the
-            modal mass and inertia coupling integrals.
+            modal mass matrix, the inertia coupling integrals, and the rigid
+            mass properties.
     """
 
     def __init__(
@@ -1219,6 +1231,8 @@ def _clamp_modal_diagonal(values: np.ndarray, tolerance: float, name: str, stack
 
 class ModalGeneratorCraigBampton:
     """Build a Newton modal basis from Craig-Bampton reduced matrices.
+
+    .. experimental::
 
     The generator accepts already-loaded arrays. Input coordinates must contain
     six DOFs per interface in ``[tx, ty, tz, rx, ry, rz]`` order, followed by
@@ -1640,6 +1654,14 @@ class ModalGeneratorCraigBampton:
 class ModalGeneratorPOD:
     """Build linear modal basis functions with proper orthogonal decomposition.
 
+    .. experimental::
+
+    Each retained mode is a right singular vector of the snapshot matrix scaled
+    to a unit maximum sample displacement, so the modal coordinates are
+    displacement-valued [m]. Modal stiffness is a heuristic derived from
+    ``stiffness_scale`` and the singular values; calibrate it for physical
+    results.
+
     Args:
         sample_points: Rest sample points [m], shape ``[sample_count, 3]``.
         displacements: Exemplar displacement fields [m], shape
@@ -1649,7 +1671,10 @@ class ModalGeneratorPOD:
             ``displacements`` is not provided.
         mode_count: Number of POD modes to retain.
         total_mass: Total mass [kg] represented by the samples. If provided,
-            modal masses are estimated by lumped sample weights.
+            it is lumped uniformly over the samples to form the modal masses,
+            the inertia coupling integrals, and the rigid mass properties.
+            Otherwise every modal mass is ``1`` and no coupling integrals are
+            formed.
         stiffness_scale: Heuristic stiffness scale [N/m].
         damping_ratio: Modal damping ratio.
         subtract_mean: Whether to remove the mean exemplar displacement before
@@ -1786,9 +1811,15 @@ class ModalGeneratorPOD:
 class ModalGeneratorFEM:
     """Build linear modal modes from nodal finite-element matrices.
 
+    .. experimental::
+
     This generator solves the generalized eigenvalue problem
     ``K phi = lambda M phi`` on translational nodal DOFs, mass-normalizes the
-    selected eigenvectors, and returns a sampled :class:`ModalBasis`.
+    selected eigenvectors, and returns a sampled :class:`ModalBasis`. With
+    ``mass_matrix`` in [kg], the modal coordinates have units [kg^(1/2) m],
+    ``mode_mass`` is ``1``, and ``mode_stiffness`` is ``lambda`` [1/s^2]. The
+    inertia coupling integrals and rigid mass properties are computed exactly
+    from the consistent nodal mass matrix.
 
     Rigid-body modes are identified by their mass-weighted overlap with the
     analytic rigid-body translations and rotations of the nodes, not by
@@ -1801,7 +1832,10 @@ class ModalGeneratorFEM:
 
     Damping is not part of the eigenproblem. ``damping_matrix`` is projected onto
     the selected modes and only its diagonal is stored; see
-    ``damping_projection``.
+    ``damping_projection``. Unlike :class:`ModalGeneratorCraigBampton`, the
+    generator does not reject damping that acts on rigid-body motion, such as
+    mass-proportional Rayleigh damping of a free-free model; that part is
+    dropped with the rigid-body modes, so the floating frame is undamped.
 
     After :meth:`build`, ``rigid_mode_count`` and ``rigid_modal_matrix``
     (``[3 * node_count, rigid_mode_count]``, mass-orthonormal rigid-body nodal
@@ -2250,6 +2284,8 @@ def _cantilever_eigenfunction(s: np.ndarray, beta_l: float, length: float) -> tu
 class ModalGeneratorBeam:
     """Build sampled linear modes for a straight Euler-Bernoulli beam.
 
+    .. experimental::
+
     The beam lies along local ``x`` with its midpoint at the body origin. Fixed
     (clamped) boundaries are at the root ``x = -length / 2``; arc length
     ``s = x + length / 2`` runs from the root to the free tip. Cantilever and
@@ -2310,28 +2346,27 @@ class ModalGeneratorBeam:
         TORSION = "torsion"
 
     class Boundary:
-        """Beam boundary names used by mode specifications.
-
-        Attributes:
-            PINNED_PINNED: Bending ``sin(n pi s / L)``, simply supported at both ends.
-            CANTILEVER_TIP: Clamped-free Euler-Bernoulli bending eigenfunctions
-                ``cosh(beta s) - cos(beta s) - sigma (sinh(beta s) - sin(beta s))``
-                for every order, with zero root deflection and slope and unit tip
-                deflection. The modes are mass- and stiffness-orthogonal.
-            CANTILEVER_STATIC: Order-1 static tip-load bending shape
-                ``s^2 (3 L - s) / (2 L^3)``. Its stiffness ``3 E I / L^3`` reproduces
-                the exact static tip-load deflection; its modal mass is
-                ``33 rho A L / 140``.
-            FIXED_FREE: Torsion or axial ``sin((n - 1/2) pi s / L)``, fixed at the root.
-            LINEAR: Axial stretch ``x / L`` about the midpoint (order 1 only), or
-                torsion ``(s / L)^n``.
-        """
+        """Beam boundary names used by mode specifications."""
 
         PINNED_PINNED = "pinned-pinned"
+        """Bending ``sin(n pi s / L)``, simply supported at both ends."""
         CANTILEVER_TIP = "cantilever-tip"
+        """Clamped-free Euler-Bernoulli bending eigenfunctions.
+
+        ``cosh(beta s) - cos(beta s) - sigma (sinh(beta s) - sin(beta s))`` for
+        every order, with zero root deflection and slope and unit tip deflection.
+        The modes are mass- and stiffness-orthogonal.
+        """
         CANTILEVER_STATIC = "cantilever-static"
+        """Order-1 static tip-load bending shape ``s^2 (3 L - s) / (2 L^3)``.
+
+        Its stiffness ``3 E I / L^3`` reproduces the exact static tip-load
+        deflection; its modal mass is ``33 rho A L / 140``.
+        """
         FIXED_FREE = "fixed-free"
+        """Torsion or axial ``sin((n - 1/2) pi s / L)``, fixed at the root."""
         LINEAR = "linear"
+        """Axial stretch ``x / L`` about the midpoint (order 1 only), or torsion ``(s / L)^n``."""
 
     _SUPPORTED_BOUNDARIES: ClassVar[dict[str, tuple[str, ...]]] = {
         Mode.AXIAL: (Boundary.LINEAR, Boundary.FIXED_FREE),

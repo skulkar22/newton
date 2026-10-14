@@ -914,9 +914,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 angular beta values to zero. ``None`` and ``True`` leave the beta controls unchanged.
             elastic_body_relaxation: Under-relaxation factor for reduced elastic body block updates. This scales the
                 coupled frame-and-mode update after inertia, joint, and contact terms are assembled. Must be finite and
-                in the range ``[0, 1]``.
+                in the range ``[0, 1]``. Elastic bodies solved inside a ``"block_sparse_joints"`` articulation use
+                ``rigid_articulation_relaxation`` instead.
             elastic_solver_metrics: Whether to compute reduced elastic block residual and update metrics. Disabled by
-                default to avoid extra dense matrix-vector products in every block solve.
+                default to avoid extra dense matrix-vector products in every block solve. Elastic bodies solved inside
+                a ``"block_sparse_joints"`` articulation report zero metrics.
             elastic_block_solver: Solve method for the coupled frame-and-mode block of each reduced elastic body.
                 ``"tiled"`` factorizes each block in shared memory and raises :class:`ValueError` at construction
                 when a block does not fit the device's per-block shared memory (about 151 modes on a device with

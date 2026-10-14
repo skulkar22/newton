@@ -1364,9 +1364,9 @@ class Model:
         self.elastic_mode_damping: wp.array[wp.float32] | None = None
         """Reduced elastic modal damping values [N s/m], shape [sum(elastic_mode_count)], float."""
         self.elastic_mode_coupling_linear: wp.array[wp.vec3] | None = None
-        """Reduced elastic linear inertia coupling ``S_i`` [kg], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
+        """Reduced elastic linear inertia coupling ``S_i = sum_s m_s phi_i(x_s)`` [kg], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
         self.elastic_mode_coupling_angular: wp.array[wp.vec3] | None = None
-        """Reduced elastic angular inertia coupling [kg m], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
+        """Reduced elastic angular inertia coupling ``G_i = sum_s m_s phi_i(x_s) cross x_s`` [kg m], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
         self.elastic_mode_coupling_centrifugal: wp.array[wp.mat33] | None = None
         """Reduced elastic centrifugal coupling ``sum_s m_s phi_i(x_s) outer x_s`` [kg m], shape [sum(elastic_mode_count)], dtype :class:`mat33`."""
         self.elastic_mode_coupling_coriolis: wp.array[wp.vec3] | None = None
