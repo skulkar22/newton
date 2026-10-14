@@ -100,9 +100,9 @@ from .reduced_elastic_kernels import (
 from .reduced_elastic_sparse_kernels import (
     assemble_elastic_sparse_frame_blocks,
     build_elastic_sparse_schur_columns,
-    factor_elastic_sparse_modes,
+    create_solve_elastic_sparse_modes_tiled,
+    launch_solve_elastic_sparse_modes,
     scatter_elastic_sparse_schur,
-    solve_elastic_sparse_schur_columns,
     update_elastic_sparse_modes,
 )
 from .rigid_sparse_articulation import build_rigid_articulation_sparse_layout
@@ -291,6 +291,30 @@ def _max_elastic_block_solve_tiled_width_cached(device_alias: str) -> int:
         else:
             high = middle
     return low
+
+
+def _sparse_modal_solve_shared_memory_estimate(width: int) -> int:
+    """Estimate the dynamic shared memory of the tiled sparse modal solve for ``width`` modes, in bytes.
+
+    The kernel holds the ``width`` squared factor tile, one ``width x 1`` and one ``width x 6``
+    right-hand-side tile, each aligned to 16 bytes.
+    """
+
+    def align(num_bytes: int) -> int:
+        return (num_bytes + 15) // 16 * 16
+
+    return align(4 * width * width) + align(4 * width) + align(24 * width)
+
+
+@functools.cache
+def _measure_sparse_modal_solve_shared_memory(device_alias: str, width: int, block_dim: int) -> tuple[int, bool]:
+    """Measure the dynamic shared memory of the tiled sparse modal solve and whether it fits the device."""
+    device = wp.get_device(device_alias)
+    kernel = create_solve_elastic_sparse_modes_tiled(width)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        hooks = kernel.module.load(device, block_dim).get_kernel_hooks(kernel)
+    return int(hooks.forward_smem_bytes), hooks.forward_smem_shortfall is None
 
 
 def _elastic_block_bucket_width(mode_count: int, max_block_width: int) -> int:
@@ -1729,14 +1753,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._sparse_elastic_body_count = count
         max_modes = int(model.elastic_max_mode_count)
         group_count = 0 if layout is None else layout.elastic_group_count
-        self._sparse_elastic_factor_diag = wp.zeros(max(count * max_modes, 1), dtype=float, device=self.device)
         self._sparse_elastic_definite = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self._sparse_elastic_z = wp.zeros(max(count * max_modes, 1), dtype=float, device=self.device)
         self._sparse_elastic_b = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
         self._sparse_elastic_w = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
         self._sparse_elastic_joint_data = None
+        self._sparse_elastic_modal_solve = None
         if layout is None:
             return
+        if count > 0 and max_modes > 0:
+            self._init_sparse_elastic_modal_solve(model, layout, count, group_count, max_modes)
 
         data = SparseElasticJointData()
         data.enabled = int(count > 0)
@@ -1754,6 +1780,56 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         data.joint_cross_slot = layout.joint_cross_slot
         self._sparse_elastic_joint_data = data
         self._validate_sparse_elastic_support()
+
+    def _init_sparse_elastic_modal_solve(
+        self, model: Model, layout, count: int, group_count: int, max_modes: int
+    ) -> None:
+        """Choose the modal factor-and-solve path of the sparse elimination and allocate its storage.
+
+        All elastic articulation bodies are solved at the largest of their mode counts; smaller
+        bases are padded with identity rows. The tiled path keeps one body's modal block in
+        shared memory; a width that does not fit uses the dense panel path, following
+        ``elastic_block_solver`` as the local block solve does.
+        """
+        elastic_index = model.body_elastic_index.numpy()[layout.elastic_bodies.numpy()]
+        width = max(int(np.max(model.elastic_mode_count.numpy()[elastic_index])), 1)
+        path, block_dim = self._select_sparse_modal_solve_path(width)
+        if path == "dense":
+            width = elastic_block_dense_width(width)
+        self._sparse_elastic_modal_solve = (path, width, block_dim)
+        self._sparse_elastic_modal_factor = wp.empty((count, width, width), dtype=float, device=self.device)
+        self._sparse_elastic_modal_rhs = wp.empty((count, width, 1), dtype=float, device=self.device)
+        self._sparse_elastic_z_columns = self._sparse_elastic_z.reshape((count, max_modes, 1))
+        self._sparse_elastic_b_groups = self._sparse_elastic_b.reshape((group_count, max_modes, 6))
+        self._sparse_elastic_w_groups = self._sparse_elastic_w.reshape((group_count, max_modes, 6))
+
+    def _select_sparse_modal_solve_path(self, width: int) -> tuple[str, int]:
+        """Return the sparse modal solve path and thread block size for ``width`` modes.
+
+        Raises:
+            ValueError: If ``elastic_block_solver="tiled"`` and the tiled modal solve does not
+                fit the device's shared memory.
+        """
+        if self.elastic_block_solver == "dense":
+            return "dense", ELASTIC_BLOCK_DENSE_BLOCK_DIM
+        estimate = _sparse_modal_solve_shared_memory_estimate(width)
+        limit = _elastic_block_solve_shared_memory_limit(self.device)
+        if not self.device.is_cuda:
+            block_dim, required_bytes, fits = 1, estimate, estimate <= limit
+        else:
+            block_dim = elastic_block_solve_tiled_block_dim(width)
+            required_bytes, fits = estimate, False
+            if estimate <= limit:
+                required_bytes, fits = _measure_sparse_modal_solve_shared_memory(self.device.alias, width, block_dim)
+        if fits:
+            return "tiled", block_dim
+        if self.elastic_block_solver == "auto":
+            return "dense", ELASTIC_BLOCK_DENSE_BLOCK_DIM
+        raise ValueError(
+            f"The block-sparse articulation solve factors each reduced elastic body's {width} x {width} modal "
+            f"block in shared memory, which needs {required_bytes} bytes, but device '{self.device}' provides "
+            f"{limit} bytes per block. Reduce the largest modal basis or use elastic_block_solver='auto' or 'dense'."
+        )
 
     def _validate_sparse_elastic_support(self) -> None:
         """Reject joint features that the block-sparse solve cannot apply to reduced elastic bodies.
@@ -7171,41 +7247,28 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             outputs=[self.elastic_body_block_matrix, self._sparse_elastic_b],
             device=self.device,
         )
-        wp.launch(
-            kernel=factor_elastic_sparse_modes,
-            dim=layout.elastic_body_count,
-            inputs=[
+        # Factor-and-solve of each modal block: a separate pass before the scatter, independent of
+        # the factorization of the sparse frame system.
+        if self._sparse_elastic_modal_solve is not None:
+            path, width, block_dim = self._sparse_elastic_modal_solve
+            launch_solve_elastic_sparse_modes(
+                path,
+                width,
+                block_dim,
                 elastic_bodies,
                 model.body_elastic_index,
                 model.elastic_mode_count,
-                max_modes,
+                layout.elastic_group_offsets,
                 self.elastic_body_block_grad,
-            ],
-            outputs=[
                 self.elastic_body_block_matrix,
-                self._sparse_elastic_factor_diag,
+                self._sparse_elastic_modal_factor,
+                self._sparse_elastic_modal_rhs,
+                self._sparse_elastic_b_groups,
                 self._sparse_elastic_definite,
-                self._sparse_elastic_z,
-            ],
-            device=self.device,
-        )
-        wp.launch(
-            kernel=solve_elastic_sparse_schur_columns,
-            dim=layout.elastic_group_count * 6,
-            inputs=[
-                elastic_bodies,
-                layout.elastic_group_owner,
-                model.body_elastic_index,
-                model.elastic_mode_count,
-                max_modes,
-                self.elastic_body_block_matrix,
-                self._sparse_elastic_factor_diag,
-                self._sparse_elastic_definite,
-                self._sparse_elastic_b,
-            ],
-            outputs=[self._sparse_elastic_w],
-            device=self.device,
-        )
+                self._sparse_elastic_z_columns,
+                self._sparse_elastic_w_groups,
+                self.device,
+            )
         wp.launch(
             kernel=scatter_elastic_sparse_schur,
             dim=36 * layout.elastic_pair_count + 6 * layout.elastic_group_count,

@@ -2180,6 +2180,42 @@ def create_solve_elastic_body_dense(block_width: int):
     )
 
 
+def launch_factor_elastic_dense_panels(
+    body_ids: wp.array,
+    body_elastic_index: wp.array,
+    factor: wp.array,
+    panel_count: int,
+    device,
+    block_dim: int = ELASTIC_BLOCK_DENSE_BLOCK_DIM,
+):
+    """Cholesky-factor ``factor[slot]`` in place by 32x32 panels for every body in ``body_ids``.
+
+    ``factor`` has shape ``(len(body_ids), W_d, W_d)`` with ``W_d = 32 * panel_count`` and holds
+    the lower panel triangle of a symmetric positive definite matrix; the factor ``L``
+    overwrites it. Bodies whose ``body_elastic_index`` is negative are skipped.
+    """
+    body_count = body_ids.shape[0]
+    for step in range(panel_count):
+        wp.launch_tiled(
+            factor_elastic_dense_panel_column,
+            dim=[body_count],
+            inputs=[body_ids, body_elastic_index, step, panel_count],
+            outputs=[factor],
+            block_dim=block_dim,
+            device=device,
+        )
+        trailing_count = (panel_count - step - 1) * (panel_count - step) // 2
+        if trailing_count > 0:
+            wp.launch_tiled(
+                update_elastic_dense_trailing_panels,
+                dim=[body_count, trailing_count],
+                inputs=[body_ids, body_elastic_index, step, panel_count],
+                outputs=[factor],
+                block_dim=block_dim,
+                device=device,
+            )
+
+
 def launch_solve_elastic_body_dense(
     block_width: int,
     body_ids: wp.array,
@@ -2211,25 +2247,7 @@ def launch_solve_elastic_body_dense(
         block_dim=block_dim,
         device=device,
     )
-    for step in range(panel_count):
-        wp.launch_tiled(
-            factor_elastic_dense_panel_column,
-            dim=[body_count],
-            inputs=[body_ids, body_elastic_index, step, panel_count],
-            outputs=[factor],
-            block_dim=block_dim,
-            device=device,
-        )
-        trailing_count = (panel_count - step - 1) * (panel_count - step) // 2
-        if trailing_count > 0:
-            wp.launch_tiled(
-                update_elastic_dense_trailing_panels,
-                dim=[body_count, trailing_count],
-                inputs=[body_ids, body_elastic_index, step, panel_count],
-                outputs=[factor],
-                block_dim=block_dim,
-                device=device,
-            )
+    launch_factor_elastic_dense_panels(body_ids, body_elastic_index, factor, panel_count, device, block_dim)
     wp.launch_tiled(
         create_solve_elastic_body_dense(block_width),
         dim=[body_count],
