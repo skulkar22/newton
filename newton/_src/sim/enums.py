@@ -229,7 +229,12 @@ class JointType(IntEnum, metaclass=_DeprecatedJointTypeMeta):
     """Rod joint: four VBD material slots for stretch, shear, bend, and twist."""
 
     ELASTIC = 8
-    """Reduced elastic body owner: free rigid frame plus per-body elastic mode DoFs."""
+    """Reduced elastic body owner: free rigid frame plus per-body elastic mode DoFs.
+
+    .. experimental::
+
+    See :ref:`Reduced Elastic Links`.
+    """
 
     def dof_count(self, num_axes: int) -> tuple[int, int]:
         """

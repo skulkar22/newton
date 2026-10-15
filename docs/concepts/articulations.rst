@@ -577,7 +577,8 @@ Joint types
      - 4
      - 4
    * - ``JointType.ELASTIC``
-     - Reduced elastic owner joint with a floating frame and modal deformation coordinates
+     - Reduced elastic owner joint with a floating frame and modal deformation
+       coordinates (see :ref:`Reduced Elastic Links`)
      - 7 + mode count (3D position + 4D quaternion + modal amplitudes)
      - 6 + mode count (twist + modal velocities)
 
@@ -590,8 +591,10 @@ floating frame and modal state; ordinary joints such as
 their existing parent and child transforms. A :class:`~newton.ModalBasis` stores
 sampled linear mode values that can be reused by multiple elastic body instances.
 Newton samples that basis at joint attachment frames for the VBD solve and at
-visible shape vertices for Viewer rendering. The legacy mode-shape callable path
-is still accepted for custom experiments.
+shape vertices for contacts and Viewer rendering. The legacy mode-shape callable
+path is still accepted for custom experiments. See :ref:`Reduced Elastic Links`
+for the state layout, inertia formulation, units, modal generators, and
+limitations.
 
 For ``JointType.ROD``, both counts represent allocated material slots, not
 generalized coordinates or velocity DOFs; see `Rod joints`_.
@@ -1337,6 +1340,52 @@ joints and omitted loop closures are rejected when the sparse solver is
 constructed. Put a loop-closing joint inside a single articulation to include
 it in the direct factorization, or use the local solve for models whose joints
 must cross articulation boundaries.
+
+Reduced elastic links (see :ref:`Reduced Elastic Links`) take part in the
+same factorization. Their owner joint
+(:attr:`~newton.JointType.ELASTIC`, created by
+:meth:`~newton.ModelBuilder.add_link_elastic`) carries no constraint, so it may
+stay outside the articulation; the link belongs to the articulation through its
+physical joints, or through the one-joint articulation that
+:meth:`~newton.ModelBuilder.add_body_elastic` creates. The solver eliminates
+each elastic link's modal coordinates onto its frame block and onto the frames
+of the bodies it is jointed to, so a loop through an elastic coupler is solved
+as one system:
+
+.. code-block:: python
+
+   crank = builder.add_link(...)
+   coupler = builder.add_link_elastic(..., modal_basis=basis)  # owner joint stays outside
+   rocker = builder.add_link(...)
+   j_drive = builder.add_joint_revolute(parent=-1, child=crank, ...)
+   j_a = builder.add_joint_revolute(parent=crank, child=coupler, ...)
+   j_b = builder.add_joint_revolute(parent=coupler, child=rocker, ...)
+   j_loop = builder.add_joint_revolute(parent=-1, child=rocker, ...)
+   builder.add_articulation([j_drive, j_a, j_b, j_loop], allow_closed_loops=True)
+
+An elastic link whose joints all connect it to rigid links (such as the
+coupler above) is eliminated exactly, so the loop converges in as many
+iterations as a rigid one. A joint between two elastic links couples their
+modes directly; the sparse solve replaces that coupling by a conservative
+per-link term, which keeps the iteration stable and the converged solution
+unchanged but slows convergence. For two hinged elastic beams the trajectory
+is about 1e-2 from the converged solution at 24 iterations, 1e-3 at 96, and
+1e-5 at 384, where the local solve reaches 5e-4 at 24 and 2e-5 at 96
+iterations. For chains of directly jointed elastic links, prefer the local
+solve or a rigid link between the elastic links.
+
+Every joint attached to an elastic link needs an elastic endpoint sample, the
+mode values at its attachment, so that the solve can couple the joint to the
+link's modes. :meth:`~newton.ModelBuilder.finalize` creates one for every
+joint of a link with modes; a joint without one is rejected when the solver is
+constructed. Joint mimics anywhere in the model, and armature, passive damping,
+or friction on joints attached to an elastic link, are not supported in this
+mode and are rejected, also when they are set later and reported with
+:meth:`~newton.solvers.SolverBase.notify_model_changed`.
+
+The modal factorization of each elastic link costs about as much as in the
+local solve; see :ref:`Reduced Elastic Links` for measured costs and mode-count
+limits.
 
 .. warning::
 

@@ -735,6 +735,8 @@ class ModelBuilder:
                 "elastic_mode_coupling_angular",
                 "elastic_mode_coupling_centrifugal",
                 "elastic_mode_coupling_coriolis",
+                "elastic_mode_coupling_quadratic",
+                "elastic_mode_mass_matrix",
                 "elastic_mode_shape_fn",
                 "modal_bases",
                 "elastic_basis",
@@ -2034,9 +2036,16 @@ class ModelBuilder:
         self.elastic_mode_coupling_angular: list[tuple[float, float, float]] = []
         """Reduced elastic angular inertia coupling integrals [kg m]."""
         self.elastic_mode_coupling_centrifugal: list[wp.mat33] = []
-        """Reduced elastic centrifugal coupling integrals [kg m^2], row-major 3x3 per mode."""
-        self.elastic_mode_coupling_coriolis: list[tuple[float, float, float]] = []
-        """Reduced elastic Coriolis coupling integrals [kg m^2], row-major mode pairs per elastic body."""
+        """Reduced elastic centrifugal coupling integrals [kg m], row-major 3x3 per mode."""
+        self.elastic_mode_coupling_coriolis: list[np.ndarray] = []
+        """Reduced elastic Coriolis coupling integrals [kg], one ``float32`` block of shape
+        ``[mode_count, mode_count, 3]`` per elastic body."""
+        self.elastic_mode_coupling_quadratic: list[np.ndarray] = []
+        """Reduced elastic mode-pair inertia integrals [kg], one ``float32`` block of shape
+        ``[mode_count, mode_count, 3, 3]`` per elastic body."""
+        self.elastic_mode_mass_matrix: list[np.ndarray] = []
+        """Reduced elastic modal mass matrices [kg], one ``float32`` block of shape
+        ``[mode_count, mode_count]`` per elastic body."""
         self.elastic_mode_shape_fn: list[Callable[[np.ndarray], Any] | None] = []
         """Builder-only mode-shape sampling callables for reduced elastic bodies."""
         self.modal_bases: list[ModalBasis] = []
@@ -3966,6 +3975,8 @@ class ModelBuilder:
             self.elastic_mode_coupling_angular.extend(builder.elastic_mode_coupling_angular)
             self.elastic_mode_coupling_centrifugal.extend(builder.elastic_mode_coupling_centrifugal)
             self.elastic_mode_coupling_coriolis.extend(builder.elastic_mode_coupling_coriolis)
+            self.elastic_mode_coupling_quadratic.extend(builder.elastic_mode_coupling_quadratic)
+            self.elastic_mode_mass_matrix.extend(builder.elastic_mode_mass_matrix)
             self.elastic_mode_shape_fn.extend(builder.elastic_mode_shape_fn)
             self.elastic_basis.extend(
                 modal_basis_map[basis_index] if basis_index >= 0 else -1 for basis_index in builder.elastic_basis
@@ -5681,29 +5692,36 @@ class ModelBuilder:
         return [wp.mat33(*block.tolist()) for block in blocks]
 
     @staticmethod
-    def _coerce_coupling_pairs(values: np.ndarray | None, mode_count: int) -> list[tuple[float, float, float]]:
-        """Return row-major mode-pair vec3 coupling rows, zeros when the basis has none."""
+    def _coerce_coupling_pairs(
+        values: np.ndarray | None, mode_count: int, value_shape: tuple[int, ...], name: str
+    ) -> np.ndarray:
+        """Return one body's ``float32`` mode-pair block, zeros when the basis has none."""
+        shape = (mode_count, mode_count, *value_shape)
         if values is None:
-            return [(0.0, 0.0, 0.0)] * (mode_count * mode_count)
-        rows = np.asarray(values, dtype=np.float32).reshape((mode_count * mode_count, 3))
-        return [(float(r[0]), float(r[1]), float(r[2])) for r in rows]
+            return np.zeros(shape, dtype=np.float32)
+        block = np.asarray(values, dtype=np.float32)
+        if block.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {block.shape}")
+        return np.array(block, dtype=np.float32, copy=True)
 
-    def _padded_coriolis_blocks(self) -> list[wp.vec3]:
-        """Pad each elastic body's row-major mode-pair Coriolis block to ``elastic_max_mode_count``."""
+    def _padded_pair_blocks(self, values_per_body: Sequence[np.ndarray], value_shape: tuple[int, ...]) -> np.ndarray:
+        """Pad per-body mode-pair blocks into one row-major ``float32`` array.
+
+        Args:
+            values_per_body: One block of shape ``[mode_count, mode_count, *value_shape]``
+                per elastic body.
+            value_shape: Shape of each mode-pair entry, e.g. ``()``, ``(3,)``, or ``(3, 3)``.
+
+        Returns:
+            Zero-padded array of shape
+            ``[elastic_body_count * elastic_max_mode_count^2, *value_shape]``.
+        """
         max_modes = self.elastic_max_mode_count
-        padded: list[wp.vec3] = []
-        offset = 0
-        for e in range(len(self.elastic_body)):
-            n = int(self.elastic_mode_count[e])
-            for i in range(max_modes):
-                for j in range(max_modes):
-                    if i < n and j < n:
-                        v = self.elastic_mode_coupling_coriolis[offset + i * n + j]
-                        padded.append(wp.vec3(float(v[0]), float(v[1]), float(v[2])))
-                    else:
-                        padded.append(wp.vec3(0.0))
-            offset += n * n
-        return padded
+        padded = np.zeros((len(values_per_body), max_modes, max_modes, *value_shape), dtype=np.float32)
+        for e, block in enumerate(values_per_body):
+            n = int(block.shape[0])
+            padded[e, :n, :n] = block
+        return padded.reshape((-1, *value_shape))
 
     def _register_modal_basis(self, basis: ModalBasis) -> int:
         basis_id = id(basis)
@@ -5731,11 +5749,16 @@ class ModelBuilder:
     ) -> int:
         """Add a reduced elastic state-owner joint.
 
+        .. experimental::
+
         The joint stores a free floating frame followed by reduced elastic modal
         coordinates. Its coordinate layout is ``[pos, quat, modes...]`` and its
-        velocity layout is ``[linear, angular, mode_dot...]``. The joint is a state
-        owner and contributes no bilateral constraints by itself; physical
-        connectivity should be added with ordinary joints.
+        velocity layout is ``[linear, angular, mode_dot...]``, where ``linear`` is
+        the world velocity of the body's rest center of mass and ``angular`` the
+        world angular velocity. The joint is a state owner and contributes no
+        bilateral constraints by itself; physical connectivity should be added
+        with ordinary joints. :meth:`add_link_elastic` adds this joint together
+        with the elastic body record and is the usual entry point.
 
         Args:
             child: Child body index owned by this reduced elastic joint.
@@ -5744,8 +5767,8 @@ class ModelBuilder:
             parent_xform: Transform from parent body to the owner joint frame.
             child_xform: Transform from child body to the owner joint frame.
             label: Joint label.
-            mode_q: Initial modal amplitudes.
-            mode_qd: Initial modal velocities.
+            mode_q: Initial modal coordinates [m for displacement-valued modes].
+            mode_qd: Initial modal velocities [m/s for displacement-valued modes].
             enabled: Whether the owner joint is enabled.
             custom_attributes: Custom joint attributes.
 
@@ -5864,13 +5887,75 @@ class ModelBuilder:
 
         return joint_id
 
+    def _resolve_elastic_rigid_properties(
+        self,
+        modal_basis: ModalBasis | None,
+        mass: float | None,
+        com: Vec3 | None,
+        inertia: Mat33 | None,
+        label: str | None,
+        inertia_tolerance: float | None,
+    ) -> tuple[float, Vec3 | None, Mat33 | None]:
+        """Default elastic frame mass properties to the basis's rigid properties and check explicit values.
+
+        Returns:
+            The resolved ``(mass, com, inertia)``; ``com`` and ``inertia`` stay
+            ``None`` when neither the caller nor the basis provides them.
+        """
+        basis_mass = None if modal_basis is None else modal_basis.rigid_mass
+        if basis_mass is not None and not basis_mass > 0.0:
+            basis_mass = None
+        basis_com = None if basis_mass is None else modal_basis.rigid_com
+        basis_inertia = None if basis_mass is None else modal_basis.rigid_inertia
+
+        if inertia_tolerance is not None and basis_mass is not None and (mass is None or mass > 0.0):
+            tolerance = float(inertia_tolerance)
+            mismatches = []
+            if mass is not None and abs(float(mass) - basis_mass) > tolerance * basis_mass:
+                mismatches.append(f"mass {float(mass):.6g} kg vs basis {basis_mass:.6g} kg")
+            if com is not None and basis_com is not None:
+                com_value = np.asarray(axis_to_vec3(com), dtype=np.float64)
+                radius = (
+                    math.sqrt(max(float(np.trace(basis_inertia)), 0.0) / basis_mass)
+                    if basis_inertia is not None
+                    else 0.0
+                )
+                if float(np.linalg.norm(com_value - basis_com)) > tolerance * radius:
+                    mismatches.append(f"com {com_value.tolist()} m vs basis {np.asarray(basis_com).tolist()} m")
+            if inertia is not None and basis_inertia is not None:
+                inertia_value = np.asarray(self._coerce_mat33(inertia), dtype=np.float64).reshape((3, 3))
+                scale = float(np.linalg.norm(basis_inertia))
+                if float(np.linalg.norm(inertia_value - basis_inertia)) > tolerance * scale:
+                    mismatches.append(
+                        f"inertia {inertia_value.round(9).tolist()} kg m^2 vs basis "
+                        f"{np.asarray(basis_inertia, dtype=np.float64).round(9).tolist()} kg m^2"
+                    )
+            if mismatches:
+                name = label if label else f"body {len(self.body_mass)}"
+                warnings.warn(
+                    f"Elastic body '{name}' mass properties differ from its modal basis rigid properties "
+                    f"(relative tolerance {tolerance:.3g}): {'; '.join(mismatches)}. An inconsistent frame mass "
+                    "or inertia can make the reduced mass matrix indefinite and disable the implicit "
+                    "frame/mode mass coupling; omit mass, com, and inertia to use the basis values.",
+                    stacklevel=self._external_warning_stacklevel(),
+                )
+
+        if mass is None:
+            mass = 0.0 if basis_mass is None else basis_mass
+        if mass > 0.0:
+            if com is None and basis_com is not None:
+                com = wp.vec3(*np.asarray(basis_com, dtype=np.float32).tolist())
+            if inertia is None and basis_inertia is not None:
+                inertia = wp.mat33(*np.asarray(basis_inertia, dtype=np.float32).ravel().tolist())
+        return float(mass), com, inertia
+
     def add_link_elastic(
         self,
         xform: Transform | None = None,
         armature: float | None = None,
         com: Vec3 | None = None,
         inertia: Mat33 | None = None,
-        mass: float = 0.0,
+        mass: float | None = None,
         label: str | None = None,
         mode_count: int = 0,
         mode_mass: Sequence[float] | None = None,
@@ -5883,34 +5968,73 @@ class ModelBuilder:
         lock_inertia: bool = False,
         is_kinematic: bool = False,
         custom_attributes: dict[str, Any] | None = None,
+        *,
+        inertia_tolerance: float | None = 0.05,
     ) -> int:
         """Add a reduced elastic link with a floating frame and modal DoFs.
 
-        The returned body has a normal body slot and a reduced elastic owner joint.
-        Ordinary joints use their existing parent/child transforms as endpoint
-        material frames; if the endpoint body is elastic, ``mode_shape_fn`` is
-        sampled at that transform during finalization.
+        .. experimental::
+
+        The returned body has a normal body slot and a reduced elastic owner joint
+        (:attr:`~newton.JointType.ELASTIC`). Ordinary joints use their existing
+        parent/child transforms as endpoint material frames. At finalization, an
+        endpoint on an elastic link takes its mode values from a coincident
+        attachment frame of ``modal_basis``, else from a coincident sample, else
+        from a new sample interpolated by inverse distance; with
+        ``mode_shape_fn``, the callable is evaluated at the endpoint. See
+        :ref:`Reduced Elastic Links`.
 
         Args:
             xform: Initial world transform of the floating frame.
-            armature: Artificial inertia added to the body.
-            com: Center of mass in the body frame.
-            inertia: Inertia tensor relative to the center of mass.
-            mass: Body mass [kg].
+            armature: Artificial inertia [kg m^2] added to the body's
+                rotational inertia after the defaults below are resolved.
+            com: Center of mass [m] in the body frame. ``None`` uses the
+                basis's ``rigid_com`` when ``modal_basis`` provides rigid
+                properties and the resolved mass is positive, else the origin.
+            inertia: Rotational inertia [kg m^2] about the center of mass.
+                ``None`` uses the basis's ``rigid_inertia`` under the same
+                conditions as ``com``, else zero.
+            mass: Body mass [kg]. ``None`` uses the basis's ``rigid_mass`` when
+                ``modal_basis`` provides one, else ``0.0``. An explicit ``0.0``
+                keeps its usual meaning (no translational inertia) and is not
+                compared against the basis.
             label: Body label.
-            mode_count: Number of reduced elastic modal coordinates.
-            mode_mass: Modal masses [kg].
-            mode_stiffness: Modal stiffness values [N/m].
-            mode_damping: Modal damping values [N s/m].
-            mode_q: Initial modal amplitudes.
-            mode_qd: Initial modal velocities.
-            mode_shape_fn: Callable receiving a local endpoint position ``np.ndarray(3,)``
-                and returning translational mode samples with shape ``(mode_count, 3)``.
-            modal_basis: Sampled linear modal basis used to evaluate attachment and
-                surface deformation samples.
+            mode_count: Number of reduced elastic modal coordinates. ``0``
+                uses ``modal_basis.mode_count``.
+            mode_mass: Modal masses [kg] for displacement-valued modal
+                coordinates. ``None`` uses the basis's ``mode_mass`` and full
+                ``mode_mass_matrix``; an explicit value replaces the basis's
+                modal mass matrix by this diagonal. Defaults to ``1`` without
+                a basis.
+            mode_stiffness: Modal stiffness values [N/m]. ``None`` uses the
+                basis values, else ``0``.
+            mode_damping: Modal damping values [N s/m]. ``None`` uses the basis
+                values, else ``0``.
+            mode_q: Initial modal coordinates [m for displacement-valued modes].
+            mode_qd: Initial modal velocities [m/s for displacement-valued modes].
+            mode_shape_fn: Legacy callable receiving a local endpoint position
+                ``np.ndarray(3,)`` and returning translational mode samples with
+                shape ``(mode_count, 3)``. It provides joint attachment values
+                only, with zero angular values and no inertia coupling.
+                Mutually exclusive with ``modal_basis``.
+            modal_basis: Sampled linear modal basis providing the attachment,
+                contact, and rendering samples, the modal mass, stiffness, and
+                damping, and the inertia coupling integrals. The basis is
+                shared by reference; finalization appends massless samples at
+                joint endpoints and shape vertices to it.
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.
+            inertia_tolerance: Relative tolerance for comparing an explicit
+                ``mass``, ``com``, and ``inertia`` with the rigid properties of
+                ``modal_basis``. A :class:`UserWarning` names the body and both
+                values when ``|mass - m_b| > tol * m_b``,
+                ``|com - c_b| > tol * sqrt(trace(I_b) / m_b)``, or
+                ``||inertia - I_b||_F > tol * ||I_b||_F``. ``None`` disables
+                the check. A frame mass or inertia inconsistent with the basis's
+                mass distribution can make the reduced mass matrix of the
+                frame and modes indefinite, which disables the solver's
+                implicit frame/mode mass coupling for the body.
 
         Returns:
             The body index.
@@ -5923,6 +6047,8 @@ class ModelBuilder:
         coupling_angular = None
         coupling_centrifugal = None
         coupling_coriolis = None
+        coupling_quadratic = None
+        mode_mass_matrix = None
         if modal_basis is not None:
             if mode_count == 0:
                 mode_count = modal_basis.mode_count
@@ -5933,6 +6059,7 @@ class ModelBuilder:
             basis_index = self._register_modal_basis(modal_basis)
             if mode_mass is None:
                 mode_mass = modal_basis.mode_mass
+                mode_mass_matrix = modal_basis.mode_mass_matrix
             if mode_stiffness is None:
                 mode_stiffness = modal_basis.mode_stiffness
             if mode_damping is None:
@@ -5941,12 +6068,17 @@ class ModelBuilder:
             coupling_angular = modal_basis.mode_coupling_angular
             coupling_centrifugal = modal_basis.mode_coupling_centrifugal
             coupling_coriolis = modal_basis.mode_coupling_coriolis
+            coupling_quadratic = modal_basis.mode_coupling_quadratic
+
+        mass, com, inertia = self._resolve_elastic_rigid_properties(
+            modal_basis, mass, com, inertia, label, inertia_tolerance
+        )
 
         if armature is not None:
             if armature < 0.0:
                 raise ValueError(f"armature must be non-negative, got {armature}")
             body_inertia = wp.mat33() if inertia is None else self._coerce_mat33(inertia)
-            inertia = body_inertia + wp.identity(3, dtype=float) * armature
+            inertia = body_inertia + wp.mat33(armature, 0.0, 0.0, 0.0, armature, 0.0, 0.0, 0.0, armature)
 
         body_id = self.add_link(
             xform=xform,
@@ -5974,13 +6106,25 @@ class ModelBuilder:
         self.elastic_joint.append(joint_id)
         self.elastic_mode_start.append(len(self.elastic_mode_mass))
         self.elastic_mode_count.append(mode_count)
-        self.elastic_mode_mass.extend(self._coerce_mode_values(mode_mass, mode_count, 1.0, "mode_mass"))
+        mode_mass_values = self._coerce_mode_values(mode_mass, mode_count, 1.0, "mode_mass")
+        self.elastic_mode_mass.extend(mode_mass_values)
         self.elastic_mode_stiffness.extend(self._coerce_mode_values(mode_stiffness, mode_count, 0.0, "mode_stiffness"))
         self.elastic_mode_damping.extend(self._coerce_mode_values(mode_damping, mode_count, 0.0, "mode_damping"))
         self.elastic_mode_coupling_linear.extend(self._coerce_coupling_values(coupling_linear, mode_count))
         self.elastic_mode_coupling_angular.extend(self._coerce_coupling_values(coupling_angular, mode_count))
         self.elastic_mode_coupling_centrifugal.extend(self._coerce_coupling_matrices(coupling_centrifugal, mode_count))
-        self.elastic_mode_coupling_coriolis.extend(self._coerce_coupling_pairs(coupling_coriolis, mode_count))
+        self.elastic_mode_coupling_coriolis.append(
+            self._coerce_coupling_pairs(coupling_coriolis, mode_count, (3,), "mode_coupling_coriolis")
+        )
+        self.elastic_mode_coupling_quadratic.append(
+            self._coerce_coupling_pairs(coupling_quadratic, mode_count, (3, 3), "mode_coupling_quadratic")
+        )
+        # Bodies without a full modal mass matrix use the diagonal so the solver has one code path.
+        if mode_mass_matrix is None:
+            mode_mass_matrix = np.diag(np.asarray(mode_mass_values, dtype=np.float32).reshape((mode_count,)))
+        self.elastic_mode_mass_matrix.append(
+            self._coerce_coupling_pairs(mode_mass_matrix, mode_count, (), "mode_mass_matrix")
+        )
         self.elastic_mode_shape_fn.append(mode_shape_fn)
         self.elastic_basis.append(basis_index)
         self.elastic_max_mode_count = max(self.elastic_max_mode_count, mode_count)
@@ -5993,7 +6137,7 @@ class ModelBuilder:
         armature: float | None = None,
         com: Vec3 | None = None,
         inertia: Mat33 | None = None,
-        mass: float = 0.0,
+        mass: float | None = None,
         label: str | None = None,
         mode_count: int = 0,
         mode_mass: Sequence[float] | None = None,
@@ -6006,8 +6150,12 @@ class ModelBuilder:
         lock_inertia: bool = False,
         is_kinematic: bool = False,
         custom_attributes: dict[str, Any] | None = None,
+        *,
+        inertia_tolerance: float | None = 0.05,
     ) -> int:
         """Add a stand-alone free-floating reduced elastic body.
+
+        .. experimental::
 
         This is the reduced-elastic equivalent of :meth:`add_body`: it creates
         an elastic link, adds its floating-frame owner joint to a one-joint
@@ -6015,24 +6163,55 @@ class ModelBuilder:
 
         Args:
             xform: Initial world transform of the floating frame.
-            armature: Artificial inertia added to the body.
-            com: Center of mass in the body frame.
-            inertia: Inertia tensor relative to the center of mass.
-            mass: Body mass [kg].
+            armature: Artificial inertia [kg m^2] added to the body's
+                rotational inertia after the defaults below are resolved.
+            com: Center of mass [m] in the body frame. ``None`` uses the
+                basis's ``rigid_com`` when ``modal_basis`` provides rigid
+                properties and the resolved mass is positive, else the origin.
+            inertia: Rotational inertia [kg m^2] about the center of mass.
+                ``None`` uses the basis's ``rigid_inertia`` under the same
+                conditions as ``com``, else zero.
+            mass: Body mass [kg]. ``None`` uses the basis's ``rigid_mass`` when
+                ``modal_basis`` provides one, else ``0.0``. An explicit ``0.0``
+                keeps its usual meaning (no translational inertia) and is not
+                compared against the basis.
             label: Body label.
-            mode_count: Number of reduced elastic modal coordinates.
-            mode_mass: Modal masses [kg].
-            mode_stiffness: Modal stiffness values [N/m].
-            mode_damping: Modal damping values [N s/m].
-            mode_q: Initial modal amplitudes.
-            mode_qd: Initial modal velocities.
-            mode_shape_fn: Callable receiving a local endpoint position ``np.ndarray(3,)``
-                and returning translational mode samples with shape ``(mode_count, 3)``.
-            modal_basis: Sampled linear modal basis used to evaluate attachment and
-                surface deformation samples.
+            mode_count: Number of reduced elastic modal coordinates. ``0``
+                uses ``modal_basis.mode_count``.
+            mode_mass: Modal masses [kg] for displacement-valued modal
+                coordinates. ``None`` uses the basis's ``mode_mass`` and full
+                ``mode_mass_matrix``; an explicit value replaces the basis's
+                modal mass matrix by this diagonal. Defaults to ``1`` without
+                a basis.
+            mode_stiffness: Modal stiffness values [N/m]. ``None`` uses the
+                basis values, else ``0``.
+            mode_damping: Modal damping values [N s/m]. ``None`` uses the basis
+                values, else ``0``.
+            mode_q: Initial modal coordinates [m for displacement-valued modes].
+            mode_qd: Initial modal velocities [m/s for displacement-valued modes].
+            mode_shape_fn: Legacy callable receiving a local endpoint position
+                ``np.ndarray(3,)`` and returning translational mode samples with
+                shape ``(mode_count, 3)``. It provides joint attachment values
+                only, with zero angular values and no inertia coupling.
+                Mutually exclusive with ``modal_basis``.
+            modal_basis: Sampled linear modal basis providing the attachment,
+                contact, and rendering samples, the modal mass, stiffness, and
+                damping, and the inertia coupling integrals. The basis is
+                shared by reference; finalization appends massless samples at
+                joint endpoints and shape vertices to it.
             lock_inertia: If True, prevents later shape additions from modifying mass properties.
             is_kinematic: If True, the floating frame is kinematic.
             custom_attributes: Body custom attributes.
+            inertia_tolerance: Relative tolerance for comparing an explicit
+                ``mass``, ``com``, and ``inertia`` with the rigid properties of
+                ``modal_basis``. A :class:`UserWarning` names the body and both
+                values when ``|mass - m_b| > tol * m_b``,
+                ``|com - c_b| > tol * sqrt(trace(I_b) / m_b)``, or
+                ``||inertia - I_b||_F > tol * ||I_b||_F``. ``None`` disables
+                the check. A frame mass or inertia inconsistent with the basis's
+                mass distribution can make the reduced mass matrix of the
+                frame and modes indefinite, which disables the solver's
+                implicit frame/mode mass coupling for the body.
 
         Returns:
             The body index.
@@ -6055,6 +6234,7 @@ class ModelBuilder:
             lock_inertia=lock_inertia,
             is_kinematic=is_kinematic,
             custom_attributes=custom_attributes,
+            inertia_tolerance=inertia_tolerance,
         )
         joint_id = self.body_elastic_joint[body_id]
         self.add_articulation([joint_id], label=f"{label}_articulation" if label else None)
@@ -13891,20 +14071,36 @@ class ModelBuilder:
     def _add_elastic_modal_sample(
         self, elastic_index: int, local_pos: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, int]:
-        """Return the translational and angular mode samples and basis sample index at a body-local point.
+        """Return the joint-endpoint mode samples and basis sample index at a body-local point.
 
         Angular samples are only available from a :class:`ModalBasis`; bodies driven by a
-        ``mode_shape_fn`` and unsampled bodies report zero angular coupling.
+        ``mode_shape_fn`` and unsampled bodies report zero angular coupling. Named
+        attachment frames of the basis take precedence over material samples.
         """
         phi, psi, sample_indices = self._add_elastic_modal_samples(
-            elastic_index, np.asarray(local_pos, dtype=np.float32).reshape((1, 3))
+            elastic_index, np.asarray(local_pos, dtype=np.float32).reshape((1, 3)), prefer_frames=True
         )
         return phi[0], psi[0], int(sample_indices[0])
 
     def _add_elastic_modal_samples(
-        self, elastic_index: int, local_positions: np.ndarray
+        self, elastic_index: int, local_positions: np.ndarray, *, prefer_frames: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return modal samples and basis indices for body-local points."""
+        """Return modal samples and basis indices for body-local points.
+
+        Args:
+            elastic_index: Elastic body index.
+            local_positions: Body-local points [m], shape ``[point_count, 3]``.
+            prefer_frames: Whether named attachment frames of the modal basis take
+                precedence over interpolated material samples. Joint endpoints set
+                this so that, e.g., a distributing Craig-Bampton interface uses its
+                interface mode values; surface (render and contact) samples do not.
+                The returned sample indices always refer to material samples, so
+                render and contact bookkeeping is unchanged.
+
+        Returns:
+            Translational and angular mode values, each shape
+            ``[point_count, mode_count, 3]``, and the basis sample indices.
+        """
         points = np.asarray(local_positions, dtype=np.float32).reshape((-1, 3))
         mode_count = self.elastic_mode_count[elastic_index]
         if mode_count == 0:
@@ -13918,6 +14114,12 @@ class ModelBuilder:
             sample_indices = basis.add_samples(points)
             phi = basis.sample_phi[sample_indices]
             psi = basis.sample_psi[sample_indices]
+            if prefer_frames and basis.frame_count > 0:
+                for point_index, point in enumerate(points):
+                    frame_index = basis.find_frame(point)
+                    if frame_index >= 0:
+                        phi[point_index] = basis.frame_phi[frame_index]
+                        psi[point_index] = basis.frame_psi[frame_index]
             if phi.shape != (points.shape[0], mode_count, 3):
                 raise ValueError(
                     f"modal_basis for elastic body {self.elastic_body[elastic_index]} must provide "
@@ -15845,7 +16047,19 @@ class ModelBuilder:
                 self.elastic_mode_coupling_centrifugal, dtype=wp.mat33, requires_grad=requires_grad
             )
             m.elastic_mode_coupling_coriolis = wp.array(
-                self._padded_coriolis_blocks(), dtype=wp.vec3, requires_grad=requires_grad
+                self._padded_pair_blocks(self.elastic_mode_coupling_coriolis, (3,)),
+                dtype=wp.vec3,
+                requires_grad=requires_grad,
+            )
+            m.elastic_mode_coupling_quadratic = wp.array(
+                self._padded_pair_blocks(self.elastic_mode_coupling_quadratic, (3, 3)),
+                dtype=wp.mat33,
+                requires_grad=requires_grad,
+            )
+            m.elastic_mode_mass_matrix = wp.array(
+                self._padded_pair_blocks(self.elastic_mode_mass_matrix, ()),
+                dtype=wp.float32,
+                requires_grad=requires_grad,
             )
             m.elastic_endpoint_sample = wp.array(self.elastic_endpoint_sample, dtype=wp.int32)
             m.elastic_endpoint_phi = wp.array(self.elastic_endpoint_phi, dtype=wp.vec3, requires_grad=requires_grad)

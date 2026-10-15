@@ -55,14 +55,14 @@ class Example:
         self.mode_stiffness = 3.0 * self.ei / (self.length**3)
         self._last_tip_load = self.tip_load_mean
 
-        beam_basis = newton.ModalGeneratorBeam(
+        shape_basis = newton.ModalGeneratorBeam(
             length=self.length,
             half_width_y=self.hy,
             half_width_z=self.hz,
             mode_specs=[
                 {
                     "type": newton.ModalGeneratorBeam.Mode.BENDING_Z,
-                    "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_TIP,
+                    "boundary": newton.ModalGeneratorBeam.Boundary.CANTILEVER_STATIC,
                 }
             ],
             sample_count=33,
@@ -74,6 +74,15 @@ class Example:
                 self.hz,
                 extra_points=((-0.5 * self.length, 0.0, 0.0), (0.5 * self.length, 0.0, 0.0)),
             )
+        )
+        # The single mode is quasi-static (zero modal mass) and tracks the analytic tip-load
+        # deflection, so it uses only the generator's shape and leaves out the floating-frame
+        # inertia coupling, which needs a consistent modal mass.
+        beam_basis = newton.ModalBasis(
+            sample_points=shape_basis.sample_points,
+            sample_phi=shape_basis.sample_phi,
+            sample_psi=shape_basis.sample_psi,
+            label="cantilever_basis",
         )
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -121,10 +130,7 @@ class Example:
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
-            rigid_compliant_alm=False,
             iterations=8,
-            rigid_joint_linear_k_start=1.0e5,
-            rigid_joint_angular_k_start=1.0e5,
             rigid_joint_linear_ke=1.0e6,
             rigid_joint_angular_ke=1.0e6,
         )

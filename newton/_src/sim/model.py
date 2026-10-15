@@ -1364,13 +1364,17 @@ class Model:
         self.elastic_mode_damping: wp.array[wp.float32] | None = None
         """Reduced elastic modal damping values [N s/m], shape [sum(elastic_mode_count)], float."""
         self.elastic_mode_coupling_linear: wp.array[wp.vec3] | None = None
-        """Reduced elastic linear inertia coupling ``S_i`` [kg], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
+        """Reduced elastic linear inertia coupling ``S_i = sum_s m_s phi_i(x_s)`` [kg], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
         self.elastic_mode_coupling_angular: wp.array[wp.vec3] | None = None
-        """Reduced elastic angular inertia coupling [kg m], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
+        """Reduced elastic angular inertia coupling ``G_i = sum_s m_s phi_i(x_s) cross x_s`` [kg m], shape [sum(elastic_mode_count)], dtype :class:`vec3`."""
         self.elastic_mode_coupling_centrifugal: wp.array[wp.mat33] | None = None
-        """Reduced elastic centrifugal coupling [kg m^2], shape [sum(elastic_mode_count)], dtype :class:`mat33`."""
+        """Reduced elastic centrifugal coupling ``sum_s m_s phi_i(x_s) outer x_s`` [kg m], shape [sum(elastic_mode_count)], dtype :class:`mat33`."""
         self.elastic_mode_coupling_coriolis: wp.array[wp.vec3] | None = None
-        """Reduced elastic Coriolis coupling [kg m^2], shape [elastic_body_count * elastic_max_mode_count^2], dtype :class:`vec3`."""
+        """Reduced elastic Coriolis coupling ``C_ij = sum_s phi_j(x_s) cross (m_s phi_i(x_s))`` [kg], row-major mode pairs ``(i, j)`` zero-padded per body, shape [elastic_body_count * elastic_max_mode_count^2], dtype :class:`vec3`."""
+        self.elastic_mode_coupling_quadratic: wp.array[wp.mat33] | None = None
+        """Reduced elastic mode-pair inertia ``P_ij = sum_s phi_i(x_s) outer (m_s phi_j(x_s))`` [kg], row-major mode pairs ``(i, j)`` zero-padded per body, shape [elastic_body_count * elastic_max_mode_count^2], dtype :class:`mat33`. Zero for bodies whose basis has no pair integral."""
+        self.elastic_mode_mass_matrix: wp.array[wp.float32] | None = None
+        """Reduced elastic modal mass matrix ``Mf_ij`` [kg], row-major mode pairs ``(i, j)`` zero-padded per body, shape [elastic_body_count * elastic_max_mode_count^2], float. Diagonal ``elastic_mode_mass`` when no full matrix is known."""
         self.elastic_endpoint_sample: wp.array[wp.int32] | None = None
         """ModalBasis-local sample index for each internal reduced elastic endpoint, shape [elastic_endpoint_count], int."""
         self.elastic_endpoint_phi: wp.array[wp.vec3] | None = None

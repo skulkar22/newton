@@ -126,8 +126,6 @@ class Example:
         )
         self.rod = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*rod_center), _quat_from_angle_z(rod_theta)),
-            mass=0.6,
-            inertia=inertia,
             mode_q=[self.initial_axial_q, 0.025, -0.015],
             modal_basis=rod_basis,
             label="elastic_connecting_rod",
@@ -201,10 +199,7 @@ class Example:
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
-            rigid_compliant_alm=False,
             iterations=20,
-            rigid_joint_linear_k_start=1.0e5,
-            rigid_joint_angular_k_start=1.0e4,
             rigid_joint_linear_ke=2.0e6,
             rigid_joint_angular_ke=5.0e5,
         )

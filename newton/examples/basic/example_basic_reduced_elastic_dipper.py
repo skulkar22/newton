@@ -162,7 +162,7 @@ class Example:
                     "order": 3,
                 },
             ],
-            density=420.0,
+            density=1.2 / (4.0 * self.arm_hy * self.arm_hz * self.arm_length),
             young_modulus=7.5e5,
             damping_ratio=0.018,
             label="dipper_arm_basis",
@@ -204,17 +204,19 @@ class Example:
             label="actuator_stand",
         )
 
-        arm_inertia = wp.mat33(0.025, 0.0, 0.0, 0.0, 0.11, 0.0, 0.0, 0.0, 0.11)
+        # The 1.2 kg arm takes its frame and modal inertia from the beam basis; the damping keeps
+        # the damping ratios of the tuned modal stiffness.
+        arm_stiffness = [1.8e5, 264.0, 6.4e4, 2.0e5]
         rigid_inertia = wp.mat33(0.04, 0.0, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0, 0.04)
         actuator_inertia = wp.mat33(0.012, 0.0, 0.0, 0.0, 0.018, 0.0, 0.0, 0.0, 0.012)
         self.arm = builder.add_body_elastic(
             xform=wp.transform(wp.vec3(*self.arm_center), _quat_from_xz_angle(self.arm_theta0)),
-            mass=1.2,
-            inertia=arm_inertia,
             mode_q=[0.0, 0.0, 0.0, 0.0],
-            mode_mass=[0.16, 0.09, 0.07, 0.055],
-            mode_stiffness=[1.8e5, 264.0, 6.4e4, 2.0e5],
-            mode_damping=[4.0, 4.65, 0.60, 0.85],
+            mode_stiffness=arm_stiffness,
+            mode_damping=[
+                2.0 * r * math.sqrt(k * float(m))
+                for r, k, m in zip((0.012, 0.48, 0.0045, 0.0041), arm_stiffness, arm_basis.mode_mass, strict=True)
+            ],
             modal_basis=arm_basis,
             label="flexible_dipper_arm",
         )
@@ -335,9 +337,6 @@ class Example:
         self.solver = newton.solvers.SolverVBD(
             self.model,
             iterations=self.solver_iterations,
-            rigid_compliant_alm=True,
-            rigid_joint_linear_k_start=5.0e5,
-            rigid_joint_angular_k_start=5.0e5,
             rigid_joint_linear_ke=5.0e5,
             rigid_joint_angular_ke=5.0e5,
             rigid_joint_linear_kd=3.0e-5,

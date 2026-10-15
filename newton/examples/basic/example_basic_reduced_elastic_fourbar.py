@@ -104,6 +104,7 @@ class Example:
                 },
             ],
             sample_count=33,
+            density=1.0 / (4.0 * self.coupler_hy * self.coupler_hz * self.b_rest),
             label="coupler_basis",
         ).build(
             sample_points=beam_render_sample_points(
@@ -113,6 +114,10 @@ class Example:
                 extra_points=((-0.5 * self.b_rest, 0.0, 0.0), (0.5 * self.b_rest, 0.0, 0.0)),
             )
         )
+
+        # The 1 kg coupler takes its frame and modal inertia from the beam basis; the damping keeps
+        # the damping ratios of the tuned modal stiffness.
+        coupler_stiffness = [10.0, 18.0, 288.0]
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         builder.add_ground_plane()
@@ -129,12 +134,12 @@ class Example:
                 wp.vec3(*(B + 0.5 * (self.b_rest + float(self.mode_q0[0])) * e3)),
                 _quat_from_angle_z(theta3),
             ),
-            mass=1.0,
-            inertia=inertia,
             mode_count=3,
-            mode_mass=[0.04, 0.035, 0.035],
-            mode_stiffness=[10.0, 18.0, 288.0],
-            mode_damping=[0.3, 0.3, 0.65],
+            mode_stiffness=coupler_stiffness,
+            mode_damping=[
+                2.0 * r * math.sqrt(k * float(m))
+                for r, k, m in zip((0.24, 0.19, 0.10), coupler_stiffness, coupler_basis.mode_mass, strict=True)
+            ],
             mode_q=self.mode_q0,
             modal_basis=coupler_basis,
             label="elastic_coupler",

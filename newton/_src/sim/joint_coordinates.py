@@ -96,7 +96,7 @@ def _continuous_euler_angles(angles: wp.vec3, previous: wp.vec3, angular_count: 
 
 
 @wp.func
-def eval_joint_coordinate(
+def eval_joint_coordinate_in_frames(
     joint: int,
     component: int,
     body_q: wp.array[wp.transform],
@@ -104,26 +104,31 @@ def eval_joint_coordinate(
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
+    X_pj: wp.transform,
+    X_cj: wp.transform,
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_axis: wp.array[wp.vec3],
     angular_reference: wp.vec3,
     continuous: bool,
 ):
-    """Return one joint coordinate and its parent/child maximal-coordinate gradients."""
+    """Return one joint coordinate and its maximal-coordinate gradients for explicit body-local joint frames.
+
+    ``X_pj`` and ``X_cj`` replace ``joint_X_p[joint]`` and ``joint_X_c[joint]``, so callers can measure
+    the coordinate at attachment frames that move relative to their bodies, such as deformed reduced
+    elastic endpoints. The gradients use the supplied anchors as lever arms.
+    """
     type = joint_type[joint]
     parent = joint_parent[joint]
     child = joint_child[joint]
 
-    X_wp = joint_X_p[joint]
+    X_wp = X_pj
     pose_p = X_wp
     if parent >= 0:
         pose_p = body_q[parent]
         X_wp = pose_p * X_wp
     pose_c = body_q[child]
-    X_wc = pose_c * joint_X_c[joint]
+    X_wc = pose_c * X_cj
 
     q_p = wp.transform_get_rotation(X_wp)
     q_c = wp.transform_get_rotation(X_wc)
@@ -199,6 +204,42 @@ def eval_joint_coordinate(
     gradient_parent = wp.spatial_vector(-linear_axis, -wp.cross(r_p + x_err, linear_axis) - angular_covector)
     gradient_child = wp.spatial_vector(linear_axis, wp.cross(r_c, linear_axis) + angular_covector)
     return coordinate, gradient_parent, gradient_child
+
+
+@wp.func
+def eval_joint_coordinate(
+    joint: int,
+    component: int,
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_axis: wp.array[wp.vec3],
+    angular_reference: wp.vec3,
+    continuous: bool,
+):
+    """Return one joint coordinate and its parent/child maximal-coordinate gradients."""
+    return eval_joint_coordinate_in_frames(
+        joint,
+        component,
+        body_q,
+        body_com,
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_X_p[joint],
+        joint_X_c[joint],
+        joint_qd_start,
+        joint_dof_dim,
+        joint_axis,
+        angular_reference,
+        continuous,
+    )
 
 
 @wp.func
