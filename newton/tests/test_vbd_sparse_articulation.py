@@ -1808,6 +1808,7 @@ add_function_test(
     devices=[device for device in devices if device.is_cpu],
 )
 
+
 def test_sparse_body_particle_attachment_reactions(test, device):
     """Transfer particle loads to both sparse articulation and local fallback bodies."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
