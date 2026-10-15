@@ -24,8 +24,8 @@ from ..sim import (
     eval_inverse_dynamics_passive,
     eval_jacobian,
 )
-from ..solvers.observables import SolverObservables
 from ..sim.articulation import _INCLUDE_ARMATURE_DEPRECATION_MSG, _eval_mass_matrix
+from ..solvers.observables import SolverObservables
 
 if TYPE_CHECKING:
     from ..actuators.actuator import Actuator
