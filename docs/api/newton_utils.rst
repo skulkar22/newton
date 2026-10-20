@@ -33,6 +33,7 @@ newton.utils
    compute_world_offsets
    download_asset
    event_scope
+   load_sparse_matrix
    load_texture
    normalize_texture
    plot_graph
