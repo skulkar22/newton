@@ -350,13 +350,13 @@ def constraint_transformation(
             f"Tie constraints connect the retained DOFs {members.tolist()}; "
             "retained DOFs, such as interface frame DOFs, cannot be tied to each other"
         )
-    group_master = np.arange(dof_count, dtype=np.int64)
+    group_lead = np.arange(dof_count, dtype=np.int64)
     retained_index = np.flatnonzero(retained)
-    group_master[root[retained_index]] = retained_index
+    group_lead[root[retained_index]] = retained_index
     roots = np.unique(root)
-    masters = group_master[roots]
-    order = np.argsort(masters, kind="stable")
-    tie_masters = masters[order]
+    leads = group_lead[roots]
+    order = np.argsort(leads, kind="stable")
+    tie_leads = leads[order]
     column_of_root = np.empty(dof_count, dtype=np.int64)
     column_of_root[roots[order]] = np.arange(roots.shape[0])
     tie_column = column_of_root[root]
@@ -425,16 +425,16 @@ def constraint_transformation(
         system_cols = general_cols[in_system]
         system_values = general_values[in_system]
         on_pivot = is_pivot[system_cols]
-        slave_rows, slave_cols, slave_values = _solve_dependent(
+        follower_rows, follower_cols, follower_values = _solve_dependent(
             (system_rows[on_pivot], pivot_position[system_cols[on_pivot]], system_values[on_pivot]),
             (system_rows[~on_pivot], kept_position[system_cols[~on_pivot]], system_values[~on_pivot]),
             pivot_count,
             independent_count,
             sparse,
         )
-        t_rows.append(pivot_cols[slave_rows])
-        t_cols.append(slave_cols)
-        t_values.append(slave_values)
+        t_rows.append(pivot_cols[follower_rows])
+        t_cols.append(follower_cols)
+        t_values.append(follower_values)
     reduced_rows = np.concatenate(t_rows)
     reduced_cols = np.concatenate(t_cols)
     reduced_values = np.concatenate(t_values)
@@ -453,7 +453,7 @@ def constraint_transformation(
         (dof_count, independent_count),
         sparse,
     )
-    independent_dofs = tie_masters[kept]
+    independent_dofs = tie_leads[kept]
     dependent_mask = np.ones(dof_count, dtype=bool)
     dependent_mask[independent_dofs] = False
 
@@ -480,7 +480,7 @@ def constraint_transformation(
 
 def _solve_dependent(
     pivot_block: tuple[np.ndarray, np.ndarray, np.ndarray],
-    master_block: tuple[np.ndarray, np.ndarray, np.ndarray],
+    lead_block: tuple[np.ndarray, np.ndarray, np.ndarray],
     pivot_count: int,
     independent_count: int,
     sparse: bool,
@@ -489,7 +489,7 @@ def _solve_dependent(
 
     Args:
         pivot_block: Triplets of the square block ``C_s`` (rows, pivot positions, values).
-        master_block: Triplets of ``C_m`` (rows, independent positions, values).
+        lead_block: Triplets of ``C_m`` (rows, independent positions, values).
         pivot_count: Order of ``C_s``.
         independent_count: Number of independent coordinates (columns of ``C_m``).
         sparse: Whether to factor ``C_s`` with SuperLU instead of dense LAPACK.
@@ -497,34 +497,30 @@ def _solve_dependent(
     Returns:
         Row (pivot position), column (independent position), and value arrays.
     """
-    support = np.unique(master_block[1])
+    support = np.unique(lead_block[1])
     if support.shape[0] == 0:
         empty = np.zeros(0, dtype=np.int64)
         return empty, empty, np.zeros(0, dtype=np.float64)
-    support_position = np.searchsorted(support, master_block[1])
+    support_position = np.searchsorted(support, lead_block[1])
     shape_s = (pivot_count, pivot_count)
     out_rows, out_cols, out_values = [], [], []
     if sparse:
         sparse_linalg = modal_sparse._import_scipy("sparse.linalg")
         factor = sparse_linalg.splu(assemble_triplets(*pivot_block, shape_s, True))
-        master = assemble_triplets(
-            master_block[0], support_position, master_block[2], (pivot_count, support.shape[0]), True
-        )
+        lead = assemble_triplets(lead_block[0], support_position, lead_block[2], (pivot_count, support.shape[0]), True)
 
         def solve(rhs: np.ndarray) -> np.ndarray:
             return factor.solve(rhs)
     else:
         dense_s = assemble_triplets(*pivot_block, shape_s, False)
-        master = assemble_triplets(
-            master_block[0], support_position, master_block[2], (pivot_count, support.shape[0]), False
-        )
+        lead = assemble_triplets(lead_block[0], support_position, lead_block[2], (pivot_count, support.shape[0]), False)
 
         def solve(rhs: np.ndarray) -> np.ndarray:
             return np.linalg.solve(dense_s, rhs)
 
     for start in range(0, support.shape[0], _SOLVE_CHUNK_COLUMNS):
         stop = min(start + _SOLVE_CHUNK_COLUMNS, support.shape[0])
-        rhs = master[:, start:stop]
+        rhs = lead[:, start:stop]
         rhs = rhs.toarray() if sparse else np.asarray(rhs)
         block = -solve(np.ascontiguousarray(rhs, dtype=np.float64))
         if not np.all(np.isfinite(block)):

@@ -109,17 +109,17 @@ def _tiled_panel(nx, ny):
     mass_tiled = sparse.block_diag([mass] * copies, format="csc")
     stiffness_tiled = sparse.block_diag([stiffness] * copies, format="csc")
     _, first, inverse = np.unique(tiled, axis=0, return_index=True, return_inverse=True)
-    master = first[inverse.reshape(-1)]
-    duplicate = np.flatnonzero(master != np.arange(tiled.shape[0]))
-    ties = _tie_rows(duplicate, master[duplicate], tiled.shape[0])
-    return tiled, mass_tiled, stiffness_tiled, ties, master
+    lead = first[inverse.reshape(-1)]
+    duplicate = np.flatnonzero(lead != np.arange(tiled.shape[0]))
+    ties = _tie_rows(duplicate, lead[duplicate], tiled.shape[0])
+    return tiled, mass_tiled, stiffness_tiled, ties, lead
 
 
-def _patch(points, master, corner, half_x=0.1, half_y=0.102):
+def _patch(points, lead, corner, half_x=0.1, half_y=0.102):
     """Return the distinct nodes within a rectangle around ``corner`` (one per coincident group)."""
     delta = np.abs(points[:, :2] - np.asarray(corner)[:2])
     nodes = np.flatnonzero((delta[:, 0] < half_x) & (delta[:, 1] < half_y))
-    return np.unique(master[nodes])
+    return np.unique(lead[nodes])
 
 
 def _reduced_static(generator, load, fixed_interfaces):
@@ -343,12 +343,12 @@ def test_cb_fem_two_panel_rbe2_statics(test, device):
     from scipy.sparse import linalg as sparse_linalg
 
     points, mass, stiffness, ties, _ = _two_panels()
-    master = np.arange(points.shape[0])
+    lead = np.arange(points.shape[0])
     x_min, x_max = points[:, 0].min(), points[:, 0].max()
     y_min, y_max = points[:, 1].min(), points[:, 1].max()
     corners = ((x_min, y_min), (x_min, y_max), (x_max, y_min), (x_max, y_max))
     interfaces = [
-        {"name": f"corner_{index}", "node_indices": _patch(points, master, corner), "coupling": "rbe2"}
+        {"name": f"corner_{index}", "node_indices": _patch(points, lead, corner), "coupling": "rbe2"}
         for index, corner in enumerate(corners)
     ]
     test.assertEqual([len(interface["node_indices"]) for interface in interfaces], [9, 9, 9, 9])
@@ -642,14 +642,14 @@ def test_cb_fem_error_paths(test, device):
 def test_cb_fem_large_tiled_model(test, device):
     """Reduce a 59,850-DOF tiling of 5x5 HMG panels with 8 RBE2 interfaces and 30 modes within 120 s on CPU."""
     _skip_without_hmg(test)
-    points, mass, stiffness, ties, master = _tiled_panel(5, 5)
+    points, mass, stiffness, ties, lead = _tiled_panel(5, 5)
     test.assertEqual(stiffness.shape[0], 59850)
     x_min, x_max = points[:, 0].min(), points[:, 0].max()
     y_min, y_max = points[:, 1].min(), points[:, 1].max()
     x_mid, y_mid = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
     corners = [(x_min, y_min), (x_min, y_max), (x_max, y_min), (x_max, y_max)]
     corners += [(x_mid, y_min), (x_mid, y_max), (x_min, y_mid), (x_max, y_mid)]
-    interfaces = [{"node_indices": _patch(points, master, corner)} for corner in corners]
+    interfaces = [{"node_indices": _patch(points, lead, corner)} for corner in corners]
     start = time.perf_counter()
     generator = newton.ModalGeneratorCraigBamptonFEM(
         points,
@@ -658,7 +658,7 @@ def test_cb_fem_large_tiled_model(test, device):
         interfaces,
         fixed_mode_count=30,
         constraints=ties,
-        sample_node_indices=np.unique(master)[::5],
+        sample_node_indices=np.unique(lead)[::5],
     )
     basis = generator.build()
     elapsed = time.perf_counter() - start
