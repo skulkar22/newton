@@ -284,6 +284,26 @@ motion. The FEM generator does not: the rigid-body part of, for example,
 mass-proportional damping of a free-free model is dropped, so the floating
 frame is undamped.
 
+:class:`ModalGeneratorFEM` accepts dense arrays or SciPy sparse matrices.
+``eigensolver="dense"`` solves the full spectrum with LAPACK, densifying
+sparse input, and suits models up to a few thousand DOFs.
+``eigensolver="arpack"`` keeps the matrices sparse and computes only the
+lowest modes with ARPACK shift-invert Lanczos on a sparse LU factorization of
+:math:`\mathbf{K} - \sigma\mathbf{M}`; it requires ``mode_count``. The
+rigid-body modes of a free-free model are deflated analytically, and a Sturm
+sequence count from a second factorization verifies that no mode below the
+retained ones was missed. The default ``"auto"`` uses ARPACK when any input
+matrix is sparse or the free DOF count exceeds ``dense_dof_limit``. The
+default shift :math:`\sigma = -10^{-6}\,\|\mathbf{K}\|_1 /
+\|\mathbf{M}\|_1` keeps the shifted matrix definite for free-free models;
+for meshes whose stiffest and softest modes differ by many decades, an
+``arpack_shift`` near the lowest wanted eigenvalue converges faster. The
+factorization dominates time and memory: its fill grows much faster for
+volume meshes than for shell meshes of the same size. For large models, also
+pass ``sample_node_indices`` (sample points that coincide with nodes are
+otherwise detected automatically, but all others are interpolated from every
+node).
+
 Joints, attachments, and contacts
 ---------------------------------
 
