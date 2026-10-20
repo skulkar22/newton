@@ -42,6 +42,7 @@ newton
    ModalBasis
    ModalGeneratorBeam
    ModalGeneratorCraigBampton
+   ModalGeneratorCraigBamptonFEM
    ModalGeneratorFEM
    ModalGeneratorPOD
    ModalGeneratorSampled

@@ -25,6 +25,7 @@ from .modal import (
     ModalGeneratorSampled,
 )
 from .modal_constraints import ConstraintElimination
+from .modal_craig_bampton_fem import ModalGeneratorCraigBamptonFEM
 from .model import Model
 from .rod import Rod
 from .state import State
@@ -41,6 +42,7 @@ __all__ = [
     "ModalBasis",
     "ModalGeneratorBeam",
     "ModalGeneratorCraigBampton",
+    "ModalGeneratorCraigBamptonFEM",
     "ModalGeneratorFEM",
     "ModalGeneratorPOD",
     "ModalGeneratorSampled",
