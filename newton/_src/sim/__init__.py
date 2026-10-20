@@ -24,6 +24,7 @@ from .modal import (
     ModalGeneratorPOD,
     ModalGeneratorSampled,
 )
+from .modal_constraints import ConstraintElimination
 from .model import Model
 from .rod import Rod
 from .state import State
@@ -32,6 +33,7 @@ from .tendon import TendonLinkFlags, TendonLinkType
 __all__ = [
     "BodyFlags",
     "CollisionPipeline",
+    "ConstraintElimination",
     "Contacts",
     "Control",
     "JointTargetMode",

@@ -30,6 +30,7 @@ newton
    Axis
    BodyFlags
    CollisionPipeline
+   ConstraintElimination
    Contacts
    Control
    Gaussian
