@@ -257,7 +257,8 @@ integrals they can compute exactly:
      - All exact from the consistent nodal mass matrix.
      - Estimated with ``derive_psi``.
      - :meth:`ModalBasis.add_frame`
-   * - :class:`ModalGeneratorCraigBampton`
+   * - :class:`ModalGeneratorCraigBampton`,
+       :class:`ModalGeneratorCraigBamptonFEM`
      - ``Mf``, ``S``, ``G``, and rigid properties exact from the reduced
        matrices; ``B``, ``C``, and ``P`` only with ``sample_mass``, lumped
        over the recovery samples.
@@ -303,6 +304,36 @@ volume meshes than for shell meshes of the same size. For large models, also
 pass ``sample_node_indices`` (sample points that coincide with nodes are
 otherwise detected automatically, but all others are interpolated from every
 node).
+
+:class:`ModalGeneratorCraigBamptonFEM` performs the fixed-interface
+Craig-Bampton reduction itself, from full nodal mass, stiffness, and optional
+damping matrices with three (``[ux, uy, uz]``) or six
+(``[ux, uy, uz, rx, ry, rz]``) DOFs per node, and passes the reduced
+matrices and the translational recovery of the sample nodes to
+:class:`ModalGeneratorCraigBampton`. Each interface is a six-DOF frame
+defined by a list of nodes: ``"node"`` uses one six-DOF node directly,
+``"rbe2"`` ties the nodes rigidly to the frame, and ``"rbe3"`` defines the
+frame as the least-squares rigid fit of the node translations without
+stiffening them. The static constraint modes and the lowest fixed-interface
+modes reuse one sparse factorization of the interior stiffness, with every
+frame fixed; a mechanism that remains, such as a part that is not tied to the
+rest, raises. The generator exposes the intermediate matrices and a report of
+residuals and timings, and :meth:`~ModalGeneratorCraigBamptonFEM.save_npz`
+writes the reduced model as arrays named like the generator arguments.
+
+Assemblies of separately meshed parts are joined with linear multi-point
+constraints :math:`\mathbf{C}\mathbf{u} = 0`, which
+:class:`ConstraintElimination` removes with a coordinate transformation
+:math:`\mathbf{u} = \mathbf{T}\mathbf{q}`; the Craig-Bampton generator
+applies it first when given ``constraints`` or a ready ``transformation``.
+Node-to-node ties keep :math:`\mathbf{T}` Boolean, so the tied matrices are
+as sparse as the mesh; other rows, such as rigid links or averaging elements,
+are eliminated by pivoting on one dependent DOF per row. Constraints between
+coincident nodes and rigid links preserve rigid-body motion, which
+:meth:`~ConstraintElimination.rigid_motion_residual` checks; constraints
+between nodes at different positions preserve it only when they include the
+lever arm. :func:`newton.utils.load_sparse_matrix` reads matrices exported as
+Matrix Market or SciPy ``.npz`` files.
 
 Joints, attachments, and contacts
 ---------------------------------
