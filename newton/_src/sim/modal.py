@@ -1067,6 +1067,71 @@ class ModalBasis:
         )
 
 
+_NEIGHBOR_CANDIDATE_EXTRA = 8
+"""Extra k-d tree candidates per point beyond ``k + 1``, so that distance ties at the ``k``-th neighbor are seen."""
+
+_NEIGHBOR_BRUTE_FORCE_LIMIT = 2048
+"""Largest point count whose neighbors :func:`_nearest_neighbors` finds by brute force."""
+
+
+def _nearest_neighbors(points: np.ndarray, k: int) -> np.ndarray:
+    """Return the ``k`` nearest other points of every point, shape ``[point_count, k]``.
+
+    Up to :data:`_NEIGHBOR_BRUTE_FORCE_LIMIT` points, or without SciPy, a
+    brute-force ``O(N^2 log N)`` search sorts all squared distances, which
+    keeps the historical results, including how ties at the ``k``-th
+    neighbor of regular grids are broken. Larger point sets use a k-d tree
+    (:class:`scipy.spatial.cKDTree`) in ``O(N log N)`` and order neighbors by
+    squared distance, then by index, so ties are broken deterministically.
+
+    Args:
+        points: Point positions [m], shape ``[point_count, 3]``, float64.
+        k: Neighbor count, at most ``point_count - 1``.
+
+    Returns:
+        Neighbor indices, nearest first, excluding the point itself.
+    """
+    count = points.shape[0]
+    neighbors = np.empty((count, k), dtype=np.int64)
+    tree = None
+    if count > _NEIGHBOR_BRUTE_FORCE_LIMIT:
+        try:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(points)
+        except ImportError:
+            tree = None
+    if tree is None:
+        for point in range(count):
+            delta = points - points[point]
+            neighbors[point] = np.argsort(np.sum(delta * delta, axis=1))[1 : k + 1]
+        return neighbors
+
+    def ordered(point: int, candidates: np.ndarray) -> np.ndarray:
+        candidates = candidates[candidates != point]
+        delta = points[candidates] - points[point]
+        dist2 = np.sum(delta * delta, axis=1)
+        return candidates[np.lexsort((candidates, dist2))[:k]]
+
+    query_count = min(count, k + 1 + _NEIGHBOR_CANDIDATE_EXTRA)
+    _, candidates = tree.query(points, k=query_count)
+    candidates = np.asarray(candidates, dtype=np.int64).reshape((count, query_count))
+    for point in range(count):
+        row = candidates[point]
+        chosen = ordered(point, row)
+        if query_count < count and k > 0:
+            # Every point outside the candidates is at least as far as the farthest candidate; when that
+            # candidate ties with the k-th neighbor, gather all tied points with a radius query.
+            delta = points[row] - points[point]
+            kth_delta = points[chosen[-1]] - points[point]
+            kth = float(kth_delta @ kth_delta)
+            if float(np.max(np.sum(delta * delta, axis=1))) <= kth * (1.0 + 1.0e-9):
+                radius = math.sqrt(kth) * (1.0 + 1.0e-6) + np.finfo(np.float64).tiny
+                chosen = ordered(point, np.asarray(tree.query_ball_point(points[point], radius), dtype=np.int64))
+        neighbors[point] = chosen
+    return neighbors
+
+
 def _estimate_sample_psi(
     sample_points: Sequence[Sequence[float]] | np.ndarray,
     sample_phi: Sequence[Sequence[Sequence[float]]] | np.ndarray,
@@ -1113,11 +1178,11 @@ def _estimate_sample_psi(
         return psi
 
     k = min(int(neighbor_count), sample_count - 1)
+    neighbors = _nearest_neighbors(points, k)
     degenerate = 0
     for s in range(sample_count):
-        delta = points - points[s]
-        order = np.argsort(np.sum(delta * delta, axis=1))[1 : k + 1]
-        dx = delta[order]  # [k, 3]
+        order = neighbors[s]
+        dx = points[order] - points[s]  # [k, 3]
         gram = dx.T @ dx  # [3, 3]
         scale = np.trace(gram) / 3.0
         if scale <= 0.0:
