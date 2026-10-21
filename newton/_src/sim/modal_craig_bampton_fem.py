@@ -15,7 +15,12 @@ import numpy as np
 
 from . import modal_sparse
 from .modal import ModalBasis, ModalGeneratorCraigBampton
-from .modal_constraints import assemble_triplets, check_transformation_rank, constraint_transformation
+from .modal_constraints import (
+    assemble_triplets,
+    check_transformation_rank,
+    constraint_transformation,
+    transformation_rigid_residual,
+)
 
 if TYPE_CHECKING:
     from scipy.sparse import sparray, spmatrix
@@ -172,6 +177,12 @@ class ModalGeneratorCraigBamptonFEM:
 
     _SOLVE_CHUNK_COLUMNS: ClassVar[int] = 64
     """Number of constraint-mode right-hand sides solved at once."""
+
+    _RIGID_RESIDUAL_TOLERANCE: ClassVar[float] = 1.0e-7
+    """Relative rigid-body residual of the reduced stiffness above which :meth:`reduce` raises.
+
+    The same threshold as in :meth:`ModalGeneratorCraigBampton.build`.
+    """
 
     def __init__(
         self,
@@ -632,8 +643,10 @@ class ModalGeneratorCraigBamptonFEM:
 
         Raises:
             ValueError: If the constraints or interfaces are inconsistent, the
-                interior has a mechanism, or the reduced mass matrix is not
-                positive definite.
+                interior has a mechanism, the reduced mass matrix is not
+                positive definite, or the reduced stiffness matrix does not
+                preserve the six rigid-body modes, for example because a
+                constraint grounds the body.
         """
         timings: dict[str, float] = {}
         clock = time.perf_counter()
@@ -730,6 +743,22 @@ class ModalGeneratorCraigBamptonFEM:
             max(float(np.linalg.norm(reduced_stiffness, ord=np.inf)), 1.0)
             * max(float(np.linalg.norm(rigid, ord=np.inf)), 1.0)
         )
+        if rigid_residual > self._RIGID_RESIDUAL_TOLERANCE:
+            # Reject here rather than in build(), so that save_npz() never exports such a model; tell
+            # constraints that resist rigid motion apart from a stiffness matrix that does.
+            message = (
+                "The reduced stiffness matrix does not preserve the six rigid-body modes (relative residual "
+                f"{rigid_residual:.3g})"
+            )
+            motion_residual = transformation_rigid_residual(transform, self.node_positions, self.dofs_per_node)
+            if motion_residual > self._RIGID_RESIDUAL_TOLERANCE:
+                raise ValueError(
+                    f"{message}: the constraints do not admit rigid-body motion (relative residual "
+                    f"{motion_residual:.3g}). A constraint grounds the body, such as an SPC (u = 0), or ties nodes at "
+                    "different positions without the lever arm of a rigid link; a Craig-Bampton model must stay "
+                    "free-free, with supports applied through its interfaces"
+                )
+            raise ValueError(f"{message}: check that stiffness_matrix is the free-free stiffness of the model")
 
         dofs = self.dofs_per_node
         translation_rows = (dofs * self.sample_node_indices[:, None] + np.arange(3)).reshape(-1)

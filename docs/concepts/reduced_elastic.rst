@@ -345,7 +345,9 @@ are eliminated by pivoting on one dependent DOF per row. Constraints between
 coincident nodes and rigid links preserve rigid-body motion, which
 :meth:`~ConstraintElimination.rigid_motion_residual` checks; constraints
 between nodes at different positions preserve it only when they include the
-lever arm. :func:`newton.utils.load_sparse_matrix` reads matrices exported as
+lever arm. :meth:`ModalGeneratorCraigBamptonFEM.reduce` rejects constraints
+that ground the body or resist rigid motion, because the reduced model would
+lack its six rigid-body modes. :func:`newton.utils.load_sparse_matrix` reads matrices exported as
 Matrix Market or SciPy ``.npz`` files. All generators require symmetric
 matrices in full storage and reject a relative asymmetry above
 :math:`10^{-8}`: a matrix exported as one triangle must be expanded first,
