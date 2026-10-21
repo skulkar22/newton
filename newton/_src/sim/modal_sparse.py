@@ -32,6 +32,12 @@ roundoff size, ``1e-16`` to ``1e-13`` of the largest one, while the shifted
 matrices of well-posed models give ratios above ``1e-8``.
 """
 
+_RESIDUAL_TOLERANCE_FACTOR = 10.0
+"""Allowed backward error of an ARPACK eigenpair relative to ``max(tol, _RESIDUAL_EPS_MULTIPLE * eps)``."""
+
+_RESIDUAL_EPS_MULTIPLE = 1.0e3
+"""Multiple of machine epsilon that replaces the ARPACK tolerance ``0`` (machine precision) in the residual check."""
+
 
 def is_sparse(matrix: Any) -> bool:
     """Return whether ``matrix`` is a SciPy sparse matrix or array.
@@ -277,7 +283,8 @@ class ShiftedFactorization:
     SuperLU raises only for exactly zero pivots; ``pivot_ratio``, the
     smallest pivot magnitude relative to the largest, reveals a numerically
     singular matrix (see :attr:`numerically_singular`), for example ``K``
-    of a free-free model factored at ``sigma = 0``.
+    of a free-free model factored at ``sigma = 0``. ``norm`` is the one norm
+    of ``K - sigma M`` [N/m], the scale of eigenpair residuals.
 
     Args:
         stiffness: Sparse stiffness matrix [N/m], shape ``[n, n]``.
@@ -294,6 +301,7 @@ class ShiftedFactorization:
         self.sigma = float(sigma)
         shifted = to_csc(to_csc(stiffness) - self.sigma * to_csc(mass))
         self.size = int(shifted.shape[0])
+        self.norm = matrix_one_norm(shifted)
         try:
             self.lu = sparse_linalg.splu(
                 shifted,
@@ -335,6 +343,31 @@ class ShiftedFactorization:
         sparse_linalg = _import_scipy("sparse.linalg")
 
         return sparse_linalg.LinearOperator((self.size, self.size), matvec=self.solve, dtype=np.float64)
+
+
+def eigenpair_backward_errors(
+    stiffness: Any, mass: Any, values: np.ndarray, vectors: np.ndarray, scale: float
+) -> np.ndarray:
+    """Return the relative residual ``||K phi - lambda M phi||_2 / (scale ||phi||_2)`` of each eigenpair.
+
+    With ``scale = ||K - sigma M||`` this is the backward error that
+    shift-invert Lanczos controls: a pair that ARPACK reports converged to
+    relative accuracy ``tol`` has a residual of about ``tol`` or roundoff,
+    independent of the conditioning of ``K - sigma M``.
+
+    Args:
+        stiffness: Stiffness matrix [N/m], shape ``[n, n]``.
+        mass: Mass matrix [kg], shape ``[n, n]``.
+        values: Eigenvalues [1/s^2], shape ``[k]``.
+        vectors: Eigenvectors, shape ``[n, k]``.
+        scale: Matrix norm [N/m] that normalizes the residual.
+
+    Returns:
+        Relative residuals [dimensionless], shape ``[k]``.
+    """
+    residual = matmul(stiffness, vectors) - matmul(mass, vectors) * values
+    denominator = max(float(scale), np.finfo(np.float64).tiny) * np.linalg.norm(vectors, axis=0)
+    return np.linalg.norm(residual, axis=0) / np.maximum(denominator, np.finfo(np.float64).tiny)
 
 
 def arpack_start_vector(size: int, seed: int = 0) -> np.ndarray:
@@ -419,7 +452,11 @@ def generalized_eigsh(
         ``M``-orthonormal eigenvectors, shape ``[n, k]``.
 
     Raises:
-        ValueError: If ARPACK does not converge or the shifted matrix is singular.
+        ValueError: If ARPACK does not converge, the shifted matrix is
+            singular, or a returned eigenpair has a relative residual (see
+            :func:`eigenpair_backward_errors`) above
+            ``10 * max(tol, 1000 * eps)``, scaled by the ratio of its
+            distance ``|lambda - sigma|`` to the smallest one.
     """
     sparse_linalg = _import_scipy("sparse.linalg")
 
@@ -468,6 +505,23 @@ def generalized_eigsh(
             f"({len(exc.eigenvalues)} converged); increase arpack_maxiter or arpack_ncv, or choose an "
             "arpack_shift closer to the lowest wanted eigenvalues"
         ) from exc
+    # ARPACK checks convergence of the Ritz values of the inverse operator only. Solves with a nearly
+    # singular factor can return unconverged or spurious pairs without an error, so check the pencil.
+    # Lanczos resolves a Ritz value theta_i = 1 / (lambda_i - sigma) only to roundoff of the largest
+    # one, so the attainable residual grows with |lambda_i - sigma| / min_j |lambda_j - sigma|.
+    errors = eigenpair_backward_errors(stiffness, mass, values, vectors, factorization.norm)
+    distance = np.abs(values - factorization.sigma)
+    spread = np.maximum(distance / max(float(np.min(distance)), np.finfo(np.float64).tiny), 1.0)
+    accuracy = max(float(tol), _RESIDUAL_EPS_MULTIPLE * np.finfo(np.float64).eps)
+    tolerance = _RESIDUAL_TOLERANCE_FACTOR * accuracy * spread
+    worst = int(np.argmax(errors / tolerance))
+    if not errors[worst] <= tolerance[worst]:
+        raise ValueError(
+            f"ARPACK returned an inaccurate eigenpair near sigma = {factorization.sigma:.6g}: eigenvalue "
+            f"{values[worst]:.6g} 1/s^2 has relative residual {errors[worst]:.3g} (||K phi - lambda M phi|| / "
+            f"(||K - sigma M||_1 ||phi||)), above the tolerance {tolerance[worst]:.3g}. The shifted matrix is "
+            "close to singular or ARPACK stopped early; choose a different arpack_shift or a smaller arpack_tol"
+        )
     order = np.argsort(values, kind="stable")
     return np.asarray(values[order], dtype=np.float64), np.asarray(vectors[:, order], dtype=np.float64)
 

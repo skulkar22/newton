@@ -317,6 +317,25 @@ def test_fem_arpack_sturm_check_never_skipped_silently(test, device):
             newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4, eigensolver="arpack").build()
 
 
+def test_fem_arpack_residual_check(test, device):
+    """Reject inaccurate ARPACK eigenpairs, which a nearly singular shifted factorization returns silently."""
+    points, mass, stiffness = _sparse_spring_lattice((10, 8, 2), 0.01, 2.0e9, 8.0e-3)
+    rigid = modal_sparse.rigid_vectors(points, 3, np.mean(points, axis=0))
+    deflation = np.linalg.qr(rigid)[0] / math.sqrt(8.0e-3)
+    # sigma = 0 factors the singular free-free stiffness: ARPACK reports convergence, but the pairs it
+    # returns include negative eigenvalues with residuals of order 0.1.
+    with test.assertRaisesRegex(ValueError, "inaccurate eigenpair near sigma = 0"):
+        modal_sparse.generalized_eigsh(stiffness, mass, 12, sigma=0.0, deflation=deflation)
+    sigma = modal_sparse.default_shift(stiffness, mass)
+    factorization = modal_sparse.ShiftedFactorization(stiffness, mass, sigma)
+    values, vectors = modal_sparse.generalized_eigsh(
+        stiffness, mass, 12, sigma=sigma, deflation=deflation, factorization=factorization
+    )
+    errors = modal_sparse.eigenpair_backward_errors(stiffness, mass, values, vectors, factorization.norm)
+    test.assertLess(float(np.max(errors)), 1.0e3 * np.finfo(np.float64).eps)
+    test.assertGreater(float(values[0]), 0.0)
+
+
 def test_fem_arpack_mechanisms_discarded(test, device):
     """Grow the ARPACK request until it spans the complete zero-energy subspace."""
     points, mass, stiffness = _sparse_spring_lattice((4, 2, 2), 0.1, 1.0e3, 1.0e-2, braced=False)
@@ -511,6 +530,7 @@ _TESTS = (
     test_fem_arpack_rejects_invalid_models,
     test_fem_arpack_rejects_invalid_shifts,
     test_fem_arpack_sturm_check_never_skipped_silently,
+    test_fem_arpack_residual_check,
     test_fem_arpack_mechanisms_discarded,
     test_fem_arpack_large_sparse_model,
     test_fem_helpers,
