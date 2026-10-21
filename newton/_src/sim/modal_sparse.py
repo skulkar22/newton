@@ -228,8 +228,17 @@ def generalized_eigenvalue_bound(stiffness: Any, mass: Any) -> float:
 
     Returns the Gershgorin-type bound ``max_i sum_j |K_ij| / M_ii``. It is an
     upper bound for a diagonal (lumped) mass matrix; for a consistent mass
-    matrix it is an estimate of the same order of magnitude, which suffices
-    as the scale of a relative zero-energy threshold.
+    matrix it is an estimate, which suffices as the scale of a relative
+    zero-energy threshold when it is of the same order of magnitude.
+
+    On three-DOF lattices with lumped or consistent mass the bound is 1.2 to
+    1.9 times the largest eigenvalue. Consistent-mass shells with rotational
+    DOFs inflate it, because their rotary-inertia diagonals are small against
+    the off-diagonal coupling: on a six-DOF shell panel it is 41 times the
+    largest eigenvalue, which puts a threshold of ``1e-12`` relative to it at
+    about 0.6 Hz, close to genuine soft modes. A tighter scale, for example
+    from a few power iterations on ``M^-1 K``, is needed before such models
+    rely on a threshold relative to this bound.
     """
     if is_sparse(stiffness):
         row_sums = np.asarray(abs(stiffness).sum(axis=1)).reshape(-1)

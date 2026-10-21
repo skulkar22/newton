@@ -535,6 +535,8 @@ class ModalGeneratorCraigBamptonFEM:
             stop = min(start + self._SOLVE_CHUNK_COLUMNS, rhs.shape[1])
             constraint_modes[:, start:stop] = -stiffness_factorization.solve(np.ascontiguousarray(rhs[:, start:stop]))
 
+        # The bound overestimates the largest eigenvalue of consistent-mass six-DOF shells by up to about
+        # 40 times (see generalized_eigenvalue_bound), which raises the mechanism threshold accordingly.
         bound = modal_sparse.generalized_eigenvalue_bound(stiffness_ii, mass_ii)
         row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness_ii), 1)
         relative = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)

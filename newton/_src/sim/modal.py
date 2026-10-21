@@ -2354,7 +2354,8 @@ class ModalGeneratorFEM:
 
         # Gershgorin-type bound on the largest eigenvalue: computing it would cost a second solve, and only
         # its order of magnitude sets the relative threshold. The floor is the roundoff of a sparse Rayleigh
-        # quotient, which grows with the nonzeros per row rather than with the DOF count.
+        # quotient, which grows with the nonzeros per row rather than with the DOF count. The bound is
+        # tight for these three-DOF nodes but loose for six-DOF shells; see generalized_eigenvalue_bound.
         eigenvalue_scale = modal_sparse.generalized_eigenvalue_bound(stiffness, mass)
         row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness), 1)
         relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)

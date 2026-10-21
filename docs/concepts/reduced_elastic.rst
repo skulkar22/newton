@@ -293,12 +293,25 @@ lowest modes with ARPACK shift-invert Lanczos on a sparse LU factorization of
 :math:`\mathbf{K} - \sigma\mathbf{M}`; it requires ``mode_count``. The
 rigid-body modes of a free-free model are deflated analytically, and a Sturm
 sequence count from a second factorization verifies that no mode below the
-retained ones was missed. The default ``"auto"`` uses ARPACK when any input
-matrix is sparse or the free DOF count exceeds ``dense_dof_limit``. The
+retained ones was missed; when no gap in the spectrum allows that check, a
+warning says so. The residual of every returned eigenpair is checked as
+well. The default ``"auto"`` uses ARPACK when any input matrix is sparse, or
+when the free DOF count exceeds ``dense_dof_limit`` and ``mode_count`` is
+set. Both paths orient each mode so that its largest-magnitude entry is
+positive; within a repeated eigenvalue the basis can differ between them. The
 default shift :math:`\sigma = -10^{-6}\,\|\mathbf{K}\|_1 /
-\|\mathbf{M}\|_1` keeps the shifted matrix definite for free-free models;
-for meshes whose stiffest and softest modes differ by many decades, an
-``arpack_shift`` near the lowest wanted eigenvalue converges faster. The
+\|\mathbf{M}\|_1` keeps the shifted matrix definite for free-free models,
+which require a negative shift because their rigid-body eigenvalues are zero;
+for constrained meshes whose stiffest and softest modes differ by many
+decades, an ``arpack_shift`` just below the lowest wanted eigenvalue
+converges faster. A shift at an eigenvalue raises. On this path the
+zero-energy threshold is relative to a Gershgorin-type bound
+:math:`\max_i \sum_j |K_{ij}| / M_{ii}` on the largest eigenvalue, which is
+close for three-DOF meshes but can exceed it about 40 times for
+consistent-mass shells with rotational DOFs, as in the six-DOF interior of
+:class:`ModalGeneratorCraigBamptonFEM`, whose fixed-interface eigenvalues at
+or below ``eigenvalue_tolerance`` times that bound are reported as
+mechanisms. The
 factorization dominates time and memory: its fill grows much faster for
 volume meshes than for shell meshes of the same size. For large models, also
 pass ``sample_node_indices`` (sample points that coincide with nodes are
