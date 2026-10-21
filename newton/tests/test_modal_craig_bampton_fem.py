@@ -748,6 +748,29 @@ def test_transformation_rank_checked(test, device):
         newton.ConstraintElimination(mass, stiffness, transformation=transform[:, :dof_count] * 3.0)
 
 
+def test_cb_fem_reduce_rejects_non_rigid_constraints(test, device):
+    """Reject constraints that ground the body or tie distant nodes in reduce(), not only in build()."""
+    points, mass, stiffness = _spring_lattice((4, 2, 2), 0.1, 1000.0, 0.01)
+    dof_count = mass.shape[0]
+    left = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].min()))
+    right = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].max()))
+    interfaces = [{"node_indices": left, "coupling": "rbe3"}, {"node_indices": right}]
+    # An SPC on a node of the RBE3 patch grounds the body.
+    spc = np.zeros((1, dof_count))
+    spc[0, 3 * int(left[1]) + 2] = 1.0
+    # A tie between nodes at different positions, without the lever arm, resists rigid rotation.
+    tie = np.zeros((3, dof_count))
+    interior = np.flatnonzero(~np.isin(np.arange(points.shape[0]), np.concatenate((left, right))))
+    tie[np.arange(3), 3 * int(interior[0]) + np.arange(3)] = 1.0
+    tie[np.arange(3), 3 * int(interior[-1]) + np.arange(3)] = -1.0
+    for constraints in (spc, tie):
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, fixed_mode_count=4, dofs_per_node=3, constraints=constraints
+        )
+        with test.assertRaisesRegex(ValueError, "constraints do not admit rigid-body motion"):
+            generator.reduce()
+
+
 def test_cb_fem_large_tiled_model(test, device):
     """Reduce a 59,850-DOF tiling of 5x5 HMG panels with 8 RBE2 interfaces and 30 modes within 120 s on CPU."""
     _skip_without_hmg(test)
@@ -845,6 +868,7 @@ _TESTS = (
     test_fe_matrices_must_be_symmetric,
     test_cb_fem_constraint_errors_name_interfaces,
     test_transformation_rank_checked,
+    test_cb_fem_reduce_rejects_non_rigid_constraints,
     test_cb_fem_large_tiled_model,
     test_load_sparse_matrix,
 )

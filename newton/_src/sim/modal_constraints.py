@@ -541,6 +541,43 @@ def check_transformation_rank(transformation: Any) -> None:
         )
 
 
+def transformation_rigid_residual(
+    transformation: Any,
+    node_positions: np.ndarray,
+    dofs_per_node: int,
+    independent_dofs: np.ndarray | None = None,
+) -> float:
+    """Return how well ``T`` reproduces rigid-body motion, as a relative maximum error.
+
+    With known ``independent_dofs`` the coordinates of a rigid motion ``R``
+    are ``R`` restricted to them; otherwise they are the least-squares fit
+    ``(T^T T)^-1 T^T R``. See :meth:`ConstraintElimination.rigid_motion_residual`.
+
+    Args:
+        transformation: Transformation ``T`` [dimensionless], shape
+            ``[dof_count, coordinate_count]``; dense or CSC.
+        node_positions: Node positions [m], shape ``[dof_count / dofs_per_node, 3]``.
+        dofs_per_node: Number of DOFs per node, 3 or 6, node-major.
+        independent_dofs: Original DOF of each column of ``T``, if each
+            column is a unit row of ``T``.
+
+    Returns:
+        ``max |T R_q - R| / max |R|`` [dimensionless].
+    """
+    positions = np.asarray(node_positions, dtype=np.float64)
+    rigid = modal_sparse.rigid_vectors(positions, dofs_per_node, np.mean(positions, axis=0))
+    if independent_dofs is not None:
+        rigid_q = rigid[independent_dofs]
+    elif modal_sparse.is_sparse(transformation):
+        sparse_linalg = modal_sparse._import_scipy("sparse.linalg")
+        gram = modal_sparse.to_csc(transformation.T @ transformation)
+        rigid_q = sparse_linalg.splu(gram).solve(np.asarray(transformation.T @ rigid))
+    else:
+        rigid_q = np.linalg.lstsq(transformation, rigid, rcond=None)[0]
+    error = np.asarray(transformation @ rigid_q) - rigid
+    return float(np.max(np.abs(error))) / max(float(np.max(np.abs(rigid))), np.finfo(np.float64).tiny)
+
+
 def _solve_dependent(
     pivot_block: tuple[np.ndarray, np.ndarray, np.ndarray],
     lead_block: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -769,15 +806,4 @@ class ConstraintElimination:
                 f"node_positions must have shape [{self.dof_count // max(dofs_per_node, 1)}, 3] "
                 f"for {self.dof_count} DOFs with dofs_per_node={dofs_per_node}, got {positions.shape}"
             )
-        rigid = modal_sparse.rigid_vectors(positions, dofs_per_node, np.mean(positions, axis=0))
-        transform = self.transformation
-        if self.independent_dofs is not None:
-            rigid_q = rigid[self.independent_dofs]
-        elif modal_sparse.is_sparse(transform):
-            sparse_linalg = modal_sparse._import_scipy("sparse.linalg")
-            gram = modal_sparse.to_csc(transform.T @ transform)
-            rigid_q = sparse_linalg.splu(gram).solve(np.asarray(transform.T @ rigid))
-        else:
-            rigid_q = np.linalg.lstsq(transform, rigid, rcond=None)[0]
-        error = np.asarray(transform @ rigid_q) - rigid
-        return float(np.max(np.abs(error))) / max(float(np.max(np.abs(rigid))), np.finfo(np.float64).tiny)
+        return transformation_rigid_residual(self.transformation, positions, dofs_per_node, self.independent_dofs)
