@@ -2039,10 +2039,13 @@ class ModalGeneratorFEM:
             not need SciPy.
         arpack_shift: ARPACK shift ``sigma`` [1/s^2]. ``None`` uses a small
             negative shift, ``-1e-6 * ||K||_1 / ||M||_1``, which keeps
-            ``K - sigma M`` positive definite for free-free models. A shift
-            at or just below the lowest wanted eigenvalue speeds up
-            convergence for very wide spectra; modes skipped by a higher shift
-            are detected by the Sturm sequence count.
+            ``K - sigma M`` positive definite for free-free models. A
+            free-free model requires a negative shift, because its rigid-body
+            eigenvalues are zero. For a constrained model, a shift just below
+            the lowest wanted eigenvalue speeds up convergence for very wide
+            spectra; modes skipped by a higher shift are detected by the Sturm
+            sequence count. A shift at an eigenvalue, which makes
+            ``K - sigma M`` numerically singular, raises.
         arpack_tol: ARPACK relative eigenvalue accuracy; ``0`` requests
             machine precision.
         arpack_maxiter: Maximum ARPACK restart iterations; ``None`` uses
@@ -2288,7 +2291,22 @@ class ModalGeneratorFEM:
         if not np.all(mass_diagonal > 0.0):
             raise ValueError("mass_matrix must be symmetric positive definite on free DOFs")
         sigma = modal_sparse.default_shift(stiffness, mass) if self.arpack_shift is None else self.arpack_shift
+        rigid_count = 0 if rigid_basis is None else int(rigid_basis.shape[1])
+        if rigid_count > 0 and sigma >= 0.0:
+            # The rigid-body eigenvalues are zero: sigma = 0 makes K - sigma M singular, and solves near it
+            # amplify roundoff in the deflated rigid directions into spurious eigenpairs.
+            raise ValueError(
+                f"arpack_shift must be negative for a free-free model, got {sigma:.6g}: its {rigid_count} rigid-body "
+                "modes have eigenvalue 0, so stiffness_matrix - arpack_shift * mass_matrix is singular or "
+                "indefinite. Omit arpack_shift to use the default negative shift"
+            )
         factorization = modal_sparse.ShiftedFactorization(stiffness, mass, sigma)
+        if factorization.numerically_singular:
+            raise ValueError(
+                f"stiffness_matrix - sigma * mass_matrix is numerically singular for sigma = {sigma:.6g} (smallest "
+                f"pivot {factorization.pivot_ratio:.3g} of the largest): sigma lies at an eigenvalue, or the "
+                "stiffness matrix has a mechanism that the shift does not separate. Choose a different arpack_shift"
+            )
         if sigma <= 0.0 and factorization.negative_pivot_count > 0:
             raise ValueError(
                 "mass_matrix must be symmetric positive definite on free DOFs: stiffness_matrix - sigma * "

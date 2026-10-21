@@ -512,14 +512,22 @@ class ModalGeneratorCraigBamptonFEM:
         if sigma == 0.0:
             stiffness_factorization = factorization
         else:
+            if factorization.numerically_singular:
+                raise ValueError(
+                    f"The interior stiffness_matrix - sigma * mass_matrix is numerically singular for sigma = "
+                    f"{sigma:.6g} (smallest pivot {factorization.pivot_ratio:.3g} of the largest): sigma lies at "
+                    "a fixed-interface eigenvalue. Choose a different arpack_shift"
+                )
             try:
                 stiffness_factorization = modal_sparse.ShiftedFactorization(stiffness_ii, mass_ii, 0.0)
             except ValueError as exc:
                 raise ValueError(self._mechanism_message()) from exc
             if stiffness_factorization.negative_pivot_count != 0:
                 raise ValueError(self._mechanism_message())
-        pivots = np.abs(np.asarray(stiffness_factorization.lu.U.diagonal(), dtype=np.float64))
-        pivot_ratio = float(np.min(pivots) / np.max(pivots)) if pivots.shape[0] else 1.0
+        # SuperLU raises only for exactly zero pivots; a roundoff-sized pivot also reveals a mechanism.
+        if stiffness_factorization.numerically_singular:
+            raise ValueError(self._mechanism_message())
+        pivot_ratio = stiffness_factorization.pivot_ratio
 
         rhs = stiffness_ib.toarray() if modal_sparse.is_sparse(stiffness_ib) else np.asarray(stiffness_ib)
         constraint_modes = np.empty_like(rhs)
