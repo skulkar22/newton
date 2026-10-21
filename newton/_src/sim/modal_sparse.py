@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import warnings
 from typing import Any
 
 import numpy as np
@@ -546,6 +547,11 @@ def lowest_generalized_eigenpairs(
     Raises:
         ValueError: If ARPACK does not converge, or eigenvalues below the
             check shift remain missing.
+
+    Warns:
+        UserWarning: If the Sturm sequence check is skipped, because a
+            repeated eigenvalue fills every computed eigenpair after the
+            wanted ones or the factorization pivoted off the diagonal.
     """
     size = int(stiffness.shape[0])
     deflated = 0 if deflation is None else int(deflation.shape[1])
@@ -578,11 +584,13 @@ def lowest_generalized_eigenpairs(
         request *= 2
 
     # Sturm check in the widest relative gap after the last wanted eigenvalue. A repeated eigenvalue
-    # spanning the whole margin leaves no gap, so the request grows until one appears.
+    # spanning the whole margin leaves no gap, so the request grows until one appears; every result,
+    # including that of the last search, is tested.
     first = max(count - 1, 0)
     tau = None
-    for _ in range(_STURM_GAP_SEARCHES):
+    for search in range(_STURM_GAP_SEARCHES + 1):
         if values.shape[0] >= available or values.shape[0] <= count:
+            # The whole spectrum outside deflation was computed, so no eigenvalue can be missing.
             return values, vectors
         lower = values[first:-1]
         upper = values[first + 1 :]
@@ -591,12 +599,26 @@ def lowest_generalized_eigenpairs(
         if relative_gap[gap] >= _STURM_MIN_RELATIVE_GAP and upper[gap] > zero_threshold:
             tau = 0.5 * (lower[gap] + upper[gap])
             break
+        if search == _STURM_GAP_SEARCHES:
+            break
         request = min(values.shape[0] + 2 * margin, available)
         values, vectors = solve(request, deflation, 0)
     if tau is None:
+        warnings.warn(
+            f"The Sturm sequence check was skipped: no relative eigenvalue gap of at least "
+            f"{_STURM_MIN_RELATIVE_GAP:g} follows eigenvalue {count} within the {values.shape[0]} computed "
+            "eigenpairs, because a repeated eigenvalue fills them, so missed copies of it cannot be ruled out. "
+            "Choose a mode count that ends at a gap in the spectrum",
+            stacklevel=2,
+        )
         return values, vectors
     below = count_eigenvalues_below(stiffness, mass, tau)
     if below < 0:
+        warnings.warn(
+            f"The Sturm sequence check was skipped: the factorization of stiffness_matrix - {tau:.6g} * "
+            "mass_matrix pivoted off the diagonal, so its inertia does not count the eigenvalues below the shift",
+            stacklevel=2,
+        )
         return values, vectors
     expected = below - deflated
     for restart in range(1, max_restarts + 1):

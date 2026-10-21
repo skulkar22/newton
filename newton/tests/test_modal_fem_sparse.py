@@ -289,6 +289,34 @@ def test_fem_arpack_rejects_invalid_shifts(test, device):
     test.assertFalse(modal_sparse.ShiftedFactorization(stiffness, mass, sigma).numerically_singular)
 
 
+def test_fem_arpack_sturm_check_never_skipped_silently(test, device):
+    """Warn whenever the Sturm sequence check cannot run, instead of returning unverified modes silently."""
+    from scipy import sparse
+
+    # Twelve identical clamped columns: the lowest eigenvalue has multiplicity 24, more than the
+    # mode count plus every margin the gap search adds, so no gap follows the retained modes.
+    points, mass, stiffness = _sparse_spring_lattice((2, 2, 10), 0.01, 2.0e9, 8.0e-3)
+    copies = 12
+    points = np.vstack([points + np.array([0.1 * copy, 0.0, 0.0]) for copy in range(copies)])
+    mass = sparse.block_diag([mass] * copies, format="csc")
+    stiffness = sparse.block_diag([stiffness] * copies, format="csc")
+    base = np.flatnonzero(np.isclose(points[:, 2], points[:, 2].min()))
+    reference = newton.ModalGeneratorFEM(points, mass, stiffness, fixed_node_indices=base, eigensolver="dense")
+    reference.build()
+    generator = newton.ModalGeneratorFEM(
+        points, mass, stiffness, fixed_node_indices=base, mode_count=4, eigensolver="arpack"
+    )
+    with test.assertWarnsRegex(UserWarning, "Sturm sequence check was skipped: no relative eigenvalue gap"):
+        generator.build()
+    np.testing.assert_allclose(generator.eigenvalues, reference.eigenvalues[:4], rtol=1.0e-8)
+
+    # Without a symmetric factorization the inertia is unavailable, which also warns.
+    points, mass, stiffness = _sparse_spring_lattice((6, 4, 3), 0.01, 2.0e9, 8.0e-3)
+    with mock.patch.object(modal_sparse, "count_eigenvalues_below", return_value=-1):
+        with test.assertWarnsRegex(UserWarning, "Sturm sequence check was skipped: the factorization"):
+            newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4, eigensolver="arpack").build()
+
+
 def test_fem_arpack_mechanisms_discarded(test, device):
     """Grow the ARPACK request until it spans the complete zero-energy subspace."""
     points, mass, stiffness = _sparse_spring_lattice((4, 2, 2), 0.1, 1.0e3, 1.0e-2, braced=False)
@@ -482,6 +510,7 @@ _TESTS = (
     test_fem_arpack_wide_spectrum_keeps_soft_modes,
     test_fem_arpack_rejects_invalid_models,
     test_fem_arpack_rejects_invalid_shifts,
+    test_fem_arpack_sturm_check_never_skipped_silently,
     test_fem_arpack_mechanisms_discarded,
     test_fem_arpack_large_sparse_model,
     test_fem_helpers,
