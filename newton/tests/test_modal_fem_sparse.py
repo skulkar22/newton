@@ -244,10 +244,9 @@ def test_fem_arpack_rejects_invalid_models(test, device):
     with test.assertRaisesRegex(ValueError, "does not preserve rigid-body motion"):
         newton.ModalGeneratorFEM(points, mass, broken.tocsc(), **kwargs).build()
 
-    # A shift high in the elastic spectrum makes ARPACK return modes near it; the Sturm sequence
-    # count reveals the skipped lower modes.
+    # A free-free model needs a negative shift; test_fem_helpers covers the Sturm check of a high shift.
     sigma = 0.5 * modal_sparse.generalized_eigenvalue_bound(stiffness, mass)
-    with test.assertRaisesRegex(ValueError, "Sturm sequence count"):
+    with test.assertRaisesRegex(ValueError, "arpack_shift must be negative"):
         newton.ModalGeneratorFEM(points, mass, stiffness, arpack_shift=sigma, **kwargs).build()
 
     with test.assertRaisesRegex(ValueError, "mode_count is required"):
@@ -259,6 +258,35 @@ def test_fem_arpack_rejects_invalid_models(test, device):
         newton.ModalGeneratorFEM(points, indefinite.tocsc(), stiffness, **kwargs).build()
     with test.assertRaisesRegex(ValueError, "eigensolver must be"):
         newton.ModalGeneratorFEM(points, mass, stiffness, eigensolver="lobpcg")
+
+
+def test_fem_arpack_rejects_invalid_shifts(test, device):
+    """Reject a non-negative shift on a free-free model and a shift at an eigenvalue before ARPACK runs."""
+    points, mass, stiffness = _sparse_spring_lattice((6, 4, 3), 0.01, 2.0e9, 8.0e-3)
+    kwargs = {"mode_count": 6, "eigensolver": "arpack"}
+    reference = newton.ModalGeneratorFEM(points, mass, stiffness, eigensolver="dense")
+    reference.build()
+    for sigma in (0.0, 0.5 * float(reference.eigenvalues[0])):
+        with test.assertRaisesRegex(ValueError, "arpack_shift must be negative for a free-free model"):
+            newton.ModalGeneratorFEM(points, mass, stiffness, arpack_shift=sigma, **kwargs).build()
+
+    clamped = {"fixed_node_indices": [0, 1, 2, 3, 4, 5]}
+    reference = newton.ModalGeneratorFEM(points, mass, stiffness, eigensolver="dense", **clamped)
+    reference.build()
+    with test.assertRaisesRegex(ValueError, "numerically singular for sigma"):
+        newton.ModalGeneratorFEM(
+            points, mass, stiffness, arpack_shift=float(reference.eigenvalues[0]), **clamped, **kwargs
+        ).build()
+    generator = newton.ModalGeneratorFEM(
+        points, mass, stiffness, arpack_shift=0.5 * float(reference.eigenvalues[0]), **clamped, **kwargs
+    )
+    generator.build()
+    np.testing.assert_allclose(generator.eigenvalues, reference.eigenvalues[:6], rtol=1.0e-8)
+
+    # SuperLU factors the singular free-free stiffness without error; only the pivot ratio reveals it.
+    test.assertTrue(modal_sparse.ShiftedFactorization(stiffness, mass, 0.0).numerically_singular)
+    sigma = modal_sparse.default_shift(stiffness, mass)
+    test.assertFalse(modal_sparse.ShiftedFactorization(stiffness, mass, sigma).numerically_singular)
 
 
 def test_fem_arpack_mechanisms_discarded(test, device):
@@ -453,6 +481,7 @@ _TESTS = (
     test_fem_sparse_input_dense_path_identical,
     test_fem_arpack_wide_spectrum_keeps_soft_modes,
     test_fem_arpack_rejects_invalid_models,
+    test_fem_arpack_rejects_invalid_shifts,
     test_fem_arpack_mechanisms_discarded,
     test_fem_arpack_large_sparse_model,
     test_fem_helpers,

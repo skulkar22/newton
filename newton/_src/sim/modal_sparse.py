@@ -23,6 +23,14 @@ SHIFT_FRACTION_DEFAULT = 1.0e-6
 _ARPACK_START_SEED = 0x5EED
 """Seed of the deterministic ARPACK starting vector."""
 
+SINGULAR_PIVOT_RATIO = 1.0e-12
+"""Pivot magnitude relative to the largest one at or below which a factorization is numerically singular [dimensionless].
+
+Factoring the singular stiffness matrix of a free-free model leaves pivots of
+roundoff size, ``1e-16`` to ``1e-13`` of the largest one, while the shifted
+matrices of well-posed models give ratios above ``1e-8``.
+"""
+
 
 def is_sparse(matrix: Any) -> bool:
     """Return whether ``matrix`` is a SciPy sparse matrix or array.
@@ -265,6 +273,10 @@ class ShiftedFactorization:
     ``U`` is the ``D`` of an ``L D L^T`` factorization and its signs give the
     matrix inertia (Sylvester's law): ``negative_pivot_count`` is the number of
     generalized eigenvalues below ``sigma`` when ``M`` is positive definite.
+    SuperLU raises only for exactly zero pivots; ``pivot_ratio``, the
+    smallest pivot magnitude relative to the largest, reveals a numerically
+    singular matrix (see :attr:`numerically_singular`), for example ``K``
+    of a free-free model factored at ``sigma = 0``.
 
     Args:
         stiffness: Sparse stiffness matrix [N/m], shape ``[n, n]``.
@@ -294,11 +306,19 @@ class ShiftedFactorization:
                 "choose a different arpack_shift"
             ) from exc
         self.symmetric_pivoting = bool(np.array_equal(self.lu.perm_r, self.lu.perm_c))
+        # SuperLU exposes U only as a copy; keep just its diagonal.
+        pivots = np.asarray(self.lu.U.diagonal(), dtype=np.float64)
+        magnitude = np.abs(pivots)
+        largest = float(np.max(magnitude, initial=0.0))
+        self.pivot_ratio = float(np.min(magnitude)) / largest if largest > 0.0 else float(self.size == 0)
         self.negative_pivot_count = -1
         if self.symmetric_pivoting:
-            # SuperLU exposes U only as a copy; keep just its diagonal.
-            pivots = np.asarray(self.lu.U.diagonal(), dtype=np.float64)
             self.negative_pivot_count = int(np.count_nonzero(pivots <= 0.0))
+
+    @property
+    def numerically_singular(self) -> bool:
+        """Whether the smallest pivot is at most :data:`SINGULAR_PIVOT_RATIO` of the largest."""
+        return self.pivot_ratio <= SINGULAR_PIVOT_RATIO
 
     @property
     def fill_nonzeros(self) -> int:
