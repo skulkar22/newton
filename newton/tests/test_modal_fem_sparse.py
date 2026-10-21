@@ -364,6 +364,20 @@ def test_fem_arpack_diagnoses_indefinite_matrices(test, device):
             newton.ModalGeneratorFEM(points, mass, stiffness, **kwargs).build()
 
 
+def test_fem_mode_sign_convention(test, device):
+    """Give the dense and ARPACK paths the same mode signs: the largest-magnitude entry is positive."""
+    points, mass, stiffness = _sparse_spring_lattice((6, 4, 3), 0.01, 2.0e9, 8.0e-3)
+    for kwargs in ({"mode_count": 10}, {"mode_count": 8, "fixed_node_indices": [0, 1, 3], "discard_mode_count": 1}):
+        dense, _, arpack, _ = _build_pair(points, mass, stiffness, **kwargs)
+        np.testing.assert_allclose(
+            arpack.modal_matrix, dense.modal_matrix, atol=1.0e-6 * np.abs(dense.modal_matrix).max()
+        )
+        for modes in (dense.modal_matrix, arpack.modal_matrix):
+            magnitude = np.abs(modes)
+            first_peak = np.argmax(magnitude >= (1.0 - 1.0e-6) * magnitude.max(axis=0), axis=0)
+            test.assertTrue(np.all(modes[first_peak, np.arange(modes.shape[1])] > 0.0))
+
+
 def test_fem_arpack_mechanisms_discarded(test, device):
     """Grow the ARPACK request until it spans the complete zero-energy subspace."""
     points, mass, stiffness = _sparse_spring_lattice((4, 2, 2), 0.1, 1.0e3, 1.0e-2, braced=False)
@@ -560,6 +574,7 @@ _TESTS = (
     test_fem_arpack_sturm_check_never_skipped_silently,
     test_fem_arpack_residual_check,
     test_fem_arpack_diagnoses_indefinite_matrices,
+    test_fem_mode_sign_convention,
     test_fem_arpack_mechanisms_discarded,
     test_fem_arpack_large_sparse_model,
     test_fem_helpers,

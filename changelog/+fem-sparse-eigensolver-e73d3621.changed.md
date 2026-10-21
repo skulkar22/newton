@@ -1,0 +1,1 @@
+Orient each `ModalGeneratorFEM` mode so that its largest-magnitude nodal entry is positive, on both the dense and the ARPACK eigensolver paths. Mode signs of existing dense builds, and with them modal coordinates and `sample_phi`, may flip; regenerate saved modal states or baselines that assume a sign.
