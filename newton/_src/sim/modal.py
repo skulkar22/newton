@@ -1328,6 +1328,27 @@ def _project_modal_damping(generator: Any, modal_damping: np.ndarray, source: st
     return _clamp_modal_diagonal(diagonal, tolerance * diagonal_scale, f"{source} damping", stacklevel=4)
 
 
+_MODE_SIGN_TIE_TOLERANCE = 1.0e-6
+"""Relative magnitude within which mode entries tie for the largest one in :func:`_orient_modes` [dimensionless]."""
+
+
+def _orient_modes(modes: np.ndarray) -> np.ndarray:
+    """Return ``modes`` with each column's sign chosen so that its largest-magnitude entry is positive.
+
+    Entries within :data:`_MODE_SIGN_TIE_TOLERANCE` of the largest magnitude
+    tie, and the first of them decides, so that eigensolvers whose results
+    differ by roundoff choose the same sign, also for symmetric modes whose
+    largest entries have equal magnitude and opposite signs.
+    """
+    if modes.shape[1] == 0:
+        return modes
+    magnitude = np.abs(modes)
+    peak = np.max(magnitude, axis=0)
+    pivot = np.argmax(magnitude >= (1.0 - _MODE_SIGN_TIE_TOLERANCE) * peak, axis=0)
+    sign = np.where(modes[pivot, np.arange(modes.shape[1])] < 0.0, -1.0, 1.0)
+    return modes * sign
+
+
 def _clamp_modal_diagonal(values: np.ndarray, tolerance: float, name: str, stacklevel: int = 3) -> np.ndarray:
     """Clamp negative projected modal values to zero, warning beyond the roundoff ``tolerance``."""
     values = np.asarray(values, dtype=np.float64)
@@ -1949,6 +1970,10 @@ class ModalGeneratorFEM:
     rigid-body motion only when it overlaps a rigid motion that the fixed DOFs
     admit.
 
+    The sign of each mode is chosen so that its largest-magnitude nodal
+    entry is positive, on both eigensolver paths. Within a repeated
+    eigenvalue the basis remains arbitrary and can differ between the paths.
+
     Damping is not part of the eigenproblem. ``damping_matrix`` is projected onto
     the selected modes and only its diagonal is stored; see
     ``damping_projection``. Unlike :class:`ModalGeneratorCraigBampton`, the
@@ -2487,7 +2512,8 @@ class ModalGeneratorFEM:
         if valid_indices.shape[0] == 0:
             raise ValueError("No eigenmodes remain after filtering")
 
-        free_modes = eigen_modes[:, valid_indices]
+        # LAPACK and ARPACK return arbitrary signs; a fixed convention makes both paths reproducible.
+        free_modes = _orient_modes(eigen_modes[:, valid_indices])
         full_modes = np.zeros((self.dof_count, valid_indices.shape[0]), dtype=np.float64)
         full_modes[free, :] = free_modes
 
