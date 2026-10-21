@@ -271,6 +271,40 @@ def default_shift(stiffness: Any, mass: Any, shift_fraction: float = SHIFT_FRACT
     return -1.0
 
 
+def _symmetric_splu(matrix: Any) -> Any:
+    """Factor a sparse symmetric matrix with SuperLU, symmetric ordering, and diagonal pivots."""
+    sparse_linalg = _import_scipy("sparse.linalg")
+
+    return sparse_linalg.splu(matrix, permc_spec="COLAMD", diag_pivot_thresh=0.0, options={"SymmetricMode": True})
+
+
+def nonpositive_pivot_count(matrix: Any) -> int:
+    """Return the number of non-positive eigenvalues of a symmetric sparse matrix, or ``-1``.
+
+    Counts the non-positive pivots of a symmetric factorization (Sylvester's
+    law), for example to certify that a mass matrix is positive definite.
+    An exactly singular matrix counts one zero pivot; ``-1`` means SuperLU
+    pivoted off the diagonal, so the inertia is unavailable.
+    """
+    try:
+        lu = _symmetric_splu(to_csc(matrix))
+    except RuntimeError:
+        return 1
+    if not np.array_equal(lu.perm_r, lu.perm_c):
+        return -1
+    return int(np.count_nonzero(np.asarray(lu.U.diagonal(), dtype=np.float64) <= 0.0))
+
+
+def _check_mass_definite(mass: Any, failure: str) -> None:
+    """Raise if ``mass`` has non-positive pivots, naming the eigensolver ``failure`` that it explains."""
+    mass_pivots = nonpositive_pivot_count(mass)
+    if mass_pivots > 0:
+        raise ValueError(
+            f"mass_matrix must be symmetric positive definite, but its factorization has {mass_pivots} "
+            f"non-positive pivots: {failure}"
+        )
+
+
 class ShiftedFactorization:
     """Sparse LU factorization of ``K - sigma M`` for shift-invert eigensolves.
 
@@ -296,19 +330,12 @@ class ShiftedFactorization:
     """
 
     def __init__(self, stiffness: Any, mass: Any, sigma: float):
-        sparse_linalg = _import_scipy("sparse.linalg")
-
         self.sigma = float(sigma)
         shifted = to_csc(to_csc(stiffness) - self.sigma * to_csc(mass))
         self.size = int(shifted.shape[0])
         self.norm = matrix_one_norm(shifted)
         try:
-            self.lu = sparse_linalg.splu(
-                shifted,
-                permc_spec="COLAMD",
-                diag_pivot_thresh=0.0,
-                options={"SymmetricMode": True},
-            )
+            self.lu = _symmetric_splu(shifted)
         except RuntimeError as exc:
             raise ValueError(
                 f"stiffness_matrix - sigma * mass_matrix is singular for sigma = {self.sigma:.6g}; "
@@ -516,11 +543,16 @@ def generalized_eigsh(
     tolerance = _RESIDUAL_TOLERANCE_FACTOR * accuracy * spread
     worst = int(np.argmax(errors / tolerance))
     if not errors[worst] <= tolerance[worst]:
-        raise ValueError(
+        failure = (
             f"ARPACK returned an inaccurate eigenpair near sigma = {factorization.sigma:.6g}: eigenvalue "
             f"{values[worst]:.6g} 1/s^2 has relative residual {errors[worst]:.3g} (||K phi - lambda M phi|| / "
-            f"(||K - sigma M||_1 ||phi||)), above the tolerance {tolerance[worst]:.3g}. The shifted matrix is "
-            "close to singular or ARPACK stopped early; choose a different arpack_shift or a smaller arpack_tol"
+            f"(||K - sigma M||_1 ||phi||)), above the tolerance {tolerance[worst]:.3g}"
+        )
+        # Lanczos needs the M inner product; an indefinite mass matrix also produces such pairs.
+        _check_mass_definite(mass, failure)
+        raise ValueError(
+            f"{failure}. The shifted matrix is close to singular or ARPACK stopped early; choose a different "
+            "arpack_shift or a smaller arpack_tol"
         )
     order = np.argsort(values, kind="stable")
     return np.asarray(values[order], dtype=np.float64), np.asarray(vectors[:, order], dtype=np.float64)
@@ -599,8 +631,10 @@ def lowest_generalized_eigenpairs(
         excluding ``deflation``.
 
     Raises:
-        ValueError: If ARPACK does not converge, or eigenvalues below the
-            check shift remain missing.
+        ValueError: If ARPACK does not converge, eigenvalues below the check
+            shift remain missing, ARPACK returns more eigenvalues below it
+            than the Sturm sequence count (spurious eigenpairs), or that
+            excess comes from an indefinite mass matrix.
 
     Warns:
         UserWarning: If the Sturm sequence check is skipped, because a
@@ -689,10 +723,24 @@ def lowest_generalized_eigenpairs(
         values = values[order]
         vectors = vectors[:, order]
     found = int(np.count_nonzero(values < tau))
-    if found != expected:
+    if found < expected:
         raise ValueError(
             f"ARPACK found {found} eigenvalues below {tau:.6g} 1/s^2, but the Sturm sequence count of "
             f"stiffness_matrix - {tau:.6g} * mass_matrix gives {expected}; repeated or clustered eigenvalues "
             "were missed. Increase arpack_ncv, or set arpack_shift at or below the lowest wanted eigenvalue"
+        )
+    if found > expected:
+        # Sylvester's law counts eigenvalues only for a positive-definite mass matrix, which the inertia
+        # at sigma <= 0 cannot certify in directions that the stiffness dominates.
+        _check_mass_definite(
+            mass,
+            f"ARPACK found {found} eigenvalues below {tau:.6g} 1/s^2 where the Sturm sequence count, which "
+            f"assumes a positive-definite mass matrix, gives {expected}",
+        )
+        raise ValueError(
+            f"ARPACK found {found} eigenvalues below {tau:.6g} 1/s^2, more than the {expected} of the Sturm "
+            f"sequence count of stiffness_matrix - {tau:.6g} * mass_matrix, so some returned eigenpairs are "
+            "spurious. Check that stiffness_matrix is symmetric positive semi-definite, and choose an "
+            "arpack_shift away from the eigenvalues"
         )
     return values, vectors

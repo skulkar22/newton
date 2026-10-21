@@ -2308,10 +2308,23 @@ class ModalGeneratorFEM:
                 "stiffness matrix has a mechanism that the shift does not separate. Choose a different arpack_shift"
             )
         if sigma <= 0.0 and factorization.negative_pivot_count > 0:
+            # K - sigma M with sigma <= 0 is indefinite only if M or K is; factor M to tell which.
+            mass_pivots = modal_sparse.nonpositive_pivot_count(mass)
+            if mass_pivots == 0:
+                raise ValueError(
+                    "stiffness_matrix must be positive semi-definite on free DOFs: stiffness_matrix - sigma * "
+                    f"mass_matrix has {factorization.negative_pivot_count} non-positive pivots for "
+                    f"sigma = {sigma:.6g} although mass_matrix is positive definite"
+                )
+            cause = (
+                f"mass_matrix has {mass_pivots}"
+                if mass_pivots > 0
+                else "also check that stiffness_matrix is positive semi-definite"
+            )
             raise ValueError(
                 "mass_matrix must be symmetric positive definite on free DOFs: stiffness_matrix - sigma * "
-                f"mass_matrix has {factorization.negative_pivot_count} non-positive pivots for sigma = {sigma:.6g}; "
-                "also check that stiffness_matrix is positive semi-definite"
+                f"mass_matrix has {factorization.negative_pivot_count} non-positive pivots for "
+                f"sigma = {sigma:.6g}; {cause}"
             )
 
         # Gershgorin-type bound on the largest eigenvalue: computing it would cost a second solve, and only
