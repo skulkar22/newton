@@ -336,6 +336,34 @@ def test_fem_arpack_residual_check(test, device):
     test.assertGreater(float(values[0]), 0.0)
 
 
+def test_fem_arpack_diagnoses_indefinite_matrices(test, device):
+    """Tell an indefinite mass, an indefinite stiffness, and spurious eigenvalues apart from missed ones."""
+    from scipy import sparse
+
+    kwargs = {"mode_count": 4, "eigensolver": "arpack"}
+    # Removing mass along the stiffest mode makes M indefinite in a direction that the inertia of
+    # K - sigma M at sigma <= 0 cannot see; the Sturm count then disagrees with ARPACK.
+    points, mass, stiffness = _sparse_spring_lattice((12, 12, 2), 0.01, 2.0e9, 8.0e-3)
+    stiffest = np.linalg.eigh(stiffness.toarray())[1][:, -1]
+    indefinite = sparse.csc_matrix(mass.toarray() - 1.5 * 8.0e-3 * np.outer(stiffest, stiffest))
+    with test.assertRaisesRegex(ValueError, "mass_matrix must be symmetric positive definite, but its factorization"):
+        newton.ModalGeneratorFEM(points, indefinite, stiffness, **kwargs).build()
+    test.assertEqual(modal_sparse.nonpositive_pivot_count(indefinite), 1)
+
+    points, mass, stiffness = _sparse_spring_lattice((6, 4, 3), 0.01, 2.0e9, 8.0e-3)
+    clamped = {"fixed_node_indices": [0, 1, 2, 3, 4, 5]}
+    reference = newton.ModalGeneratorFEM(points, mass, stiffness, eigensolver="dense", **clamped)
+    reference.build()
+    softened = (stiffness - 1.5 * float(reference.eigenvalues[0]) * mass).tocsc()
+    with test.assertRaisesRegex(ValueError, "stiffness_matrix must be positive semi-definite on free DOFs"):
+        newton.ModalGeneratorFEM(points, mass, softened, **clamped, **kwargs).build()
+
+    # More eigenvalues than the Sturm count, with a positive-definite mass, are spurious, not missed.
+    with mock.patch.object(modal_sparse, "count_eigenvalues_below", return_value=7):
+        with test.assertRaisesRegex(ValueError, "more than the 1 of the Sturm sequence count.*spurious"):
+            newton.ModalGeneratorFEM(points, mass, stiffness, **kwargs).build()
+
+
 def test_fem_arpack_mechanisms_discarded(test, device):
     """Grow the ARPACK request until it spans the complete zero-energy subspace."""
     points, mass, stiffness = _sparse_spring_lattice((4, 2, 2), 0.1, 1.0e3, 1.0e-2, braced=False)
@@ -531,6 +559,7 @@ _TESTS = (
     test_fem_arpack_rejects_invalid_shifts,
     test_fem_arpack_sturm_check_never_skipped_silently,
     test_fem_arpack_residual_check,
+    test_fem_arpack_diagnoses_indefinite_matrices,
     test_fem_arpack_mechanisms_discarded,
     test_fem_arpack_large_sparse_model,
     test_fem_helpers,
