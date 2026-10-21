@@ -722,6 +722,32 @@ def test_cb_fem_constraint_errors_name_interfaces(test, device):
         reduce(ties)
 
 
+def test_transformation_rank_checked(test, device):
+    """Report a transformation with dependent columns as such, not as a mechanism or a singular mass."""
+    from scipy import sparse
+
+    points, mass, stiffness = _spring_lattice((3, 2, 2), 0.1, 1000.0, 0.01)
+    dof_count = mass.shape[0]
+    left = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].min()))
+    duplicated = np.hstack((np.eye(dof_count), np.eye(dof_count)[:, :1]))
+    pattern = rf"transformation has linearly dependent columns: its rank is {dof_count}, below its {dof_count + 1}"
+    for transform in (duplicated, sparse.csc_matrix(duplicated)):
+        with test.assertRaisesRegex(ValueError, pattern):
+            newton.ConstraintElimination(mass, stiffness, transformation=transform)
+        with test.assertRaisesRegex(ValueError, pattern):
+            newton.ModalGeneratorCraigBamptonFEM(
+                points,
+                mass,
+                stiffness,
+                [{"node_indices": left}],
+                fixed_mode_count=4,
+                dofs_per_node=3,
+                transformation=transform,
+            ).reduce()
+        # A full-rank transformation, for example from scaled and combined columns, is accepted.
+        newton.ConstraintElimination(mass, stiffness, transformation=transform[:, :dof_count] * 3.0)
+
+
 def test_cb_fem_large_tiled_model(test, device):
     """Reduce a 59,850-DOF tiling of 5x5 HMG panels with 8 RBE2 interfaces and 30 modes within 120 s on CPU."""
     _skip_without_hmg(test)
@@ -818,6 +844,7 @@ _TESTS = (
     test_cb_fem_error_paths,
     test_fe_matrices_must_be_symmetric,
     test_cb_fem_constraint_errors_name_interfaces,
+    test_transformation_rank_checked,
     test_cb_fem_large_tiled_model,
     test_load_sparse_matrix,
 )

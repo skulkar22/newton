@@ -15,7 +15,7 @@ import numpy as np
 
 from . import modal_sparse
 from .modal import ModalBasis, ModalGeneratorCraigBampton
-from .modal_constraints import assemble_triplets, constraint_transformation
+from .modal_constraints import assemble_triplets, check_transformation_rank, constraint_transformation
 
 if TYPE_CHECKING:
     from scipy.sparse import sparray, spmatrix
@@ -465,6 +465,7 @@ class ModalGeneratorCraigBamptonFEM:
             base = modal_sparse.to_csc(base) if sparse else np.asarray(modal_sparse.to_dense(base))
             if base.ndim != 2 or base.shape[0] != size:
                 raise ValueError(f"transformation must have shape [{size}, independent_count], got {base.shape}")
+            check_transformation_rank(base)
             mpc_report = {"independent_dofs": int(base.shape[1]), "dependent_dofs": None}
         coordinate_count = size if base is None else int(base.shape[1])
 

@@ -26,6 +26,12 @@ if TYPE_CHECKING:
 _SOLVE_CHUNK_COLUMNS = 256
 """Number of right-hand sides solved at once when forming ``-C_s^-1 C_m``."""
 
+_TRANSFORMATION_RANK_TOLERANCE = 1.0e-10
+"""Squared sine of the angle to the other columns below which a sparse ``T`` column counts as dependent."""
+
+_GRAM_REGULARIZATION = 1.0e-13
+"""Diagonal shift of the normalized Gram matrix ``T^T T`` that keeps exactly dependent columns factorable."""
+
 
 class _Transformation(NamedTuple):
     """Result of :func:`constraint_transformation`."""
@@ -494,6 +500,47 @@ def constraint_transformation(
     return _Transformation(transformation, independent_dofs, np.flatnonzero(dependent_mask), report)
 
 
+def check_transformation_rank(transformation: Any) -> None:
+    """Raise if a transformation ``T`` (``u = T q``) has linearly dependent columns.
+
+    Dependent columns make ``T^T K T`` and ``T^T M T`` singular, which would
+    otherwise surface as a mechanism or an indefinite mass. A dense ``T`` is
+    checked with its singular values. For a sparse ``T`` the Gram matrix
+    ``T^T T`` with unit diagonal is factored symmetrically; each pivot is the
+    squared sine of the angle between a column and the columns eliminated
+    before it, and pivots at or below
+    :data:`_TRANSFORMATION_RANK_TOLERANCE` count as dependent columns.
+
+    Args:
+        transformation: Transformation [dimensionless], shape
+            ``[dof_count, independent_count]``; dense or CSC.
+
+    Raises:
+        ValueError: If the rank of ``T`` is below its column count.
+    """
+    column_count = int(transformation.shape[1])
+    if column_count == 0:
+        return
+    if modal_sparse.is_sparse(transformation):
+        scipy_sparse = modal_sparse._import_scipy("sparse")
+        gram = modal_sparse.to_csc(transformation.T @ transformation)
+        diagonal = np.asarray(gram.diagonal(), dtype=np.float64)
+        scale = np.zeros(column_count, dtype=np.float64)
+        np.divide(1.0, np.sqrt(diagonal), out=scale, where=diagonal > 0.0)
+        normalized = scipy_sparse.diags(scale) @ gram @ scipy_sparse.diags(scale)
+        normalized = modal_sparse.to_csc(normalized + _GRAM_REGULARIZATION * scipy_sparse.identity(column_count))
+        pivots = np.abs(np.asarray(modal_sparse._symmetric_splu(normalized).U.diagonal(), dtype=np.float64))
+        rank = column_count - int(np.count_nonzero(pivots <= _TRANSFORMATION_RANK_TOLERANCE))
+    else:
+        rank = int(np.linalg.matrix_rank(np.asarray(transformation, dtype=np.float64)))
+    if rank < column_count:
+        raise ValueError(
+            f"transformation has linearly dependent columns: its rank is {rank}, below its {column_count} "
+            "columns (independent_count). Each column must be an independent coordinate; remove the dependent "
+            "columns, such as duplicates"
+        )
+
+
 def _solve_dependent(
     pivot_block: tuple[np.ndarray, np.ndarray, np.ndarray],
     lead_block: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -613,8 +660,9 @@ class ConstraintElimination:
 
     Raises:
         ValueError: If shapes mismatch, both or neither of ``constraints`` and
-            ``transformation`` are given, entries are not finite, or the
-            constraints relate retained DOFs to each other.
+            ``transformation`` are given, entries are not finite, the
+            constraints relate retained DOFs to each other, or
+            ``transformation`` has linearly dependent columns.
     """
 
     def __init__(
@@ -667,6 +715,7 @@ class ConstraintElimination:
             values = transform.data if sparse else transform
             if not np.all(np.isfinite(values)):
                 raise ValueError("transformation contains non-finite entries")
+            check_transformation_rank(transform)
             self.report = {"independent_dofs": int(transform.shape[1]), "dependent_dofs": None}
 
         self.transformation = transform
