@@ -13,7 +13,7 @@ are processed with NumPy only; sparse inputs keep ``T`` sparse and need SciPy.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -151,6 +151,7 @@ def _select_pivots(
     retained: np.ndarray,
     tolerance: float,
     row_ids: np.ndarray,
+    describe_row: Callable[[int], str],
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Choose one dependent column per independent constraint row by greedy pivoted elimination.
 
@@ -170,6 +171,7 @@ def _select_pivots(
         retained: Mask of columns that must stay independent, shape ``[col_count]``.
         tolerance: Relative magnitude below which an eliminated row is zero.
         row_ids: Original row index of each row, for error messages.
+        describe_row: Description of an original row index, for error messages.
 
     Returns:
         Kept row indices, their pivot columns (aligned), and the number of
@@ -186,9 +188,9 @@ def _select_pivots(
 
     def inconsistent(row: int) -> ValueError:
         return ValueError(
-            f"Constraint row {int(row_ids[row])} cannot be satisfied without making a retained DOF dependent; "
-            "the constraints relate retained DOFs to each other (for example two interface frames tied together "
-            "or a node attached to two interfaces)"
+            f"{describe_row(int(row_ids[row]))} cannot be satisfied without making a retained DOF dependent; "
+            "the constraints relate retained DOFs to each other (for example two interface frames tied together, "
+            "a node attached to two interfaces, or an interface DOF that a constraint fixes or eliminates)"
         )
 
     pivot_rows: list[np.ndarray] = []
@@ -276,6 +278,8 @@ def constraint_transformation(
     retained_dofs: Sequence[int] | np.ndarray | None = None,
     tolerance: float = 1.0e-10,
     sparse: bool | None = None,
+    dof_label: Callable[[int], str] | None = None,
+    row_label: Callable[[int], str] | None = None,
 ) -> _Transformation:
     """Return a transformation ``u = T q`` whose columns span the null space of ``constraints``.
 
@@ -300,6 +304,10 @@ def constraint_transformation(
             linearly dependent; also the relative tolerance of the tie test.
         sparse: Whether ``T`` is assembled as a CSC matrix. ``None`` follows
             the type of ``constraints``.
+        dof_label: Description of a column (DOF) index for error messages.
+            ``None`` uses ``"DOF <index>"``.
+        row_label: Description of a constraint row index for error messages.
+            ``None`` uses ``"Constraint row <index>"``.
 
     Returns:
         The transformation, the independent and dependent DOF indices, and a report.
@@ -346,8 +354,15 @@ def constraint_transformation(
     conflict = np.flatnonzero(retained_per_group > 1)
     if conflict.shape[0] > 0:
         members = np.flatnonzero((root == conflict[0]) & retained)
+        links = np.flatnonzero((root == conflict[0]) & ~retained)[:4]
+        if dof_label is None:
+            described = str(members.tolist())
+            through = f" through DOFs {links.tolist()}" if links.shape[0] else ""
+        else:
+            described = ", ".join(dof_label(int(member)) for member in members)
+            through = f" through {', '.join(dof_label(int(link)) for link in links)}" if links.shape[0] else ""
         raise ValueError(
-            f"Tie constraints connect the retained DOFs {members.tolist()}; "
+            f"Tie constraints connect the retained DOFs {described}{through}; "
             "retained DOFs, such as interface frame DOFs, cannot be tied to each other"
         )
     group_lead = np.arange(dof_count, dtype=np.int64)
@@ -395,6 +410,7 @@ def constraint_transformation(
         retained_columns,
         tolerance,
         general_ids,
+        row_label if row_label is not None else (lambda row: f"Constraint row {row}"),
     )
     dependent_rows = redundant_ties + dependent_general
     if dependent_rows > 0:

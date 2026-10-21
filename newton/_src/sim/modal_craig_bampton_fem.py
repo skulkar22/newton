@@ -26,6 +26,12 @@ _COUPLINGS = {"node": "node", "rbe2": "rbe2", "direct": "rbe2", "rbe3": "rbe3", 
 _RANK_TOLERANCE = 1.0e-9
 """Relative singular-value threshold for the rigid-fit rank of an interface patch."""
 
+_DOF_COMPONENTS = ("ux", "uy", "uz", "rx", "ry", "rz")
+"""Names of the nodal DOF components, node-major."""
+
+_FRAME_COMPONENTS = ("tx", "ty", "tz", "rx", "ry", "rz")
+"""Names of the six interface frame coordinates."""
+
 
 class _Interface(NamedTuple):
     name: str
@@ -364,16 +370,26 @@ class ModalGeneratorCraigBamptonFEM:
             return self.dof_count > self.dense_dof_limit and modal_sparse.has_scipy()
         return self.eigensolver == "arpack"
 
-    def _interface_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    def _describe_dof(self, dof: int) -> str:
+        """Return ``"DOF <dof> (node <node> <component>)"`` for an original DOF index."""
+        node, component = divmod(int(dof), self.dofs_per_node)
+        return f"DOF {int(dof)} (node {node} {_DOF_COMPONENTS[component]})"
+
+    def _interface_rows(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, list[tuple[int, int]]]:
         """Return the interface constraint triplets ``G u - H f = 0`` on DOFs ``u`` and frame coordinates ``f``.
 
         Returns:
             Row, DOF, and value arrays of ``G``; row, frame-coordinate, and
-            value arrays of ``H``; and the row count.
+            value arrays of ``H``; the row count; and, per row, the interface
+            index and the coupled DOF (``"node"`` and ``"rbe2"``) or ``-1 -
+            frame component`` (``"rbe3"``), for error messages.
         """
         dofs = self.dofs_per_node
         g_rows, g_cols, g_values = [], [], []
         h_rows, h_cols, h_values = [], [], []
+        origins: list[tuple[int, int]] = []
         row = 0
         for index, interface in enumerate(self.interfaces):
             frame = 6 * index
@@ -390,6 +406,7 @@ class ModalGeneratorCraigBamptonFEM:
                         h_rows.extend([row] * nonzero.shape[0])
                         h_cols.extend((frame + nonzero).tolist())
                         h_values.extend(coefficients[nonzero].tolist())
+                        origins.append((index, dofs * node + axis))
                         row += 1
                     if dofs == 6:
                         for axis in range(3):
@@ -399,6 +416,7 @@ class ModalGeneratorCraigBamptonFEM:
                             h_rows.append(row)
                             h_cols.append(frame + 3 + axis)
                             h_values.append(1.0)
+                            origins.append((index, dofs * node + 3 + axis))
                             row += 1
             else:
                 weights = np.repeat(interface.weights, 3)
@@ -413,6 +431,7 @@ class ModalGeneratorCraigBamptonFEM:
                     h_rows.append(row)
                     h_cols.append(frame + axis)
                     h_values.append(1.0)
+                    origins.append((index, -1 - axis))
                     row += 1
         return (
             np.asarray(g_rows, dtype=np.int64),
@@ -422,6 +441,7 @@ class ModalGeneratorCraigBamptonFEM:
             np.asarray(h_cols, dtype=np.int64),
             np.asarray(h_values, dtype=np.float64),
             row,
+            origins,
         )
 
     def _coordinate_transformation(self, sparse: bool) -> tuple[Any, dict[str, Any] | None, dict[str, Any]]:
@@ -430,12 +450,16 @@ class ModalGeneratorCraigBamptonFEM:
         frame_count = 6 * self.interface_count
         mpc_report = None
         base = None
+        independent_dofs = None
+        eliminated = np.zeros(size, dtype=bool)
         if self.constraints is not None:
             result = constraint_transformation(
                 self.constraints, size, tolerance=self.constraint_tolerance, sparse=sparse
             )
             base = result.transformation
             mpc_report = result.report
+            independent_dofs = result.independent_dofs
+            eliminated[result.dependent_dofs] = True
         elif self.input_transformation is not None:
             base = self.input_transformation
             base = modal_sparse.to_csc(base) if sparse else np.asarray(modal_sparse.to_dense(base))
@@ -444,7 +468,7 @@ class ModalGeneratorCraigBamptonFEM:
             mpc_report = {"independent_dofs": int(base.shape[1]), "dependent_dofs": None}
         coordinate_count = size if base is None else int(base.shape[1])
 
-        g_rows, g_cols, g_values, h_rows, h_cols, h_values, row_count = self._interface_rows()
+        g_rows, g_cols, g_values, h_rows, h_cols, h_values, row_count, origins = self._interface_rows()
         interface_dofs = assemble_triplets(g_rows, g_cols, g_values, (row_count, size), sparse)
         if base is not None:
             interface_dofs = interface_dofs @ base
@@ -461,12 +485,34 @@ class ModalGeneratorCraigBamptonFEM:
             (row_count, coordinate_count + frame_count),
             sparse,
         )
+
+        # Name the user's DOFs and the interfaces in errors, not the augmented coordinates [q, f].
+        def describe_coordinate(coordinate: int) -> str:
+            if coordinate >= coordinate_count:
+                index, component = divmod(coordinate - coordinate_count, 6)
+                return f"interface '{self.interfaces[index].name}' frame {_FRAME_COMPONENTS[component]}"
+            if independent_dofs is not None:
+                return self._describe_dof(int(independent_dofs[coordinate]))
+            if base is not None:
+                return f"transformation column {coordinate}"
+            return self._describe_dof(coordinate)
+
+        def describe_row(row: int) -> str:
+            index, dof = origins[row]
+            name = self.interfaces[index].name
+            if dof < 0:
+                return f"The rigid-fit row {_FRAME_COMPONENTS[-1 - dof]} of interface '{name}'"
+            text = f"The coupling of interface '{name}' to {self._describe_dof(dof)}"
+            return f"{text}, which the constraints eliminate," if eliminated[dof] else text
+
         result = constraint_transformation(
             extended,
             coordinate_count + frame_count,
             retained_dofs=np.arange(coordinate_count, coordinate_count + frame_count),
             tolerance=self.constraint_tolerance,
             sparse=sparse,
+            dof_label=describe_coordinate,
+            row_label=describe_row,
         )
         independent = result.independent_dofs
         if not np.array_equal(independent[-frame_count:], np.arange(coordinate_count, coordinate_count + frame_count)):
