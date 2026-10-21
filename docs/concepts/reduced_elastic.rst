@@ -346,7 +346,11 @@ coincident nodes and rigid links preserve rigid-body motion, which
 :meth:`~ConstraintElimination.rigid_motion_residual` checks; constraints
 between nodes at different positions preserve it only when they include the
 lever arm. :func:`newton.utils.load_sparse_matrix` reads matrices exported as
-Matrix Market or SciPy ``.npz`` files.
+Matrix Market or SciPy ``.npz`` files. All generators require symmetric
+matrices in full storage and reject a relative asymmetry above
+:math:`10^{-8}`: a matrix exported as one triangle must be expanded first,
+which :func:`~newton.utils.load_sparse_matrix` does for Matrix Market files
+declared ``symmetric`` and checks with ``symmetric=True``.
 
 Joints, attachments, and contacts
 ---------------------------------

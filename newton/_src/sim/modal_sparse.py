@@ -21,6 +21,9 @@ import numpy as np
 SHIFT_FRACTION_DEFAULT = 1.0e-6
 """Default magnitude of the ARPACK shift relative to ``||K||_1 / ||M||_1`` [dimensionless]."""
 
+SYMMETRY_TOLERANCE = 1.0e-8
+"""Largest relative asymmetry ``||A - A^T||_F / ||A||_F`` of an input matrix that is treated as roundoff [dimensionless]."""
+
 _ARPACK_START_SEED = 0x5EED
 """Seed of the deterministic ARPACK starting vector."""
 
@@ -86,8 +89,41 @@ def to_dense(matrix: Any) -> np.ndarray:
     return np.asarray(matrix, dtype=np.float64)
 
 
+def relative_asymmetry(matrix: Any) -> float:
+    """Return ``||A - A^T||_F / ||A||_F`` of a dense or sparse square matrix, or ``0`` for a zero matrix."""
+    if is_sparse(matrix):
+        csc = to_csc(matrix)
+        norm = float(np.linalg.norm(csc.data))
+        difference = float(np.linalg.norm(to_csc(csc - csc.T).data))
+    else:
+        array = np.asarray(matrix, dtype=np.float64)
+        norm = float(np.linalg.norm(array))
+        difference = float(np.linalg.norm(array - array.T))
+    return difference / norm if norm > 0.0 else 0.0
+
+
+def check_symmetric(matrix: Any, name: str) -> None:
+    """Raise if the relative asymmetry of ``matrix`` exceeds :data:`SYMMETRY_TOLERANCE`.
+
+    Finite-element tools often export symmetric matrices as one triangle.
+    Symmetrizing such a matrix would silently halve its off-diagonal terms,
+    so only roundoff-sized asymmetry is accepted.
+    """
+    asymmetry = relative_asymmetry(matrix)
+    if asymmetry > SYMMETRY_TOLERANCE:
+        raise ValueError(
+            f"{name} is not symmetric: its relative asymmetry ||A - A^T||_F / ||A||_F is {asymmetry:.3g}, above "
+            f"{SYMMETRY_TOLERANCE:g}. A matrix stored as one triangle must be expanded to the full matrix first, "
+            "for example to A + A^T - diag(A); scipy.io.mmread and newton.utils.load_sparse_matrix expand Matrix "
+            "Market files declared 'symmetric', but not 'general' files that hold one triangle"
+        )
+
+
 def coerce_symmetric_matrix(matrix: Any, size: int, name: str, *, keep_sparse: bool = True) -> Any:
-    """Validate a square matrix and return its symmetric part in float64.
+    """Validate a square symmetric matrix and return its symmetric part in float64.
+
+    Asymmetry up to :data:`SYMMETRY_TOLERANCE`, such as assembly roundoff, is
+    removed; larger asymmetry raises (see :func:`check_symmetric`).
 
     Args:
         matrix: Dense array-like or SciPy sparse matrix.
@@ -101,22 +137,25 @@ def coerce_symmetric_matrix(matrix: Any, size: int, name: str, *, keep_sparse: b
         input with ``keep_sparse``.
 
     Raises:
-        ValueError: If the shape is not ``(size, size)`` or sparse entries are
-            not finite.
+        ValueError: If the shape is not ``(size, size)``, sparse entries are
+            not finite, or the matrix is not symmetric.
     """
     if is_sparse(matrix):
         if tuple(matrix.shape) != (size, size):
             raise ValueError(f"{name} must have shape ({size}, {size}), got {tuple(matrix.shape)}")
         if not keep_sparse:
             array = np.ascontiguousarray(matrix.toarray(), dtype=np.float64)
+            check_symmetric(array, name)
             return 0.5 * (array + array.T)
         csc = to_csc(matrix)
         if not np.all(np.isfinite(csc.data)):
             raise ValueError(f"{name} contains non-finite entries")
+        check_symmetric(csc, name)
         return to_csc(0.5 * (csc + csc.T))
     array = np.asarray(matrix, dtype=np.float64)
     if array.shape != (size, size):
         raise ValueError(f"{name} must have shape ({size}, {size}), got {array.shape}")
+    check_symmetric(array, name)
     return 0.5 * (array + array.T)
 
 

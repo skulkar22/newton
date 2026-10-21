@@ -639,6 +639,52 @@ def test_cb_fem_error_paths(test, device):
         make(interfaces=[{"node_indices": left}, {"node_indices": right}], constraints=ties).reduce()
 
 
+def test_fe_matrices_must_be_symmetric(test, device):
+    """Reject triangular-storage or asymmetric matrices instead of silently using their symmetric part."""
+    from scipy import io, sparse
+
+    points, mass, stiffness = _spring_lattice((3, 2, 2), 0.1, 1000.0, 0.01)
+    dof_count = mass.shape[0]
+    left = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].min()))
+    interfaces = [{"node_indices": left}]
+    # A consistent-type mass with off-diagonal coupling, still positive definite.
+    coupled = mass + 1.0e-3 * (np.eye(dof_count, k=3) + np.eye(dof_count, k=-3))
+    options = {"fixed_mode_count": 4, "dofs_per_node": 3}
+    upper_mass = sparse.triu(sparse.csc_matrix(coupled), format="csc")
+    upper_stiffness = sparse.triu(sparse.csc_matrix(stiffness), format="csc")
+    with test.assertRaisesRegex(ValueError, "mass_matrix is not symmetric.*expanded"):
+        newton.ModalGeneratorCraigBamptonFEM(points, upper_mass, stiffness, interfaces, **options)
+    with test.assertRaisesRegex(ValueError, "stiffness_matrix is not symmetric"):
+        newton.ModalGeneratorCraigBamptonFEM(points, coupled, upper_stiffness.toarray(), interfaces, **options)
+    with test.assertRaisesRegex(ValueError, "damping_matrix is not symmetric"):
+        newton.ModalGeneratorCraigBamptonFEM(
+            points, coupled, stiffness, interfaces, damping_matrix=1.0e-3 * upper_stiffness, **options
+        )
+    ties = np.zeros((1, dof_count))
+    ties[0, [0, 3]] = [1.0, -1.0]
+    with test.assertRaisesRegex(ValueError, "mass_matrix is not symmetric"):
+        newton.ConstraintElimination(upper_mass, stiffness, ties)
+    with test.assertRaisesRegex(ValueError, "stiffness_matrix is not symmetric"):
+        newton.ModalGeneratorFEM(points, coupled, upper_stiffness, mode_count=4)
+
+    # Roundoff-sized asymmetry is accepted and removed.
+    noise = np.random.default_rng(1).uniform(-1.0, 1.0, stiffness.shape) * 1.0e-12 * np.abs(stiffness).max()
+    perturbed = stiffness + noise
+    generator = newton.ModalGeneratorCraigBamptonFEM(points, coupled, perturbed, interfaces, **options)
+    np.testing.assert_array_equal(generator.stiffness_matrix, 0.5 * (perturbed + perturbed.T))
+
+    # A Matrix Market file declared "general" that holds one triangle is not expanded on load.
+    with tempfile.TemporaryDirectory() as name:
+        folder = Path(name)
+        io.mmwrite(folder / "upper.mtx", upper_mass)
+        io.mmwrite(folder / "full.mtx", sparse.csc_matrix(coupled), symmetry="symmetric")
+        test.assertEqual(newton.utils.load_sparse_matrix(folder / "upper.mtx").nnz, upper_mass.nnz)
+        with test.assertRaisesRegex(ValueError, "upper.mtx is not symmetric"):
+            newton.utils.load_sparse_matrix(folder / "upper.mtx", symmetric=True)
+        full = newton.utils.load_sparse_matrix(folder / "full.mtx", symmetric=True)
+        np.testing.assert_allclose(full.toarray(), coupled)
+
+
 def test_cb_fem_large_tiled_model(test, device):
     """Reduce a 59,850-DOF tiling of 5x5 HMG panels with 8 RBE2 interfaces and 30 modes within 120 s on CPU."""
     _skip_without_hmg(test)
@@ -733,6 +779,7 @@ _TESTS = (
     test_cb_fem_transformation_matches_constraints,
     test_constraint_elimination_general_path,
     test_cb_fem_error_paths,
+    test_fe_matrices_must_be_symmetric,
     test_cb_fem_large_tiled_model,
     test_load_sparse_matrix,
 )

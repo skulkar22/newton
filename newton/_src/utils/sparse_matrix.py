@@ -16,16 +16,21 @@ if TYPE_CHECKING:
     from scipy.sparse import csc_matrix
 
 
-def load_sparse_matrix(path: str | os.PathLike[str]) -> csc_matrix:
+def load_sparse_matrix(path: str | os.PathLike[str], *, symmetric: bool = False) -> csc_matrix:
     """Load a sparse matrix from a Matrix Market or SciPy ``.npz`` file.
 
     Matrix Market files (``.mtx``) are read with :func:`scipy.io.mmread`,
-    which expands symmetric storage to the full matrix. ``.npz`` files must
-    have been written with :func:`scipy.sparse.save_npz`. Duplicate entries
-    are summed.
+    which expands storage declared ``symmetric`` to the full matrix; a file
+    declared ``general`` that holds only one triangle is read as that
+    triangle. ``.npz`` files must have been written with
+    :func:`scipy.sparse.save_npz`. Duplicate entries are summed.
 
     Args:
         path: Path of a ``.mtx`` or ``.npz`` file.
+        symmetric: Whether the matrix must be symmetric, as finite-element
+            mass, stiffness, and damping matrices are. A relative asymmetry
+            ``||A - A^T||_F / ||A||_F`` above ``1e-8``, as in a single
+            stored triangle, then raises.
 
     Returns:
         The matrix as a float64 :class:`scipy.sparse.csc_matrix` with sorted
@@ -33,7 +38,8 @@ def load_sparse_matrix(path: str | os.PathLike[str]) -> csc_matrix:
 
     Raises:
         ImportError: If SciPy is not installed.
-        ValueError: If the file extension is not ``.mtx`` or ``.npz``.
+        ValueError: If the file extension is not ``.mtx`` or ``.npz``, or
+            ``symmetric`` is set and the matrix is not symmetric.
     """
     path = Path(path)
     suffix = path.suffix.lower()
@@ -55,4 +61,8 @@ def load_sparse_matrix(path: str | os.PathLike[str]) -> csc_matrix:
     result = sparse.csc_matrix(matrix, dtype=np.float64)
     result.sum_duplicates()
     result.sort_indices()
+    if symmetric:
+        from ..sim.modal_sparse import check_symmetric  # noqa: PLC0415
+
+        check_symmetric(result, path.name)
     return result
