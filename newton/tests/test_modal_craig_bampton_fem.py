@@ -685,6 +685,43 @@ def test_fe_matrices_must_be_symmetric(test, device):
         np.testing.assert_allclose(full.toarray(), coupled)
 
 
+def test_cb_fem_constraint_errors_name_interfaces(test, device):
+    """Name interfaces, nodes, and original DOFs in constraint conflicts, not internal coordinate indices."""
+    points, mass, stiffness = _spring_lattice((3, 2, 2), 0.1, 1000.0, 0.01)
+    dof_count = mass.shape[0]
+    left = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].min()))
+    right = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].max()))
+    # Frames at a node: that node's translations follow the frame through pure tie rows.
+    interfaces = [
+        {"name": "left", "node_indices": left, "position": points[left[0]]},
+        {"name": "right", "node_indices": right, "position": points[right[0]]},
+    ]
+
+    def reduce(constraints):
+        return newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, fixed_mode_count=4, dofs_per_node=3, constraints=constraints
+        ).reduce()
+
+    # An SPC on a DOF of an interface node leaves its coupling row with frame coordinates only.
+    dof = 3 * int(left[1]) + 2
+    spc = np.zeros((1, dof_count))
+    spc[0, dof] = 1.0
+    pattern = rf"coupling of interface 'left' to DOF {dof} \(node {int(left[1])} uz\), which the constraints eliminate"
+    with test.assertRaisesRegex(ValueError, pattern):
+        reduce(spc)
+
+    # Tying the two frame nodes ties the two frames: name the frame coordinates and the shared DOF.
+    ties = np.zeros((3, dof_count))
+    ties[np.arange(3), 3 * int(left[0]) + np.arange(3)] = 1.0
+    ties[np.arange(3), 3 * int(right[0]) + np.arange(3)] = -1.0
+    pattern = (
+        rf"retained DOFs interface 'left' frame tx, interface 'right' frame tx through DOF {3 * int(left[0])} "
+        rf"\(node {int(left[0])} ux\)"
+    )
+    with test.assertRaisesRegex(ValueError, pattern):
+        reduce(ties)
+
+
 def test_cb_fem_large_tiled_model(test, device):
     """Reduce a 59,850-DOF tiling of 5x5 HMG panels with 8 RBE2 interfaces and 30 modes within 120 s on CPU."""
     _skip_without_hmg(test)
@@ -780,6 +817,7 @@ _TESTS = (
     test_constraint_elimination_general_path,
     test_cb_fem_error_paths,
     test_fe_matrices_must_be_symmetric,
+    test_cb_fem_constraint_errors_name_interfaces,
     test_cb_fem_large_tiled_model,
     test_load_sparse_matrix,
 )
