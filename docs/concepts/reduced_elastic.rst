@@ -408,8 +408,8 @@ every joint at that endpoint. When the endpoints of a body rotate differently,
 as in a closed loop through the body, rotating the body's rest pose cannot
 compensate for all of them. In that case, pass the original frames to
 :meth:`~newton.solvers.SolverVBD.set_joint_rest_frames` once, after creating
-the solver: the joints then act on the rewritten frames but keep their original
-targets.
+the solver and before capturing a CUDA graph: the joints then act on the
+rewritten frames but keep their original targets.
 
 Contacts are generated between the deformed vertices of the shapes on an
 elastic link and rigid shapes; shape pairs in which both shapes belong to

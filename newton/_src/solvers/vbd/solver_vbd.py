@@ -1270,10 +1270,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             collision_frequency=collision_frequency,
             collision_frequency_type=collision_frequency_type,
         )
-        # Joint frames that define each joint's rest relative rotation (see set_joint_rest_frames()).
-        # By default they are the model's joint frames themselves.
-        self.joint_X_p_rest = model.joint_X_p
-        self.joint_X_c_rest = model.joint_X_c
+        # Owned copies of the pinned joint rest frames (see set_joint_rest_frames()); ``None`` for a side
+        # that follows the model's joint frames, which are then resolved at every launch.
+        self._joint_X_p_rest: wp.array[wp.transform] | None = None
+        self._joint_X_c_rest: wp.array[wp.transform] | None = None
+        self._joint_X_p_rest_pinned = False
+        self._joint_X_c_rest_pinned = False
         # The solver's warm-start setting is authoritative for an owned pipeline:
         # lambda/penalty restores ride the pipeline's matched contact indices, so
         # history without matching silently cold-starts every refresh (k times per
@@ -2707,6 +2709,24 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.BODY_PROPERTIES):
             self._refresh_rod_rest_bend_twist_cache()
 
+    @property
+    def joint_X_p_rest(self) -> wp.array[wp.transform]:
+        """Parent joint frames that define the rest relative rotations, shape ``(joint_count,)``.
+
+        The solver's pinned copy after :meth:`set_joint_rest_frames`, otherwise the model's
+        current :attr:`~newton.Model.joint_X_p`.
+        """
+        return self._joint_X_p_rest if self._joint_X_p_rest_pinned else self.model.joint_X_p
+
+    @property
+    def joint_X_c_rest(self) -> wp.array[wp.transform]:
+        """Child joint frames that define the rest relative rotations, shape ``(joint_count,)``.
+
+        The solver's pinned copy after :meth:`set_joint_rest_frames`, otherwise the model's
+        current :attr:`~newton.Model.joint_X_c`.
+        """
+        return self._joint_X_c_rest if self._joint_X_c_rest_pinned else self.model.joint_X_c
+
     def set_joint_rest_frames(
         self,
         *,
@@ -2729,10 +2749,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         joint targets stay unchanged. This applies to the local and the
         ``"block_sparse_joints"`` articulation solves.
 
-        The arrays are copied. Passing ``None`` for a side makes that side follow the model's
-        joint frames again. Only the rotations are used; joint positions are not measured against
-        a rest configuration. Code that edits the model's joint frames for another reason after
-        pinning must update the pinned frames as well.
+        The arrays are copied into buffers owned by the solver. The first call that pins a side
+        allocates its buffer; later calls copy into the same buffer, so a captured CUDA graph sees
+        updated frames. Pin each side before capturing a CUDA graph, because a graph captured
+        before pinning, or before passing ``None``, keeps reading the arrays it was captured with.
+        Passing ``None`` for a side makes that side follow the model's joint frames again, read
+        from the model at every step. Only the rotations are used; joint positions are not
+        measured against a rest configuration. Code that edits the model's joint frames for
+        another reason after pinning must update the pinned frames as well.
 
         Args:
             joint_X_p_rest: Parent rest frames in the parent body frame (translation [m],
@@ -2743,23 +2767,34 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 :attr:`~newton.Model.joint_X_c`.
 
         Raises:
-            ValueError: If an array does not have one transform per joint.
+            ValueError: If an array is not a Warp array of :class:`warp.transform` with one
+                transform per joint.
         """
         model = self.model
-        frames = []
-        for name, array, default in (
-            ("joint_X_p_rest", joint_X_p_rest, model.joint_X_p),
-            ("joint_X_c_rest", joint_X_c_rest, model.joint_X_c),
-        ):
+        for name, array in (("joint_X_p_rest", joint_X_p_rest), ("joint_X_c_rest", joint_X_c_rest)):
             if array is None:
-                frames.append(default)
                 continue
+            if not isinstance(array, wp.array) or array.dtype != wp.transform:
+                dtype = getattr(array, "dtype", None)
+                raise ValueError(
+                    f"{name} must be a wp.array of wp.transform, got {type(array).__name__} with dtype {dtype}."
+                )
             if array.shape != (model.joint_count,):
                 raise ValueError(f"{name} must have shape ({model.joint_count},), got {array.shape}.")
-            copy = wp.empty(model.joint_count, dtype=wp.transform, device=self.device)
-            wp.copy(copy, array)
-            frames.append(copy)
-        self.joint_X_p_rest, self.joint_X_c_rest = frames
+        if joint_X_p_rest is None:
+            self._joint_X_p_rest_pinned = False
+        else:
+            if self._joint_X_p_rest is None:
+                self._joint_X_p_rest = wp.empty(model.joint_count, dtype=wp.transform, device=self.device)
+            wp.copy(self._joint_X_p_rest, joint_X_p_rest)
+            self._joint_X_p_rest_pinned = True
+        if joint_X_c_rest is None:
+            self._joint_X_c_rest_pinned = False
+        else:
+            if self._joint_X_c_rest is None:
+                self._joint_X_c_rest = wp.empty(model.joint_count, dtype=wp.transform, device=self.device)
+            wp.copy(self._joint_X_c_rest, joint_X_c_rest)
+            self._joint_X_c_rest_pinned = True
         if model.joint_count > 0 and self._integrates_rigid_bodies:
             self._refresh_rod_rest_bend_twist_cache()
 
