@@ -1284,6 +1284,22 @@ class ModalGeneratorSampled:
 _DAMPING_PROJECTIONS = ("diagonal", "error")
 
 
+def _normalize_eigensolver(
+    eigensolver: str | modal_sparse.ModalEigensolver | modal_sparse.EigenSolverBackend,
+) -> str | modal_sparse.EigenSolverBackend:
+    """Return ``"auto"``, ``"dense"``, or ``"arpack"`` for a built-in selection, or the backend to dispatch to.
+
+    ``"subspace"`` and :attr:`~newton.ModalEigensolver.SUBSPACE` resolve to a
+    default :class:`~newton.SubspaceIterationBackend`.
+    """
+    kind = modal_sparse.eigensolver_kind(eigensolver)
+    if not isinstance(kind, modal_sparse.ModalEigensolver):
+        return kind
+    if kind is modal_sparse.ModalEigensolver.SUBSPACE:
+        return modal_sparse.resolve_eigensolver(kind)
+    return kind.value
+
+
 def _validate_damping_projection(damping_projection: str) -> str:
     value = str(damping_projection)
     if value not in _DAMPING_PROJECTIONS:
@@ -2055,13 +2071,22 @@ class ModalGeneratorFEM:
             exceeds ``damping_coupling_tolerance``; ``"error"`` raises instead.
         damping_coupling_tolerance: Relative off-diagonal damping magnitude
             allowed before ``damping_projection`` warns or raises.
-        eigensolver: Generalized eigensolver. ``"dense"`` solves the full
-            spectrum with LAPACK, densifying sparse input. ``"arpack"`` uses
-            sparse ARPACK shift-invert and requires ``mode_count`` and SciPy.
-            ``"auto"`` selects ``"arpack"`` when any input matrix is sparse, or
-            when the free DOF count exceeds ``dense_dof_limit``, ``mode_count``
-            is set, and SciPy is installed; otherwise ``"dense"``, which does
-            not need SciPy.
+        eigensolver: Generalized eigensolver: a name, a
+            :class:`~newton.ModalEigensolver`, or an
+            :class:`~newton.EigenSolverBackend` instance. ``"dense"`` solves
+            the full spectrum with LAPACK, densifying sparse input.
+            ``"arpack"`` uses sparse ARPACK shift-invert and requires
+            ``mode_count`` and SciPy. ``"auto"`` selects ``"arpack"`` when any
+            input matrix is sparse, or when the free DOF count exceeds
+            ``dense_dof_limit``, ``mode_count`` is set, and SciPy is
+            installed; otherwise ``"dense"``, which does not need SciPy.
+            ``"subspace"`` uses a default
+            :class:`~newton.SubspaceIterationBackend`. A backend instance
+            receives the free-DOF matrices in SciPy CSC form, the rigid-body
+            motions of a free-free model as ``deflation``, ``arpack_shift``
+            as ``sigma``, and ``arpack_tol`` as ``tol``, and requires
+            ``mode_count``; its result is checked as by
+            :func:`~newton._src.sim.modal_sparse.validate_eigen_result`.
         arpack_shift: ARPACK shift ``sigma`` [1/s^2]. ``None`` uses a small
             negative shift, ``-1e-6 * ||K||_1 / ||M||_1``, which keeps
             ``K - sigma M`` positive definite for free-free models. A
@@ -2074,9 +2099,9 @@ class ModalGeneratorFEM:
         arpack_tol: ARPACK relative eigenvalue accuracy; ``0`` requests
             machine precision.
         arpack_maxiter: Maximum ARPACK restart iterations; ``None`` uses
-            SciPy's default.
+            SciPy's default. Ignored by backend instances.
         arpack_ncv: Number of ARPACK Lanczos vectors; ``None`` uses SciPy's
-            default.
+            default. Ignored by backend instances.
         dense_dof_limit: Largest free DOF count that ``eigensolver="auto"``
             solves densely for dense input.
     """
@@ -2104,16 +2129,17 @@ class ModalGeneratorFEM:
         free_free: bool | None = None,
         damping_projection: Literal["diagonal", "error"] = "diagonal",
         damping_coupling_tolerance: float = 1.0e-5,
-        eigensolver: Literal["auto", "dense", "arpack"] = "auto",
+        eigensolver: Literal["auto", "dense", "arpack", "subspace"]
+        | modal_sparse.ModalEigensolver
+        | modal_sparse.EigenSolverBackend = "auto",
         arpack_shift: float | None = None,
         arpack_tol: float = 0.0,
         arpack_maxiter: int | None = None,
         arpack_ncv: int | None = None,
         dense_dof_limit: int = 2000,
     ):
-        if eigensolver not in ("auto", "dense", "arpack"):
-            raise ValueError(f"eigensolver must be 'auto', 'dense', or 'arpack', got '{eigensolver}'")
-        self.eigensolver = eigensolver
+        self.eigensolver = _normalize_eigensolver(eigensolver)
+        """``"auto"``, ``"dense"``, ``"arpack"``, or the :class:`~newton.EigenSolverBackend` that solves the eigenproblem."""
         self.arpack_shift = None if arpack_shift is None else float(arpack_shift)
         self.arpack_tol = float(arpack_tol)
         if self.arpack_tol < 0.0:
@@ -2255,7 +2281,9 @@ class ModalGeneratorFEM:
         return vectors @ (rotation[:, keep] / np.sqrt(values[keep]))
 
     def _uses_arpack(self, free_count: int) -> bool:
-        """Return whether :meth:`build` solves the eigenproblem with ARPACK for ``free_count`` free DOFs."""
+        """Return whether :meth:`build` solves a sparse eigenproblem through a backend for ``free_count`` free DOFs."""
+        if not isinstance(self.eigensolver, str):
+            return True
         if self.eigensolver == "auto":
             matrices = (self.mass_matrix, self.stiffness_matrix, self.damping_matrix)
             if any(modal_sparse.is_sparse(matrix) for matrix in matrices):
@@ -2264,6 +2292,14 @@ class ModalGeneratorFEM:
             return free_count > self.dense_dof_limit and self.mode_count is not None and modal_sparse.has_scipy()
         return self.eigensolver == "arpack"
 
+    def _eigen_backend(self) -> modal_sparse.EigenSolverBackend:
+        """Return the backend of the sparse path: the given instance, or ARPACK with this generator's options."""
+        if not isinstance(self.eigensolver, str):
+            return self.eigensolver
+        return modal_sparse.ScipyArpackBackend(
+            margin=self._ARPACK_MARGIN, maxiter=self.arpack_maxiter, ncv=self.arpack_ncv
+        )
+
     def _solve_dense(self, mass: np.ndarray, stiffness: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
         """Solve the full generalized eigenproblem on the free DOFs with LAPACK.
 
@@ -2271,19 +2307,7 @@ class ModalGeneratorFEM:
             Ascending eigenvalues [1/s^2], ``M``-orthonormal eigenvectors, the
             zero-energy threshold [1/s^2], and its relative tolerance.
         """
-        try:
-            chol = np.linalg.cholesky(mass)
-        except np.linalg.LinAlgError as exc:
-            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs") from exc
-
-        inv_chol_stiffness = np.linalg.solve(chol, stiffness)
-        standard = np.linalg.solve(chol, inv_chol_stiffness.T).T
-        standard = 0.5 * (standard + standard.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(standard)
-        order = np.argsort(eigenvalues)
-        eigenvalues = eigenvalues[order]
-        eigenvectors = eigenvectors[:, order]
-        eigen_modes = np.linalg.solve(chol.T, eigenvectors)
+        eigenvalues, eigen_modes = modal_sparse.cholesky_eigh(stiffness, mass)
         # Relative to the largest eigenvalue: a genuine elastic mode far below a stiff one stays
         # elastic, while eigenvalues within the eigensolver's roundoff of zero are zero energy.
         eigenvalue_scale = float(np.max(np.abs(eigenvalues)))
@@ -2293,23 +2317,27 @@ class ModalGeneratorFEM:
     def _solve_arpack(
         self, mass: spmatrix, stiffness: spmatrix, rigid_basis: np.ndarray | None
     ) -> tuple[np.ndarray, np.ndarray, float, float]:
-        """Solve for the lowest generalized eigenpairs on the free DOFs with ARPACK shift-invert.
+        """Solve for the lowest generalized eigenpairs on the free DOFs with an eigensolver backend.
 
-        The rigid-body motions ``rigid_basis`` of a free-free model are exact
-        zero-energy eigenvectors once the stiffness check has passed, so they
-        are deflated from the Lanczos operator and prepended to the result
+        The default backend is ARPACK shift-invert. The rigid-body motions
+        ``rigid_basis`` of a free-free model are exact zero-energy
+        eigenvectors once the stiffness check has passed, so they are
+        deflated from the backend's operator and prepended to the result
         instead of being sought as a six-fold repeated eigenvalue.
         ``discard_mode_count + mode_count`` further eigenpairs, plus a small
-        margin, are computed and verified with a Sturm sequence count; see
-        :func:`~newton._src.sim.modal_sparse.lowest_generalized_eigenpairs`.
+        margin, are computed and verified with a Sturm sequence count when
+        the backend provides one; see
+        :func:`~newton._src.sim.modal_sparse.validate_eigen_result`.
 
         Returns:
             Ascending eigenvalues [1/s^2], ``M``-orthonormal eigenvectors, the
             zero-energy threshold [1/s^2], and its relative tolerance.
         """
+        backend = self._eigen_backend()
         if self.mode_count is None:
+            solver = "ARPACK" if backend.name == "arpack" else f"'{backend.name}'"
             raise ValueError(
-                "mode_count is required by the ARPACK eigensolver, which computes only the lowest modes; "
+                f"mode_count is required by the {solver} eigensolver, which computes only the lowest modes; "
                 "set mode_count, or use eigensolver='dense' for the full spectrum of a small model"
             )
         mass_diagonal = np.asarray(mass.diagonal(), dtype=np.float64)
@@ -2325,6 +2353,55 @@ class ModalGeneratorFEM:
                 "modes have eigenvalue 0, so stiffness_matrix - arpack_shift * mass_matrix is singular or "
                 "indefinite. Omit arpack_shift to use the default negative shift"
             )
+        # Host backends share a validated SuperLU factorization; a device backend factors on its own device.
+        factorization = None
+        if backend.device == "cpu":
+            factorization = self._checked_factorization(mass, stiffness, sigma)
+
+        # Gershgorin-type bound on the largest eigenvalue: computing it would cost a second solve, and only
+        # its order of magnitude sets the relative threshold. The floor is the roundoff of a sparse Rayleigh
+        # quotient, which grows with the nonzeros per row rather than with the DOF count. The bound is
+        # tight for these three-DOF nodes but loose for six-DOF shells; see generalized_eigenvalue_bound.
+        eigenvalue_scale = modal_sparse.generalized_eigenvalue_bound(stiffness, mass)
+        row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness), 1)
+        relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
+        zero_threshold = relative_tolerance * eigenvalue_scale
+
+        count = self.discard_mode_count + self.mode_count
+        try:
+            result = backend.solve(
+                stiffness,
+                mass,
+                count,
+                deflation=rigid_basis,
+                sigma=sigma,
+                tol=self.arpack_tol,
+                factorization=factorization,
+                zero_threshold=zero_threshold,
+            )
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs") from exc
+        eigenvalues, eigen_modes = modal_sparse.validate_eigen_result(
+            result,
+            size=int(stiffness.shape[0]),
+            count=count,
+            deflated=rigid_count,
+            supports_inertia_count=bool(backend.supports_inertia_count),
+        )
+        modal_mass = modal_sparse.quadratic_form_diag(eigen_modes, mass)
+        if not np.all(modal_mass > 0.0):
+            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs")
+        if rigid_basis is not None and rigid_basis.shape[1] > 0:
+            eigenvalues = np.concatenate((modal_sparse.quadratic_form_diag(rigid_basis, stiffness), eigenvalues))
+            eigen_modes = np.hstack((rigid_basis, eigen_modes))
+            order = np.argsort(eigenvalues, kind="stable")
+            eigenvalues = eigenvalues[order]
+            eigen_modes = eigen_modes[:, order]
+        return eigenvalues, eigen_modes, zero_threshold, relative_tolerance
+
+    @staticmethod
+    def _checked_factorization(mass: spmatrix, stiffness: spmatrix, sigma: float) -> modal_sparse.ShiftedFactorization:
+        """Factor ``K - sigma M`` and raise if it is singular or reveals an indefinite matrix."""
         factorization = modal_sparse.ShiftedFactorization(stiffness, mass, sigma)
         if factorization.numerically_singular:
             raise ValueError(
@@ -2351,42 +2428,7 @@ class ModalGeneratorFEM:
                 f"mass_matrix has {factorization.negative_pivot_count} non-positive pivots for "
                 f"sigma = {sigma:.6g}; {cause}"
             )
-
-        # Gershgorin-type bound on the largest eigenvalue: computing it would cost a second solve, and only
-        # its order of magnitude sets the relative threshold. The floor is the roundoff of a sparse Rayleigh
-        # quotient, which grows with the nonzeros per row rather than with the DOF count. The bound is
-        # tight for these three-DOF nodes but loose for six-DOF shells; see generalized_eigenvalue_bound.
-        eigenvalue_scale = modal_sparse.generalized_eigenvalue_bound(stiffness, mass)
-        row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness), 1)
-        relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
-        zero_threshold = relative_tolerance * eigenvalue_scale
-
-        try:
-            eigenvalues, eigen_modes = modal_sparse.lowest_generalized_eigenpairs(
-                stiffness,
-                mass,
-                self.discard_mode_count + self.mode_count,
-                sigma=sigma,
-                zero_threshold=zero_threshold,
-                margin=self._ARPACK_MARGIN,
-                deflation=rigid_basis,
-                tol=self.arpack_tol,
-                maxiter=self.arpack_maxiter,
-                ncv=self.arpack_ncv,
-                factorization=factorization,
-            )
-        except np.linalg.LinAlgError as exc:
-            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs") from exc
-        modal_mass = modal_sparse.quadratic_form_diag(eigen_modes, mass)
-        if not np.all(modal_mass > 0.0):
-            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs")
-        if rigid_basis is not None and rigid_basis.shape[1] > 0:
-            eigenvalues = np.concatenate((modal_sparse.quadratic_form_diag(rigid_basis, stiffness), eigenvalues))
-            eigen_modes = np.hstack((rigid_basis, eigen_modes))
-            order = np.argsort(eigenvalues, kind="stable")
-            eigenvalues = eigenvalues[order]
-            eigen_modes = eigen_modes[:, order]
-        return eigenvalues, eigen_modes, zero_threshold, relative_tolerance
+        return factorization
 
     @staticmethod
     def _check_rigid_motion_preserved(stiffness: np.ndarray | spmatrix, rigid_free: np.ndarray) -> None:

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 import numpy as np
 
 from . import modal_sparse
-from .modal import ModalBasis, ModalGeneratorCraigBampton
+from .modal import ModalBasis, ModalGeneratorCraigBampton, _normalize_eigensolver
 from .modal_constraints import (
     assemble_triplets,
     check_transformation_rank,
@@ -145,18 +145,26 @@ class ModalGeneratorCraigBamptonFEM:
             covers the whole body only when every node is a sample. ``None``
             leaves those integrals unavailable.
         label: Optional basis label.
-        eigensolver: Fixed-interface eigensolver. ``"dense"`` uses LAPACK on
-            dense matrices and does not need SciPy. ``"arpack"`` keeps the
-            matrices sparse and needs SciPy. ``"auto"`` selects ``"arpack"``
-            when any input matrix is sparse or the DOF count exceeds
-            ``dense_dof_limit`` and SciPy is installed.
+        eigensolver: Fixed-interface eigensolver: a name, a
+            :class:`~newton.ModalEigensolver`, or an
+            :class:`~newton.EigenSolverBackend` instance. ``"dense"`` uses
+            LAPACK on dense matrices and does not need SciPy. ``"arpack"``
+            keeps the matrices sparse and needs SciPy. ``"auto"`` selects
+            ``"arpack"`` when any input matrix is sparse or the DOF count
+            exceeds ``dense_dof_limit`` and SciPy is installed.
+            ``"subspace"`` uses a default
+            :class:`~newton.SubspaceIterationBackend`. A backend instance
+            keeps the matrices sparse (the constraint modes still use a
+            SuperLU factorization, so SciPy is needed) and receives the
+            interior matrices, ``arpack_shift`` (default ``0``) as ``sigma``,
+            and ``arpack_tol`` as ``tol``.
         arpack_shift: ARPACK shift ``sigma`` [1/s^2]. ``None`` uses ``0``.
         arpack_tol: ARPACK relative eigenvalue accuracy; ``0`` requests
             machine precision.
         arpack_maxiter: Maximum ARPACK restart iterations; ``None`` uses
-            SciPy's default.
+            SciPy's default. Ignored by backend instances.
         arpack_ncv: Number of ARPACK Lanczos vectors; ``None`` uses SciPy's
-            default.
+            default. Ignored by backend instances.
         dense_dof_limit: Largest DOF count that ``eigensolver="auto"`` reduces
             densely for dense input.
         constraint_tolerance: Relative tolerance of the constraint
@@ -199,7 +207,9 @@ class ModalGeneratorCraigBamptonFEM:
         sample_node_indices: Sequence[int] | np.ndarray | None = None,
         sample_mass: Literal["lumped"] | Sequence[float] | np.ndarray | None = None,
         label: str | None = None,
-        eigensolver: Literal["auto", "dense", "arpack"] = "auto",
+        eigensolver: Literal["auto", "dense", "arpack", "subspace"]
+        | modal_sparse.ModalEigensolver
+        | modal_sparse.EigenSolverBackend = "auto",
         arpack_shift: float | None = None,
         arpack_tol: float = 0.0,
         arpack_maxiter: int | None = None,
@@ -222,9 +232,8 @@ class ModalGeneratorCraigBamptonFEM:
         self.node_count = int(self.node_positions.shape[0])
         self.dof_count = self.dofs_per_node * self.node_count
 
-        if eigensolver not in ("auto", "dense", "arpack"):
-            raise ValueError(f"eigensolver must be 'auto', 'dense', or 'arpack', got '{eigensolver}'")
-        self.eigensolver = eigensolver
+        self.eigensolver = _normalize_eigensolver(eigensolver)
+        """``"auto"``, ``"dense"``, ``"arpack"``, or the :class:`~newton.EigenSolverBackend` of the interior eigenproblem."""
         self.arpack_shift = None if arpack_shift is None else float(arpack_shift)
         self.arpack_tol = float(arpack_tol)
         if self.arpack_tol < 0.0:
@@ -371,7 +380,9 @@ class ModalGeneratorCraigBamptonFEM:
         return result
 
     def _uses_sparse(self) -> bool:
-        """Return whether the reduction keeps the matrices sparse and uses ARPACK."""
+        """Return whether the reduction keeps the matrices sparse and solves through a backend (ARPACK by default)."""
+        if not isinstance(self.eigensolver, str):
+            return True
         if self.eigensolver == "auto":
             matrices = (self.mass_matrix, self.stiffness_matrix, self.damping_matrix, self.constraints)
             if any(modal_sparse.is_sparse(matrix) for matrix in matrices):
@@ -558,8 +569,16 @@ class ModalGeneratorCraigBamptonFEM:
         modes = np.linalg.solve(chol_m.T, vectors[:, :count])
         return constraint_modes, values[:count], modes, pivot_ratio, threshold
 
+    def _eigen_backend(self) -> modal_sparse.EigenSolverBackend:
+        """Return the backend of the sparse path: the given instance, or ARPACK with this generator's options."""
+        if not isinstance(self.eigensolver, str):
+            return self.eigensolver
+        return modal_sparse.ScipyArpackBackend(
+            margin=self._ARPACK_MARGIN, maxiter=self.arpack_maxiter, ncv=self.arpack_ncv
+        )
+
     def _interior_sparse(self, stiffness_ii, stiffness_ib, mass_ii, count: int):
-        """Solve the constraint modes and fixed-interface modes with SuperLU and ARPACK."""
+        """Solve the constraint modes with SuperLU and the fixed-interface modes with the backend (ARPACK by default)."""
         sigma = 0.0 if self.arpack_shift is None else self.arpack_shift
         try:
             factorization = modal_sparse.ShiftedFactorization(stiffness_ii, mass_ii, sigma)
@@ -601,17 +620,23 @@ class ModalGeneratorCraigBamptonFEM:
         threshold = relative * bound
         if count == 0:
             return constraint_modes, np.zeros(0), np.zeros((stiffness_ii.shape[0], 0)), pivot_ratio, threshold
-        values, modes = modal_sparse.lowest_generalized_eigenpairs(
+        backend = self._eigen_backend()
+        result = backend.solve(
             stiffness_ii,
             mass_ii,
             count,
             sigma=sigma,
-            zero_threshold=threshold,
-            margin=self._ARPACK_MARGIN,
             tol=self.arpack_tol,
-            maxiter=self.arpack_maxiter,
-            ncv=self.arpack_ncv,
-            factorization=factorization,
+            # The host factorization is needed for the constraint modes anyway; device backends factor on their own.
+            factorization=factorization if backend.device == "cpu" else None,
+            zero_threshold=threshold,
+        )
+        values, modes = modal_sparse.validate_eigen_result(
+            result,
+            size=int(stiffness_ii.shape[0]),
+            count=count,
+            deflated=0,
+            supports_inertia_count=bool(backend.supports_inertia_count),
         )
         if values[0] <= threshold:
             raise ValueError(self._mechanism_message())
@@ -807,7 +832,7 @@ class ModalGeneratorCraigBamptonFEM:
             "coordinate_count": coordinate_count,
             "interior_count": interior_count,
             "reduced_dof_count": reduced_count,
-            "eigensolver": "arpack" if sparse else "dense",
+            "eigensolver": self._eigen_backend().name if sparse else "dense",
             "constraint_elimination": mpc_report,
             "interface_elimination": interface_report,
             "fixed_interface_eigenvalues": self.fixed_interface_eigenvalues.tolist(),
