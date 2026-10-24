@@ -56,7 +56,9 @@ class RotationTrigger(Trigger):
     [rad], or the max nodal modal displacement ``|Phi q|`` exceeds ``disp_tol * char_length``.
 
     Element rotations are evaluated on ``options.element_ids`` or a deterministic sample of
-    ``options.n_sample_elements`` elements (all elements when the mesh is smaller).
+    ``options.n_sample_elements`` elements (all elements when the mesh is smaller). On the device update
+    path with a device tangent assembler the check runs as kernels (:meth:`DeviceUpdater.rotation_check
+    <rerom.update_kernels.DeviceUpdater.rotation_check>`) with one 3-value device-to-host read per check.
     """
 
     theta_tol: float | None = math.radians(4.0)
@@ -65,6 +67,9 @@ class RotationTrigger(Trigger):
     _sample: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def check(self, ctrl, state, steps_since, metrics):
+        dev = getattr(ctrl, "device_updater", None)
+        if dev is not None and (dev.device_assembly or self.theta_tol is None):
+            return self._check_device(ctrl, dev, state, metrics)
         q = ctrl.read_modes(state)[0]
         u = (ctrl.Phi @ q).reshape(-1, 3)
         if self.disp_tol is not None:
@@ -86,6 +91,23 @@ class RotationTrigger(Trigger):
             theta = float(np.max(ang)) if ang.size else 0.0
             metrics["theta_max"] = theta
             if theta > self.theta_tol:
+                return True, "rotation", metrics
+        return False, "", metrics
+
+    def _check_device(self, ctrl, dev, state, metrics):
+        """Same criterion on the device (no ``joint_q`` host read; one 3-value flag read)."""
+        L = self.char_length if self.char_length is not None else ctrl.char_length
+        has_theta = self.theta_tol is not None and hasattr(ctrl.assembler, "element_rotations")
+        code, theta, disp = dev.rotation_check(
+            state, self.sample_ids(ctrl) if has_theta else None, self.theta_tol if has_theta else None, self.disp_tol, L
+        )
+        if self.disp_tol is not None:
+            metrics["disp_rel"] = disp
+            if code == 1.0:
+                return True, "displacement", metrics
+        if has_theta:
+            metrics["theta_max"] = theta
+            if code == 2.0:
                 return True, "rotation", metrics
         return False, "", metrics
 

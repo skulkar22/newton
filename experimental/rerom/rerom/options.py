@@ -13,6 +13,7 @@ __all__ = [
     "NonlinearForceOptions",
     "RestRotationMode",
     "TriggerOptions",
+    "UpdatePath",
     "UpdatePolicy",
 ]
 
@@ -38,6 +39,22 @@ class RestRotationMode(enum.Enum):
     REST_FRAMES = "rest_frames"
     """Pin the build-time joint frames once with ``SolverVBD.set_joint_rest_frames`` (requires the
     per-joint rest-frame patch) and leave ``model.body_q`` alone; works with kinematic loops."""
+
+
+class UpdatePath(enum.Enum):
+    """Where the non-eigensolver part of an update runs (see :mod:`rerom.update_kernels`)."""
+
+    DEVICE = "device"
+    """Device-side update: one packed gather (state, ``r_new``, ``f_int``, ``K_T`` values) and one packed scatter
+    per update; recovery, inertia integrals, sample rewrites, rigid properties and the state projection run as
+    Warp kernels writing in place; the solver's mass-solve data are refreshed in place
+    (``SolverVBD.refresh_elastic_mass_solve_data``, CUDA graphs stay valid); per-step pre-stress, velocity
+    history and the rotation trigger run on the device. Results agree with :attr:`HOST` to roundoff
+    (different summation order), not bit for bit."""
+    HOST = "host"
+    """Legacy host path (numpy writes through :class:`rerom.model_io.ModelArrays`,
+    ``solver.notify_model_changed``); with ``BasisOptions(shared_factorization=False)`` it reproduces the
+    recorded M1/WP3a runs bit for bit."""
 
 
 class IndefiniteGuard(enum.Enum):
@@ -134,7 +151,12 @@ class UpdatePolicy:
         clamp_floor_ratio: Floor of :attr:`IndefiniteGuard.CLAMP` relative to the smallest positive one.
         rest_rotation: Joint rest-rotation handling after endpoint frames moved.
         rest_root: Root body of :attr:`RestRotationMode.JOINT_TREE` (``None``: the world).
-        notify: Call ``solver.notify_model_changed`` after a rewrite.
+        notify: Refresh the solver after a rewrite (``SolverVBD.refresh_elastic_mass_solve_data`` on the device
+            path, ``solver.notify_model_changed`` on the host path; ``JOINT_PROPERTIES`` is notified when joint
+            frames moved).
+        path: :class:`UpdatePath` (default :attr:`UpdatePath.DEVICE`).
+        diagnostics: Device path: read the momentum / kinetic-energy bookkeeping of each update (one small
+            extra device-to-host copy). ``False`` leaves those ``info`` entries ``nan``.
     """
 
     freeze_after_release: bool = False
@@ -146,6 +168,8 @@ class UpdatePolicy:
     rest_rotation: RestRotationMode = RestRotationMode.COUNTER_ROTATE
     rest_root: int | None = None
     notify: bool = True
+    path: UpdatePath = UpdatePath.DEVICE
+    diagnostics: bool = True
 
 
 @dataclass(kw_only=True)

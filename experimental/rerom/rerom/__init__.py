@@ -8,7 +8,7 @@ Controllers     :class:`ReROMController` (one body, :class:`BodyAdapter` strateg
                 :class:`FreeBodyAdapter`, :class:`InterfaceBodyAdapter`, :class:`MultiFrameController`
 Options         :class:`BasisOptions`, :class:`TriggerOptions`, :class:`UpdatePolicy`,
                 :class:`NonlinearForceOptions`; enums :class:`RestRotationMode`, :class:`IndefiniteGuard`,
-                :class:`UpdateSync`
+                :class:`UpdateSync`, :class:`UpdatePath`
 Triggers        :class:`RotationTrigger`, :class:`EnergyMismatchTrigger`, :class:`ResidualTrigger`
 Assembly        :class:`TangentAssembler` (protocol), :class:`NumpyTetAssembler`, :class:`TetMesh`,
                 :func:`make_beam_mesh`, :func:`make_flexure_mesh`, :func:`default_assembler`
@@ -19,7 +19,7 @@ Craig-Bampton   :func:`cb_basis`, :class:`CBSegment`, :class:`CBChain`, :func:`b
 References      :class:`FullFEReference`, :class:`PrescribedMotionReference`, :class:`BaseMotion`
 
 Submodules :mod:`rerom.numerics`, :mod:`rerom.model_io`, :mod:`rerom.hyper_reduction`, :mod:`rerom.strain`,
-:mod:`rerom.ccx` and :mod:`rerom.panel` (CalculiX; need the ``ccx`` binary) are imported on demand.
+:mod:`rerom.update_kernels` (device-side update), :mod:`rerom.ccx` and :mod:`rerom.panel` (CalculiX; need the ``ccx`` binary) are imported on demand.
 """
 
 from .assembly import NumpyTetAssembler, TangentAssembler, TetMesh, default_assembler, make_beam_mesh, make_flexure_mesh
@@ -47,6 +47,7 @@ from .options import (
     NonlinearForceOptions,
     RestRotationMode,
     TriggerOptions,
+    UpdatePath,
     UpdatePolicy,
 )
 from .triggers import EnergyMismatchTrigger, ResidualTrigger, RotationTrigger, Trigger
@@ -77,6 +78,7 @@ __all__ = [
     "TetMesh",
     "Trigger",
     "TriggerOptions",
+    "UpdatePath",
     "UpdatePolicy",
     "UpdateSync",
     "build_cb_chain",

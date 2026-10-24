@@ -535,11 +535,20 @@ class WarpTetAssembler:
 
     def to_scipy_csc(self, K: wps.BsrMatrix):
         """SciPy CSC copy of a matrix on this assembler's pattern (one value copy; pattern cached)."""
+        return self.scipy_from_block_values(self.block_values_numpy(K), "csc")
+
+    def scipy_from_block_values(self, values: np.ndarray, fmt: str = "csc"):
+        """SciPy CSR/CSC matrix from host block values ``(nnz_blocks, 3, 3)`` (or flat) on the cached pattern.
+
+        For callers that gathered the BSR values themselves (e.g. packed with other data in one
+        device-to-host copy).
+        """
         from scipy import sparse
 
-        indptr, indices, perm = self._scalar_permutation("csc")
-        data = self.block_values_numpy(K).reshape(-1)[perm]
-        return sparse.csc_matrix((data, indices, indptr), shape=(self.n_dof, self.n_dof))
+        indptr, indices, perm = self._scalar_permutation(fmt)
+        data = np.asarray(values, dtype=np.float64).reshape(-1)[perm]
+        cls = sparse.csc_matrix if fmt == "csc" else sparse.csr_matrix
+        return cls((data, indices, indptr), shape=(self.n_dof, self.n_dof))
 
     def _convert(self, K: wps.BsrMatrix, fmt: str):
         if fmt == "bsr":
@@ -608,8 +617,33 @@ class WarpTetAssembler:
         Raises:
             FloatingPointError: neo-Hookean with an inverted element (``det F <= 0``).
         """
+        self.evaluate_device(x_flat, need_tangent=need_tangent)
+        self._check_inverted()
+        W = float(np.sum(self._We_wp.numpy()))
+        f_int = self._f_wp if device_output else _host_copy(self._f_wp).reshape(-1)
+        if not need_tangent:
+            return W, f_int, None
+        if tangent_format == "bsr":
+            K = wps.bsr_copy(self._K) if copy_tangent else self._K
+        else:
+            K = self._convert(self._K, tangent_format)
+        return W, f_int, K
+
+    def evaluate_device(self, x: wp.array, *, need_tangent: bool = True):
+        """Assemble at device positions without any host synchronization.
+
+        Args:
+            x: Positions, Warp ``vec3d`` array (N,) on :attr:`device`.
+            need_tangent: Assemble ``K_T``.
+
+        Returns:
+            ``(element_energy (E,) float64, f_int (N,) vec3d, K_T BsrMatrix or None, inverted (1,) int32)``:
+            internal buffers overwritten by the next call. The total energy is the sum of
+            ``element_energy`` and ``inverted[0] != 0`` flags inverted elements (neo-Hookean); both stay on
+            the device (no host reduction, no check).
+        """
         E, N, dev = self.n_tets, self.n_nodes, self.device
-        x = self._load_positions(x_flat, self._x_wp, N)
+        x = self._load_positions(x, self._x_wp, N)
         self._inverted_wp.zero_()
         lam, mu, mat = wp.float64(self.lam), wp.float64(self.mu), MATERIALS[self.material]
         tan = int(bool(need_tangent))
@@ -648,16 +682,7 @@ class WarpTetAssembler:
                 outputs=[self._We_wp, self._f_wp, Kv, self._inverted_wp],
                 device=dev,
             )
-        self._check_inverted()
-        W = float(np.sum(self._We_wp.numpy()))
-        f_int = self._f_wp if device_output else _host_copy(self._f_wp).reshape(-1)
-        if not need_tangent:
-            return W, f_int, None
-        if tangent_format == "bsr":
-            K = wps.bsr_copy(self._K) if copy_tangent else self._K
-        else:
-            K = self._convert(self._K, tangent_format)
-        return W, f_int, K
+        return self._We_wp, self._f_wp, (Kv if need_tangent else None), self._inverted_wp
 
     def _check_inverted(self):
         if self.material == "neo_hookean" and int(self._inverted_wp.numpy()[0]) != 0:
@@ -721,24 +746,38 @@ class WarpTetAssembler:
         return self._convert(self._K0, tangent_format)
 
     # -- per-element kinematic measures ----------------------------------------------------
-    def element_rotations(self, x_flat, element_ids=None, reference_flat=None, *, device_output: bool = False):
+    def element_rotations(
+        self, x_flat, element_ids=None, reference_flat=None, *, device_output: bool = False, out: wp.array = None
+    ):
         """Rotation angle [rad] in [0, pi] of the polar factor R of F = R U per element.
 
         F is relative to the rest nodes; with ``reference_flat`` the relative gradient
         ``F(x) F(reference)^-1`` is used (rotation since that reference). The angle is
         ``atan2(|axial(R)|, (tr R - 1) / 2)``, accurate also near 0 and pi.
+
+        ``element_ids`` may be a Warp ``int32`` array on :attr:`device` (no upload); ``out`` an optional
+        preallocated ``float64`` output of the sample size (no allocation). Device-resident ``vec3d``
+        positions/reference and both options make the call free of host copies (per-step triggers).
         """
         dev, N = self.device, self.n_nodes
         x = self._load_positions(x_flat, self._x_wp, N)
         has_ref = reference_flat is not None
         xr = self._load_positions(reference_flat, self._xref_wp, N) if has_ref else x
-        ids = np.arange(self.n_tets) if element_ids is None else np.asarray(element_ids).reshape(-1)
-        ids_wp = self._all_ids_wp if element_ids is None else wp.array(ids.astype(np.int32), dtype=wp.int32, device=dev)
-        out = wp.zeros(int(ids.size), dtype=wp.float64, device=dev)
-        if ids.size:
+        if isinstance(element_ids, wp.array):
+            ids_wp = element_ids
+            n_ids = int(element_ids.shape[0])
+        else:
+            ids = np.arange(self.n_tets) if element_ids is None else np.asarray(element_ids).reshape(-1)
+            n_ids = int(ids.size)
+            ids_wp = (
+                self._all_ids_wp if element_ids is None else wp.array(ids.astype(np.int32), dtype=wp.int32, device=dev)
+            )
+        if out is None:
+            out = wp.zeros(n_ids, dtype=wp.float64, device=dev)
+        if n_ids:
             wp.launch(
                 _rotation_kernel,
-                dim=int(ids.size),
+                dim=n_ids,
                 inputs=[x, xr, int(has_ref), self._tets_wp, ids_wp, self._G_wp],
                 outputs=[out],
                 device=dev,

@@ -84,9 +84,11 @@ from .options import (
     NonlinearForceOptions,
     RestRotationMode,
     TriggerOptions,
+    UpdatePath,
     UpdatePolicy,
 )
 from .triggers import RotationTrigger
+from .update_kernels import DeviceUpdater
 
 __all__ = [
     "BodyAdapter",
@@ -329,6 +331,37 @@ class FreeBodyAdapter(BodyAdapter):
         damping = 2.0 * ctrl.damping_ratio * np.sqrt(np.maximum(mode_mass * lam * mode_mass, 0.0))
 
         # ---- state projection: rigid part -> frame twist (about com_new), remainder -> qd ----------
+        if ctx.get("device_projection"):
+            # device path (rerom.update_kernels): only the rigid Gram matrix about com_new is formed here
+            dynamic = not (ctrl.constrained or not lay.frame_dynamic)
+            return {
+                "Phi": Phi_new,
+                "mass_modes": mass_modes,
+                "mode_mass_matrix": mode_mass_matrix,
+                "mode_mass": mode_mass,
+                "lam": lam,
+                "damping": damping,
+                "rigid": (mass_new, com_new, I_new),
+                "ep_phi": ep_phi,
+                "ep_psi": ep_psi,
+                "map_shapes": True,
+                "projection": {"mode": 0 if dynamic else 1, "G": (Yraw.T @ (M @ Yraw)) if dynamic else None},
+                "v_c": None,
+                "omega": None,
+                "qd": None,
+                "u_el_old": None,
+                "t_samples": t2,
+                "solver": get_solver,
+                "info": {
+                    "eigen_raw": np.asarray(vals).tolist(),
+                    "negative_eigenvalues": int(np.count_nonzero(np.asarray(vals) < 0.0)),
+                    "eigen_info": {k: v for k, v in eig_info.items() if k != "sigma_tries"},
+                    "ritz": ritz_info,
+                    "ritz_kept": ritz_kept,
+                    "md_kept": md_kept,
+                    **({"eigen_compare": eig_compare} if eig_compare is not None else {}),
+                },
+            }
         R, u_local, qd = ctx["R"], ctx["u_local"], ctx["qd"]
         if ctrl.constrained or not lay.frame_dynamic:
             omega_l = R.T @ ctx["omega"]
@@ -499,6 +532,7 @@ class InterfaceBodyAdapter(BodyAdapter):
             "ep_phi": ep_phi,
             "ep_psi": ep_psi,
             "map_shapes": True,
+            "projection": {"mode": 2, "G": None},
             "v_c": R @ t_vec,
             "omega": ctx["omega"],
             "qd": qd_new,
@@ -513,6 +547,21 @@ class InterfaceBodyAdapter(BodyAdapter):
                 "tip_frame_velocity_change": None if fdot is None else float(np.max(np.abs(fdot_after - fdot))),
             },
         }
+
+
+class _GatheredArrays:
+    """``ModelArrays``-like read access for the adapters on the device path: ``gravity`` comes from the
+    update's packed gather; any other array falls back to a host gather (diagnostic switches only)."""
+
+    def __init__(self, model, gravity: np.ndarray, world: int):
+        self._gravity = np.zeros((max(world, 0) + 1, 3))
+        self._gravity[max(world, 0)] = gravity
+        self._fallback = io.ModelArrays(model)
+
+    def get(self, name: str) -> np.ndarray:
+        if name == "gravity":
+            return self._gravity
+        return self._fallback.get(name)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -649,6 +698,7 @@ class ReROMController:
         self.g0 = np.zeros(self.m)
         self.lam = kk / np.maximum(mm, 1.0e-30)
         self.W_ref = 0.0
+        self._dev: DeviceUpdater | None = None
         self.modal_force = np.zeros(self.m)  # user modal joint_f added to -g0 by apply_prestress
         self.stats: list[dict] = []
         self.steps_since_update = 0
@@ -711,6 +761,14 @@ class ReROMController:
             solver.set_joint_rest_frames(joint_X_p_rest=model.joint_X_p, joint_X_c_rest=model.joint_X_c)
         adapter.attach(self)
 
+        # device-side update (rerom.update_kernels)
+        self._dev_hist_ready = False
+        self._dev_qdd_valid = False
+        self.last_refresh_in_place: bool | None = None
+        if self.policy.path is UpdatePath.DEVICE:
+            self._dev = DeviceUpdater(self)
+            self._dev.set_prestress(self.modal_joint_force())
+
     # ------------------------------------------------------------------------------------------
     # properties / phase hooks
     # ------------------------------------------------------------------------------------------
@@ -718,6 +776,11 @@ class ReROMController:
     def update_count(self) -> int:
         """Number of updates made so far."""
         return len(self.stats)
+
+    @property
+    def device_updater(self) -> DeviceUpdater | None:
+        """The :class:`rerom.update_kernels.DeviceUpdater` (``None`` on the host path)."""
+        return self._dev
 
     @property
     def endpoints(self):
@@ -756,11 +819,20 @@ class ReROMController:
     # ------------------------------------------------------------------------------------------
     def _state_arrays(self, state) -> tuple[np.ndarray, np.ndarray]:
         if self._view is not None and self._view[0] is state:
+            if self._view[1] is None:  # lazy bind: gather on first use
+                jq, jqd = io.read_joint_state(state)
+                self._view = (state, jq, jqd)
             return self._view[1], self._view[2]
         return io.read_joint_state(state)
 
     def _bind(self, state, view=None) -> None:
-        """Cache ``(joint_q, joint_qd)`` of ``state`` for the duration of a controller call."""
+        """Cache ``(joint_q, joint_qd)`` of ``state`` for the duration of a controller call.
+
+        On the device path the gather is deferred to the first host read (none for device triggers).
+        """
+        if view is None and self._dev is not None:
+            self._view = (state, None, None)
+            return
         jq, jqd = view if view is not None else io.read_joint_state(state)
         self._view = (state, jq, jqd)
 
@@ -926,9 +998,18 @@ class ReROMController:
         return f
 
     def apply_prestress(self, control, state=None) -> None:
-        """Write the pre-stress (and the due IMEX remainder at ``state``) into ``control.joint_f``."""
+        """Write the pre-stress (and the due IMEX remainder at ``state``) into ``control.joint_f``.
+
+        Device path: one kernel into the modal rows (graph-capturable; the IMEX remainder, when due, is
+        evaluated on the host and uploaded first).
+        """
         if state is not None and self._nl_due():
             self._nl_refresh(state)
+        if self._dev is not None:
+            # host-side change detection (user modal_force, g0 edits, IMEX remainder): upload only on change
+            self._dev.set_prestress(self.modal_joint_force(), only_if_changed=True)
+            self._dev.write_prestress(control)
+            return
         io.write_modal_joint_f(control, [(self.layout, self.modal_joint_force())])
 
     # ------------------------------------------------------------------------------------------
@@ -943,10 +1024,16 @@ class ReROMController:
             self.last_dt = float(dt)
         self._bind(state, view)
         try:
-            _, qd = self.read_modes(state)
-            if self._qd_hist is not None and dt is not None:
-                self._qdd_est = (qd - self._qd_hist[0]) / dt
-            self._qd_hist = (qd, dt)
+            if self._dev is not None:
+                # velocity history on the device (the M a Ritz candidate reads it at the next update)
+                self._dev.poll(state, dt)
+                self._dev_qdd_valid = self._dev_hist_ready and dt is not None
+                self._dev_hist_ready = dt is not None
+            else:
+                _, qd = self.read_modes(state)
+                if self._qd_hist is not None and dt is not None:
+                    self._qdd_est = (qd - self._qd_hist[0]) / dt
+                self._qd_hist = (qd, dt)
             if self._nl_due():
                 self._nl_refresh(state)
             if self._update_requested:
@@ -1002,6 +1089,8 @@ class ReROMController:
         eigenvalues, kinetic energy before/after and lost in the projection, nonlinear vs ROM strain energy,
         momentum before/after.
         """
+        if self._dev is not None:
+            return self._relinearize_device(state, control, stiffness_override, rebasis, debug)
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
         arrays = io.ModelArrays(self.model)
@@ -1146,6 +1235,181 @@ class ReROMController:
         self.trigger.on_update(self)
         return info
 
+    def _relinearize_device(self, state, control, stiffness_override, rebasis, debug) -> dict:
+        """Device-side :meth:`relinearize` (:attr:`UpdatePath.DEVICE`, see :mod:`rerom.update_kernels`)."""
+        timings: dict[str, float] = {}
+        t0 = time.perf_counter()
+        dev = self._dev
+        lay = self.layout
+
+        # ---- 1. recovery + assembly on the device, ONE packed device-to-host copy -------------------
+        g = dev.gather(state, need_assembly=stiffness_override is None)
+        q, qd, v_c, omega = g.q, g.qd, g.v_c, g.omega
+        R = quat_to_matrix(g.quat)
+        x_new = g.x_new.copy()
+        self._qdd_est = g.qdd.copy() if self._dev_qdd_valid else None
+        if stiffness_override is not None:
+            W_nl, f_int, K_T = stiffness_override
+        elif g.f_int is not None:
+            if g.inverted:
+                raise FloatingPointError("inverted element(s): det F <= 0")
+            W_nl, f_int, K_T = g.W, g.f_int, dev.device_assembler.scipy_from_block_values(g.K_values, "csr")
+        else:  # host assembler: evaluate at the gathered reference
+            W_nl, f_int, K_T = self.assembler.evaluate(x_new.reshape(-1), need_tangent=True)
+        f_int = np.asarray(f_int, dtype=np.float64)
+        K_T = host_sparse(K_T)
+        K_T = 0.5 * (K_T + K_T.T)
+        t1 = time.perf_counter()
+        timings["assembly"] = t1 - t0
+
+        # ---- 2. basis (host; the adapter skips the state projection) --------------------------------
+        ctx = {
+            "state": state,
+            "q": q,
+            "qd": qd,
+            "R": R,
+            "v_c": v_c,
+            "omega": omega,
+            "x_new": x_new,
+            "u_local": None,
+            "f_int": f_int,
+            "K_T": K_T,
+            "timings": timings,
+            "arrays": _GatheredArrays(self.model, g.gravity, lay.world),
+            "rebasis": rebasis,
+            "debug": debug or {},
+            "device_projection": True,
+        }
+        res = self.adapter.rebuild(self, ctx)
+        Phi_new, mode_mass, lam = res["Phi"], res["mode_mass"], res["lam"]
+        mass_new, com_new, I_new = res["rigid"]
+        g0 = Phi_new.T @ f_int
+        t2 = time.perf_counter()
+
+        # ---- 3. ONE packed host-to-device copy, rewrite kernels in place ------------------------------
+        lam_written = self._guard_indefinite(lam)
+        proj = res["projection"]
+        mode = int(proj["mode"])
+        mass_total = mass_new + self.mass_offset
+        inertia_total = I_new + self.inertia_offset
+        dynamic = lay.frame_dynamic
+        dev.pack_inbox(
+            Phi=Phi_new,
+            com_new=com_new,
+            G=proj.get("G"),
+            mass=mass_total,
+            inertia=inertia_total,
+            inv_mass=(1.0 / mass_total if mass_total > 0 else 0.0) if dynamic else 0.0,
+            inv_inertia=np.linalg.inv(inertia_total) if dynamic else np.zeros((3, 3)),
+            mode_mass=mode_mass,
+            stiffness=lam_written * mode_mass,
+            damping=res["damping"],
+            prestress=self.modal_force - g0,
+            qd_given=res["qd"] if mode == 2 else None,
+            v_c_given=res["v_c"] if mode == 2 else None,
+            omega_given=res["omega"] if mode == 2 else None,
+            ep_phi=res["ep_phi"],
+            ep_psi=res["ep_psi"],
+        )
+        diag = dev.rewrite(
+            state,
+            control,
+            mode=mode,
+            counter_rotate=self.policy.rest_rotation is RestRotationMode.COUNTER_ROTATE,
+            diagnostics=self.policy.diagnostics,
+        )
+        t3 = time.perf_counter()
+        timings["integrals"] = t3 - t2 + (t2 - res["t_samples"] if "t_samples" in res else 0.0)
+        W_rom = self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
+
+        # ---- 4. host bookkeeping, rest rotations, solver refresh ---------------------------------------
+        self.last_joint_rest_mismatch = 0.0
+        if diag is not None and lay.endpoints and self.policy.rest_rotation is RestRotationMode.COUNTER_ROTATE:
+            self.last_joint_rest_mismatch = float(diag[9])
+            if self.last_joint_rest_mismatch > 1.0e-6:
+                warnings.warn(
+                    f"elastic endpoints of body {lay.body} rotated differently (spread "
+                    f"{self.last_joint_rest_mismatch:.2e} rad); joint rest rotations are only approximately "
+                    "preserved by RestRotationMode.COUNTER_ROTATE",
+                    stacklevel=3,
+                )
+        if self.rest_propagator is not None:
+            self.rest_propagator.fix()
+        com_old = self.com
+        self.r_ref = x_new
+        self.Phi = Phi_new
+        self.com = com_new
+        self.g0 = g0
+        self.lam = lam
+        self.W_ref = float(W_nl)
+        self._qd_hist = None
+        self._qdd_est = None
+        self._dev_hist_ready = True  # history = projected qd (written by the state kernel)
+        self._dev_qdd_valid = False
+        if self.nl_model is not None and self.nl_manifold > 0:
+            t_md = time.perf_counter()
+            self._Theta = self._static_mds(x_new.reshape(-1), Phi_new, res["solver"]())
+            timings["nl_manifold_md"] = time.perf_counter() - t_md
+        nl_info = self._init_nl_model(K_T) if self.nl_model is not None else {}
+        if nl_info:
+            timings["nl_setup"] = nl_info["nl_setup"]
+        self.steps_since_fold = 0
+        self._notify()
+        t4 = time.perf_counter()
+        timings["rewrite"] = t4 - t3 - timings.get("nl_setup", 0.0) - timings.get("nl_manifold_md", 0.0)
+        timings["total"] = t4 - t0 - timings.get("eigen_compare_excluded", 0.0)
+
+        # ---- diagnostics (momenta in world, about the world origin) ---------------------------------
+        p = g.p
+
+        def world(Pl, Ll):
+            P = R @ Pl
+            return P, R @ Ll + np.cross(p, P)
+
+        P_b, L_b = world(g.moments[:3], g.moments[3:6])
+        ke_total = 0.5 * float(g.moments[6])
+        if diag is not None:
+            P_a, L_a = world(diag[:3], diag[3:6])
+            ke_after, ke_el, ke_lost = 0.5 * float(diag[6]), float(diag[7]), float(diag[8])
+        else:
+            nan3 = np.full(3, np.nan)
+            P_a, L_a = nan3, nan3
+            ke_after = ke_el = ke_lost = float("nan")
+        info = {
+            "body": self.body,
+            "step": self.step_count,
+            "interval": self.steps_since_update,
+            "timings": timings,
+            "eigenvalues": lam.tolist(),
+            "g0_norm": float(np.linalg.norm(g0)),
+            "W_nonlinear": float(W_nl),
+            "W_rom": W_rom,
+            "W_rel_error": (W_rom - float(W_nl)) / max(abs(float(W_nl)), 1.0e-30),
+            "KE_before": ke_total,
+            "KE_after": ke_after,
+            "KE_lost_projection": ke_lost,
+            "KE_elastic_before": ke_el,
+            "KE_lost_fraction_total": ke_lost / max(ke_total, 1.0e-30),
+            "KE_lost_fraction_elastic": ke_lost / max(ke_el, 1.0e-30),
+            "P_before": P_b.tolist(),
+            "P_after": P_a.tolist(),
+            "L_before": L_b.tolist(),
+            "L_after": L_a.tolist(),
+            "dP": float(np.linalg.norm(P_a - P_b)),
+            "dL": float(np.linalg.norm(L_a - L_b)),
+            "q_norm_before": float(np.linalg.norm(q)),
+            "com_shift": float(np.linalg.norm(com_new - com_old)),
+            "update_path": "device",
+            "solver_refresh_in_place": self.last_refresh_in_place,
+            **res["info"],
+        }
+        if nl_info:
+            info["nl_model"] = nl_info
+        self.stats.append(info)
+        self.steps_since_update = 0
+        self.trigger.on_update(self)
+        return info
+
     def _guard_indefinite(self, lam: np.ndarray) -> np.ndarray:
         if self.policy.guard_indefinite is IndefiniteGuard.CLAMP and np.any(lam <= 0.0):
             pos = lam[lam > 0.0]
@@ -1163,6 +1427,11 @@ class ReROMController:
 
     def _notify(self) -> None:
         if not self.policy.notify:
+            return
+        if self._dev is not None and hasattr(self.solver, "refresh_elastic_mass_solve_data"):
+            self.last_refresh_in_place = bool(self.solver.refresh_elastic_mass_solve_data())
+            if self.layout.endpoints or self.rest_propagator is not None:
+                self.solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
             return
         flags = newton.ModelFlags.BODY_INERTIAL_PROPERTIES
         if self.layout.endpoints or self.rest_propagator is not None:
@@ -1228,6 +1497,11 @@ class ReROMController:
             self._qd_hist = (Q.T @ self._qd_hist[0], self._qd_hist[1])
         if self._qdd_est is not None:
             self._qdd_est = Q.T @ self._qdd_est
+        if self._dev is not None:
+            self._dev.upload_basis(self.Phi, self.r_ref, self.com)
+            self._dev.set_prestress(self.modal_joint_force())
+            self._dev_hist_ready = False
+            self._dev_qdd_valid = False
         if control is not None:
             self.apply_prestress(control)
         self._notify()
@@ -1339,8 +1613,16 @@ class MultiFrameController:
         return self.rest.error()
 
     # ---- stepping --------------------------------------------------------------------------------
+    def _all_device(self) -> bool:
+        return all(c.device_updater is not None for c in self.ctrls)
+
     def apply_prestress(self, control) -> None:
-        """Pre-stress of every body (one ``joint_f`` gather and scatter)."""
+        """Pre-stress of every body (one kernel per body on the device path, else one ``joint_f`` gather and
+        scatter)."""
+        if self._all_device():
+            for c in self.ctrls:
+                c.apply_prestress(control)
+            return
         io.write_modal_joint_f(control, [(c.layout, c.modal_joint_force()) for c in self.ctrls])
 
     def update(self, state, control, bodies, reasons=None) -> list[dict]:
@@ -1358,9 +1640,13 @@ class MultiFrameController:
             t = time.perf_counter()
             self.fix_rest_rotations()
             self.apply_prestress(control)
-            self.solver.notify_model_changed(
-                newton.ModelFlags.BODY_INERTIAL_PROPERTIES | newton.ModelFlags.JOINT_PROPERTIES
-            )
+            if self._all_device() and hasattr(self.solver, "refresh_elastic_mass_solve_data"):
+                self.solver.refresh_elastic_mass_solve_data()
+                self.solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            else:
+                self.solver.notify_model_changed(
+                    newton.ModelFlags.BODY_INERTIAL_PROPERTIES | newton.ModelFlags.JOINT_PROPERTIES
+                )
             dt_fix = time.perf_counter() - t
             err = self.rest_target_error()
             for info in infos:
@@ -1372,7 +1658,7 @@ class MultiFrameController:
     def after_step(self, state, control, dt) -> list[dict]:
         """Evaluate every body's trigger (one state gather); update the bodies that fire."""
         self.step_count += 1
-        view = io.read_joint_state(state)
+        view = None if self._all_device() else io.read_joint_state(state)
         fire = []
         for i, c in enumerate(self.ctrls):
             ok, reason, metrics = c.poll(state, dt, view=view)
