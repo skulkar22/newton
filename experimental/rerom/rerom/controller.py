@@ -53,6 +53,7 @@ from .eigen import (
     RestrictedSubspaceBackend,
     ShiftedRestrictedSolver,
     resolve_backend,
+    shared_restricted_solver,
     solve_restricted_eigen,
 )
 from .hyper_reduction import ReducedElementForce
@@ -183,7 +184,13 @@ class FreeBodyAdapter(BodyAdapter):
         def get_solver():
             # ONE restricted factorization shared by the subspace iteration, Ritz vectors and modal derivatives
             if "f" not in shared:
-                shared["f"] = ShiftedRestrictedSolver(Kf, Mf, Yf)
+                # the symmetric factorization (with inertia count) is needed only to share it with ARPACK;
+                # the subspace iteration always shared the pivoting LU
+                shared["f"] = (
+                    shared_restricted_solver(Kf, Mf, Yf)
+                    if o.shared_factorization and isinstance(ctrl.eigen_backend, RestrictedArpackBackend)
+                    else ShiftedRestrictedSolver(Kf, Mf, Yf)
+                )
                 factor["t"] += shared["f"].factor_time
             return shared["f"]
 
@@ -196,7 +203,15 @@ class FreeBodyAdapter(BodyAdapter):
             previous = ctrl.Phi[free]
             seed = 1234 + ctrl.step_count
             vals, Vf, eig_info = solve_restricted_eigen(
-                backend, Kf, Mf, Yf, k_eig, previous=previous, shared_solver=get_solver, seed=seed
+                backend,
+                Kf,
+                Mf,
+                Yf,
+                k_eig,
+                previous=previous,
+                shared_solver=get_solver,
+                seed=seed,
+                share_arpack=o.shared_factorization,
             )
             f_in_eig = factor["t"] - f_before_eig
             if o.eigen_compare:

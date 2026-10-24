@@ -72,6 +72,13 @@ class BasisOptions:
         damping_ratio: Modal damping ratio of the new modes; ``None`` infers the mean initial ratio.
         eigen_compare: Also run the other built-in restricted eigensolver and record principal angles
             (diagnostic; its time is excluded from ``timings["total"]``).
+        shared_factorization: One factorization of ``K_T - sigma M`` per update (``sigma`` = the Ritz shift
+            ``1e-3 default_shift``) serves the eigensolve, the static Ritz vectors and the modal derivatives.
+            With ARPACK it is a symmetric factorization whose inertia count gives the Sturm check at
+            ``sigma``; ARPACK factors a lower shift only when that check finds eigenvalues below ``sigma``.
+            The subspace iteration always shared its (pivoting) factorization, so the option does not change
+            it. ``False`` reproduces the legacy ARPACK path bit for bit (ARPACK at ``default_shift``, a
+            separate pivoting LU for the Ritz solves).
     """
 
     n_ritz: int = 2
@@ -86,6 +93,7 @@ class BasisOptions:
     derive_psi: bool | None = None
     damping_ratio: float | None = None
     eigen_compare: bool = False
+    shared_factorization: bool = True
 
 
 @dataclass(kw_only=True)

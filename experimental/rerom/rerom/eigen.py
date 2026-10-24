@@ -20,8 +20,11 @@ generic backends do) is not the inverse of the restricted pencil. Generic backen
 ``previous_vectors`` attribute (Newton's :class:`~newton.SubspaceIterationBackend`) is warm-started with
 the previous basis before every solve.
 
-:class:`ShiftedRestrictedSolver` is the one factorization per update shared by the subspace iteration, the
-static Ritz vectors and the modal derivatives.
+:class:`ShiftedRestrictedSolver` is the one factorization per update shared by the eigensolve (ARPACK
+shift-invert operator and Sturm check, or the subspace iteration), the static Ritz vectors and the modal
+derivatives (:func:`shared_restricted_solver`, ``BasisOptions.shared_factorization``). The legacy path
+(``shared_factorization=False``) factors ARPACK's shift and the Ritz shift separately and reproduces the
+recorded runs bit for bit.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ __all__ = [
     "RestrictedSubspaceBackend",
     "ShiftedRestrictedSolver",
     "resolve_backend",
+    "shared_restricted_solver",
     "solve_restricted_eigen",
 ]
 
@@ -53,11 +57,20 @@ class ShiftedRestrictedSolver:
     motions (``None``: no deflation, a clamped body). The tiny shift ``sigma = 1e-3 default_shift(K, M)``
     keeps ``K - sigma M`` nonsingular for the rigid translations; the restriction is exact
     (``x = A^-1 b' - A^-1 B (B^T A^-1 B)^-1 B^T A^-1 b'``, ``A = K - sigma M``, ``B = M Y``,
-    ``b' = b - B Y^T b``). The factorization is a SciPy SuperLU of ``A`` (``factor_time`` [s] records its
-    cost); ``sigma`` is exposed so the object can be passed as the ``factorization`` of a backend.
+    ``b' = b - B Y^T b``). ``factor_time`` [s] records the factorization cost; ``sigma`` is exposed so the
+    object can be passed as the ``factorization`` of a backend.
+
+    Args:
+        K, M: Free-DOF stiffness and mass (sparse).
+        Y: M-orthonormal rigid motions (n, d) or ``None``.
+        symmetric: ``False`` (legacy): a pivoting SciPy SuperLU of ``A`` (``splu`` defaults).
+            ``True``: :class:`newton._src.sim.modal_sparse.ShiftedFactorization` (symmetric ordering,
+            diagonal pivots), whose inertia count lets :class:`RestrictedArpackBackend` reuse the same
+            factorization for its shift-invert operator (one factorization per update, see
+            :func:`shared_restricted_solver`).
     """
 
-    def __init__(self, K, M, Y: np.ndarray | None):
+    def __init__(self, K, M, Y: np.ndarray | None, *, symmetric: bool = False):
         M = sp.csr_matrix(M)
         if Y is None:
             Y = np.zeros((K.shape[0], 0))
@@ -65,13 +78,20 @@ class ShiftedRestrictedSolver:
         self.B = np.asarray(M @ Y)
         Kc = sp.csc_matrix(K)
         self.sigma = modal_sparse.default_shift(Kc, M) * 1.0e-3
+        self.symmetric = bool(symmetric)
         t_f = time.perf_counter()
-        self.lu = spla.splu(sp.csc_matrix(Kc - self.sigma * M))
+        if self.symmetric:
+            self.factorization = modal_sparse.ShiftedFactorization(Kc, M, self.sigma)
+            self.lu = self.factorization.lu
+        else:
+            self.factorization = None
+            self.lu = spla.splu(sp.csc_matrix(Kc - self.sigma * M))
         self.factor_time = time.perf_counter() - t_f
         B = self.B
         self.AinvB = self.lu.solve(B) if B.shape[1] else np.zeros_like(B)
         S6 = B.T @ self.AinvB
-        self.S6inv = np.linalg.inv(0.5 * (S6 + S6.T)) if B.shape[1] else np.zeros((0, 0))
+        self.S6 = 0.5 * (S6 + S6.T)
+        self.S6inv = np.linalg.inv(self.S6) if B.shape[1] else np.zeros((0, 0))
 
     def solve(self, b: np.ndarray) -> np.ndarray:
         """Restricted static solve (vector or block of columns)."""
@@ -81,6 +101,16 @@ class ShiftedRestrictedSolver:
         return x - self.AinvB @ (self.S6inv @ (self.B.T @ x))
 
     __call__ = solve
+
+
+def shared_restricted_solver(K, M, Y: np.ndarray | None) -> ShiftedRestrictedSolver:
+    """The update's single factorization: a symmetric :class:`ShiftedRestrictedSolver` (with inertia count).
+
+    Passed as ``factorization`` to :class:`RestrictedArpackBackend` (shift-invert operator and Sturm check at
+    the same shift) and :class:`RestrictedSubspaceBackend` (block inverse iteration), and used for the static
+    Ritz vectors and the modal derivatives of the same update.
+    """
+    return ShiftedRestrictedSolver(K, M, Y, symmetric=True)
 
 
 class RestrictedArpackBackend:
@@ -114,8 +144,17 @@ class RestrictedArpackBackend:
         factorization=None,
         zero_threshold: float = 0.0,
     ) -> newton.EigenResult:
-        """Return the ``count`` lowest eigenpairs outside ``deflation`` (``sigma``/``factorization`` ignored)."""
-        del sigma, tol, factorization, zero_threshold
+        """Return the ``count`` lowest eigenpairs outside ``deflation``.
+
+        ``sigma`` is ignored. ``factorization``: a symmetric :class:`ShiftedRestrictedSolver` (from
+        :func:`shared_restricted_solver`) on the same pencil is reused as the first shift-invert operator
+        (its shift and inertia count); only when its Sturm check finds eigenvalues below that shift is a
+        new, lower shift factored. ``None`` (legacy): factor at ``default_shift(K, M)``.
+        """
+        del sigma, tol, zero_threshold
+        shared = None
+        if isinstance(factorization, ShiftedRestrictedSolver) and factorization.factorization is not None:
+            shared = factorization
         t0 = time.perf_counter()
         K, M, Y, k = stiffness, mass, deflation, int(count)
         n = int(K.shape[0])
@@ -145,22 +184,30 @@ class RestrictedArpackBackend:
             return newton.EigenResult(vals, V, backend=self.name, wall_s=time.perf_counter() - t0)
 
         K = sp.csc_matrix(K)
-        sigma = modal_sparse.default_shift(K, M)
+        sigma = shared.sigma if shared is not None else modal_sparse.default_shift(K, M)
         scale = modal_sparse.matrix_one_norm(K) / max(modal_sparse.matrix_one_norm(M), 1.0e-300)
         tries = []
         fact = None
         below = -1
+        info["shared_factorization"] = False
         for attempt in range(12):
-            t_f = time.perf_counter()
-            try:
-                fact = modal_sparse.ShiftedFactorization(K, M, sigma)
-                info["t_factor"] = info.get("t_factor", 0.0) + time.perf_counter() - t_f
-            except ValueError:
-                sigma *= 1.37
-                continue
-            AinvB = np.column_stack([fact.solve(B[:, i]) for i in range(d)]) if d else np.zeros((n, 0))
-            S6 = B.T @ AinvB if d else np.zeros((0, 0))
-            S6 = 0.5 * (S6 + S6.T)
+            if attempt == 0 and shared is not None:
+                fact = shared.factorization
+                AinvB = shared.AinvB
+                S6 = shared.S6 if d else np.zeros((0, 0))
+                info["shared_factorization"] = True
+            else:
+                info["shared_factorization"] = False
+                t_f = time.perf_counter()
+                try:
+                    fact = modal_sparse.ShiftedFactorization(K, M, sigma)
+                    info["t_factor"] = info.get("t_factor", 0.0) + time.perf_counter() - t_f
+                except ValueError:
+                    sigma *= 1.37
+                    continue
+                AinvB = np.column_stack([fact.solve(B[:, i]) for i in range(d)]) if d else np.zeros((n, 0))
+                S6 = B.T @ AinvB if d else np.zeros((0, 0))
+                S6 = 0.5 * (S6 + S6.T)
             negA = fact.negative_pivot_count
             if negA < 0:
                 below = -1
@@ -309,13 +356,15 @@ def solve_restricted_eigen(
     previous: np.ndarray | None,
     shared_solver,
     seed: int,
+    share_arpack: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Run ``backend`` on the free-DOF pencil with the rigid motions ``Yf`` deflated.
 
     ``previous`` is the previous basis on the free DOFs (warm start of backends with a
     ``previous_vectors`` attribute); ``shared_solver`` is a zero-argument callable returning the update's
-    :class:`ShiftedRestrictedSolver` (built lazily, only for the restricted subspace backend). Returns
-    ``(values, vectors, info)`` in ascending order.
+    :class:`ShiftedRestrictedSolver` (built lazily: always for the restricted subspace backend, and for the
+    restricted ARPACK backend with ``share_arpack``, which then reuses it as its shift-invert factorization).
+    Returns ``(values, vectors, info)`` in ascending order.
     """
     info: dict[str, Any] = {}
     if isinstance(backend, RestrictedSubspaceBackend):
@@ -325,7 +374,7 @@ def solve_restricted_eigen(
         info.update(backend.last_info)
         return np.asarray(res.values), np.asarray(res.vectors), info
     if isinstance(backend, RestrictedArpackBackend):
-        res = backend.solve(Kf, Mf, count, deflation=Yf)
+        res = backend.solve(Kf, Mf, count, deflation=Yf, factorization=shared_solver() if share_arpack else None)
         info.update(backend.last_info)
         return np.asarray(res.values), np.asarray(res.vectors), info
     # generic newton.EigenSolverBackend (Newton built-ins, Warpack, test doubles)
