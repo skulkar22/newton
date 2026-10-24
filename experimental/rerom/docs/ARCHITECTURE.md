@@ -17,7 +17,7 @@ Since the note was written, several rows of the "Today" column below moved to th
 |---|---|---|
 | Full mesh, material, full nodal basis Φ (N,m,3), mass, mutable reference shape r_ref | Python object outside Newton | Model arrays per adaptive body (`elastic_full_*`), or a `ModalBasis.full_field` record carried through the builder |
 | Tangent stiffness K_T(x) and internal force f_int(x) at the deformed shape | numpy StVK assembler (23–34 ms at 6k DOF) | Warp per-tet kernel → `warp.sparse.BsrMatrix`, pattern built once |
-| Eigensolve + static Ritz solves | SciPy ARPACK / subspace iteration on host (27–112 ms) | `EigenSolverBackend` seam in `modal_sparse`: SciPy, subspace, Warpack + cuDSS, FSAI-CG + LOBPCG |
+| Eigensolve + static Ritz solves | SciPy ARPACK / subspace iteration on host (27–112 ms) | `ModalEigensolverBackend` seam in `modal_sparse`: SciPy, subspace, Warpack + cuDSS, FSAI-CG + LOBPCG |
 | New modes → Newton arrays (five coupling integrals, modal mass matrix, endpoint/render/shape φ, rigid props) | host numpy + `.assign()` (≈66 host round trips per update) | device kernels writing in place into the fixed-size `elastic_*` arrays |
 | State transfer at a switch (rigid part → frame twist, rest → new modes), pre-stress g₀ | host; pre-stress via `control.joint_f` modal rows | device kernel; dedicated `elastic_mode_prestress` array so user modal forces keep working |
 | Solver cache refresh | `notify_model_changed` reallocates mass-solve data → CUDA graph recapture | in-place refresh (`refresh_elastic_mass_solve_data`), captured step graph stays valid |

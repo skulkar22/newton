@@ -146,9 +146,8 @@ eigensolve, the Ritz vectors and the modal derivatives.
 
 The controller's `eigensolver` argument takes a name (`"arpack"`, `"subspace"`, `"dense"`), a
 `newton.ModalEigensolver`, or any object that satisfies Newton's eigensolver backend protocol
-(`newton.EigenSolverBackend` on this branch; a pending rename calls it `newton.ModalEigensolverBackend`, and the
-result type `newton.EigenResult` becomes `newton.ModalEigenResult`). Subclassing is not required; the protocol
-is duck-typed:
+(`newton.ModalEigensolverBackend`; the result type is `newton.ModalEigenResult`). Subclassing is not
+required; the protocol is duck-typed:
 
 * attributes `name` (str), `supports_inertia_count` (bool) and `device` (`"cpu"` for host backends);
 * `solve(stiffness, mass, count, *, deflation=None, sigma=None, tol=0.0, factorization=None, zero_threshold=0.0)`
@@ -159,7 +158,7 @@ is duck-typed:
 import newton
 
 
-class WarpackBackend:  # duck-typed; newton.WarpackBackend is a placeholder that documents the contract
+class WarpackBackend:  # duck-typed; newton._src.sim.modal_sparse.WarpackBackend is a placeholder documenting the contract
     name = "warpack"
     supports_inertia_count = False  # True only if solve() returns a Sturm count (e.g. cuDSS LDL^T inertia)
 
@@ -169,10 +168,10 @@ class WarpackBackend:  # duck-typed; newton.WarpackBackend is a placeholder that
     def solve(
         self, stiffness, mass, count, *, deflation=None, sigma=None, tol=0.0, factorization=None, zero_threshold=0.0
     ):
-        # stiffness, mass: host SciPy CSC (newton.to_backend_matrix converts or passes them through);
+        # stiffness, mass: host SciPy CSC (newton._src.sim.modal_sparse.to_backend_matrix converts or passes them through);
         # deflation: M-orthonormal rigid motions (n, 6) of a free body, or None for a clamped body.
         values, vectors = ...  # move to the device, solve, return float64 host arrays
-        return newton.EigenResult(values, vectors, inertia_count=None, backend=self.name)
+        return newton.ModalEigenResult(values, vectors, inertia_count=None, backend=self.name)
 
 
 ctrl = rerom.ReROMController(..., eigensolver=WarpackBackend("cuda:0"))
@@ -192,7 +191,7 @@ What the backend receives and must return:
 
 The controller validates the result (`modal_sparse.validate_eigen_result`), adds its static Ritz vectors and
 re-diagonalizes (Rayleigh-Ritz). A backend with a `previous_vectors` attribute (like
-`newton.SubspaceIterationBackend`) is warm-started with the previous basis at every update. For Craig-Bampton
+`newton.ModalSubspaceIterationBackend`) is warm-started with the previous basis at every update. For Craig-Bampton
 bodies an explicitly passed backend also solves the fixed-interface eigenproblem.
 
 The named built-ins `"arpack"` and `"subspace"` resolve to the *restricted* backends of `rerom/eigen.py`
