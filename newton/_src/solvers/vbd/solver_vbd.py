@@ -7061,6 +7061,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             inputs=[
                 dt,
                 True,
+                True,
                 body_ids,
                 model.elastic_joint,
                 model.elastic_mode_start,
