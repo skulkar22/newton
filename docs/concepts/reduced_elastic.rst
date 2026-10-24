@@ -334,6 +334,33 @@ rest, raises. The generator exposes the intermediate matrices and a report of
 residuals and timings, and :meth:`~ModalGeneratorCraigBamptonFEM.save_npz`
 writes the reduced model as arrays named like the generator arguments.
 
+The eigensolver of both finite-element generators is pluggable. Besides the
+names above, ``eigensolver`` accepts a :class:`ModalEigensolver` member or any
+object that satisfies the :class:`EigenSolverBackend` protocol: a ``name``, a
+``device``, a ``supports_inertia_count`` flag, and a ``solve`` method that
+returns the lowest eigenpairs of :math:`\mathbf{K}\boldsymbol{\phi} =
+\lambda\mathbf{M}\boldsymbol{\phi}` as an :class:`EigenResult`, in ascending
+order, :math:`\mathbf{M}`-orthonormal, and orthogonal to the deflated
+rigid-body motions. The generators pass the free (or interior) DOF matrices
+in SciPy CSC form with the shift and tolerance from ``arpack_shift`` and
+``arpack_tol``, and check the result: a backend that computes only part of
+the spectrum either returns a Sturm sequence count, which must match the
+eigenvalues it returned below the count's shift, or sets
+``supports_inertia_count`` to ``False``, in which case the check is skipped
+with a warning. Host (``"cpu"``) backends share the validated sparse
+factorization of :math:`\mathbf{K} - \sigma\mathbf{M}`; a device backend
+receives none. :class:`DenseBackend` and :class:`ScipyArpackBackend` wrap the
+built-in paths; :class:`SubspaceIterationBackend` (``"subspace"``) runs
+shift-invert block subspace iteration with Rayleigh-Ritz on that
+factorization and can warm-start from the modes of a nearby configuration, as
+when an adaptive reduced model updates its basis.
+:class:`WarpackBackend` is a placeholder that documents the contract of a GPU
+backend, such as a sparse direct (cuDSS) or preconditioned LOBPCG solver, and
+raises :class:`NotImplementedError` in this build;
+:func:`resolve_eigensolver` maps any accepted value to a backend, and
+:func:`to_backend_matrix` converts a :class:`warp.sparse.BsrMatrix` to the
+host form.
+
 Assemblies of separately meshed parts are joined with linear multi-point
 constraints :math:`\mathbf{C}\mathbf{u} = 0`, which
 :class:`ConstraintElimination` removes with a coordinate transformation
