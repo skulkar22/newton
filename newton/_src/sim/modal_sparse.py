@@ -11,10 +11,13 @@ the original dense generator code, so dense results are unchanged.
 
 from __future__ import annotations
 
+import enum
 import importlib
 import sys
+import time
 import warnings
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -689,6 +692,47 @@ def lowest_generalized_eigenpairs(
             repeated eigenvalue fills every computed eigenpair after the
             wanted ones or the factorization pivoted off the diagonal.
     """
+    values, vectors, _, _ = _lowest_generalized_eigenpairs(
+        stiffness,
+        mass,
+        count,
+        sigma=sigma,
+        zero_threshold=zero_threshold,
+        margin=margin,
+        deflation=deflation,
+        tol=tol,
+        maxiter=maxiter,
+        ncv=ncv,
+        factorization=factorization,
+        max_restarts=max_restarts,
+    )
+    return values, vectors
+
+
+def _lowest_generalized_eigenpairs(
+    stiffness: Any,
+    mass: Any,
+    count: int,
+    *,
+    sigma: float,
+    zero_threshold: float,
+    margin: int,
+    deflation: np.ndarray | None,
+    tol: float,
+    maxiter: int | None,
+    ncv: int | None,
+    factorization: ShiftedFactorization | None,
+    max_restarts: int,
+) -> tuple[np.ndarray, np.ndarray, float | None, int | None]:
+    """Implement :func:`lowest_generalized_eigenpairs` and also return its Sturm check.
+
+    Returns:
+        The eigenvalues and eigenvectors, the check shift ``tau`` [1/s^2], and
+        the number of eigenvalues of the whole pencil below it (deflated
+        directions included). Both are ``None`` when no check was made, either
+        because the whole spectrum outside ``deflation`` was computed or because
+        the check was skipped with a warning.
+    """
     size = int(stiffness.shape[0])
     deflated = 0 if deflation is None else int(deflation.shape[1])
     available = size - deflated
@@ -727,7 +771,7 @@ def lowest_generalized_eigenpairs(
     for search in range(_STURM_GAP_SEARCHES + 1):
         if values.shape[0] >= available or values.shape[0] <= count:
             # The whole spectrum outside deflation was computed, so no eigenvalue can be missing.
-            return values, vectors
+            return values, vectors, None, None
         lower = values[first:-1]
         upper = values[first + 1 :]
         relative_gap = (upper - lower) / np.maximum(np.abs(upper), np.finfo(np.float64).tiny)
@@ -745,17 +789,17 @@ def lowest_generalized_eigenpairs(
             f"{_STURM_MIN_RELATIVE_GAP:g} follows eigenvalue {count} within the {values.shape[0]} computed "
             "eigenpairs, because a repeated eigenvalue fills them, so missed copies of it cannot be ruled out. "
             "Choose a mode count that ends at a gap in the spectrum",
-            stacklevel=2,
+            stacklevel=3,
         )
-        return values, vectors
+        return values, vectors, None, None
     below = count_eigenvalues_below(stiffness, mass, tau)
     if below < 0:
         warnings.warn(
             f"The Sturm sequence check was skipped: the factorization of stiffness_matrix - {tau:.6g} * "
             "mass_matrix pivoted off the diagonal, so its inertia does not count the eigenvalues below the shift",
-            stacklevel=2,
+            stacklevel=3,
         )
-        return values, vectors
+        return values, vectors, None, None
     expected = below - deflated
     for restart in range(1, max_restarts + 1):
         found = int(np.count_nonzero(values < tau))
@@ -790,5 +834,679 @@ def lowest_generalized_eigenpairs(
             f"sequence count of stiffness_matrix - {tau:.6g} * mass_matrix, so some returned eigenpairs are "
             "spurious. Check that stiffness_matrix is symmetric positive semi-definite, and choose an "
             "arpack_shift away from the eigenvalues"
+        )
+    return values, vectors, tau, below
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Pluggable eigensolver backends
+# ----------------------------------------------------------------------------------------------------------------
+
+
+class ModalEigensolver(enum.Enum):
+    """Built-in eigensolvers of the finite-element modal generators.
+
+    .. experimental::
+
+    Each member's value is the string that the ``eigensolver`` argument of
+    :class:`~newton.ModalGeneratorFEM` and
+    :class:`~newton.ModalGeneratorCraigBamptonFEM` also accepts.
+    """
+
+    AUTO = "auto"
+    """Let the generator choose ``DENSE`` or ``ARPACK`` from the input format and size."""
+
+    DENSE = "dense"
+    """Full spectrum with a Cholesky reduction and a dense symmetric eigensolve; see :class:`~newton.DenseBackend`."""
+
+    ARPACK = "arpack"
+    """Sparse shift-invert Lanczos with a Sturm sequence check; see :class:`~newton.ScipyArpackBackend`."""
+
+    SUBSPACE = "subspace"
+    """Shift-invert block subspace iteration with Rayleigh-Ritz; see :class:`~newton.SubspaceIterationBackend`."""
+
+
+@dataclass
+class EigenResult:
+    """Lowest generalized eigenpairs of ``K phi = lambda M phi`` returned by an :class:`~newton.EigenSolverBackend`.
+
+    .. experimental::
+    """
+
+    values: np.ndarray
+    """Eigenvalues [1/s^2] in ascending order, shape ``[k]``."""
+    vectors: np.ndarray
+    """``M``-orthonormal eigenvectors, shape ``[n, k]``; excludes the deflated directions."""
+    inertia_count: int | None = None
+    """Number of eigenvalues of the whole pencil, deflated directions included, below :attr:`~newton.EigenResult.inertia_shift`.
+
+    It is a Sturm sequence count (the inertia of a factorization of
+    ``K - inertia_shift * M``), or ``None`` when the backend did not compute one.
+    """
+    backend: str = ""
+    """Name of the backend that produced the result."""
+    wall_s: float = 0.0
+    """Wall-clock time of the solve [s]."""
+    inertia_shift: float | None = None
+    """Shift [1/s^2] of :attr:`inertia_count`, placed in a spectral gap above the wanted eigenvalues."""
+
+
+@runtime_checkable
+class EigenSolverBackend(Protocol):
+    """Interface of a generalized symmetric eigensolver used by the finite-element modal generators.
+
+    .. experimental::
+
+    A backend computes the lowest eigenpairs of ``K phi = lambda M phi`` for a
+    symmetric positive semi-definite stiffness ``K`` [N/m] and a symmetric
+    positive-definite mass ``M`` [kg]. Any object with these attributes and
+    method is accepted; subclassing is not required. The generators pass host
+    matrices: SciPy CSC matrices, or dense :class:`numpy.ndarray` for
+    :class:`~newton.DenseBackend`. A device backend (``device`` other than ``"cpu"``)
+    may convert them with :func:`~newton.to_backend_matrix` or accept
+    :class:`warp.sparse.BsrMatrix` input from its own callers. Generators
+    build and validate a SuperLU factorization of ``K - sigma M`` only for
+    ``"cpu"`` backends.
+
+    Contract of :meth:`~newton.EigenSolverBackend.solve`:
+
+    - Return at least ``count`` eigenpairs outside ``deflation`` (fewer only
+      when fewer exist) in ascending order, ``M``-orthonormal and
+      ``M``-orthogonal to ``deflation``. Extra pairs above them are allowed.
+    - When every computed eigenvalue is at most ``zero_threshold``, compute
+      more, so that zero-energy mechanisms cannot hide the elastic spectrum.
+    - Either set :attr:`~newton.EigenSolverBackend.supports_inertia_count` and return
+      :attr:`~newton.EigenResult.inertia_count` with :attr:`~newton.EigenResult.inertia_shift`
+      whenever only part of the spectrum is returned, or set
+      :attr:`~newton.EigenSolverBackend.supports_inertia_count` to ``False``; callers then skip the Sturm
+      sequence check with a warning. A backend that supports the count may
+      return ``None`` after warning itself why the check was skipped.
+    - Raise :class:`ValueError` when the solve fails to converge.
+    """
+
+    name: str
+    """Short backend name, recorded in :attr:`~newton.EigenResult.backend` and generator reports."""
+    supports_inertia_count: bool
+    """Whether :meth:`~newton.EigenSolverBackend.solve` returns a Sturm sequence count for partial spectra."""
+    device: str
+    """Device that runs the solve, ``"cpu"`` for host backends."""
+
+    def solve(
+        self,
+        stiffness: Any,
+        mass: Any,
+        count: int,
+        *,
+        deflation: np.ndarray | None = None,
+        sigma: float | None = None,
+        tol: float = 0.0,
+        factorization: ShiftedFactorization | None = None,
+        zero_threshold: float = 0.0,
+    ) -> EigenResult:
+        """Return the ``count`` lowest generalized eigenpairs outside ``deflation``.
+
+        Args:
+            stiffness: Symmetric stiffness matrix [N/m], shape ``[n, n]``.
+            mass: Symmetric positive-definite mass matrix [kg], shape ``[n, n]``.
+            count: Number of lowest eigenpairs wanted.
+            deflation: ``M``-orthonormal zero-energy eigenvectors to exclude,
+                such as rigid-body motions, shape ``[n, d]``.
+            sigma: Shift [1/s^2] at or below the lowest wanted eigenvalue;
+                ``None`` uses ``modal_sparse.default_shift``.
+            tol: Relative accuracy; ``0`` requests machine precision.
+            factorization: Optional reusable factorization of
+                ``K - sigma M``; backends may ignore it.
+            zero_threshold: Largest eigenvalue treated as zero energy [1/s^2].
+
+        Returns:
+            The computed eigenpairs.
+        """
+        ...
+
+
+def is_bsr_matrix(matrix: Any) -> bool:
+    """Return whether ``matrix`` looks like a :class:`warp.sparse.BsrMatrix` (duck-typed, never imports Warp)."""
+    return all(hasattr(matrix, attribute) for attribute in ("nrow", "ncol", "block_shape", "offsets", "columns"))
+
+
+def to_backend_matrix(matrix: Any, *, device: str = "cpu") -> Any:
+    """Return ``matrix`` in a form that a backend on ``device`` accepts.
+
+    For ``"cpu"``, a :class:`warp.sparse.BsrMatrix` is copied to a SciPy CSC
+    matrix, and dense arrays and SciPy matrices pass unchanged. For any other
+    device the matrix passes unchanged; a device backend converts host input
+    itself.
+
+    Args:
+        matrix: Dense array, SciPy sparse matrix, or Warp BSR matrix.
+        device: Device of the consuming backend.
+    """
+    if device != "cpu" or not is_bsr_matrix(matrix):
+        return matrix
+    sparse = _import_scipy("sparse")
+    offsets = np.asarray(matrix.offsets.numpy(), dtype=np.int64)[: int(matrix.nrow) + 1]
+    nonzeros = int(offsets[-1])
+    columns = np.asarray(matrix.columns.numpy(), dtype=np.int64)[:nonzeros]
+    rows_per_block, cols_per_block = (int(size) for size in matrix.block_shape)
+    values = np.asarray(matrix.values.numpy(), dtype=np.float64)[:nonzeros]
+    values = values.reshape((nonzeros, rows_per_block, cols_per_block))
+    shape = (int(matrix.nrow) * rows_per_block, int(matrix.ncol) * cols_per_block)
+    return to_csc(sparse.bsr_matrix((values, columns, offsets), shape=shape))
+
+
+def cholesky_eigh(stiffness: np.ndarray, mass: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return all generalized eigenpairs of dense ``K``, ``M`` by a Cholesky reduction, without SciPy.
+
+    Args:
+        stiffness: Dense symmetric stiffness matrix [N/m], shape ``[n, n]``.
+        mass: Dense symmetric positive-definite mass matrix [kg], shape ``[n, n]``.
+
+    Returns:
+        Ascending eigenvalues [1/s^2] and ``M``-orthonormal eigenvectors.
+
+    Raises:
+        ValueError: If ``mass`` is not positive definite.
+    """
+    try:
+        chol = np.linalg.cholesky(mass)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("mass_matrix must be symmetric positive definite on free DOFs") from exc
+
+    inv_chol_stiffness = np.linalg.solve(chol, stiffness)
+    standard = np.linalg.solve(chol, inv_chol_stiffness.T).T
+    standard = 0.5 * (standard + standard.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(standard)
+    order = np.argsort(eigenvalues)
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+    return eigenvalues, np.linalg.solve(chol.T, eigenvectors)
+
+
+def _mass_orthonormalize(vectors: np.ndarray, mass: Any, relative_cutoff: float = 1.0e-12) -> np.ndarray:
+    """Return an ``M``-orthonormal basis of the span of ``vectors``, dropping numerically dependent directions."""
+    # Column scaling and a second pass (as in CholeskyQR2) keep the Gram-matrix method accurate when the
+    # block columns differ in magnitude by many decades, as after a shift-invert solve.
+    for _ in range(2):
+        if vectors.shape[1] == 0:
+            return vectors
+        norms = np.sqrt(np.maximum(quadratic_form_diag(vectors, mass), 0.0))
+        vectors = vectors[:, norms > 0.0] / norms[norms > 0.0]
+        gram = vectors.T @ matmul(mass, vectors)
+        values, rotation = np.linalg.eigh(0.5 * (gram + gram.T))
+        keep = values > relative_cutoff * max(float(np.max(values, initial=0.0)), np.finfo(np.float64).tiny)
+        vectors = vectors @ (rotation[:, keep] / np.sqrt(values[keep]))
+    return vectors
+
+
+class DenseBackend:
+    """Dense full-spectrum eigensolver: Cholesky reduction and :func:`numpy.linalg.eigh`.
+
+    .. experimental::
+
+    Densifies sparse input and returns every eigenpair outside ``deflation``,
+    ignoring ``count``, so no Sturm sequence check is needed. Memory grows
+    as ``n^2`` and time as ``n^3``; use it for small models. It needs no
+    SciPy.
+    """
+
+    name: str = "dense"
+    supports_inertia_count: bool = False
+    device: str = "cpu"
+
+    def solve(
+        self,
+        stiffness: Any,
+        mass: Any,
+        count: int,
+        *,
+        deflation: np.ndarray | None = None,
+        sigma: float | None = None,
+        tol: float = 0.0,
+        factorization: ShiftedFactorization | None = None,
+        zero_threshold: float = 0.0,
+    ) -> EigenResult:
+        """Return all eigenpairs outside ``deflation``; see :meth:`~newton.EigenSolverBackend.solve`."""
+        del count, sigma, tol, factorization, zero_threshold
+        start = time.perf_counter()
+        stiffness = to_dense(stiffness)
+        mass = to_dense(mass)
+        if deflation is None or deflation.shape[1] == 0:
+            values, vectors = cholesky_eigh(stiffness, mass)
+        else:
+            # Orthonormal basis of the null space of Y^T M: the M-orthogonal complement of span(Y).
+            constraint = (mass @ deflation).T
+            _, singular, right = np.linalg.svd(constraint, full_matrices=True)
+            rank = int(np.count_nonzero(singular > singular[0] * max(constraint.shape) * np.finfo(np.float64).eps))
+            complement = right[rank:].T
+            values, reduced = cholesky_eigh(complement.T @ stiffness @ complement, complement.T @ mass @ complement)
+            vectors = complement @ reduced
+        return EigenResult(values, vectors, backend=self.name, wall_s=time.perf_counter() - start)
+
+
+class ScipyArpackBackend:
+    """SciPy ARPACK shift-invert Lanczos backend with a Sturm sequence check.
+
+    .. experimental::
+
+    Wraps ``modal_sparse.lowest_generalized_eigenpairs``: computes ``count + margin``
+    eigenpairs on a SuperLU factorization of ``K - sigma M``, deflates the
+    given zero-energy vectors, and verifies with the inertia of a second
+    factorization that no eigenvalue below a shift in the spectral gap after
+    the wanted ones was missed. Needs SciPy.
+
+    Args:
+        margin: Extra eigenpairs computed beyond the wanted ones.
+        maxiter: Maximum ARPACK restart iterations; ``None`` uses SciPy's default.
+        ncv: Number of Lanczos vectors; ``None`` uses SciPy's default.
+        max_restarts: Searches for eigenpairs missed by the first one.
+    """
+
+    name: str = "arpack"
+    supports_inertia_count: bool = True
+    device: str = "cpu"
+
+    def __init__(self, *, margin: int = 2, maxiter: int | None = None, ncv: int | None = None, max_restarts: int = 2):
+        self.margin = int(margin)
+        self.maxiter = None if maxiter is None else int(maxiter)
+        self.ncv = None if ncv is None else int(ncv)
+        self.max_restarts = int(max_restarts)
+
+    def solve(
+        self,
+        stiffness: Any,
+        mass: Any,
+        count: int,
+        *,
+        deflation: np.ndarray | None = None,
+        sigma: float | None = None,
+        tol: float = 0.0,
+        factorization: ShiftedFactorization | None = None,
+        zero_threshold: float = 0.0,
+    ) -> EigenResult:
+        """Return the lowest eigenpairs outside ``deflation``; see :meth:`~newton.EigenSolverBackend.solve`."""
+        start = time.perf_counter()
+        if sigma is None:
+            sigma = factorization.sigma if factorization is not None else default_shift(stiffness, mass)
+        if factorization is not None and factorization.sigma != float(sigma):
+            factorization = None
+        values, vectors, tau, below = _lowest_generalized_eigenpairs(
+            stiffness,
+            mass,
+            count,
+            sigma=float(sigma),
+            zero_threshold=float(zero_threshold),
+            margin=self.margin,
+            deflation=deflation,
+            tol=float(tol),
+            maxiter=self.maxiter,
+            ncv=self.ncv,
+            factorization=factorization,
+            max_restarts=self.max_restarts,
+        )
+        return EigenResult(
+            values,
+            vectors,
+            inertia_count=below,
+            backend=self.name,
+            wall_s=time.perf_counter() - start,
+            inertia_shift=tau,
+        )
+
+
+class SubspaceIterationBackend:
+    """Shift-invert block subspace iteration with Rayleigh-Ritz, warm-started from previous eigenvectors.
+
+    .. experimental::
+
+    Each iteration applies ``(I - Y Y^T M) (K - sigma M)^-1 M`` to a block of
+    ``count + margin`` vectors, with ``Y`` the deflated vectors, and
+    ``M``-orthonormalizes it; a Rayleigh-Ritz projection then gives the Ritz
+    pairs. The block starts from ``previous_vectors`` (for example the modes
+    of a nearby configuration, which makes one or two iterations enough)
+    padded with deterministic random vectors; after each solve
+    ``previous_vectors`` is replaced by the returned eigenvectors, so a
+    backend reused on a slowly changing model warm-starts itself. Previous
+    vectors of a different length are ignored. The factorization passed to
+    :meth:`~newton.EigenSolverBackend.solve` is reused when its shift matches. Needs SciPy.
+
+    At least ``iterations`` iterations run. With ``require_convergence``,
+    iterations continue until every wanted pair has the relative residual
+    ``||K phi - lambda M phi|| / (||K - sigma M||_1 ||phi||)`` that
+    ``modal_sparse.generalized_eigsh`` accepts, and :class:`ValueError` is raised after
+    ``max_iterations``; otherwise exactly ``iterations`` iterations run and
+    :attr:`~newton.SubspaceIterationBackend.last_residuals` records the accuracy reached.
+
+    Args:
+        iterations: Minimum number of block iterations.
+        margin: Extra block vectors beyond the wanted eigenpairs; a larger
+            margin speeds up convergence of the highest wanted pair.
+        previous_vectors: Warm-start vectors, shape ``[n, p]``.
+        max_iterations: Iteration limit with ``require_convergence``.
+        require_convergence: Whether to iterate to convergence and raise
+            when it is not reached.
+        sturm_check: Whether to return a Sturm sequence count (one extra
+            factorization) at a shift in the gap after the wanted eigenvalues.
+        seed: Seed of the random padding vectors.
+    """
+
+    name: str = "subspace"
+    device: str = "cpu"
+
+    def __init__(
+        self,
+        *,
+        iterations: int = 1,
+        margin: int = 2,
+        previous_vectors: np.ndarray | None = None,
+        max_iterations: int = 500,
+        require_convergence: bool = True,
+        sturm_check: bool = False,
+        seed: int = 0,
+    ):
+        self.iterations = int(iterations)
+        if self.iterations < 1:
+            raise ValueError(f"iterations must be at least 1, got {self.iterations}")
+        self.margin = int(margin)
+        if self.margin < 0:
+            raise ValueError(f"margin must be non-negative, got {self.margin}")
+        self.previous_vectors = None if previous_vectors is None else np.asarray(previous_vectors, dtype=np.float64)
+        self.max_iterations = max(int(max_iterations), self.iterations)
+        self.require_convergence = bool(require_convergence)
+        self.sturm_check = bool(sturm_check)
+        self.seed = int(seed)
+        self.last_iterations = 0
+        """Number of block iterations of the last solve."""
+        self.last_residuals = np.zeros(0, dtype=np.float64)
+        """Relative residuals of the eigenpairs of the last solve [dimensionless]."""
+
+    @property
+    def supports_inertia_count(self) -> bool:
+        """Whether :meth:`~newton.EigenSolverBackend.solve` returns a Sturm sequence count, as set by ``sturm_check``."""
+        return self.sturm_check
+
+    def solve(
+        self,
+        stiffness: Any,
+        mass: Any,
+        count: int,
+        *,
+        deflation: np.ndarray | None = None,
+        sigma: float | None = None,
+        tol: float = 0.0,
+        factorization: ShiftedFactorization | None = None,
+        zero_threshold: float = 0.0,
+    ) -> EigenResult:
+        """Return the lowest eigenpairs outside ``deflation``; see :meth:`~newton.EigenSolverBackend.solve`."""
+        start = time.perf_counter()
+        size = int(stiffness.shape[0])
+        deflated = 0 if deflation is None else int(deflation.shape[1])
+        available = size - deflated
+        count = min(int(count), available)
+        if count <= 0:
+            return EigenResult(np.zeros(0), np.zeros((size, 0)), backend=self.name, wall_s=time.perf_counter() - start)
+        if sigma is None:
+            sigma = factorization.sigma if factorization is not None else default_shift(stiffness, mass)
+        if factorization is None or factorization.sigma != float(sigma):
+            factorization = ShiftedFactorization(stiffness, mass, float(sigma))
+        project = _deflation_projector(mass, deflation)
+
+        block = min(count + self.margin, available)
+        previous = self.previous_vectors
+        if previous is None or previous.ndim != 2 or previous.shape[0] != size:
+            previous = np.zeros((size, 0), dtype=np.float64)
+        rng = np.random.default_rng(_ARPACK_START_SEED + self.seed)
+        pad = max(block - previous.shape[1], 0)
+        vectors = np.hstack((previous, rng.uniform(-1.0, 1.0, (size, pad))))
+        if project is not None:
+            vectors = project(vectors)
+        vectors = _mass_orthonormalize(vectors, mass)
+
+        accuracy = max(float(tol), _RESIDUAL_EPS_MULTIPLE * np.finfo(np.float64).eps)
+        iteration = 0
+        while True:
+            vectors = factorization.solve(matmul(mass, vectors))
+            if project is not None:
+                vectors = project(vectors)
+            vectors = _mass_orthonormalize(vectors, mass)
+            iteration += 1
+            if iteration < self.iterations:
+                continue
+            reduced_stiffness = vectors.T @ matmul(stiffness, vectors)
+            reduced_mass = vectors.T @ matmul(mass, vectors)
+            ritz_values, ritz_vectors = cholesky_eigh(
+                0.5 * (reduced_stiffness + reduced_stiffness.T), 0.5 * (reduced_mass + reduced_mass.T)
+            )
+            ritz = vectors @ ritz_vectors
+            wanted = min(count, ritz.shape[1])
+            errors = eigenpair_backward_errors(
+                stiffness, mass, ritz_values[:wanted], ritz[:, :wanted], factorization.norm
+            )
+            distance = np.abs(ritz_values[:wanted] - factorization.sigma)
+            spread = np.maximum(distance / max(float(np.min(distance)), np.finfo(np.float64).tiny), 1.0)
+            converged = bool(np.all(errors <= _RESIDUAL_TOLERANCE_FACTOR * accuracy * spread))
+            if converged or not self.require_convergence or iteration >= self.max_iterations:
+                break
+            vectors = ritz
+        self.last_iterations = iteration
+        self.last_residuals = errors
+        if self.require_convergence and not converged:
+            raise ValueError(
+                f"Subspace iteration did not converge in {iteration} iterations: the largest relative residual "
+                f"of the {wanted} wanted eigenpairs is {float(np.max(errors)):.3g}. Increase max_iterations or "
+                "margin, or pass previous_vectors closer to the wanted modes"
+            )
+        if wanted < count:
+            raise ValueError(
+                f"Subspace iteration kept only {wanted} independent vectors for {count} wanted eigenpairs; the "
+                "block lost rank. Increase margin"
+            )
+
+        inertia_count = None
+        inertia_shift = None
+        if self.sturm_check and ritz_values.shape[0] > count and count < available:
+            lower, upper = float(ritz_values[count - 1]), float(ritz_values[count])
+            if (upper - lower) >= _STURM_MIN_RELATIVE_GAP * max(abs(upper), np.finfo(np.float64).tiny):
+                inertia_shift = 0.5 * (lower + upper)
+                below = count_eigenvalues_below(stiffness, mass, inertia_shift)
+                inertia_count = None if below < 0 else below
+            if inertia_count is None:
+                warnings.warn(
+                    "The Sturm sequence check of the subspace iteration was skipped: no relative gap of at least "
+                    f"{_STURM_MIN_RELATIVE_GAP:g} follows eigenvalue {count}, or the factorization pivoted off "
+                    "the diagonal",
+                    stacklevel=2,
+                )
+                inertia_shift = None
+        values = np.asarray(ritz_values[:count], dtype=np.float64)
+        result_vectors = np.ascontiguousarray(ritz[:, :count])
+        self.previous_vectors = result_vectors
+        return EigenResult(
+            values,
+            result_vectors,
+            inertia_count=inertia_count,
+            backend=self.name,
+            wall_s=time.perf_counter() - start,
+            inertia_shift=inertia_shift,
+        )
+
+
+class WarpackBackend:
+    """Placeholder for a GPU eigensolver backend (Warpack with cuDSS, or FSAI-CG with LOBPCG).
+
+    .. experimental::
+
+    This build contains no GPU eigensolver: :meth:`~newton.EigenSolverBackend.solve` raises
+    :class:`NotImplementedError`. The class documents the contract that such
+    a backend fulfills, so it can be subclassed, or replaced by any object
+    that satisfies :class:`~newton.EigenSolverBackend`, and passed as the
+    ``eigensolver`` of a finite-element modal generator:
+
+    - Inputs are host SciPy CSC matrices from the generators;
+      :func:`~newton.to_backend_matrix` leaves them unchanged for a device other
+      than ``"cpu"``, and direct callers may pass
+      :class:`warp.sparse.BsrMatrix`. ``deflation`` holds the rigid-body
+      vectors of a free-free model (``M``-orthonormal, host
+      :class:`numpy.ndarray`), which must be projected out. ``sigma`` is a
+      shift at or below the lowest wanted eigenvalue; the host
+      ``factorization`` is ``None`` for a non-``"cpu"`` device.
+    - The output is an :class:`~newton.EigenResult` in float64 host arrays with
+      ascending eigenvalues and ``M``-orthonormal eigenvectors.
+    - Either return :attr:`~newton.EigenResult.inertia_count` (for example from the
+      inertia of a cuDSS ``L D L^T`` factorization of ``K - tau M``) or
+      leave :attr:`~newton.EigenSolverBackend.supports_inertia_count` ``False``; callers then skip the
+      Sturm sequence check with a warning, so missed repeated eigenvalues
+      are not detected.
+
+    Args:
+        device: Warp device that would run the solve.
+    """
+
+    name: str = "warpack"
+    supports_inertia_count: bool = False
+
+    def __init__(self, *, device: str = "cuda:0"):
+        self.device = str(device)
+
+    def solve(
+        self,
+        stiffness: Any,
+        mass: Any,
+        count: int,
+        *,
+        deflation: np.ndarray | None = None,
+        sigma: float | None = None,
+        tol: float = 0.0,
+        factorization: ShiftedFactorization | None = None,
+        zero_threshold: float = 0.0,
+    ) -> EigenResult:
+        """Raise :class:`NotImplementedError`; a subclass implements the GPU solve."""
+        raise NotImplementedError("Warpack backend is not available in this build")
+
+
+_EIGENSOLVER_CHOICES = "'auto', 'dense', 'arpack', or 'subspace', a ModalEigensolver, or an EigenSolverBackend"
+
+
+def eigensolver_kind(spec: str | ModalEigensolver | EigenSolverBackend) -> ModalEigensolver | EigenSolverBackend:
+    """Return the :class:`ModalEigensolver` named by ``spec``, or ``spec`` itself if it is a backend.
+
+    Raises:
+        ValueError: If ``spec`` is a string that names no eigensolver.
+        TypeError: If ``spec`` is neither a name, a :class:`ModalEigensolver`,
+            nor an :class:`~newton.EigenSolverBackend`.
+    """
+    if isinstance(spec, ModalEigensolver):
+        return spec
+    if isinstance(spec, str):
+        try:
+            return ModalEigensolver(spec)
+        except ValueError:
+            raise ValueError(f"eigensolver must be {_EIGENSOLVER_CHOICES}, got '{spec}'") from None
+    if isinstance(spec, EigenSolverBackend):
+        return spec
+    raise TypeError(f"eigensolver must be {_EIGENSOLVER_CHOICES}, got {type(spec).__name__}")
+
+
+def resolve_eigensolver(
+    spec: str | ModalEigensolver | EigenSolverBackend,
+    *,
+    margin: int = 2,
+    maxiter: int | None = None,
+    ncv: int | None = None,
+) -> EigenSolverBackend:
+    """Return the eigensolver backend selected by ``spec``.
+
+    .. experimental::
+
+    A backend instance is returned unchanged. ``"subspace"`` resolves to a
+    cold-started :class:`~newton.SubspaceIterationBackend` that iterates to
+    convergence and returns a Sturm sequence count. ``"auto"`` resolves to
+    :class:`~newton.ScipyArpackBackend` when SciPy is installed and to
+    :class:`~newton.DenseBackend` otherwise; the generators make a finer choice from
+    the input format and size before they resolve.
+
+    Args:
+        spec: Eigensolver name, :class:`ModalEigensolver`, or backend.
+        margin: Extra eigenpairs of the ARPACK and subspace backends.
+        maxiter: Maximum ARPACK restart iterations.
+        ncv: Number of ARPACK Lanczos vectors.
+
+    Returns:
+        A backend that satisfies :class:`~newton.EigenSolverBackend`.
+
+    Raises:
+        ValueError: If ``spec`` is a string that names no eigensolver.
+        TypeError: If ``spec`` has an unsupported type.
+    """
+    kind = eigensolver_kind(spec)
+    if not isinstance(kind, ModalEigensolver):
+        return kind
+    if kind is ModalEigensolver.AUTO:
+        kind = ModalEigensolver.ARPACK if has_scipy() else ModalEigensolver.DENSE
+    if kind is ModalEigensolver.DENSE:
+        return DenseBackend()
+    if kind is ModalEigensolver.ARPACK:
+        return ScipyArpackBackend(margin=margin, maxiter=maxiter, ncv=ncv)
+    # A one-shot build cannot rely on a warm start, so the named choice verifies its result.
+    return SubspaceIterationBackend(margin=margin, sturm_check=True)
+
+
+def validate_eigen_result(
+    result: EigenResult, *, size: int, count: int, deflated: int, supports_inertia_count: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Check an :class:`~newton.EigenResult` against the backend contract and return its sorted eigenpairs.
+
+    Verifies shapes and finiteness, that at least ``min(count, size - deflated)``
+    eigenpairs were returned, and the Sturm sequence count when the result
+    carries one. A partial spectrum without a count from a backend that does
+    not support counting warns that the check was skipped.
+
+    Args:
+        result: Backend output.
+        size: Matrix dimension ``n``.
+        count: Number of eigenpairs requested.
+        deflated: Number of deflated directions.
+        supports_inertia_count: The backend's :attr:`~newton.EigenSolverBackend.supports_inertia_count`.
+
+    Returns:
+        Ascending eigenvalues [1/s^2] and the matching eigenvectors.
+
+    Raises:
+        ValueError: If the result violates the contract or the Sturm count
+            disagrees with the returned eigenvalues.
+    """
+    values = np.asarray(result.values, dtype=np.float64).reshape(-1)
+    vectors = np.asarray(result.vectors, dtype=np.float64)
+    name = result.backend or "eigensolver"
+    if vectors.ndim != 2 or vectors.shape != (size, values.shape[0]):
+        raise ValueError(
+            f"The {name} backend returned eigenvectors of shape {vectors.shape} for {values.shape[0]} eigenvalues "
+            f"of a size-{size} problem"
+        )
+    if not (np.all(np.isfinite(values)) and np.all(np.isfinite(vectors))):
+        raise ValueError(f"The {name} backend returned non-finite eigenpairs")
+    available = size - int(deflated)
+    wanted = min(int(count), available)
+    if values.shape[0] < wanted:
+        raise ValueError(f"The {name} backend returned {values.shape[0]} eigenpairs, fewer than the {wanted} requested")
+    order = np.argsort(values, kind="stable")
+    values = values[order]
+    vectors = vectors[:, order]
+    if values.shape[0] >= available:
+        return values, vectors
+    if result.inertia_count is not None:
+        if result.inertia_shift is None:
+            raise ValueError(f"The {name} backend returned an inertia_count without its inertia_shift")
+        expected = int(result.inertia_count) - int(deflated)
+        found = int(np.count_nonzero(values < result.inertia_shift))
+        if found != expected:
+            raise ValueError(
+                f"The {name} backend returned {found} eigenvalues below {result.inertia_shift:.6g} 1/s^2, but the "
+                f"Sturm sequence count gives {expected}; eigenpairs were missed or are spurious"
+            )
+    elif not supports_inertia_count:
+        warnings.warn(
+            f"The Sturm sequence check was skipped: the {name} eigensolver backend does not report an inertia "
+            "count, so missed copies of repeated eigenvalues cannot be ruled out",
+            stacklevel=3,
         )
     return values, vectors

@@ -26,6 +26,17 @@ from .modal import (
 )
 from .modal_constraints import ConstraintElimination
 from .modal_craig_bampton_fem import ModalGeneratorCraigBamptonFEM
+from .modal_sparse import (
+    DenseBackend,
+    EigenResult,
+    EigenSolverBackend,
+    ModalEigensolver,
+    ScipyArpackBackend,
+    SubspaceIterationBackend,
+    WarpackBackend,
+    resolve_eigensolver,
+    to_backend_matrix,
+)
 from .model import Model
 from .rod import Rod
 from .state import State
@@ -37,9 +48,13 @@ __all__ = [
     "ConstraintElimination",
     "Contacts",
     "Control",
+    "DenseBackend",
+    "EigenResult",
+    "EigenSolverBackend",
     "JointTargetMode",
     "JointType",
     "ModalBasis",
+    "ModalEigensolver",
     "ModalGeneratorBeam",
     "ModalGeneratorCraigBampton",
     "ModalGeneratorCraigBamptonFEM",
@@ -50,10 +65,13 @@ __all__ = [
     "ModelBuilder",
     "ModelFlags",
     "Rod",
+    "ScipyArpackBackend",
     "State",
     "StateFlags",
+    "SubspaceIterationBackend",
     "TendonLinkFlags",
     "TendonLinkType",
+    "WarpackBackend",
     "eval_fk",
     "eval_ik",
     "eval_inverse_dynamics_force",
@@ -62,4 +80,6 @@ __all__ = [
     "eval_mass_matrix",
     "eval_mimic",
     "eval_rigid_contact_kinematics",
+    "resolve_eigensolver",
+    "to_backend_matrix",
 ]
