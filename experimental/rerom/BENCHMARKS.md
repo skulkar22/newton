@@ -4,6 +4,9 @@
    factorization, in-place solver refresh, device trigger and pre-stress).
 2. [Tangent assembly](#2-tangent-assembly-warptetassembler) (WP-D.1: `WarpTetAssembler`).
 
+For an end-to-end accuracy and cost comparison on a small mesh (fixed basis vs re-ROM vs an implicit FE
+reference), run `examples/beam_swing.py` (see `README.md`).
+
 Environment: Intel Core Ultra 9 285K (24 cores), NVIDIA RTX PRO 6000 Blackwell Workstation Edition
 (driver 595.99.02), Python 3.12.14, numpy 2.5.3, SciPy 1.18.1, Warp 1.18.0. Sub-millisecond GPU numbers
 and differences below ~10 % between runs are within run-to-run noise (single machine, no pinning).
