@@ -1270,6 +1270,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             collision_frequency=collision_frequency,
             collision_frequency_type=collision_frequency_type,
         )
+        # Joint frames that define each joint's rest relative rotation (see set_joint_rest_frames()).
+        # By default they are the model's joint frames themselves.
+        self.joint_X_p_rest = model.joint_X_p
+        self.joint_X_c_rest = model.joint_X_c
         # The solver's warm-start setting is authoritative for an owned pipeline:
         # lambda/penalty restores ride the pipeline's matched contact indices, so
         # history without matching silently cold-starts every refresh (k times per
@@ -2651,6 +2655,62 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.BODY_PROPERTIES):
             self._refresh_rod_rest_bend_twist_cache()
 
+    def set_joint_rest_frames(
+        self,
+        *,
+        joint_X_p_rest: wp.array[wp.transform] | None = None,
+        joint_X_c_rest: wp.array[wp.transform] | None = None,
+    ) -> None:
+        """Set the joint frames that define each joint's rest relative rotation.
+
+        .. experimental::
+            This method may change without a deprecation period.
+
+        SolverVBD measures the angular error of a joint against the rest relative rotation
+        ``rot(model.body_q[parent] * X_p)^-1 * rot(model.body_q[child] * X_c)``. By default it is
+        evaluated with the model's joint frames, so editing :attr:`~newton.Model.joint_X_p` or
+        :attr:`~newton.Model.joint_X_c` moves both the current attachment frame and the joint
+        target. Code that moves a reduced elastic endpoint frame to a deformed reference, for
+        example an elastic basis update that rewrites the joint frames and resets the modal
+        coordinates, can pass the original frames here to keep the original rest relative
+        rotations: the current attachment frames then follow the rewritten model frames while the
+        joint targets stay unchanged. This applies to the local and the
+        ``"block_sparse_joints"`` articulation solves.
+
+        The arrays are copied. Passing ``None`` for a side makes that side follow the model's
+        joint frames again. Only the rotations are used; joint positions are not measured against
+        a rest configuration. Code that edits the model's joint frames for another reason after
+        pinning must update the pinned frames as well.
+
+        Args:
+            joint_X_p_rest: Parent rest frames in the parent body frame (translation [m],
+                rotation as a unit quaternion), shape ``(joint_count,)``, or ``None`` to follow
+                :attr:`~newton.Model.joint_X_p`.
+            joint_X_c_rest: Child rest frames in the child body frame (translation [m], rotation
+                as a unit quaternion), shape ``(joint_count,)``, or ``None`` to follow
+                :attr:`~newton.Model.joint_X_c`.
+
+        Raises:
+            ValueError: If an array does not have one transform per joint.
+        """
+        model = self.model
+        frames = []
+        for name, array, default in (
+            ("joint_X_p_rest", joint_X_p_rest, model.joint_X_p),
+            ("joint_X_c_rest", joint_X_c_rest, model.joint_X_c),
+        ):
+            if array is None:
+                frames.append(default)
+                continue
+            if array.shape != (model.joint_count,):
+                raise ValueError(f"{name} must have shape ({model.joint_count},), got {array.shape}.")
+            copy = wp.empty(model.joint_count, dtype=wp.transform, device=self.device)
+            wp.copy(copy, array)
+            frames.append(copy)
+        self.joint_X_p_rest, self.joint_X_c_rest = frames
+        if model.joint_count > 0 and self._integrates_rigid_bodies:
+            self._refresh_rod_rest_bend_twist_cache()
+
     @override
     def coupling_supports_inertial_property_refresh(self) -> bool:
         return True
@@ -3088,6 +3148,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.model.joint_child,
                 self.model.joint_X_p,
                 self.model.joint_X_c,
+                self.joint_X_p_rest,
+                self.joint_X_c_rest,
                 self.model.body_q,
             ],
             outputs=[
@@ -5302,6 +5364,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.joint_child,
                         model.joint_X_p,
                         model.joint_X_c,
+                        self.joint_X_p_rest,
+                        self.joint_X_c_rest,
                         model.joint_axis,
                         model.joint_qd_start,
                         model.joint_dof_dim,
@@ -6239,6 +6303,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.joint_child,
                     model.joint_X_p,
                     model.joint_X_c,
+                    self.joint_X_p_rest,
+                    self.joint_X_c_rest,
                     model.body_elastic_index,
                     model.elastic_joint,
                     model.elastic_mode_count,
@@ -6459,6 +6525,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.joint_child,
                     model.joint_X_p,
                     model.joint_X_c,
+                    self.joint_X_p_rest,
+                    self.joint_X_c_rest,
                     model.body_elastic_index,
                     model.elastic_joint,
                     model.elastic_mode_count,
@@ -6756,6 +6824,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             model.joint_child,
             model.joint_X_p,
             model.joint_X_c,
+            self.joint_X_p_rest,
+            self.joint_X_c_rest,
             model.joint_axis,
             self.joint_rod_rest_kb_local,
             self.joint_rod_rest_twist,
@@ -7012,6 +7082,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.joint_child,
                     model.joint_X_p,
                     model.joint_X_c,
+                    self.joint_X_p_rest,
+                    self.joint_X_c_rest,
                     model.joint_axis,
                     self.joint_rod_rest_kb_local,
                     self.joint_rod_rest_twist,
@@ -7521,6 +7593,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             data.coordinates.elastic_q_prev = state.joint_q
         data.joint_friction = self._joint_friction
         data.body_q_rest = model.body_q
+        data.joint_X_p_rest = self.joint_X_p_rest
+        data.joint_X_c_rest = self.joint_X_c_rest
         if self.rigid_articulation_sparse_layout is not None:
             data.body_articulation_local = self.rigid_articulation_sparse_layout.body_articulation_local
         data.alpha = self.rigid_joint_alpha

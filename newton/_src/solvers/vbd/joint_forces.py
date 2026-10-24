@@ -28,6 +28,8 @@ wp.set_module_options({"enable_backward": False})
 class JointForceData:
     coordinates: JointCoordinateData
     body_q_rest: wp.array[wp.transform]
+    joint_X_p_rest: wp.array[wp.transform]
+    joint_X_c_rest: wp.array[wp.transform]
     body_articulation_local: wp.array[int]
     joint_enabled: wp.array[bool]
     joint_target_q_start: wp.array[int]
@@ -254,6 +256,8 @@ def evaluate_joint_forces(
         c.child,
         c.X_p,
         c.X_c,
+        data.joint_X_p_rest,
+        data.joint_X_c_rest,
         data.body_elastic_index,
         data.elastic_joint,
         data.elastic_mode_count,

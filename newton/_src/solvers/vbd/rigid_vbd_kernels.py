@@ -3923,6 +3923,8 @@ def evaluate_joint_force_hessian(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     body_elastic_index: wp.array[wp.int32],
     elastic_joint: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
@@ -4184,10 +4186,10 @@ def evaluate_joint_force_hessian(
         return _zero_force_hessian()
 
     if parent_index >= 0:
-        X_wp_rest = body_q_rest[parent_index] * joint_X_p[joint_index]
+        X_wp_rest = body_q_rest[parent_index] * joint_X_p_rest[joint_index]
     else:
-        X_wp_rest = joint_X_p[joint_index]
-    X_wc_rest = body_q_rest[child_index] * joint_X_c[joint_index]
+        X_wp_rest = joint_X_p_rest[joint_index]
+    X_wc_rest = body_q_rest[child_index] * joint_X_c_rest[joint_index]
     q_wp_rest = wp.transform_get_rotation(X_wp_rest)
     q_wc_rest = wp.transform_get_rotation(X_wc_rest)
 
@@ -5263,6 +5265,8 @@ def init_rod_rest_bend_twist(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     body_q_rest: wp.array[wp.transform],
     joint_rod_rest_kb_local: wp.array[wp.vec3],
     joint_rod_rest_twist: wp.array[float],
@@ -5281,10 +5285,10 @@ def init_rod_rest_bend_twist(
 
     parent = joint_parent[j]
     if parent >= 0:
-        X_wp_rest = body_q_rest[parent] * joint_X_p[j]
+        X_wp_rest = body_q_rest[parent] * joint_X_p_rest[j]
     else:
-        X_wp_rest = joint_X_p[j]
-    X_wc_rest = body_q_rest[child] * joint_X_c[j]
+        X_wp_rest = joint_X_p_rest[j]
+    X_wc_rest = body_q_rest[child] * joint_X_c_rest[j]
 
     q_wp_rest = wp.transform_get_rotation(X_wp_rest)
     q_wc_rest = wp.transform_get_rotation(X_wc_rest)
@@ -5515,6 +5519,8 @@ def step_joint_C0_lambda_rho(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
@@ -5651,9 +5657,9 @@ def step_joint_C0_lambda_rho(
                 linear_factor = wp.sqrt((k_lin + joint_penalty_kd[c_start] * inv_dt) / inv_dt_sq) * P_lin
             if c_dim > 1 and joint_rho[c_start + 1] > 0.0:
                 q_wp_rest = wp.transform_get_rotation(
-                    (body_q_rest[parent] * joint_X_p[j]) if parent >= 0 else joint_X_p[j]
+                    (body_q_rest[parent] * joint_X_p_rest[j]) if parent >= 0 else joint_X_p_rest[j]
                 )
-                q_wc_rest = wp.transform_get_rotation(body_q_rest[child] * joint_X_c[j])
+                q_wc_rest = wp.transform_get_rotation(body_q_rest[child] * joint_X_c_rest[j])
                 _kappa, angular_jacobian = compute_kappa_and_jacobian(q_wp, q_wc, q_wp_rest, q_wc_rest)
                 _s_a, k_ang, _a_a = _compliant_alm_coefficients(joint_material_k[c_start + 1], joint_rho[c_start + 1])
                 angular_factor = wp.sqrt((k_ang + joint_penalty_kd[c_start + 1] * inv_dt) / inv_dt_sq) * (
@@ -5819,9 +5825,9 @@ def step_joint_C0_lambda_rho(
 
             if has_angular_material_row:
                 q_wp_rest = wp.transform_get_rotation(
-                    (body_q_rest[parent] * joint_X_p[j]) if parent >= 0 else joint_X_p[j]
+                    (body_q_rest[parent] * joint_X_p_rest[j]) if parent >= 0 else joint_X_p_rest[j]
                 )
-                q_wc_rest = wp.transform_get_rotation(body_q_rest[child] * joint_X_c[j])
+                q_wc_rest = wp.transform_get_rotation(body_q_rest[child] * joint_X_c_rest[j])
                 _kappa, angular_jacobian_world = compute_kappa_and_jacobian(q_wp, q_wc, q_wp_rest, q_wc_rest)
                 for axis in range(angular_count):
                     dof = qd_start + linear_count + axis
@@ -6036,10 +6042,10 @@ def step_joint_C0_lambda_rho(
         q_wp = wp.transform_get_rotation(X_wp)
         q_wc = wp.transform_get_rotation(X_wc)
         if parent >= 0:
-            X_wp_rest = body_q_rest[parent] * joint_X_p[j]
+            X_wp_rest = body_q_rest[parent] * joint_X_p_rest[j]
         else:
-            X_wp_rest = joint_X_p[j]
-        X_wc_rest = body_q_rest[child] * joint_X_c[j]
+            X_wp_rest = joint_X_p_rest[j]
+        X_wc_rest = body_q_rest[child] * joint_X_c_rest[j]
         q_wp_rest = wp.transform_get_rotation(X_wp_rest)
         q_wc_rest = wp.transform_get_rotation(X_wc_rest)
         joint_C0_ang[j] = compute_kappa(q_wp, q_wc, q_wp_rest, q_wc_rest)
@@ -7835,6 +7841,8 @@ def solve_rigid_body(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     body_elastic_index: wp.array[wp.int32],
     elastic_joint: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
@@ -8103,6 +8111,8 @@ def solve_rigid_body(
             joint_child,
             joint_X_p,
             joint_X_c,
+            joint_X_p_rest,
+            joint_X_c_rest,
             body_elastic_index,
             elastic_joint,
             elastic_mode_count,
@@ -8224,6 +8234,8 @@ def update_duals_joint(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     body_elastic_index: wp.array[wp.int32],
     elastic_joint: wp.array[wp.int32],
     elastic_mode_count: wp.array[wp.int32],
@@ -8513,10 +8525,10 @@ def update_duals_joint(
         return
 
     if parent >= 0:
-        X_wp_rest = body_q_rest[parent] * joint_X_p[j]
+        X_wp_rest = body_q_rest[parent] * joint_X_p_rest[j]
     else:
-        X_wp_rest = joint_X_p[j]
-    X_wc_rest = body_q_rest[child] * joint_X_c[j]
+        X_wp_rest = joint_X_p_rest[j]
+    X_wc_rest = body_q_rest[child] * joint_X_c_rest[j]
 
     # FIXED joint: update isotropic linear + isotropic angular penalties (2 scalars).
     if jt == JointType.FIXED:

@@ -1354,6 +1354,8 @@ def _assemble_articulation_joint_scalar(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_rod_rest_kb_local: wp.array[wp.vec3],
     joint_rod_rest_twist: wp.array[float],
@@ -1556,7 +1558,7 @@ def _assemble_articulation_joint_scalar(
     child_anchor_q = wp.mul(wp.transform_get_rotation(child_pose), wp.transform_get_rotation(X_c))
     child_anchor_q_prev = wp.mul(wp.transform_get_rotation(child_prev_pose), wp.transform_get_rotation(X_c_prev))
     # Rest frames are undeformed, matching the local VBD joint evaluation.
-    child_rest_q = wp.mul(wp.transform_get_rotation(child_rest_pose), wp.transform_get_rotation(joint_X_c[joint]))
+    child_rest_q = wp.mul(wp.transform_get_rotation(child_rest_pose), wp.transform_get_rotation(joint_X_c_rest[joint]))
 
     if parent >= 0:
         parent_pose = body_q[parent]
@@ -1566,13 +1568,15 @@ def _assemble_articulation_joint_scalar(
         parent_anchor_prev = wp.transform_point(parent_prev_pose, wp.transform_get_translation(X_p_prev))
         parent_anchor_q = wp.mul(wp.transform_get_rotation(parent_pose), wp.transform_get_rotation(X_p))
         parent_anchor_q_prev = wp.mul(wp.transform_get_rotation(parent_prev_pose), wp.transform_get_rotation(X_p_prev))
-        parent_rest_q = wp.mul(wp.transform_get_rotation(parent_rest_pose), wp.transform_get_rotation(joint_X_p[joint]))
+        parent_rest_q = wp.mul(
+            wp.transform_get_rotation(parent_rest_pose), wp.transform_get_rotation(joint_X_p_rest[joint])
+        )
     else:
         parent_anchor = wp.transform_get_translation(X_p)
         parent_anchor_prev = parent_anchor
         parent_anchor_q = wp.transform_get_rotation(X_p)
         parent_anchor_q_prev = parent_anchor_q
-        parent_rest_q = parent_anchor_q
+        parent_rest_q = wp.transform_get_rotation(joint_X_p_rest[joint])
 
     c_start = joint_constraint_start[joint]
     qd_start = joint_qd_start[joint]
@@ -1968,6 +1972,8 @@ def assemble_articulation_joints_scalar(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_rod_rest_kb_local: wp.array[wp.vec3],
     joint_rod_rest_twist: wp.array[float],
@@ -2027,6 +2033,8 @@ def assemble_articulation_joints_scalar(
         joint_child,
         joint_X_p,
         joint_X_c,
+        joint_X_p_rest,
+        joint_X_c_rest,
         joint_axis,
         joint_rod_rest_kb_local,
         joint_rod_rest_twist,
@@ -2295,6 +2303,8 @@ def solve_articulation_sparse_serial_scalar(
     joint_child: wp.array[int],
     joint_X_p: wp.array[wp.transform],
     joint_X_c: wp.array[wp.transform],
+    joint_X_p_rest: wp.array[wp.transform],
+    joint_X_c_rest: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
     joint_rod_rest_kb_local: wp.array[wp.vec3],
     joint_rod_rest_twist: wp.array[float],
@@ -2408,6 +2418,8 @@ def solve_articulation_sparse_serial_scalar(
                 joint_child,
                 joint_X_p,
                 joint_X_c,
+                joint_X_p_rest,
+                joint_X_c_rest,
                 joint_axis,
                 joint_rod_rest_kb_local,
                 joint_rod_rest_twist,
