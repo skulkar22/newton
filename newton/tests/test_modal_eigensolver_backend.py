@@ -279,7 +279,8 @@ def test_subspace_iteration_matches_arpack(test, device):
                 test, m, warm_result.values, warm_result.vectors, reference_values, reference_vectors
             )
             test.assertLess(warm.last_iterations, cold.last_iterations)
-            test.assertIs(warm.previous_vectors, warm_result.vectors)
+            # Without warm_start the explicit start vectors are kept, not replaced by the result.
+            np.testing.assert_array_equal(warm.previous_vectors, previous)
 
     # Exactly one iteration without a convergence requirement returns a result and its residuals.
     fixed = newton.ModalSubspaceIterationBackend(iterations=1, require_convergence=False)
@@ -303,6 +304,67 @@ def test_subspace_backend_drives_fem_generator(test, device):
         subspace.build()
     test.assertIsInstance(subspace.eigensolver, newton.ModalSubspaceIterationBackend)
     np.testing.assert_allclose(subspace.eigenvalues, arpack.eigenvalues, rtol=1.0e-8)
+
+
+def test_subspace_named_path_does_not_warm_start(test, device):
+    """Solve every build of a ``"subspace"`` generator cold, even after its model changes.
+
+    A generator rebuilt on a uniformly stiffer model of the same size has the
+    same eigenvectors, so a warm start would converge in one or two
+    iterations; a cold start takes about as many iterations as a fresh
+    generator on that model.
+    """
+    points, mass, stiffness = _sparse_spring_lattice((5, 3, 3), 0.01, 2.0e9, 8.0e-3)
+    stiffer = 3.0 * stiffness
+    generator = newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=9, eigensolver="subspace")
+    generator.build()
+    test.assertFalse(generator.eigensolver.warm_start)
+    test.assertIsNone(generator.eigensolver.previous_vectors)
+
+    generator.stiffness_matrix = stiffer
+    generator.build()
+    test.assertIsNone(generator.eigensolver.previous_vectors)
+    fresh = newton.ModalGeneratorFEM(points, mass, stiffer, mode_count=9, eigensolver="subspace")
+    fresh.build()
+    test.assertGreater(fresh.eigensolver.last_iterations, 10)
+    test.assertGreater(generator.eigensolver.last_iterations, fresh.eigensolver.last_iterations // 2)
+    np.testing.assert_allclose(generator.eigenvalues, fresh.eigenvalues, rtol=1.0e-10)
+
+    other = newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=9, eigensolver="subspace")
+    test.assertIsNot(other.eigensolver, generator.eigensolver)
+
+
+def test_subspace_warm_start_reuses_a_copy(test, device):
+    """Warm-start from a private copy of the previous eigenvectors only when ``warm_start`` is set."""
+    _, _, stiffness, mass = _clamped_problem()
+    count = 8
+    sigma = modal_sparse.default_shift(stiffness, mass)
+    cold = newton.ModalSubspaceIterationBackend(margin=4)
+    cold.solve(stiffness, mass, count, sigma=sigma)
+    cold_iterations = cold.last_iterations
+    cold.solve(stiffness, mass, count, sigma=sigma)
+    test.assertEqual(cold.last_iterations, cold_iterations)
+    test.assertIsNone(cold.previous_vectors)
+
+    warm = newton.ModalSubspaceIterationBackend(margin=4, warm_start=True)
+    first = warm.solve(stiffness, mass, count, sigma=sigma)
+    test.assertEqual(warm.last_iterations, cold_iterations)
+    test.assertIsNot(warm.previous_vectors, first.vectors)
+    np.testing.assert_array_equal(warm.previous_vectors, first.vectors)
+    stored = warm.previous_vectors.copy()
+    first.vectors[:] = 0.0
+    np.testing.assert_array_equal(warm.previous_vectors, stored)
+
+    second = warm.solve(stiffness, mass, count, sigma=sigma)
+    test.assertLess(warm.last_iterations, cold_iterations)
+    np.testing.assert_allclose(second.values, first.values, rtol=1.0e-8)
+
+    # Previous vectors of another size are ignored, and replaced by the new result.
+    small_points, small_mass, small_stiffness = _sparse_spring_lattice((4, 3, 3), 0.01, 2.0e9, 8.0e-3)
+    deflation = _rigid_deflation(small_points, small_mass)
+    other = warm.solve(small_stiffness, small_mass, count, deflation=deflation)
+    test.assertEqual(warm.previous_vectors.shape, (small_stiffness.shape[0], count))
+    np.testing.assert_array_equal(warm.previous_vectors, other.vectors)
 
 
 def test_warpack_backend_placeholder(test, device):
@@ -371,6 +433,13 @@ def test_backend_result_validation_and_bsr_input(test, device):
             supports_inertia_count=True,
         )
 
+    # A partial spectrum without a count warns even when the backend advertises counting.
+    partial = newton.ModalEigenResult(values[:2], np.zeros((size, 2)), backend="counting")
+    with test.assertWarnsRegex(UserWarning, "supports an inertia count but returned none"):
+        modal_sparse.validate_eigen_result(partial, size=size, count=2, deflated=0, supports_inertia_count=True)
+    with test.assertWarnsRegex(UserWarning, "does not report an inertia count"):
+        modal_sparse.validate_eigen_result(partial, size=size, count=2, deflated=0, supports_inertia_count=False)
+
     coo = stiffness.tocoo()
     with wp.ScopedDevice("cpu"):
         bsr = wps.bsr_from_triplets(
@@ -400,6 +469,8 @@ _TESTS = (
     test_fake_backend_drives_craig_bampton_generator,
     test_subspace_iteration_matches_arpack,
     test_subspace_backend_drives_fem_generator,
+    test_subspace_named_path_does_not_warm_start,
+    test_subspace_warm_start_reuses_a_copy,
     test_warpack_backend_placeholder,
     test_backend_result_validation_and_bsr_input,
 )

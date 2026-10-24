@@ -379,7 +379,7 @@ class TestEigensolvers(unittest.TestCase):
         """Newton's ModalScipyArpackBackend and ModalSubspaceIterationBackend (warm-started through previous_vectors) give the
         same eigenvalues as the restricted ARPACK path on a clamped body (no deflation)."""
         _, ref = self._update_with("arpack")
-        sub = newton.ModalSubspaceIterationBackend(iterations=2, margin=2)
+        sub = newton.ModalSubspaceIterationBackend(iterations=2, margin=2, warm_start=True)
         for backend in (newton.ModalScipyArpackBackend(), sub, newton.ModalEigensolver.DENSE):
             with self.subTest(backend=str(backend)):
                 _ctrl, info = self._update_with(backend)

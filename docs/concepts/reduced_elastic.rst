@@ -352,9 +352,11 @@ factorization of :math:`\mathbf{K} - \sigma\mathbf{M}`; a device backend
 receives none. :class:`ModalDenseBackend` and :class:`ModalScipyArpackBackend`
 wrap the built-in paths; :class:`ModalSubspaceIterationBackend`
 (``"subspace"``) runs shift-invert block subspace iteration with
-Rayleigh-Ritz on that factorization and can warm-start from the modes of a
-nearby configuration, as when an adaptive reduced model updates its basis. A
-GPU backend, such as a sparse direct
+Rayleigh-Ritz on that factorization. Constructed with ``warm_start=True``, it
+reuses the modes of its previous solve as the start block, as when an
+adaptive reduced model updates its basis; such a backend is stateful and
+should not be shared between generators. The ``"subspace"`` name always
+selects a cold-started backend. A GPU backend, such as a sparse direct
 (cuDSS) or preconditioned LOBPCG solver, can be supplied as any object that
 satisfies the protocol; this build contains none.
 

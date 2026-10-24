@@ -920,7 +920,8 @@ class ModalEigensolverBackend(Protocol):
       whenever only part of the spectrum is returned, or set
       :attr:`~newton.ModalEigensolverBackend.supports_inertia_count` to ``False``; callers then skip the Sturm
       sequence check with a warning. A backend that supports the count may
-      return ``None`` after warning itself why the check was skipped.
+      return ``None`` after warning itself why the check was skipped; callers
+      then also warn that the check was skipped.
     - Raise :class:`ValueError` when the solve fails to converge.
     """
 
@@ -1163,10 +1164,8 @@ class ModalSubspaceIterationBackend:
     ``M``-orthonormalizes it; a Rayleigh-Ritz projection then gives the Ritz
     pairs. The block starts from ``previous_vectors`` (for example the modes
     of a nearby configuration, which makes one or two iterations enough)
-    padded with deterministic random vectors; after each solve
-    ``previous_vectors`` is replaced by the returned eigenvectors, so a
-    backend reused on a slowly changing model warm-starts itself. Previous
-    vectors of a different length are ignored. The factorization passed to
+    padded with deterministic random vectors. Previous vectors of a
+    different length are ignored. The factorization passed to
     :meth:`~newton.ModalEigensolverBackend.solve` is reused when its shift matches. Needs SciPy.
 
     At least ``iterations`` iterations run. With ``require_convergence``,
@@ -1176,11 +1175,22 @@ class ModalSubspaceIterationBackend:
     ``max_iterations``; otherwise exactly ``iterations`` iterations run and
     :attr:`~newton.ModalSubspaceIterationBackend.last_residuals` records the accuracy reached.
 
+    The backend is stateful. With ``warm_start``, each solve replaces
+    ``previous_vectors`` with a copy of the returned eigenvectors, so a
+    backend reused on a slowly changing model warm-starts itself; results
+    then depend on the order of the solves. Do not share a warm-started
+    backend between generators or between unrelated problems of equal
+    size. Without ``warm_start``, ``previous_vectors`` is never changed by a
+    solve, so repeated solves are independent.
+
     Args:
         iterations: Minimum number of block iterations.
         margin: Extra block vectors beyond the wanted eigenpairs; a larger
             margin speeds up convergence of the highest wanted pair.
-        previous_vectors: Warm-start vectors, shape ``[n, p]``.
+        previous_vectors: Start vectors of the next solve, shape ``[n, p]``;
+            copied.
+        warm_start: Whether each solve stores a copy of its eigenvectors as
+            ``previous_vectors`` for the next solve.
         max_iterations: Iteration limit with ``require_convergence``.
         require_convergence: Whether to iterate to convergence and raise
             when it is not reached.
@@ -1198,6 +1208,7 @@ class ModalSubspaceIterationBackend:
         iterations: int = 1,
         margin: int = 2,
         previous_vectors: np.ndarray | None = None,
+        warm_start: bool = False,
         max_iterations: int = 500,
         require_convergence: bool = True,
         sturm_check: bool = False,
@@ -1209,7 +1220,8 @@ class ModalSubspaceIterationBackend:
         self.margin = int(margin)
         if self.margin < 0:
             raise ValueError(f"margin must be non-negative, got {self.margin}")
-        self.previous_vectors = None if previous_vectors is None else np.asarray(previous_vectors, dtype=np.float64)
+        self.previous_vectors = None if previous_vectors is None else np.array(previous_vectors, dtype=np.float64)
+        self.warm_start = bool(warm_start)
         self.max_iterations = max(int(max_iterations), self.iterations)
         self.require_convergence = bool(require_convergence)
         self.sturm_check = bool(sturm_check)
@@ -1321,7 +1333,8 @@ class ModalSubspaceIterationBackend:
                 inertia_shift = None
         values = np.asarray(ritz_values[:count], dtype=np.float64)
         result_vectors = np.ascontiguousarray(ritz[:, :count])
-        self.previous_vectors = result_vectors
+        if self.warm_start:
+            self.previous_vectors = result_vectors.copy()
         return ModalEigenResult(
             values,
             result_vectors,
@@ -1422,8 +1435,9 @@ def resolve_eigensolver(
     .. experimental::
 
     A backend instance is returned unchanged. ``"subspace"`` resolves to a
-    cold-started :class:`~newton.ModalSubspaceIterationBackend` that iterates to
-    convergence and returns a Sturm sequence count. ``"auto"`` resolves to
+    :class:`~newton.ModalSubspaceIterationBackend` without ``warm_start``,
+    so every solve is cold-started; it iterates to convergence and returns
+    a Sturm sequence count. ``"auto"`` resolves to
     :class:`~newton.ModalScipyArpackBackend` when SciPy is installed and to
     :class:`~newton.ModalDenseBackend` otherwise; the generators make a finer choice from
     the input format and size before they resolve.
@@ -1450,8 +1464,9 @@ def resolve_eigensolver(
         return ModalDenseBackend()
     if kind is ModalEigensolver.ARPACK:
         return ModalScipyArpackBackend(margin=margin, maxiter=maxiter, ncv=ncv)
-    # A one-shot build cannot rely on a warm start, so the named choice verifies its result.
-    return ModalSubspaceIterationBackend(margin=margin, sturm_check=True)
+    # A one-shot build cannot rely on a warm start, so the named choice verifies its result and keeps no
+    # state between builds.
+    return ModalSubspaceIterationBackend(margin=margin, sturm_check=True, warm_start=False)
 
 
 def validate_eigen_result(
@@ -1461,8 +1476,8 @@ def validate_eigen_result(
 
     Verifies shapes and finiteness, that at least ``min(count, size - deflated)``
     eigenpairs were returned, and the Sturm sequence count when the result
-    carries one. A partial spectrum without a count from a backend that does
-    not support counting warns that the check was skipped.
+    carries one. A partial spectrum without a count warns that the check was
+    skipped, whether or not the backend supports counting.
 
     Args:
         result: Backend output.
@@ -1511,6 +1526,12 @@ def validate_eigen_result(
         warnings.warn(
             f"The Sturm sequence check was skipped: the {name} eigensolver backend does not report an inertia "
             "count, so missed copies of repeated eigenvalues cannot be ruled out",
+            stacklevel=3,
+        )
+    else:
+        warnings.warn(
+            f"The Sturm sequence check was skipped: the {name} eigensolver backend supports an inertia count but "
+            "returned none for a partial spectrum, so missed copies of repeated eigenvalues cannot be ruled out",
             stacklevel=3,
         )
     return values, vectors
