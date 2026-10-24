@@ -372,6 +372,19 @@ frames. The attachment's mode values are chosen in this order:
 Interpolated values are only approximate. Place an exact sample, or add an
 attachment frame with :meth:`ModalBasis.add_frame`, at every joint location.
 
+:class:`~newton.solvers.SolverVBD` measures a joint's angular error against the
+rest relative rotation of its parent and child frames, evaluated with
+:attr:`Model.joint_X_p` and :attr:`Model.joint_X_c`, so editing a joint frame
+moves the joint target with it. Code that updates an elastic basis in place
+and moves an endpoint frame to the deformed reference, by rewriting the joint
+frames and resetting :math:`\mathbf{q}`, would therefore change the target of
+every joint at that endpoint. When the endpoints of a body rotate differently,
+as in a closed loop through the body, rotating the body's rest pose cannot
+compensate for all of them. In that case, pass the original frames to
+:meth:`~newton.solvers.SolverVBD.set_joint_rest_frames` once, after creating
+the solver: the joints then act on the rewritten frames but keep their original
+targets.
+
 Contacts are generated between the deformed vertices of the shapes on an
 elastic link and rigid shapes; shape pairs in which both shapes belong to
 elastic links produce no contacts. :class:`~newton.viewer.ViewerGL` renders the
