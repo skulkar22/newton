@@ -398,7 +398,7 @@ def rayleigh_ritz(B: np.ndarray, K, M) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 
 def host_sparse(K):
-    """SciPy CSR copy of a tangent: SciPy/dense input, or a ``warp.sparse.BsrMatrix`` (via ``newton.to_backend_matrix``)."""
+    """SciPy CSR copy of a tangent: SciPy/dense input, or a ``warp.sparse.BsrMatrix`` (via ``modal_sparse.to_backend_matrix``)."""
     if modal_sparse.is_bsr_matrix(K):
         K = modal_sparse.to_backend_matrix(K, device="cpu")
     return sp.csr_matrix(K)

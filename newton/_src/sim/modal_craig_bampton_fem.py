@@ -146,14 +146,14 @@ class ModalGeneratorCraigBamptonFEM:
             leaves those integrals unavailable.
         label: Optional basis label.
         eigensolver: Fixed-interface eigensolver: a name, a
-            :class:`~newton.ModalEigensolver`, or an
-            :class:`~newton.EigenSolverBackend` instance. ``"dense"`` uses
+            :class:`~newton.ModalEigensolver`, or a
+            :class:`~newton.ModalEigensolverBackend` instance. ``"dense"`` uses
             LAPACK on dense matrices and does not need SciPy. ``"arpack"``
             keeps the matrices sparse and needs SciPy. ``"auto"`` selects
             ``"arpack"`` when any input matrix is sparse or the DOF count
             exceeds ``dense_dof_limit`` and SciPy is installed.
             ``"subspace"`` uses a default
-            :class:`~newton.SubspaceIterationBackend`. A backend instance
+            :class:`~newton.ModalSubspaceIterationBackend`. A backend instance
             keeps the matrices sparse (the constraint modes still use a
             SuperLU factorization, so SciPy is needed) and receives the
             interior matrices, ``arpack_shift`` (default ``0``) as ``sigma``,
@@ -209,7 +209,7 @@ class ModalGeneratorCraigBamptonFEM:
         label: str | None = None,
         eigensolver: Literal["auto", "dense", "arpack", "subspace"]
         | modal_sparse.ModalEigensolver
-        | modal_sparse.EigenSolverBackend = "auto",
+        | modal_sparse.ModalEigensolverBackend = "auto",
         arpack_shift: float | None = None,
         arpack_tol: float = 0.0,
         arpack_maxiter: int | None = None,
@@ -233,7 +233,7 @@ class ModalGeneratorCraigBamptonFEM:
         self.dof_count = self.dofs_per_node * self.node_count
 
         self.eigensolver = _normalize_eigensolver(eigensolver)
-        """``"auto"``, ``"dense"``, ``"arpack"``, or the :class:`~newton.EigenSolverBackend` of the interior eigenproblem."""
+        """``"auto"``, ``"dense"``, ``"arpack"``, or the :class:`~newton.ModalEigensolverBackend` of the interior eigenproblem."""
         self.arpack_shift = None if arpack_shift is None else float(arpack_shift)
         self.arpack_tol = float(arpack_tol)
         if self.arpack_tol < 0.0:
@@ -569,11 +569,11 @@ class ModalGeneratorCraigBamptonFEM:
         modes = np.linalg.solve(chol_m.T, vectors[:, :count])
         return constraint_modes, values[:count], modes, pivot_ratio, threshold
 
-    def _eigen_backend(self) -> modal_sparse.EigenSolverBackend:
+    def _eigen_backend(self) -> modal_sparse.ModalEigensolverBackend:
         """Return the backend of the sparse path: the given instance, or ARPACK with this generator's options."""
         if not isinstance(self.eigensolver, str):
             return self.eigensolver
-        return modal_sparse.ScipyArpackBackend(
+        return modal_sparse.ModalScipyArpackBackend(
             margin=self._ARPACK_MARGIN, maxiter=self.arpack_maxiter, ncv=self.arpack_ncv
         )
 

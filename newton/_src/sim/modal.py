@@ -1285,12 +1285,12 @@ _DAMPING_PROJECTIONS = ("diagonal", "error")
 
 
 def _normalize_eigensolver(
-    eigensolver: str | modal_sparse.ModalEigensolver | modal_sparse.EigenSolverBackend,
-) -> str | modal_sparse.EigenSolverBackend:
+    eigensolver: str | modal_sparse.ModalEigensolver | modal_sparse.ModalEigensolverBackend,
+) -> str | modal_sparse.ModalEigensolverBackend:
     """Return ``"auto"``, ``"dense"``, or ``"arpack"`` for a built-in selection, or the backend to dispatch to.
 
     ``"subspace"`` and :attr:`~newton.ModalEigensolver.SUBSPACE` resolve to a
-    default :class:`~newton.SubspaceIterationBackend`.
+    default :class:`~newton.ModalSubspaceIterationBackend`.
     """
     kind = modal_sparse.eigensolver_kind(eigensolver)
     if not isinstance(kind, modal_sparse.ModalEigensolver):
@@ -2072,8 +2072,8 @@ class ModalGeneratorFEM:
         damping_coupling_tolerance: Relative off-diagonal damping magnitude
             allowed before ``damping_projection`` warns or raises.
         eigensolver: Generalized eigensolver: a name, a
-            :class:`~newton.ModalEigensolver`, or an
-            :class:`~newton.EigenSolverBackend` instance. ``"dense"`` solves
+            :class:`~newton.ModalEigensolver`, or a
+            :class:`~newton.ModalEigensolverBackend` instance. ``"dense"`` solves
             the full spectrum with LAPACK, densifying sparse input.
             ``"arpack"`` uses sparse ARPACK shift-invert and requires
             ``mode_count`` and SciPy. ``"auto"`` selects ``"arpack"`` when any
@@ -2081,12 +2081,14 @@ class ModalGeneratorFEM:
             ``dense_dof_limit``, ``mode_count`` is set, and SciPy is
             installed; otherwise ``"dense"``, which does not need SciPy.
             ``"subspace"`` uses a default
-            :class:`~newton.SubspaceIterationBackend`. A backend instance
+            :class:`~newton.ModalSubspaceIterationBackend`. A backend instance
             receives the free-DOF matrices in SciPy CSC form, the rigid-body
             motions of a free-free model as ``deflation``, ``arpack_shift``
             as ``sigma``, and ``arpack_tol`` as ``tol``, and requires
-            ``mode_count``; its result is checked as by
-            :func:`~newton._src.sim.modal_sparse.validate_eigen_result`.
+            ``mode_count``; its result must have finite eigenpairs of the
+            right shape and at least the requested count, and a partial
+            spectrum is checked against the backend's Sturm sequence count,
+            or warns when it reports none.
         arpack_shift: ARPACK shift ``sigma`` [1/s^2]. ``None`` uses a small
             negative shift, ``-1e-6 * ||K||_1 / ||M||_1``, which keeps
             ``K - sigma M`` positive definite for free-free models. A
@@ -2131,7 +2133,7 @@ class ModalGeneratorFEM:
         damping_coupling_tolerance: float = 1.0e-5,
         eigensolver: Literal["auto", "dense", "arpack", "subspace"]
         | modal_sparse.ModalEigensolver
-        | modal_sparse.EigenSolverBackend = "auto",
+        | modal_sparse.ModalEigensolverBackend = "auto",
         arpack_shift: float | None = None,
         arpack_tol: float = 0.0,
         arpack_maxiter: int | None = None,
@@ -2139,7 +2141,7 @@ class ModalGeneratorFEM:
         dense_dof_limit: int = 2000,
     ):
         self.eigensolver = _normalize_eigensolver(eigensolver)
-        """``"auto"``, ``"dense"``, ``"arpack"``, or the :class:`~newton.EigenSolverBackend` that solves the eigenproblem."""
+        """``"auto"``, ``"dense"``, ``"arpack"``, or the :class:`~newton.ModalEigensolverBackend` that solves the eigenproblem."""
         self.arpack_shift = None if arpack_shift is None else float(arpack_shift)
         self.arpack_tol = float(arpack_tol)
         if self.arpack_tol < 0.0:
@@ -2292,11 +2294,11 @@ class ModalGeneratorFEM:
             return free_count > self.dense_dof_limit and self.mode_count is not None and modal_sparse.has_scipy()
         return self.eigensolver == "arpack"
 
-    def _eigen_backend(self) -> modal_sparse.EigenSolverBackend:
+    def _eigen_backend(self) -> modal_sparse.ModalEigensolverBackend:
         """Return the backend of the sparse path: the given instance, or ARPACK with this generator's options."""
         if not isinstance(self.eigensolver, str):
             return self.eigensolver
-        return modal_sparse.ScipyArpackBackend(
+        return modal_sparse.ModalScipyArpackBackend(
             margin=self._ARPACK_MARGIN, maxiter=self.arpack_maxiter, ncv=self.arpack_ncv
         )
 
@@ -2326,8 +2328,8 @@ class ModalGeneratorFEM:
         instead of being sought as a six-fold repeated eigenvalue.
         ``discard_mode_count + mode_count`` further eigenpairs, plus a small
         margin, are computed and verified with a Sturm sequence count when
-        the backend provides one; see
-        :func:`~newton._src.sim.modal_sparse.validate_eigen_result`.
+        the backend provides one; otherwise the check is skipped with a
+        warning.
 
         Returns:
             Ascending eigenvalues [1/s^2], ``M``-orthonormal eigenvectors, the

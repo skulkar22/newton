@@ -60,11 +60,11 @@ class _RecordingBackend:
         values, vectors = linalg.eigh(complement.T @ stiffness @ complement, complement.T @ mass @ complement)
         vectors = complement @ vectors
         if self.inertia_offset is None:
-            return newton.EigenResult(values, vectors, backend=self.name)
+            return newton.ModalEigenResult(values, vectors, backend=self.name)
         # Return a partial spectrum with a deliberately wrong Sturm sequence count.
         deflated = 0 if deflation is None else deflation.shape[1]
         shift = 0.5 * (values[count - 1] + values[count])
-        return newton.EigenResult(
+        return newton.ModalEigenResult(
             values[:count],
             vectors[:, :count],
             inertia_count=deflated + count + self.inertia_offset,
@@ -103,27 +103,29 @@ def _assert_same_eigenpairs(test, mass, values, vectors, reference_values, refer
 def test_backend_protocol_and_resolution(test, device):
     """Resolve names and enum members to the same backends, and accept duck-typed backends unchanged."""
     for backend in (
-        newton.DenseBackend(),
-        newton.ScipyArpackBackend(),
-        newton.SubspaceIterationBackend(),
-        newton.WarpackBackend(),
+        newton.ModalDenseBackend(),
+        newton.ModalScipyArpackBackend(),
+        newton.ModalSubspaceIterationBackend(),
+        modal_sparse.WarpackBackend(),
         _RecordingBackend(),
     ):
-        test.assertIsInstance(backend, newton.EigenSolverBackend)
-        test.assertIs(newton.resolve_eigensolver(backend), backend)
+        test.assertIsInstance(backend, newton.ModalEigensolverBackend)
+        test.assertIs(modal_sparse.resolve_eigensolver(backend), backend)
     for member in newton.ModalEigensolver:
-        test.assertIs(type(newton.resolve_eigensolver(member)), type(newton.resolve_eigensolver(member.value)))
-    test.assertIsInstance(newton.resolve_eigensolver("dense"), newton.DenseBackend)
-    test.assertIsInstance(newton.resolve_eigensolver("arpack"), newton.ScipyArpackBackend)
-    test.assertIsInstance(newton.resolve_eigensolver("auto"), newton.ScipyArpackBackend)
-    subspace = newton.resolve_eigensolver(newton.ModalEigensolver.SUBSPACE, margin=4)
-    test.assertIsInstance(subspace, newton.SubspaceIterationBackend)
+        test.assertIs(
+            type(modal_sparse.resolve_eigensolver(member)), type(modal_sparse.resolve_eigensolver(member.value))
+        )
+    test.assertIsInstance(modal_sparse.resolve_eigensolver("dense"), newton.ModalDenseBackend)
+    test.assertIsInstance(modal_sparse.resolve_eigensolver("arpack"), newton.ModalScipyArpackBackend)
+    test.assertIsInstance(modal_sparse.resolve_eigensolver("auto"), newton.ModalScipyArpackBackend)
+    subspace = modal_sparse.resolve_eigensolver(newton.ModalEigensolver.SUBSPACE, margin=4)
+    test.assertIsInstance(subspace, newton.ModalSubspaceIterationBackend)
     test.assertEqual(subspace.margin, 4)
     test.assertTrue(subspace.supports_inertia_count)
     with test.assertRaisesRegex(ValueError, "eigensolver must be"):
-        newton.resolve_eigensolver("lobpcg")
+        modal_sparse.resolve_eigensolver("lobpcg")
     with test.assertRaisesRegex(TypeError, "eigensolver must be"):
-        newton.resolve_eigensolver(3)
+        modal_sparse.resolve_eigensolver(3)
     with test.assertRaisesRegex(TypeError, "eigensolver must be"):
         newton.ModalGeneratorFEM(np.zeros((2, 3)), np.eye(6), np.eye(6), eigensolver=object())
 
@@ -143,7 +145,9 @@ def test_enum_and_string_select_identical_paths(test, device):
         np.testing.assert_array_equal(by_enum.modal_matrix, by_name.modal_matrix)
         np.testing.assert_array_equal(basis_enum.sample_phi, basis_name.sample_phi)
     # An explicit default ARPACK backend runs the same computation as the name.
-    explicit = newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=6, eigensolver=newton.ScipyArpackBackend())
+    explicit = newton.ModalGeneratorFEM(
+        points, mass, stiffness, mode_count=6, eigensolver=newton.ModalScipyArpackBackend()
+    )
     explicit.build()
     np.testing.assert_array_equal(explicit.eigenvalues, by_name.eigenvalues)
     np.testing.assert_array_equal(explicit.modal_matrix, by_name.modal_matrix)
@@ -246,13 +250,13 @@ def test_subspace_iteration_matches_arpack(test, device):
     for label, k, m, deflation in cases:
         with test.subTest(label):
             sigma = modal_sparse.default_shift(k, m)
-            arpack = newton.ScipyArpackBackend().solve(k, m, count, deflation=deflation, sigma=sigma)
+            arpack = newton.ModalScipyArpackBackend().solve(k, m, count, deflation=deflation, sigma=sigma)
             reference_values = arpack.values[:count]
             reference_vectors = arpack.vectors[:, :count]
             # The mode count must end at a gap for the subspace comparison to be well posed.
             test.assertGreater((arpack.values[count] - arpack.values[count - 1]) / arpack.values[count], 1.0e-3)
 
-            cold = newton.SubspaceIterationBackend(margin=4, sturm_check=True)
+            cold = newton.ModalSubspaceIterationBackend(margin=4, sturm_check=True)
             result = cold.solve(k, m, count, deflation=deflation, sigma=sigma)
             test.assertEqual(result.backend, "subspace")
             _assert_same_eigenpairs(test, m, result.values, result.vectors, reference_values, reference_vectors)
@@ -269,7 +273,7 @@ def test_subspace_iteration_matches_arpack(test, device):
                 reference_vectors
                 + 1.0e-3 * rng.standard_normal(reference_vectors.shape) * np.abs(reference_vectors).max()
             )
-            warm = newton.SubspaceIterationBackend(margin=4, previous_vectors=previous)
+            warm = newton.ModalSubspaceIterationBackend(margin=4, previous_vectors=previous)
             warm_result = warm.solve(k, m, count, deflation=deflation, sigma=sigma)
             _assert_same_eigenpairs(
                 test, m, warm_result.values, warm_result.vectors, reference_values, reference_vectors
@@ -278,12 +282,12 @@ def test_subspace_iteration_matches_arpack(test, device):
             test.assertIs(warm.previous_vectors, warm_result.vectors)
 
     # Exactly one iteration without a convergence requirement returns a result and its residuals.
-    fixed = newton.SubspaceIterationBackend(iterations=1, require_convergence=False)
+    fixed = newton.ModalSubspaceIterationBackend(iterations=1, require_convergence=False)
     fixed.solve(clamped_stiffness, clamped_mass, count)
     test.assertEqual(fixed.last_iterations, 1)
     test.assertEqual(fixed.last_residuals.shape, (count,))
     with test.assertRaisesRegex(ValueError, "Subspace iteration did not converge"):
-        newton.SubspaceIterationBackend(max_iterations=1, margin=0).solve(clamped_stiffness, clamped_mass, count)
+        newton.ModalSubspaceIterationBackend(max_iterations=1, margin=0).solve(clamped_stiffness, clamped_mass, count)
 
 
 def test_subspace_backend_drives_fem_generator(test, device):
@@ -297,14 +301,14 @@ def test_subspace_backend_drives_fem_generator(test, device):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         subspace.build()
-    test.assertIsInstance(subspace.eigensolver, newton.SubspaceIterationBackend)
+    test.assertIsInstance(subspace.eigensolver, newton.ModalSubspaceIterationBackend)
     np.testing.assert_allclose(subspace.eigenvalues, arpack.eigenvalues, rtol=1.0e-8)
 
 
 def test_warpack_backend_placeholder(test, device):
     """Raise ``NotImplementedError`` from the Warpack placeholder, and run a subclass without a host factorization."""
     points, mass, stiffness = _sparse_spring_lattice((5, 3, 3), 0.01, 2.0e9, 8.0e-3)
-    placeholder = newton.WarpackBackend()
+    placeholder = modal_sparse.WarpackBackend()
     test.assertFalse(placeholder.supports_inertia_count)
     test.assertNotEqual(placeholder.device, "cpu")
     with test.assertRaisesRegex(NotImplementedError, "Warpack backend is not available in this build"):
@@ -312,7 +316,7 @@ def test_warpack_backend_placeholder(test, device):
     with test.assertRaisesRegex(NotImplementedError, "Warpack backend is not available in this build"):
         newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4, eigensolver=placeholder).build()
 
-    class PartialDense(newton.WarpackBackend):
+    class PartialDense(modal_sparse.WarpackBackend):
         """Device-tagged backend that returns only the wanted eigenpairs and no Sturm sequence count."""
 
         def __init__(self):
@@ -323,8 +327,8 @@ def test_warpack_backend_placeholder(test, device):
             self, stiffness, mass, count, *, deflation=None, sigma=None, tol=0.0, factorization=None, zero_threshold=0.0
         ):
             self.factorizations.append(factorization)
-            full = newton.DenseBackend().solve(stiffness, mass, count, deflation=deflation)
-            return newton.EigenResult(full.values[: count + 1], full.vectors[:, : count + 1], backend="partial")
+            full = newton.ModalDenseBackend().solve(stiffness, mass, count, deflation=deflation)
+            return newton.ModalEigenResult(full.values[: count + 1], full.vectors[:, : count + 1], backend="partial")
 
     backend = PartialDense()
     generator = newton.ModalGeneratorFEM(points, mass, stiffness, mode_count=4, eigensolver=backend)
@@ -344,11 +348,15 @@ def test_backend_result_validation_and_bsr_input(test, device):
     values = np.arange(1.0, 5.0)
     with test.assertRaisesRegex(ValueError, "eigenvectors of shape"):
         modal_sparse.validate_eigen_result(
-            newton.EigenResult(values, np.zeros((size, 3))), size=size, count=4, deflated=0, supports_inertia_count=True
+            newton.ModalEigenResult(values, np.zeros((size, 3))),
+            size=size,
+            count=4,
+            deflated=0,
+            supports_inertia_count=True,
         )
     with test.assertRaisesRegex(ValueError, "fewer than the 4 requested"):
         modal_sparse.validate_eigen_result(
-            newton.EigenResult(values[:3], np.zeros((size, 3))),
+            newton.ModalEigenResult(values[:3], np.zeros((size, 3))),
             size=size,
             count=4,
             deflated=0,
@@ -356,7 +364,7 @@ def test_backend_result_validation_and_bsr_input(test, device):
         )
     with test.assertRaisesRegex(ValueError, "non-finite"):
         modal_sparse.validate_eigen_result(
-            newton.EigenResult(np.array([np.nan]), np.zeros((size, 1))),
+            newton.ModalEigenResult(np.array([np.nan]), np.zeros((size, 1))),
             size=size,
             count=1,
             deflated=0,
@@ -374,11 +382,11 @@ def test_backend_result_validation_and_bsr_input(test, device):
         )
     test.assertTrue(modal_sparse.is_bsr_matrix(bsr))
     test.assertFalse(modal_sparse.is_bsr_matrix(stiffness))
-    host = newton.to_backend_matrix(bsr)
+    host = modal_sparse.to_backend_matrix(bsr)
     test.assertTrue(modal_sparse.is_sparse(host))
     np.testing.assert_allclose(host.toarray(), stiffness.toarray(), rtol=0.0, atol=0.0)
-    test.assertIs(newton.to_backend_matrix(bsr, device="cuda:0"), bsr)
-    test.assertIs(newton.to_backend_matrix(stiffness), stiffness)
+    test.assertIs(modal_sparse.to_backend_matrix(bsr, device="cuda:0"), bsr)
+    test.assertIs(modal_sparse.to_backend_matrix(stiffness), stiffness)
 
 
 class TestModalEigensolverBackend(unittest.TestCase):

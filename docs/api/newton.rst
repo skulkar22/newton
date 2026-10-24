@@ -33,9 +33,6 @@ newton
    ConstraintElimination
    Contacts
    Control
-   DenseBackend
-   EigenResult
-   EigenSolverBackend
    Gaussian
    GeoType
    Heightfield
@@ -43,28 +40,30 @@ newton
    JointType
    Mesh
    ModalBasis
+   ModalDenseBackend
+   ModalEigenResult
    ModalEigensolver
+   ModalEigensolverBackend
    ModalGeneratorBeam
    ModalGeneratorCraigBampton
    ModalGeneratorCraigBamptonFEM
    ModalGeneratorFEM
    ModalGeneratorPOD
    ModalGeneratorSampled
+   ModalScipyArpackBackend
+   ModalSubspaceIterationBackend
    Model
    ModelBuilder
    ModelFlags
    ParticleFlags
    Rod
    SDF
-   ScipyArpackBackend
    ShapeFlags
    State
    StateFlags
-   SubspaceIterationBackend
    TendonLinkFlags
    TendonLinkType
    TetMesh
-   WarpackBackend
 
 .. rubric:: Functions
 
@@ -82,8 +81,6 @@ newton
    eval_mimic
    eval_rigid_contact_kinematics
    intersect_ray
-   resolve_eigensolver
-   to_backend_matrix
 
 .. rubric:: Constants
 

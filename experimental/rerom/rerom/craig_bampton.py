@@ -104,7 +104,7 @@ def cb_basis(
     ``extra_vectors`` (taken as given; their rigid tip-face part is removed through the constraint modes)
     and the lowest fixed-interface eigenmodes filling up to ``mode_count``. The fixed-interface eigenmodes
     use ARPACK shift-invert at ``sigma = 0`` on the same ``K_II`` factorization (``eigensolver=None``) or
-    the given ``newton.EigenSolverBackend``.
+    the given ``newton.ModalEigensolverBackend``.
 
     Returns ``(Phi (3N,m), lam (m,), F (6,m) or None, info)`` with ``Phi^T M Phi = I``,
     ``Phi^T K Phi = diag(lam)``, ``F`` the tip-frame motion per modal coordinate.

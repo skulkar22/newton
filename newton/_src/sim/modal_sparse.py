@@ -857,18 +857,18 @@ class ModalEigensolver(enum.Enum):
     """Let the generator choose ``DENSE`` or ``ARPACK`` from the input format and size."""
 
     DENSE = "dense"
-    """Full spectrum with a Cholesky reduction and a dense symmetric eigensolve; see :class:`~newton.DenseBackend`."""
+    """Full spectrum with a Cholesky reduction and a dense symmetric eigensolve; see :class:`~newton.ModalDenseBackend`."""
 
     ARPACK = "arpack"
-    """Sparse shift-invert Lanczos with a Sturm sequence check; see :class:`~newton.ScipyArpackBackend`."""
+    """Sparse shift-invert Lanczos with a Sturm sequence check; see :class:`~newton.ModalScipyArpackBackend`."""
 
     SUBSPACE = "subspace"
-    """Shift-invert block subspace iteration with Rayleigh-Ritz; see :class:`~newton.SubspaceIterationBackend`."""
+    """Shift-invert block subspace iteration with Rayleigh-Ritz; see :class:`~newton.ModalSubspaceIterationBackend`."""
 
 
 @dataclass
-class EigenResult:
-    """Lowest generalized eigenpairs of ``K phi = lambda M phi`` returned by an :class:`~newton.EigenSolverBackend`.
+class ModalEigenResult:
+    """Lowest generalized eigenpairs of ``K phi = lambda M phi`` returned by a :class:`~newton.ModalEigensolverBackend`.
 
     .. experimental::
     """
@@ -878,7 +878,7 @@ class EigenResult:
     vectors: np.ndarray
     """``M``-orthonormal eigenvectors, shape ``[n, k]``; excludes the deflated directions."""
     inertia_count: int | None = None
-    """Number of eigenvalues of the whole pencil, deflated directions included, below :attr:`~newton.EigenResult.inertia_shift`.
+    """Number of eigenvalues of the whole pencil, deflated directions included, below :attr:`~newton.ModalEigenResult.inertia_shift`.
 
     It is a Sturm sequence count (the inertia of a factorization of
     ``K - inertia_shift * M``), or ``None`` when the backend did not compute one.
@@ -892,7 +892,7 @@ class EigenResult:
 
 
 @runtime_checkable
-class EigenSolverBackend(Protocol):
+class ModalEigensolverBackend(Protocol):
     """Interface of a generalized symmetric eigensolver used by the finite-element modal generators.
 
     .. experimental::
@@ -902,32 +902,32 @@ class EigenSolverBackend(Protocol):
     positive-definite mass ``M`` [kg]. Any object with these attributes and
     method is accepted; subclassing is not required. The generators pass host
     matrices: SciPy CSC matrices, or dense :class:`numpy.ndarray` for
-    :class:`~newton.DenseBackend`. A device backend (``device`` other than ``"cpu"``)
-    may convert them with :func:`~newton.to_backend_matrix` or accept
+    :class:`~newton.ModalDenseBackend`. A device backend (``device`` other than ``"cpu"``)
+    may convert them itself or accept
     :class:`warp.sparse.BsrMatrix` input from its own callers. Generators
     build and validate a SuperLU factorization of ``K - sigma M`` only for
     ``"cpu"`` backends.
 
-    Contract of :meth:`~newton.EigenSolverBackend.solve`:
+    Contract of :meth:`~newton.ModalEigensolverBackend.solve`:
 
     - Return at least ``count`` eigenpairs outside ``deflation`` (fewer only
       when fewer exist) in ascending order, ``M``-orthonormal and
       ``M``-orthogonal to ``deflation``. Extra pairs above them are allowed.
     - When every computed eigenvalue is at most ``zero_threshold``, compute
       more, so that zero-energy mechanisms cannot hide the elastic spectrum.
-    - Either set :attr:`~newton.EigenSolverBackend.supports_inertia_count` and return
-      :attr:`~newton.EigenResult.inertia_count` with :attr:`~newton.EigenResult.inertia_shift`
+    - Either set :attr:`~newton.ModalEigensolverBackend.supports_inertia_count` and return
+      :attr:`~newton.ModalEigenResult.inertia_count` with :attr:`~newton.ModalEigenResult.inertia_shift`
       whenever only part of the spectrum is returned, or set
-      :attr:`~newton.EigenSolverBackend.supports_inertia_count` to ``False``; callers then skip the Sturm
+      :attr:`~newton.ModalEigensolverBackend.supports_inertia_count` to ``False``; callers then skip the Sturm
       sequence check with a warning. A backend that supports the count may
       return ``None`` after warning itself why the check was skipped.
     - Raise :class:`ValueError` when the solve fails to converge.
     """
 
     name: str
-    """Short backend name, recorded in :attr:`~newton.EigenResult.backend` and generator reports."""
+    """Short backend name, recorded in :attr:`~newton.ModalEigenResult.backend` and generator reports."""
     supports_inertia_count: bool
-    """Whether :meth:`~newton.EigenSolverBackend.solve` returns a Sturm sequence count for partial spectra."""
+    """Whether :meth:`~newton.ModalEigensolverBackend.solve` returns a Sturm sequence count for partial spectra."""
     device: str
     """Device that runs the solve, ``"cpu"`` for host backends."""
 
@@ -942,7 +942,7 @@ class EigenSolverBackend(Protocol):
         tol: float = 0.0,
         factorization: ShiftedFactorization | None = None,
         zero_threshold: float = 0.0,
-    ) -> EigenResult:
+    ) -> ModalEigenResult:
         """Return the ``count`` lowest generalized eigenpairs outside ``deflation``.
 
         Args:
@@ -1038,7 +1038,7 @@ def _mass_orthonormalize(vectors: np.ndarray, mass: Any, relative_cutoff: float 
     return vectors
 
 
-class DenseBackend:
+class ModalDenseBackend:
     """Dense full-spectrum eigensolver: Cholesky reduction and :func:`numpy.linalg.eigh`.
 
     .. experimental::
@@ -1064,8 +1064,8 @@ class DenseBackend:
         tol: float = 0.0,
         factorization: ShiftedFactorization | None = None,
         zero_threshold: float = 0.0,
-    ) -> EigenResult:
-        """Return all eigenpairs outside ``deflation``; see :meth:`~newton.EigenSolverBackend.solve`."""
+    ) -> ModalEigenResult:
+        """Return all eigenpairs outside ``deflation``; see :meth:`~newton.ModalEigensolverBackend.solve`."""
         del count, sigma, tol, factorization, zero_threshold
         start = time.perf_counter()
         stiffness = to_dense(stiffness)
@@ -1080,10 +1080,10 @@ class DenseBackend:
             complement = right[rank:].T
             values, reduced = cholesky_eigh(complement.T @ stiffness @ complement, complement.T @ mass @ complement)
             vectors = complement @ reduced
-        return EigenResult(values, vectors, backend=self.name, wall_s=time.perf_counter() - start)
+        return ModalEigenResult(values, vectors, backend=self.name, wall_s=time.perf_counter() - start)
 
 
-class ScipyArpackBackend:
+class ModalScipyArpackBackend:
     """SciPy ARPACK shift-invert Lanczos backend with a Sturm sequence check.
 
     .. experimental::
@@ -1122,8 +1122,8 @@ class ScipyArpackBackend:
         tol: float = 0.0,
         factorization: ShiftedFactorization | None = None,
         zero_threshold: float = 0.0,
-    ) -> EigenResult:
-        """Return the lowest eigenpairs outside ``deflation``; see :meth:`~newton.EigenSolverBackend.solve`."""
+    ) -> ModalEigenResult:
+        """Return the lowest eigenpairs outside ``deflation``; see :meth:`~newton.ModalEigensolverBackend.solve`."""
         start = time.perf_counter()
         if sigma is None:
             sigma = factorization.sigma if factorization is not None else default_shift(stiffness, mass)
@@ -1143,7 +1143,7 @@ class ScipyArpackBackend:
             factorization=factorization,
             max_restarts=self.max_restarts,
         )
-        return EigenResult(
+        return ModalEigenResult(
             values,
             vectors,
             inertia_count=below,
@@ -1153,7 +1153,7 @@ class ScipyArpackBackend:
         )
 
 
-class SubspaceIterationBackend:
+class ModalSubspaceIterationBackend:
     """Shift-invert block subspace iteration with Rayleigh-Ritz, warm-started from previous eigenvectors.
 
     .. experimental::
@@ -1167,14 +1167,14 @@ class SubspaceIterationBackend:
     ``previous_vectors`` is replaced by the returned eigenvectors, so a
     backend reused on a slowly changing model warm-starts itself. Previous
     vectors of a different length are ignored. The factorization passed to
-    :meth:`~newton.EigenSolverBackend.solve` is reused when its shift matches. Needs SciPy.
+    :meth:`~newton.ModalEigensolverBackend.solve` is reused when its shift matches. Needs SciPy.
 
     At least ``iterations`` iterations run. With ``require_convergence``,
     iterations continue until every wanted pair has the relative residual
     ``||K phi - lambda M phi|| / (||K - sigma M||_1 ||phi||)`` that
     ``modal_sparse.generalized_eigsh`` accepts, and :class:`ValueError` is raised after
     ``max_iterations``; otherwise exactly ``iterations`` iterations run and
-    :attr:`~newton.SubspaceIterationBackend.last_residuals` records the accuracy reached.
+    :attr:`~newton.ModalSubspaceIterationBackend.last_residuals` records the accuracy reached.
 
     Args:
         iterations: Minimum number of block iterations.
@@ -1221,7 +1221,7 @@ class SubspaceIterationBackend:
 
     @property
     def supports_inertia_count(self) -> bool:
-        """Whether :meth:`~newton.EigenSolverBackend.solve` returns a Sturm sequence count, as set by ``sturm_check``."""
+        """Whether :meth:`~newton.ModalEigensolverBackend.solve` returns a Sturm sequence count, as set by ``sturm_check``."""
         return self.sturm_check
 
     def solve(
@@ -1235,15 +1235,17 @@ class SubspaceIterationBackend:
         tol: float = 0.0,
         factorization: ShiftedFactorization | None = None,
         zero_threshold: float = 0.0,
-    ) -> EigenResult:
-        """Return the lowest eigenpairs outside ``deflation``; see :meth:`~newton.EigenSolverBackend.solve`."""
+    ) -> ModalEigenResult:
+        """Return the lowest eigenpairs outside ``deflation``; see :meth:`~newton.ModalEigensolverBackend.solve`."""
         start = time.perf_counter()
         size = int(stiffness.shape[0])
         deflated = 0 if deflation is None else int(deflation.shape[1])
         available = size - deflated
         count = min(int(count), available)
         if count <= 0:
-            return EigenResult(np.zeros(0), np.zeros((size, 0)), backend=self.name, wall_s=time.perf_counter() - start)
+            return ModalEigenResult(
+                np.zeros(0), np.zeros((size, 0)), backend=self.name, wall_s=time.perf_counter() - start
+            )
         if sigma is None:
             sigma = factorization.sigma if factorization is not None else default_shift(stiffness, mass)
         if factorization is None or factorization.sigma != float(sigma):
@@ -1320,7 +1322,7 @@ class SubspaceIterationBackend:
         values = np.asarray(ritz_values[:count], dtype=np.float64)
         result_vectors = np.ascontiguousarray(ritz[:, :count])
         self.previous_vectors = result_vectors
-        return EigenResult(
+        return ModalEigenResult(
             values,
             result_vectors,
             inertia_count=inertia_count,
@@ -1335,25 +1337,25 @@ class WarpackBackend:
 
     .. experimental::
 
-    This build contains no GPU eigensolver: :meth:`~newton.EigenSolverBackend.solve` raises
+    This build contains no GPU eigensolver: :meth:`~newton.ModalEigensolverBackend.solve` raises
     :class:`NotImplementedError`. The class documents the contract that such
     a backend fulfills, so it can be subclassed, or replaced by any object
-    that satisfies :class:`~newton.EigenSolverBackend`, and passed as the
+    that satisfies :class:`~newton.ModalEigensolverBackend`, and passed as the
     ``eigensolver`` of a finite-element modal generator:
 
     - Inputs are host SciPy CSC matrices from the generators;
-      :func:`~newton.to_backend_matrix` leaves them unchanged for a device other
+      :func:`to_backend_matrix` leaves them unchanged for a device other
       than ``"cpu"``, and direct callers may pass
       :class:`warp.sparse.BsrMatrix`. ``deflation`` holds the rigid-body
       vectors of a free-free model (``M``-orthonormal, host
       :class:`numpy.ndarray`), which must be projected out. ``sigma`` is a
       shift at or below the lowest wanted eigenvalue; the host
       ``factorization`` is ``None`` for a non-``"cpu"`` device.
-    - The output is an :class:`~newton.EigenResult` in float64 host arrays with
+    - The output is a :class:`~newton.ModalEigenResult` in float64 host arrays with
       ascending eigenvalues and ``M``-orthonormal eigenvectors.
-    - Either return :attr:`~newton.EigenResult.inertia_count` (for example from the
+    - Either return :attr:`~newton.ModalEigenResult.inertia_count` (for example from the
       inertia of a cuDSS ``L D L^T`` factorization of ``K - tau M``) or
-      leave :attr:`~newton.EigenSolverBackend.supports_inertia_count` ``False``; callers then skip the
+      leave :attr:`~newton.ModalEigensolverBackend.supports_inertia_count` ``False``; callers then skip the
       Sturm sequence check with a warning, so missed repeated eigenvalues
       are not detected.
 
@@ -1378,21 +1380,23 @@ class WarpackBackend:
         tol: float = 0.0,
         factorization: ShiftedFactorization | None = None,
         zero_threshold: float = 0.0,
-    ) -> EigenResult:
+    ) -> ModalEigenResult:
         """Raise :class:`NotImplementedError`; a subclass implements the GPU solve."""
         raise NotImplementedError("Warpack backend is not available in this build")
 
 
-_EIGENSOLVER_CHOICES = "'auto', 'dense', 'arpack', or 'subspace', a ModalEigensolver, or an EigenSolverBackend"
+_EIGENSOLVER_CHOICES = "'auto', 'dense', 'arpack', or 'subspace', a ModalEigensolver, or a ModalEigensolverBackend"
 
 
-def eigensolver_kind(spec: str | ModalEigensolver | EigenSolverBackend) -> ModalEigensolver | EigenSolverBackend:
+def eigensolver_kind(
+    spec: str | ModalEigensolver | ModalEigensolverBackend,
+) -> ModalEigensolver | ModalEigensolverBackend:
     """Return the :class:`ModalEigensolver` named by ``spec``, or ``spec`` itself if it is a backend.
 
     Raises:
         ValueError: If ``spec`` is a string that names no eigensolver.
         TypeError: If ``spec`` is neither a name, a :class:`ModalEigensolver`,
-            nor an :class:`~newton.EigenSolverBackend`.
+            nor a :class:`~newton.ModalEigensolverBackend`.
     """
     if isinstance(spec, ModalEigensolver):
         return spec
@@ -1401,27 +1405,27 @@ def eigensolver_kind(spec: str | ModalEigensolver | EigenSolverBackend) -> Modal
             return ModalEigensolver(spec)
         except ValueError:
             raise ValueError(f"eigensolver must be {_EIGENSOLVER_CHOICES}, got '{spec}'") from None
-    if isinstance(spec, EigenSolverBackend):
+    if isinstance(spec, ModalEigensolverBackend):
         return spec
     raise TypeError(f"eigensolver must be {_EIGENSOLVER_CHOICES}, got {type(spec).__name__}")
 
 
 def resolve_eigensolver(
-    spec: str | ModalEigensolver | EigenSolverBackend,
+    spec: str | ModalEigensolver | ModalEigensolverBackend,
     *,
     margin: int = 2,
     maxiter: int | None = None,
     ncv: int | None = None,
-) -> EigenSolverBackend:
+) -> ModalEigensolverBackend:
     """Return the eigensolver backend selected by ``spec``.
 
     .. experimental::
 
     A backend instance is returned unchanged. ``"subspace"`` resolves to a
-    cold-started :class:`~newton.SubspaceIterationBackend` that iterates to
+    cold-started :class:`~newton.ModalSubspaceIterationBackend` that iterates to
     convergence and returns a Sturm sequence count. ``"auto"`` resolves to
-    :class:`~newton.ScipyArpackBackend` when SciPy is installed and to
-    :class:`~newton.DenseBackend` otherwise; the generators make a finer choice from
+    :class:`~newton.ModalScipyArpackBackend` when SciPy is installed and to
+    :class:`~newton.ModalDenseBackend` otherwise; the generators make a finer choice from
     the input format and size before they resolve.
 
     Args:
@@ -1431,7 +1435,7 @@ def resolve_eigensolver(
         ncv: Number of ARPACK Lanczos vectors.
 
     Returns:
-        A backend that satisfies :class:`~newton.EigenSolverBackend`.
+        A backend that satisfies :class:`~newton.ModalEigensolverBackend`.
 
     Raises:
         ValueError: If ``spec`` is a string that names no eigensolver.
@@ -1443,17 +1447,17 @@ def resolve_eigensolver(
     if kind is ModalEigensolver.AUTO:
         kind = ModalEigensolver.ARPACK if has_scipy() else ModalEigensolver.DENSE
     if kind is ModalEigensolver.DENSE:
-        return DenseBackend()
+        return ModalDenseBackend()
     if kind is ModalEigensolver.ARPACK:
-        return ScipyArpackBackend(margin=margin, maxiter=maxiter, ncv=ncv)
+        return ModalScipyArpackBackend(margin=margin, maxiter=maxiter, ncv=ncv)
     # A one-shot build cannot rely on a warm start, so the named choice verifies its result.
-    return SubspaceIterationBackend(margin=margin, sturm_check=True)
+    return ModalSubspaceIterationBackend(margin=margin, sturm_check=True)
 
 
 def validate_eigen_result(
-    result: EigenResult, *, size: int, count: int, deflated: int, supports_inertia_count: bool
+    result: ModalEigenResult, *, size: int, count: int, deflated: int, supports_inertia_count: bool
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Check an :class:`~newton.EigenResult` against the backend contract and return its sorted eigenpairs.
+    """Check a :class:`~newton.ModalEigenResult` against the backend contract and return its sorted eigenpairs.
 
     Verifies shapes and finiteness, that at least ``min(count, size - deflated)``
     eigenpairs were returned, and the Sturm sequence count when the result
@@ -1465,7 +1469,7 @@ def validate_eigen_result(
         size: Matrix dimension ``n``.
         count: Number of eigenpairs requested.
         deflated: Number of deflated directions.
-        supports_inertia_count: The backend's :attr:`~newton.EigenSolverBackend.supports_inertia_count`.
+        supports_inertia_count: The backend's :attr:`~newton.ModalEigensolverBackend.supports_inertia_count`.
 
     Returns:
         Ascending eigenvalues [1/s^2] and the matching eigenvectors.

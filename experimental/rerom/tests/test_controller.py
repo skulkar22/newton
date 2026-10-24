@@ -29,6 +29,7 @@ from _fixtures import (
 from rerom.numerics import m_orthonormal_rigid, nodal_rigid_vectors, rigid_properties
 
 import newton
+from newton._src.sim import modal_sparse
 
 FREE_FLIGHT_YOUNG = 1.0e7  # soft enough that the modes survive implicit-Euler damping at dt = 1 ms
 CANTILEVER_YOUNG = 1.0e8  # Euler-Bernoulli tip sag ~ 9 % of L for the 1 m x 0.06 x 0.04 beam
@@ -375,11 +376,11 @@ class TestEigensolvers(unittest.TestCase):
         self.assertLess(out[2]["max_eig_rel_err"], 1e-2)
 
     def test_newton_backends_against_restricted_arpack(self):
-        """Newton's ScipyArpackBackend and SubspaceIterationBackend (warm-started through previous_vectors) give the
+        """Newton's ModalScipyArpackBackend and ModalSubspaceIterationBackend (warm-started through previous_vectors) give the
         same eigenvalues as the restricted ARPACK path on a clamped body (no deflation)."""
         _, ref = self._update_with("arpack")
-        sub = newton.SubspaceIterationBackend(iterations=2, margin=2)
-        for backend in (newton.ScipyArpackBackend(), sub, newton.ModalEigensolver.DENSE):
+        sub = newton.ModalSubspaceIterationBackend(iterations=2, margin=2)
+        for backend in (newton.ModalScipyArpackBackend(), sub, newton.ModalEigensolver.DENSE):
             with self.subTest(backend=str(backend)):
                 _ctrl, info = self._update_with(backend)
                 np.testing.assert_allclose(info["eigen_raw"][:6], ref["eigen_raw"][:6], rtol=1e-6)
@@ -387,7 +388,7 @@ class TestEigensolvers(unittest.TestCase):
         self.assertIsNotNone(sub.previous_vectors)
 
     def test_fake_backend_accepted_end_to_end(self):
-        """Any object satisfying newton.EigenSolverBackend plugs in (Warpack seam): it is called with the free-DOF
+        """Any object satisfying newton.ModalEigensolverBackend plugs in (Warpack seam): it is called with the free-DOF
         pencil and the M-orthonormal rigid deflation, and its eigenpairs reach the model."""
 
         class FakeBackend:
@@ -397,7 +398,7 @@ class TestEigensolvers(unittest.TestCase):
 
             def __init__(self):
                 self.calls = []
-                self.inner = newton.DenseBackend()
+                self.inner = newton.ModalDenseBackend()
 
             def solve(
                 self,
@@ -413,10 +414,10 @@ class TestEigensolvers(unittest.TestCase):
             ):
                 self.calls.append((stiffness.shape, count, None if deflation is None else deflation.shape))
                 res = self.inner.solve(stiffness, mass, count, deflation=deflation)
-                return newton.EigenResult(res.values[:count], res.vectors[:, :count], backend=self.name)
+                return newton.ModalEigenResult(res.values[:count], res.vectors[:, :count], backend=self.name)
 
         fake = FakeBackend()
-        self.assertIsInstance(fake, newton.EigenSolverBackend)
+        self.assertIsInstance(fake, newton.ModalEigensolverBackend)
         asm = beam_assembler(young=FREE_FLIGHT_YOUNG)
         gen, model, state, body = _free_flight(asm, 8)
         solver = newton.solvers.SolverVBD(model, iterations=8)
@@ -440,7 +441,7 @@ class TestEigensolvers(unittest.TestCase):
         asm = beam_assembler(young=FREE_FLIGHT_YOUNG)
         gen, model, state, body = _free_flight(asm, 6)
         solver = newton.solvers.SolverVBD(model, iterations=4)
-        ctrl = free_controller(model, solver, body, asm, gen, eigensolver=newton.WarpackBackend(device="cpu"))
+        ctrl = free_controller(model, solver, body, asm, gen, eigensolver=modal_sparse.WarpackBackend(device="cpu"))
         with self.assertRaises(NotImplementedError):
             ctrl.relinearize(state)
 

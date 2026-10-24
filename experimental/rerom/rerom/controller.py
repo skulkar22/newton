@@ -583,7 +583,7 @@ class ReROMController:
         trigger: A :class:`~rerom.Trigger` (default: :class:`~rerom.RotationTrigger`, 4 deg).
         policy: :class:`~rerom.UpdatePolicy`.
         eigensolver: ``"arpack"`` (default), ``"subspace"``, ``"dense"``, ``"auto"``, a
-            ``newton.ModalEigensolver`` or a ``newton.EigenSolverBackend`` instance (see :mod:`rerom.eigen`).
+            ``newton.ModalEigensolver`` or a ``newton.ModalEigensolverBackend`` instance (see :mod:`rerom.eigen`).
         nonlinear_force: :class:`~rerom.NonlinearForceOptions` to enable the IMEX hyper-reduced remainder
             (free-body adapter only).
     """
@@ -600,7 +600,7 @@ class ReROMController:
         basis: BasisOptions | None = None,
         trigger=None,
         policy: UpdatePolicy | None = None,
-        eigensolver: str | newton.ModalEigensolver | newton.EigenSolverBackend = "arpack",
+        eigensolver: str | newton.ModalEigensolver | newton.ModalEigensolverBackend = "arpack",
         nonlinear_force: NonlinearForceOptions | None = None,
     ):
         self.model = model

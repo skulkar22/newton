@@ -1,8 +1,8 @@
 # ruff: noqa: TID253
-"""Eigensolver seam of the re-ROM controller, on top of Newton's ``newton.EigenSolverBackend``.
+"""Eigensolver seam of the re-ROM controller, on top of Newton's ``newton.ModalEigensolverBackend``.
 
 The controller's ``eigensolver`` option is a name, a :class:`newton.ModalEigensolver` or any object that
-satisfies :class:`newton.EigenSolverBackend` (for example :class:`newton.SubspaceIterationBackend`, a
+satisfies :class:`newton.ModalEigensolverBackend` (for example :class:`newton.ModalSubspaceIterationBackend`, a
 Warpack/cuDSS backend, or a test double). :func:`resolve_backend` maps it to a backend:
 
 - ``"arpack"`` / ``"auto"`` / ``ModalEigensolver.ARPACK`` / ``AUTO``: :class:`RestrictedArpackBackend`, ARPACK
@@ -10,14 +10,14 @@ Warpack/cuDSS backend, or a test double). :func:`resolve_backend` maps it to a b
   motions and a Haynsworth inertia count (the M1 re-ROM path);
 - ``"subspace"`` / ``ModalEigensolver.SUBSPACE``: :class:`RestrictedSubspaceBackend`, warm-started block
   inverse iteration with the shared restricted factorization (the WP3a path);
-- ``"dense"`` / ``ModalEigensolver.DENSE``: ``newton.resolve_eigensolver("dense")``, i.e. :class:`newton.DenseBackend`;
-- a backend instance: returned unchanged (validated with ``isinstance(x, newton.EigenSolverBackend)``).
+- ``"dense"`` / ``ModalEigensolver.DENSE``: ``modal_sparse.resolve_eigensolver("dense")``, i.e. :class:`newton.ModalDenseBackend`;
+- a backend instance: returned unchanged (validated with ``isinstance(x, newton.ModalEigensolverBackend)``).
 
 The two restricted backends exist because the tangent stiffness of a pre-stressed body does not have the
 rigid motions in its null space: projecting them out after a plain shift-invert solve (what Newton's
 generic backends do) is not the inverse of the restricted pencil. Generic backends still work: they see
 ``(K_T, M)`` on the free DOFs with the M-orthonormal rigid motions as ``deflation``; a backend exposing a
-``previous_vectors`` attribute (Newton's :class:`~newton.SubspaceIterationBackend`) is warm-started with
+``previous_vectors`` attribute (Newton's :class:`~newton.ModalSubspaceIterationBackend`) is warm-started with
 the previous basis before every solve.
 
 :class:`ShiftedRestrictedSolver` is the one factorization per update shared by the eigensolve (ARPACK
@@ -116,7 +116,7 @@ def shared_restricted_solver(K, M, Y: np.ndarray | None) -> ShiftedRestrictedSol
 class RestrictedArpackBackend:
     """ARPACK shift-invert on the M-orthogonal complement of ``deflation`` with an exact restricted inverse.
 
-    Satisfies :class:`newton.EigenSolverBackend`. Up to ``dense_dof_limit`` free DOFs (or when the request
+    Satisfies :class:`newton.ModalEigensolverBackend`. Up to ``dense_dof_limit`` free DOFs (or when the request
     is close to the full size) the complement is solved densely (QR complement + LAPACK). Otherwise
     ``x = A^-1 b - A^-1 B (B^T A^-1 B)^-1 B^T A^-1 b`` (``A = K - sigma M``, ``B = M Y``); eigenvalues below
     ``sigma`` are detected by the Haynsworth inertia count ``neg(Z^T A Z) = neg(A) + neg(-B^T A^-1 B) - d``
@@ -143,7 +143,7 @@ class RestrictedArpackBackend:
         tol: float = 0.0,
         factorization=None,
         zero_threshold: float = 0.0,
-    ) -> newton.EigenResult:
+    ) -> newton.ModalEigenResult:
         """Return the ``count`` lowest eigenpairs outside ``deflation``.
 
         ``sigma`` is ignored. ``factorization``: a symmetric :class:`ShiftedRestrictedSolver` (from
@@ -181,7 +181,7 @@ class RestrictedArpackBackend:
             V = Z @ vecs
             info.update(path="dense", sigma=None, below_sigma=0)
             self.last_info = info
-            return newton.EigenResult(vals, V, backend=self.name, wall_s=time.perf_counter() - t0)
+            return newton.ModalEigenResult(vals, V, backend=self.name, wall_s=time.perf_counter() - t0)
 
         K = sp.csc_matrix(K)
         sigma = shared.sigma if shared is not None else modal_sparse.default_shift(K, M)
@@ -240,7 +240,7 @@ class RestrictedArpackBackend:
         R = R - B @ (Y.T @ R)
         info["max_rel_residual"] = float(np.max(np.linalg.norm(R, axis=0) / (fact.norm * np.linalg.norm(vecs, axis=0))))
         self.last_info = info
-        return newton.EigenResult(
+        return newton.ModalEigenResult(
             vals,
             vecs,
             inertia_count=None if below < 0 else int(below) + d,
@@ -253,7 +253,7 @@ class RestrictedArpackBackend:
 class RestrictedSubspaceBackend:
     """Warm-started subspace iteration (Bathe) with the shared restricted factorization.
 
-    Satisfies :class:`newton.EigenSolverBackend`. The start block is :attr:`previous_vectors` (the previous
+    Satisfies :class:`newton.ModalEigensolverBackend`. The start block is :attr:`previous_vectors` (the previous
     basis on the free DOFs) with the deflated directions removed, padded with ``margin`` deterministic
     normal random vectors (seed :attr:`seed`); ``iterations`` block inverse iterations
     ``X <- solve(M X)`` with the :class:`ShiftedRestrictedSolver` passed as ``factorization`` (built here
@@ -285,7 +285,7 @@ class RestrictedSubspaceBackend:
         tol: float = 0.0,
         factorization=None,
         zero_threshold: float = 0.0,
-    ) -> newton.EigenResult:
+    ) -> newton.ModalEigenResult:
         """Return the Ritz pairs of the warm-started block (at least ``count`` when the block allows)."""
         del sigma, tol, zero_threshold
         t0 = time.perf_counter()
@@ -326,7 +326,7 @@ class RestrictedSubspaceBackend:
             "max_rel_residual": float(np.max(rel)),
         }
         self.previous_vectors = V
-        return newton.EigenResult(vals, V, backend=self.name, wall_s=time.perf_counter() - t0)
+        return newton.ModalEigenResult(vals, V, backend=self.name, wall_s=time.perf_counter() - t0)
 
 
 def resolve_backend(spec, *, margin: int = 2, iterations: int = 1, dense_dof_limit: int = 0):
@@ -337,12 +337,12 @@ def resolve_backend(spec, *, margin: int = 2, iterations: int = 1, dense_dof_lim
             return RestrictedArpackBackend(dense_dof_limit=dense_dof_limit)
         if kind is newton.ModalEigensolver.SUBSPACE:
             return RestrictedSubspaceBackend(iterations=iterations, margin=margin)
-        return newton.resolve_eigensolver(kind, margin=margin)
-    if isinstance(spec, newton.EigenSolverBackend):
-        return newton.resolve_eigensolver(spec)
+        return modal_sparse.resolve_eigensolver(kind, margin=margin)
+    if isinstance(spec, newton.ModalEigensolverBackend):
+        return modal_sparse.resolve_eigensolver(spec)
     raise TypeError(
         "eigensolver must be 'auto', 'arpack', 'subspace', 'dense', a newton.ModalEigensolver or a "
-        f"newton.EigenSolverBackend, got {type(spec).__name__}"
+        f"newton.ModalEigensolverBackend, got {type(spec).__name__}"
     )
 
 
@@ -377,15 +377,15 @@ def solve_restricted_eigen(
         res = backend.solve(Kf, Mf, count, deflation=Yf, factorization=shared_solver() if share_arpack else None)
         info.update(backend.last_info)
         return np.asarray(res.values), np.asarray(res.vectors), info
-    # generic newton.EigenSolverBackend (Newton built-ins, Warpack, test doubles)
+    # generic newton.ModalEigensolverBackend (Newton built-ins, Warpack, test doubles)
     if hasattr(backend, "previous_vectors") and previous is not None:
         prev = previous
         if Yf is not None:
             prev = prev - Yf @ (Yf.T @ (Mf @ prev))
         backend.previous_vectors = prev
     device = getattr(backend, "device", "cpu")
-    K_in = newton.to_backend_matrix(sp.csc_matrix(Kf), device=device)
-    M_in = newton.to_backend_matrix(sp.csc_matrix(Mf), device=device)
+    K_in = modal_sparse.to_backend_matrix(sp.csc_matrix(Kf), device=device)
+    M_in = modal_sparse.to_backend_matrix(sp.csc_matrix(Mf), device=device)
     t0 = time.perf_counter()
     res = backend.solve(K_in, M_in, int(count), deflation=Yf)
     values, vectors = modal_sparse.validate_eigen_result(

@@ -13,7 +13,7 @@ Triggers        :class:`RotationTrigger`, :class:`EnergyMismatchTrigger`, :class
 Assembly        :class:`TangentAssembler` (protocol), :class:`NumpyTetAssembler`, :class:`TetMesh`,
                 :func:`make_beam_mesh`, :func:`make_flexure_mesh`, :func:`default_assembler`
 Eigensolvers    :class:`RestrictedArpackBackend`, :class:`RestrictedSubspaceBackend`,
-                :class:`ShiftedRestrictedSolver` (any ``newton.EigenSolverBackend`` is accepted too)
+                :class:`ShiftedRestrictedSolver` (any ``newton.ModalEigensolverBackend`` is accepted too)
 Craig-Bampton   :func:`cb_basis`, :class:`CBSegment`, :class:`CBChain`, :func:`build_cb_chain`,
                 :func:`segment_from_mesh`, :func:`install_interface_endpoint_maps`
 References      :class:`FullFEReference`, :class:`PrescribedMotionReference`, :class:`BaseMotion`
