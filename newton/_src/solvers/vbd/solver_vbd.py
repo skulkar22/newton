@@ -2033,7 +2033,68 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         return width, path, block_dim, body_ids, factor
 
     def _build_elastic_mass_solve_data(self, model: Model) -> tuple[wp.array, ElasticReducedMobility]:
-        """Build coupled-mass flags and the Schur-form inverse reduced mass.
+        """Allocate coupled-mass flags and the Schur-form inverse reduced mass.
+
+        See :meth:`_compute_elastic_mass_solve_data` for the contents.
+        """
+        flags, frame_inv_schur, frame_modal_mass, modal_inv_mass, modal_inv_mass_dense, modal_mass_is_dense = (
+            self._compute_elastic_mass_solve_data(model)
+        )
+        mobility = ElasticReducedMobility()
+        mobility.frame_inv_schur = wp.array(frame_inv_schur, dtype=wp.spatial_matrix, device=self.device)
+        mobility.frame_modal_mass = wp.array(frame_modal_mass, dtype=wp.spatial_vector, device=self.device)
+        mobility.modal_inv_mass = wp.array(modal_inv_mass, dtype=float, device=self.device)
+        mobility.modal_mass_is_dense = int(modal_mass_is_dense)
+        if modal_mass_is_dense:
+            mobility.modal_inv_mass_dense = wp.array(modal_inv_mass_dense, dtype=float, device=self.device)
+        else:
+            mobility.modal_inv_mass_dense = wp.zeros((0, 0, 0), dtype=float, device=self.device)
+        return wp.array(flags, dtype=bool, device=self.device), mobility
+
+    def refresh_elastic_mass_solve_data(self) -> bool:
+        """Recompute the inverse reduced mass of the reduced elastic bodies in place.
+
+        Call this after writing new inertial properties of reduced elastic bodies into the
+        existing :class:`~newton.Model` arrays (body mass, COM, inertia and their inverses,
+        :attr:`~newton.Model.elastic_mode_mass`, :attr:`~newton.Model.elastic_mode_mass_matrix`
+        and the mode coupling integrals), for example when a reduced basis is replaced at run
+        time. It refreshes the effective inverse masses and recomputes the coupled-mass flags
+        and the Schur-form inverse reduced mass like
+        ``notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)``, but writes the results
+        into the arrays allocated at construction instead of reallocating them, so a CUDA graph
+        captured around :meth:`step` stays valid. Array shapes do not change.
+
+        The data are reallocated only when the modal mass storage switches between diagonal and
+        dense (a modal mass matrix gaining or losing off-diagonal terms); a captured graph must
+        then be recaptured.
+
+        Returns:
+            ``True`` if the data were refreshed in place, ``False`` if they were reallocated.
+        """
+        self._refresh_kinematic_state()
+        if self.model.elastic_body_count == 0:
+            return True
+        flags, frame_inv_schur, frame_modal_mass, modal_inv_mass, modal_inv_mass_dense, modal_mass_is_dense = (
+            self._compute_elastic_mass_solve_data(self.model)
+        )
+        mobility = self.elastic_reduced_mobility
+        if int(modal_mass_is_dense) != int(mobility.modal_mass_is_dense):
+            self.elastic_implicit_mass_coupling, self.elastic_reduced_mobility = self._build_elastic_mass_solve_data(
+                self.model
+            )
+            return False
+        self.elastic_implicit_mass_coupling.assign(flags)
+        mobility.frame_inv_schur.assign(frame_inv_schur)
+        mobility.frame_modal_mass.assign(frame_modal_mass)
+        mobility.modal_inv_mass.assign(modal_inv_mass)
+        if modal_mass_is_dense:
+            mobility.modal_inv_mass_dense.assign(modal_inv_mass_dense)
+        return True
+
+    def _compute_elastic_mass_solve_data(
+        self, model: Model
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+        """Compute coupled-mass flags and the Schur-form inverse reduced mass on the host.
 
         The reduced mass ``M(0)`` of a dynamic frame couples the rest-COM translation, the
         rotation, and the modes through ``S_i`` and ``-(G_i + c x S_i)`` and uses the full
@@ -2149,7 +2210,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     "SolverVBD falls back to explicit frame/mode coupling for this body, which can diverge under "
                     "stiff or compliant joints; pass the basis's rigid mass, COM, and inertia to add_body_elastic.",
                     UserWarning,
-                    stacklevel=3,
+                    stacklevel=4,
                 )
             if is_spd:
                 frame_inv, modal_inv = _elastic_schur_inverse_blocks(frame_mass, cross_mass, modal_mass)
@@ -2163,16 +2224,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 if off_diagonal > 1.0e-10 * np.max(np.abs(np.diag(modal_mass))):
                     modal_mass_is_dense = True
 
-        mobility = ElasticReducedMobility()
-        mobility.frame_inv_schur = wp.array(frame_inv_schur, dtype=wp.spatial_matrix, device=self.device)
-        mobility.frame_modal_mass = wp.array(frame_modal_mass, dtype=wp.spatial_vector, device=self.device)
-        mobility.modal_inv_mass = wp.array(modal_inv_mass, dtype=float, device=self.device)
-        mobility.modal_mass_is_dense = int(modal_mass_is_dense)
-        if modal_mass_is_dense:
-            mobility.modal_inv_mass_dense = wp.array(modal_inv_mass_dense, dtype=float, device=self.device)
-        else:
-            mobility.modal_inv_mass_dense = wp.zeros((0, 0, 0), dtype=float, device=self.device)
-        return wp.array(flags, dtype=bool, device=self.device), mobility
+        return flags, frame_inv_schur, frame_modal_mass, modal_inv_mass, modal_inv_mass_dense, modal_mass_is_dense
 
     def _init_particle_system(
         self,

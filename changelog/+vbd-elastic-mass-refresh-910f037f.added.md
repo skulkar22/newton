@@ -1,0 +1,1 @@
+Add `SolverVBD.refresh_elastic_mass_solve_data()`, which recomputes the inverse reduced mass of reduced elastic bodies in place after their inertial properties change, so CUDA graphs captured around `SolverVBD.step()` stay valid; `notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)` reallocates these arrays.
