@@ -1,8 +1,10 @@
 # re-ROM: adaptive re-linearization of reduced elastic bodies (experimental)
 
 **Status: experimental.** This folder is *not* part of the `newton` package, has no API stability
-guarantee and is not installed with Newton. It is a host-side (numpy/SciPy) research package built on
-Newton's reduced elastic (FFRF) bodies and `SolverVBD`, kept next to the code it exercises.
+guarantee and is not installed with Newton. It is a research package built on Newton's reduced elastic
+(FFRF) bodies and `SolverVBD`, kept next to the code it exercises: the eigensolve and the basis
+construction run on the host (numpy/SciPy, or a pluggable GPU backend); the rest of an update, the
+per-step trigger and the pre-stress run as Warp kernels on the Model's device.
 
 ## What re-ROM is
 
@@ -30,9 +32,10 @@ Newton's reduced elastic (FFRF) bodies and `SolverVBD`, kept next to the code it
 | `rerom/triggers.py` | `RotationTrigger`, `EnergyMismatchTrigger`, `ResidualTrigger` on a shared gating base `Trigger` |
 | `rerom/numerics.py` | the shared numerics (rigid vectors, M-orthonormal blocks, Ritz/Krylov enrichment, Rayleigh-Ritz, modal derivatives, state projection, quaternions) |
 | `rerom/eigen.py` | the eigensolver seam: `resolve_backend`, `RestrictedArpackBackend`, `RestrictedSubspaceBackend`, `ShiftedRestrictedSolver` |
-| `rerom/model_io.py` | every `Model`/`State`/`Control` array read and write (batched), joint rest-rotation propagation |
+| `rerom/model_io.py` | every `Model`/`State`/`Control` array read and write of the host path (batched), joint rest-rotation propagation |
+| `rerom/update_kernels.py` | device-side update (`DeviceUpdater`): recovery, packed gather/scatter, inertia integrals, sample/endpoint rewrites, state projection, per-step trigger and pre-stress kernels |
 | `rerom/assembly.py` | `TangentAssembler` protocol, `NumpyTetAssembler`, meshes, `Material`, `default_assembler` |
-| `rerom/assembly_warp.py` | `WarpTetAssembler` (CPU/CUDA tangent assembly, see `BENCHMARKS_assembly.md`) |
+| `rerom/assembly_warp.py` | `WarpTetAssembler` (CPU/CUDA tangent assembly, see `BENCHMARKS.md`) |
 | `rerom/craig_bampton.py` | CB basis with interface frames, segments, chains, linear statics |
 | `rerom/hyper_reduction.py` | element-subset modal force (ECSW, stratified sampling) for the IMEX remainder |
 | `rerom/fe_reference.py` | `FullFEReference` (implicit Newmark FE), `BaseMotion`, `PrescribedMotionReference` |
@@ -74,6 +77,35 @@ Tests (CPU; the CUDA cases run when a device is present, the CalculiX cases when
 ```bash
 uv run python -m unittest discover -s experimental/rerom/tests -t experimental/rerom/tests
 ```
+
+## Device-side update and CUDA graphs
+
+`UpdatePolicy(path=UpdatePath.DEVICE)` (default) keeps everything except the eigensolve on the Model's
+device: one packed device-to-host copy at the start of an update (modal state, `r_new = r_ref + Phi q`,
+`f_int`, the BSR values of `K_T` from a `WarpTetAssembler` on the same device), the host builds the basis,
+one packed host-to-device copy brings it back, and Warp kernels rewrite the inertia integrals, modal mass
+matrix, render/shape/endpoint samples, rigid properties and the projected state in place. The solver is
+refreshed with `SolverVBD.refresh_elastic_mass_solve_data()` (in place), so a CUDA graph captured around
+the step stays valid across updates:
+
+```python
+with wp.ScopedCapture() as capture:
+    ctrl.apply_prestress(control)  # one kernel: modal rows of control.joint_f
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control, None, dt)
+    ...
+for _ in range(steps):
+    wp.capture_launch(capture.graph)
+    fire, reason, metrics = ctrl.poll(state_0, dt)  # device trigger: one 3-value read
+    if fire:
+        ctrl.relinearize(state_0, control)  # outside the graph; no recapture needed
+```
+
+`UpdatePolicy(path=UpdatePath.HOST)` is the legacy numpy path; with
+`BasisOptions(shared_factorization=False)` it reproduces the recorded runs bit for bit. The device path
+agrees with it to roundoff (see `BENCHMARKS.md` for the acceptance runs and timings).
+`BasisOptions.shared_factorization` (default `True`) factors `K_T - sigma M` once per update for the
+eigensolve, the Ritz vectors and the modal derivatives.
 
 ## Plugging in a GPU eigensolver (Warpack + cuDSS, FSAI-CG + LOBPCG)
 
