@@ -52,6 +52,7 @@ from . import (
     reduced_elastic_kernels,
     reduced_elastic_sparse_kernels,
     rigid_sparse_articulation_kernels,
+    rigid_sparse_articulation_variable_kernels,
     rigid_vbd_kernels,
     vbd_coupling_kernels,
 )
@@ -1341,6 +1342,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
+                rigid_sparse_articulation_variable_kernels,
                 reduced_elastic_kernels,
                 reduced_elastic_sparse_kernels,
                 accumulate_body_body_contacts_per_body.module,

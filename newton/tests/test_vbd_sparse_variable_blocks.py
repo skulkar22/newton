@@ -17,10 +17,20 @@ import warp as wp
 
 import newton
 from newton._src.sim import JointType
+from newton._src.solvers.vbd import rigid_sparse_articulation_kernels as legacy_kernels
+from newton._src.solvers.vbd import rigid_sparse_articulation_variable_kernels as variable_kernels
+from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData
 from newton._src.solvers.vbd.rigid_sparse_articulation import (
     _minimum_degree_order,
     _weighted_minimum_degree_order,
     build_rigid_articulation_sparse_layout,
+)
+from newton._src.solvers.vbd.rigid_sparse_articulation_variable_kernels import (
+    VB_FACTOR_INDEFINITE,
+    VB_FACTOR_OK,
+    VB_SOLVE_NONFINITE,
+    apply_articulation_variable_delta,
+    launch_solve_articulation_variable,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -607,6 +617,609 @@ def test_layout_rejects_int32_overflow(test, device):
     build_rigid_articulation_sparse_layout(model, device, elastic_solve="schur")
 
 
+# ---------------------------------------------------------------------------
+# Variable-block factorization and solve
+# ---------------------------------------------------------------------------
+
+
+def _variable_solvers(device):
+    """Variable-block solve launchers to check on ``device``, as ``(name, launcher)`` pairs.
+
+    The serial kernel is device agnostic (one thread per articulation) and runs everywhere. A
+    cooperative CUDA kernel is to be added to this list for CUDA devices.
+    """
+    return [("serial", launch_solve_articulation_variable)]
+
+
+def _articulation_rows(layout, articulation: int) -> tuple[int, int]:
+    offsets = layout.articulation_body_offsets.numpy()
+    return int(offsets[articulation]), int(offsets[articulation + 1])
+
+
+def _random_system(layout, model, mode_counts, rng, *, edge_scale: float = 0.5, scale_decades: float = 0.0):
+    """Random SPD system on each mixed articulation's joint graph, in model body order.
+
+    Returns ``(H, rhs)`` dicts per mixed articulation, where ``H`` is in layout (eliminated)
+    row order and ``P`` the permutation such that ``H = P H_model P^T``. With ``scale_decades``
+    the matrix is scaled symmetrically, ``S H S``, by a diagonal ``S`` with entries spread
+    log-uniformly over ``10**[-scale_decades, scale_decades]`` (stored per layout row as ``scale``).
+    """
+    bodies = layout.articulation_bodies.numpy()
+    dims_all = layout.articulation_row_dims.numpy()
+    parent = model.joint_parent.numpy()
+    child = model.joint_child.numpy()
+    joint_type = model.joint_type.numpy()
+    joint_offsets = layout.articulation_joint_offsets.numpy()
+    joints = layout.articulation_joints.numpy()
+    systems = {}
+    for a in range(layout.rigid_articulation_count, layout.articulation_count):
+        start, end = _articulation_rows(layout, a)
+        model_bodies = sorted(int(b) for b in bodies[start:end])
+        dims = [6 + (mode_counts[b] or 0) for b in model_bodies]
+        offsets = np.concatenate([[0], np.cumsum(dims)])
+        size = int(offsets[-1])
+        index = {b: i for i, b in enumerate(model_bodies)}
+        H = np.zeros((size, size))
+        for i, n in enumerate(dims):
+            M = rng.normal(size=(n, n))
+            H[offsets[i] : offsets[i + 1], offsets[i] : offsets[i + 1]] += M @ M.T / n + np.eye(n)
+        for joint in joints[joint_offsets[a] : joint_offsets[a + 1]]:
+            p, c = int(parent[joint]), int(child[joint])
+            if joint_type[joint] == int(JointType.ELASTIC) or p < 0 or c < 0:
+                continue
+            idx = np.concatenate(
+                [
+                    np.arange(offsets[index[p]], offsets[index[p] + 1]),
+                    np.arange(offsets[index[c]], offsets[index[c] + 1]),
+                ]
+            )
+            E = rng.normal(size=(min(len(idx), 12), len(idx))) * edge_scale
+            H[np.ix_(idx, idx)] += E.T @ E
+        # Permutation into layout row order.
+        perm = np.concatenate(
+            [np.arange(offsets[index[int(b)]], offsets[index[int(b)] + 1]) for b in bodies[start:end]]
+        )
+        np.testing.assert_array_equal([dims[index[int(b)]] for b in bodies[start:end]], dims_all[start:end])
+        scale = 10.0 ** rng.uniform(-scale_decades, scale_decades, size=size)
+        H_model = scale[:, None] * H * scale[None, :]
+        H_layout = H_model[np.ix_(perm, perm)]
+        systems[a] = {
+            "H_model": H_model,
+            "perm": perm,
+            "H": H_layout,
+            "rhs": rng.normal(size=size) * scale[perm],
+            "scale": scale[perm],
+        }
+    return systems
+
+
+def _scatter_system(layout, systems, rng):
+    """Write the lower block triangle of each system into flat value and rhs arrays.
+
+    Rigid-prefix entries and fill slots get sentinels/zeros so untouched storage can be checked.
+    """
+    value_offsets = layout.articulation_block_value_offsets.numpy()
+    block_dims = layout.articulation_block_dims.numpy()
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    row_offsets = layout.articulation_block_row_offsets.numpy()
+    cols = layout.articulation_block_cols.numpy()
+    values = rng.normal(size=layout.articulation_value_count)
+    rhs = rng.normal(size=layout.articulation_scalar_count)
+    for a, system in systems.items():
+        start, end = _articulation_rows(layout, a)
+        base = scalar_offsets[start]
+        for row in range(start, end):
+            for slot in range(row_offsets[row], row_offsets[row + 1]):
+                col_row = start + int(cols[slot])
+                r0, c0 = scalar_offsets[row] - base, scalar_offsets[col_row] - base
+                R, C = block_dims[slot]
+                block = system["H"][r0 : r0 + R, c0 : c0 + C]
+                values[value_offsets[slot] : value_offsets[slot + 1]] = block.ravel()
+        rhs[scalar_offsets[start] : scalar_offsets[end]] = system["rhs"]
+    return values, rhs
+
+
+def _dense_factor(layout, values, articulation: int) -> np.ndarray:
+    """Assemble the dense lower factor of one articulation from factored block values."""
+    value_offsets = layout.articulation_block_value_offsets.numpy()
+    block_dims = layout.articulation_block_dims.numpy()
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    row_offsets = layout.articulation_block_row_offsets.numpy()
+    cols = layout.articulation_block_cols.numpy()
+    start, end = _articulation_rows(layout, articulation)
+    base = scalar_offsets[start]
+    size = scalar_offsets[end] - base
+    L = np.zeros((size, size))
+    for row in range(start, end):
+        for slot in range(row_offsets[row], row_offsets[row + 1]):
+            col_row = start + int(cols[slot])
+            r0, c0 = scalar_offsets[row] - base, scalar_offsets[col_row] - base
+            R, C = block_dims[slot]
+            block = np.asarray(values[value_offsets[slot] : value_offsets[slot + 1]], dtype=np.float64).reshape(R, C)
+            if col_row == row:
+                block = np.tril(block)
+            L[r0 : r0 + R, c0 : c0 + C] = block
+    return L
+
+
+def _reference_layout_solve(layout, values, rhs, articulation: int) -> np.ndarray:
+    """Float64 right-looking block Cholesky that walks the layout's column and update lists."""
+    value_offsets = layout.articulation_block_value_offsets.numpy()
+    block_dims = layout.articulation_block_dims.numpy()
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    diag = layout.articulation_diag_slots.numpy()
+    col_offsets = layout.articulation_block_col_offsets.numpy()
+    col_rows = layout.articulation_block_col_rows.numpy()
+    col_slots = layout.articulation_block_col_slots.numpy()
+    update_offsets = layout.articulation_factor_update_offsets.numpy()
+    update_dst = layout.articulation_factor_update_dst_slots.numpy()
+    update_left = layout.articulation_factor_update_left_slots.numpy()
+    update_right = layout.articulation_factor_update_right_slots.numpy()
+    row_offsets = layout.articulation_block_row_offsets.numpy()
+    cols = layout.articulation_block_cols.numpy()
+    start, end = _articulation_rows(layout, articulation)
+
+    blocks = {}
+    for row in range(start, end):
+        for slot in range(row_offsets[row], row_offsets[row + 1]):
+            R, C = block_dims[slot]
+            blocks[slot] = np.asarray(values[value_offsets[slot] : value_offsets[slot + 1]], dtype=np.float64).reshape(
+                R, C
+            )
+    for row in range(start, end):
+        blocks[diag[row]] = np.linalg.cholesky(blocks[diag[row]])
+        L_kk = blocks[diag[row]]
+        for entry in range(col_offsets[row], col_offsets[row + 1]):
+            slot = col_slots[entry]
+            blocks[slot] = np.linalg.solve(L_kk, blocks[slot].T).T
+        for entry in range(update_offsets[row], update_offsets[row + 1]):
+            blocks[update_dst[entry]] = (
+                blocks[update_dst[entry]] - blocks[update_left[entry]] @ blocks[update_right[entry]].T
+            )
+
+    def seg(r):
+        return slice(scalar_offsets[r] - scalar_offsets[start], scalar_offsets[r + 1] - scalar_offsets[start])
+
+    x = np.asarray(rhs[scalar_offsets[start] : scalar_offsets[end]], dtype=np.float64).copy()
+    for row in range(start, end):
+        for slot in range(row_offsets[row], row_offsets[row + 1]):
+            if slot != diag[row]:
+                x[seg(row)] -= blocks[slot] @ x[seg(start + cols[slot])]
+        x[seg(row)] = np.linalg.solve(blocks[diag[row]], x[seg(row)])
+    for row in range(end - 1, start - 1, -1):
+        for entry in range(col_offsets[row], col_offsets[row + 1]):
+            x[seg(row)] -= blocks[col_slots[entry]].T @ x[seg(start + col_rows[entry])]
+        x[seg(row)] = np.linalg.solve(blocks[diag[row]].T, x[seg(row)])
+    return x
+
+
+def _run_solve(launcher, layout, values_np, rhs_np, device, frame_regularization: float = 0.0, delta_fill=None):
+    values = wp.array(np.asarray(values_np, dtype=np.float32), dtype=float, device=device)
+    rhs = wp.array(np.asarray(rhs_np, dtype=np.float32), dtype=float, device=device)
+    delta_init = np.full(layout.articulation_scalar_count, 7.0 if delta_fill is None else delta_fill, dtype=np.float32)
+    delta = wp.array(delta_init, dtype=float, device=device)
+    diag_backup = wp.zeros(layout.articulation_scalar_count, dtype=float, device=device)
+    status = wp.full(max(layout.mixed_articulation_count, 1), -1, dtype=wp.int32, device=device)
+    failures = wp.zeros(1, dtype=wp.int32, device=device)
+    launcher(layout, frame_regularization, rhs, values, diag_backup, status, failures, delta, device=device)
+    return {
+        "values": values.numpy(),
+        "delta": delta.numpy(),
+        "diag_backup": diag_backup.numpy(),
+        "status": status.numpy(),
+        "failures": int(failures.numpy()[0]),
+        "rhs": rhs.numpy(),
+    }
+
+
+# Rigid prefix articulation, then mixed articulations whose rows have sizes 6, 7, 31, 32, 33, 64
+# and 163: an adjacent elastic chain, a loop of elastic links, and a branched loop with a
+# zero-mode elastic body. Modal counts per body (``None`` for rigid).
+_SOLVE_MODE_COUNTS = [None, None, 157, 58, 1, None, 25, 26, 27, None, 0, None, 1, 58]
+_SOLVE_ARTICULATIONS = [
+    [(-1, 0), (0, 1)],
+    [(-1, 2), (2, 3), (3, 4), (4, 5)],
+    [(-1, 6), (6, 7), (7, 8), (8, 9), (9, 6)],
+    [(-1, 10), (10, 11), (10, 12), (12, 13), (11, 13)],
+]
+
+
+def _solve_fixture(device, seed: int = 5, scale_decades: float = 0.0):
+    model = _synthetic_model(device, _SOLVE_MODE_COUNTS, _SOLVE_ARTICULATIONS)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    rng = np.random.default_rng(seed)
+    systems = _random_system(layout, model, _SOLVE_MODE_COUNTS, rng, scale_decades=scale_decades)
+    values, rhs = _scatter_system(layout, systems, rng)
+    return model, layout, systems, values, rhs
+
+
+def test_reference_layout_solve_matches_dense(test, device):
+    """A float64 solve that walks the layout's lists equals numpy.linalg.solve."""
+    _model, layout, systems, values, rhs = _solve_fixture(device)
+    test.assertEqual(sorted(set(layout.articulation_row_dims.numpy().tolist())), [6, 7, 31, 32, 33, 64, 163])
+    for a, system in systems.items():
+        x = _reference_layout_solve(layout, values, rhs, a)
+        expected = np.linalg.solve(system["H"], system["rhs"])
+        np.testing.assert_allclose(x, expected, rtol=0.0, atol=1.0e-10 * np.linalg.norm(expected))
+
+
+def test_variable_solve_random_spd(test, device):
+    """Random SPD mixed systems: solution vs numpy and factor ``L L^T`` vs ``P H P^T``.
+
+    The third system is scaled over four decades (condition number about 1e8); errors are
+    measured in the scaled coordinates, where float32 Cholesky is accurate.
+    """
+    for name, launcher in _variable_solvers(device):
+        for seed, decades in ((5, 0.0), (6, 0.0), (7, 2.0)):
+            _model, layout, systems, values, rhs = _solve_fixture(device, seed, decades)
+            out = _run_solve(launcher, layout, values, rhs, device)
+            test.assertEqual(out["failures"], 0, name)
+            np.testing.assert_array_equal(out["status"], VB_FACTOR_OK)
+            scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+            for a, system in systems.items():
+                start, end = _articulation_rows(layout, a)
+                delta = out["delta"][scalar_offsets[start] : scalar_offsets[end]].astype(np.float64)
+                expected = np.linalg.solve(system["H"], system["rhs"])
+                scale = system["scale"]
+                error = np.linalg.norm(scale * (delta - expected)) / np.linalg.norm(scale * expected)
+                test.assertLess(error, 1.0e-4, f"{name} articulation {a}")
+                # The factor reproduces the permuted matrix.
+                P = np.eye(len(system["perm"]))[system["perm"]]
+                L = _dense_factor(layout, out["values"], a) / scale[:, None]
+                H_unscaled = (P @ system["H_model"] @ P.T) / np.outer(scale, scale)
+                factor_error = np.linalg.norm(L @ L.T - H_unscaled) / np.linalg.norm(H_unscaled)
+                test.assertLess(factor_error, 1.0e-5, f"{name} articulation {a}")
+            # The rigid prefix is left untouched.
+            rigid_values = layout.articulation_block_value_offsets.numpy()[layout.rigid_block_count]
+            np.testing.assert_array_equal(out["values"][:rigid_values], values[:rigid_values].astype(np.float32))
+            np.testing.assert_array_equal(out["delta"][: scalar_offsets[layout.rigid_body_row_count]], 7.0)
+
+
+def test_variable_solve_frame_regularization(test, device):
+    """The backend adds the frame regularization to the six frame diagonal entries of mixed rows."""
+    regularization = 0.75
+    for name, launcher in _variable_solvers(device):
+        _model, layout, systems, values, rhs = _solve_fixture(device, 9)
+        out = _run_solve(launcher, layout, values, rhs, device, frame_regularization=regularization)
+        test.assertEqual(out["failures"], 0, name)
+        scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+        dims = layout.articulation_row_dims.numpy()
+        for a, system in systems.items():
+            start, end = _articulation_rows(layout, a)
+            base = scalar_offsets[start]
+            H = system["H"].copy()
+            for row in range(start, end):
+                for k in range(6):
+                    H[scalar_offsets[row] - base + k, scalar_offsets[row] - base + k] += regularization
+                np.testing.assert_allclose(
+                    out["diag_backup"][scalar_offsets[row] : scalar_offsets[row] + dims[row]],
+                    np.diag(H)[scalar_offsets[row] - base : scalar_offsets[row] - base + dims[row]],
+                    rtol=1.0e-6,
+                )
+            expected = np.linalg.solve(H, system["rhs"])
+            delta = out["delta"][scalar_offsets[start] : scalar_offsets[end]]
+            test.assertLess(np.linalg.norm(delta - expected) / np.linalg.norm(expected), 1.0e-4, name)
+
+
+def test_variable_solve_failure_takes_jacobi_step(test, device):
+    """Indefinite or non-finite systems set the status, count once, and take a finite Jacobi step."""
+    for name, launcher in _variable_solvers(device):
+        _model, layout, systems, values, rhs = _solve_fixture(device, 13)
+        value_offsets = layout.articulation_block_value_offsets.numpy()
+        block_dims = layout.articulation_block_dims.numpy()
+        scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+        diag = layout.articulation_diag_slots.numpy()
+        mixed = list(range(layout.rigid_articulation_count, layout.articulation_count))
+        # Articulation 1: an indefinite modal diagonal block in its second row.
+        start, _end = _articulation_rows(layout, mixed[0])
+        row = start + 1
+        n = int(block_dims[diag[row], 0])
+        block = values[value_offsets[diag[row]] : value_offsets[diag[row] + 1]].reshape(n, n)
+        block[6:, 6:] -= 1.0e3 * np.eye(n - 6)
+        values[value_offsets[diag[row]] : value_offsets[diag[row] + 1]] = block.ravel()
+        # Articulation 2: a NaN in an off-diagonal block.
+        start, end = _articulation_rows(layout, mixed[1])
+        row_offsets = layout.articulation_block_row_offsets.numpy()
+        off_slot = next(s for r in range(start, end) for s in range(row_offsets[r], row_offsets[r + 1]) if s != diag[r])
+        values[value_offsets[off_slot]] = np.nan
+        # Articulation 3: a valid matrix with a non-finite right-hand side entry.
+        start, end = _articulation_rows(layout, mixed[2])
+        rhs[scalar_offsets[start] + 2] = np.inf
+
+        out = _run_solve(launcher, layout, values, rhs, device)
+        np.testing.assert_array_equal(out["status"], [VB_FACTOR_INDEFINITE, VB_FACTOR_INDEFINITE, VB_SOLVE_NONFINITE])
+        test.assertEqual(out["failures"], 3, name)
+        test.assertTrue(np.isfinite(out["delta"]).all())
+        for a in mixed:
+            start, end = _articulation_rows(layout, a)
+            segment = slice(scalar_offsets[start], scalar_offsets[end])
+            d, r = out["diag_backup"][segment], out["rhs"][segment]
+            usable = (d > 0.0) & np.isfinite(d) & np.isfinite(r)
+            expected = np.where(usable, r / np.where(usable, d, 1.0), 0.0).astype(np.float32)
+            np.testing.assert_allclose(out["delta"][segment], expected, rtol=1.0e-6, atol=0.0)
+            test.assertTrue((~usable).any() or a != mixed[0])
+
+        # A healthy articulation next to a failing one is still solved exactly.
+        _model, layout, systems, values, rhs = _solve_fixture(device, 13)
+        start, _end = _articulation_rows(layout, mixed[0])
+        row = start + 1
+        block = values[value_offsets[diag[row]] : value_offsets[diag[row] + 1]].reshape(n, n)
+        block[6:, 6:] -= 1.0e3 * np.eye(n - 6)
+        values[value_offsets[diag[row]] : value_offsets[diag[row] + 1]] = block.ravel()
+        out = _run_solve(launcher, layout, values, rhs, device)
+        np.testing.assert_array_equal(out["status"], [VB_FACTOR_INDEFINITE, VB_FACTOR_OK, VB_FACTOR_OK])
+        test.assertEqual(out["failures"], 1, name)
+        for a in mixed[1:]:
+            start, end = _articulation_rows(layout, a)
+            expected = np.linalg.solve(systems[a]["H"], systems[a]["rhs"])
+            delta = out["delta"][scalar_offsets[start] : scalar_offsets[end]]
+            test.assertLess(np.linalg.norm(delta - expected) / np.linalg.norm(expected), 1.0e-4, name)
+
+
+def _launch_legacy_serial_solve(layout, values, rhs, delta, body_count, device):
+    """Run the 6 x 6 serial kernel on preassembled values (``assemble=False``)."""
+    body_q = wp.zeros(body_count, dtype=wp.transform, device=device)
+    body_q_new = wp.zeros(body_count, dtype=wp.transform, device=device)
+    body_vec = wp.zeros(body_count, dtype=wp.vec3, device=device)
+    zeros_float = wp.zeros(body_count, dtype=float, device=device)
+    wp.launch(
+        legacy_kernels.solve_articulation_sparse_serial_scalar,
+        dim=layout.articulation_count,
+        inputs=[
+            1.0,
+            layout.articulation_joints,
+            layout.articulation_joint_body_start,
+            layout.articulation_block_row_offsets,
+            layout.articulation_block_cols,
+            layout.body_articulation_local,
+            body_q,
+            *([None] * 3),
+            body_vec,
+            *([None] * 19),
+            JointCoordinateData(),
+            *([None] * 20),
+            0.0,
+            0,
+            legacy_kernels.SparseElasticJointData(),
+            layout.articulation_body_offsets,
+            layout.articulation_joint_offsets,
+            layout.articulation_bodies,
+            layout.articulation_diag_slots,
+            None,
+            zeros_float,
+            *([None] * 6),
+            1.0,
+            False,
+            False,
+            None,
+            None,
+            values,
+            rhs,
+            delta,
+            body_vec,
+            body_vec,
+            0,
+            body_q_new,
+        ],
+        device=device,
+    )
+
+
+def test_all_six_mixed_matches_legacy_serial_kernel(test, device):
+    """A mixed articulation whose blocks are all 6 x 6 matches the legacy serial kernel."""
+    # Zero-mode elastic bodies make a mixed articulation with size-6 rows only.
+    mode_counts = [None, None, 0, None, 0, None, 0]
+    articulations = [[(-1, 0), (0, 1)], [(-1, 2), (2, 3), (3, 4), (4, 2), (3, 5), (5, 6)]]
+    model = _synthetic_model(device, mode_counts, articulations)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    test.assertEqual(layout.mixed_articulation_count, 1)
+    np.testing.assert_array_equal(layout.articulation_row_dims.numpy(), 6)
+    rng = np.random.default_rng(21)
+    systems = _random_system(layout, model, mode_counts, rng)
+    values, rhs = _scatter_system(layout, systems, rng)
+    # Make the rigid prefix SPD too, since the legacy kernel factors every articulation.
+    for slot in layout.articulation_diag_slots.numpy()[: layout.rigid_body_row_count]:
+        values[36 * slot : 36 * slot + 36] = (10.0 * np.eye(6)).ravel()
+    for slot in range(layout.rigid_block_count):
+        if slot not in set(layout.articulation_diag_slots.numpy().tolist()):
+            values[36 * slot : 36 * slot + 36] = 0.1
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    mixed = slice(scalar_offsets[layout.rigid_body_row_count], scalar_offsets[-1])
+    mixed_values = slice(36 * layout.rigid_block_count, 36 * layout.block_count)
+
+    for name, launcher in _variable_solvers(device):
+        out = _run_solve(launcher, layout, values, rhs, device)
+        test.assertEqual(out["failures"], 0, name)
+        legacy_values = wp.array(values.astype(np.float32), dtype=float, device=device)
+        legacy_rhs = wp.array(rhs.astype(np.float32), dtype=float, device=device)
+        legacy_delta = wp.zeros(layout.articulation_scalar_count, dtype=float, device=device)
+        _launch_legacy_serial_solve(
+            layout,
+            legacy_values.reshape((layout.block_count, 6, 6)).view(legacy_kernels.mat66f),
+            legacy_rhs.reshape((layout.articulation_body_count, 6)).view(legacy_kernels.vec6f),
+            legacy_delta.reshape((layout.articulation_body_count, 6)).view(legacy_kernels.vec6f),
+            model.body_count,
+            device,
+        )
+        expected = legacy_delta.numpy()[mixed]
+        np.testing.assert_allclose(out["delta"][mixed], expected, rtol=0.0, atol=2.0e-6 * np.abs(expected).max())
+        np.testing.assert_allclose(
+            out["values"][mixed_values],
+            legacy_values.numpy()[mixed_values],
+            rtol=0.0,
+            atol=2.0e-6 * np.abs(legacy_values.numpy()[mixed_values]).max(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Update application
+# ---------------------------------------------------------------------------
+
+
+def _np_quat_mul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ]
+    )
+
+
+def _np_quat_rotate(q, v):
+    qv = np.asarray(q[:3], dtype=np.float64)
+    return v + 2.0 * np.cross(qv, np.cross(qv, v) + float(q[3]) * v)
+
+
+def _launch_apply(layout, model, state, delta_np, joint_q_prev_np, relaxation, dt, use_displacement, device):
+    body_q_new = wp.array(np.full((model.body_count, 7), 3.0, dtype=np.float32), dtype=wp.transform, device=device)
+    joint_q = wp.clone(state.joint_q)
+    joint_qd = wp.array(np.full(model.joint_dof_count, 5.0, dtype=np.float32), dtype=float, device=device)
+    body_disp = wp.array(
+        np.random.default_rng(1).normal(size=(model.body_count, 3)).astype(np.float32) * 1e-3,
+        dtype=wp.vec3,
+        device=device,
+    )
+    body_disp_ang = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
+    inertia_q = wp.clone(state.body_q)
+    wp.launch(
+        apply_articulation_variable_delta,
+        dim=layout.articulation_body_count - layout.rigid_body_row_count,
+        inputs=[
+            dt,
+            relaxation,
+            layout.rigid_body_row_count,
+            layout.articulation_bodies,
+            layout.articulation_row_dims,
+            layout.articulation_row_scalar_offsets,
+            wp.array(delta_np.astype(np.float32), dtype=float, device=device),
+            state.body_q,
+            model.body_inv_mass,
+            model.body_com,
+            inertia_q,
+            use_displacement,
+            model.body_elastic_index,
+            model.elastic_joint,
+            model.joint_q_start,
+            model.joint_qd_start,
+            wp.array(joint_q_prev_np.astype(np.float32), dtype=float, device=device),
+        ],
+        outputs=[body_disp, body_disp_ang, body_q_new, joint_q, joint_qd],
+        device=device,
+    )
+    return body_q_new, joint_q, joint_qd, body_disp, body_disp_ang, inertia_q
+
+
+def test_apply_variable_delta(test, device):
+    """Frame (displacement form via the 6 x 6 helper) and modal updates, relaxation applied once."""
+    model, ids = _mixed_model(device)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    state = model.state()
+    rng = np.random.default_rng(4)
+    delta = rng.normal(size=layout.articulation_scalar_count) * 0.05
+    joint_q0 = state.joint_q.numpy()
+    joint_q_prev = joint_q0 + rng.normal(size=joint_q0.shape) * 1.0e-3
+    dt = 1.0 / 240.0
+    bodies = layout.articulation_bodies.numpy()
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    dims = layout.articulation_row_dims.numpy()
+    body_q0 = state.body_q.numpy().astype(np.float64)
+    com = model.body_com.numpy().astype(np.float64)
+    q_start = model.joint_q_start.numpy()
+    qd_start = model.joint_qd_start.numpy()
+    owner = model.elastic_joint.numpy()[model.body_elastic_index.numpy()[ids["link"]]]
+    untouched_bodies = [b for b in range(model.body_count) if b not in bodies[layout.rigid_body_row_count :]]
+
+    for relaxation in (0.65, 1.0):
+        body_q_new, joint_q, joint_qd, _disp, _ang, _q_star = _launch_apply(
+            layout, model, state, delta, joint_q_prev, relaxation, dt, 0, device
+        )
+        body_q_new, joint_q, joint_qd = body_q_new.numpy(), joint_q.numpy(), joint_qd.numpy()
+        for row in range(layout.rigid_body_row_count, layout.articulation_body_count):
+            body = int(bodies[row])
+            d = delta[scalar_offsets[row] : scalar_offsets[row] + dims[row]].astype(np.float32).astype(np.float64)
+            pos, rot = body_q0[body, :3], body_q0[body, 3:]
+            w = relaxation * d[3:6]
+            angle = np.linalg.norm(w)
+            dq = np.concatenate([np.sin(0.5 * angle) * w / angle, [np.cos(0.5 * angle)]])
+            rot_new = _np_quat_mul(dq, rot)
+            rot_new /= np.linalg.norm(rot_new)
+            com_new = pos + _np_quat_rotate(rot, com[body]) + relaxation * d[:3]
+            pos_new = com_new - _np_quat_rotate(rot_new, com[body])
+            np.testing.assert_allclose(body_q_new[body, :3], pos_new, atol=2.0e-6)
+            np.testing.assert_allclose(np.abs(np.dot(body_q_new[body, 3:], rot_new)), 1.0, atol=1.0e-6)
+            if body == ids["link"]:
+                modes = slice(q_start[owner] + 7, q_start[owner] + 7 + ids["link_modes"])
+                q_new = joint_q0[modes] + relaxation * d[6:]
+                np.testing.assert_allclose(joint_q[modes], q_new, atol=1.0e-6)
+                dofs = slice(qd_start[owner] + 6, qd_start[owner] + 6 + ids["link_modes"])
+                np.testing.assert_allclose(joint_qd[dofs], (q_new - joint_q_prev[modes]) / dt, rtol=1.0e-4, atol=1.0e-3)
+        # Rigid-prefix and standalone bodies and every other coordinate are untouched.
+        np.testing.assert_array_equal(body_q_new[untouched_bodies], 3.0)
+        link_modes = set(range(q_start[owner] + 7, q_start[owner] + 7 + ids["link_modes"]))
+        others = [i for i in range(len(joint_q0)) if i not in link_modes]
+        np.testing.assert_array_equal(joint_q[others], joint_q0[others])
+        link_dofs = set(range(qd_start[owner] + 6, qd_start[owner] + 6 + ids["link_modes"]))
+        np.testing.assert_array_equal(joint_qd[[i for i in range(len(joint_qd)) if i not in link_dofs]], 5.0)
+
+    # The displacement-form frame update equals the 6 x 6 kernel's, bit for bit.
+    relaxation = 0.65
+    body_q_new, _joint_q, _joint_qd, disp, disp_ang, inertia_q = _launch_apply(
+        layout, model, state, delta, joint_q_prev, relaxation, dt, 1, device
+    )
+    frames = np.zeros((layout.articulation_body_count, 6), dtype=np.float32)
+    for row in range(layout.articulation_body_count):
+        frames[row] = delta[scalar_offsets[row] : scalar_offsets[row] + 6]
+    legacy_q_new = wp.array(np.full((model.body_count, 7), 3.0, dtype=np.float32), dtype=wp.transform, device=device)
+    legacy_disp = wp.array(
+        np.random.default_rng(1).normal(size=(model.body_count, 3)).astype(np.float32) * 1e-3,
+        dtype=wp.vec3,
+        device=device,
+    )
+    legacy_disp_ang = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
+    wp.launch(
+        legacy_kernels.apply_articulation_sparse_delta_scalar,
+        dim=layout.articulation_body_count,
+        inputs=[
+            layout.articulation_bodies,
+            state.body_q,
+            model.body_inv_mass,
+            model.body_com,
+            relaxation,
+            wp.array(frames.ravel(), dtype=float, device=device),
+            inertia_q,
+            legacy_disp,
+            legacy_disp_ang,
+            1,
+        ],
+        outputs=[legacy_q_new],
+        device=device,
+    )
+    mixed_bodies = bodies[layout.rigid_body_row_count :]
+    np.testing.assert_array_equal(body_q_new.numpy()[mixed_bodies], legacy_q_new.numpy()[mixed_bodies])
+    np.testing.assert_array_equal(disp.numpy()[mixed_bodies], legacy_disp.numpy()[mixed_bodies])
+    np.testing.assert_array_equal(disp_ang.numpy()[mixed_bodies], legacy_disp_ang.numpy()[mixed_bodies])
+
+
+def test_variable_kernels_honor_deterministic_option(test, device):
+    """SolverVBD forwards its deterministic mode to the variable-block kernel module."""
+    original = wp.get_module_options(module=variable_kernels)
+    try:
+        wp.set_module_options({"deterministic": wp.DeterministicMode.NOT_GUARANTEED}, module=variable_kernels)
+        newton.solvers.SolverVBD(
+            _rigid_model(device),
+            rigid_articulation_solve="block_sparse_joints",
+            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        )
+        options = wp.get_module_options(module=variable_kernels)
+        test.assertEqual(options["deterministic"], wp.DeterministicMode.RUN_TO_RUN)
+    finally:
+        wp.set_module_options(original, module=variable_kernels)
+
+
 class TestVBDSparseVariableBlocks(unittest.TestCase):
     pass
 
@@ -622,9 +1235,20 @@ for _name, _func in [
     ("test_coupled_layout_adds_no_elastic_clique", test_coupled_layout_adds_no_elastic_clique),
     ("test_weighted_order_reduces_to_minimum_degree", test_weighted_order_reduces_to_minimum_degree),
     ("test_layout_rejects_int32_overflow", test_layout_rejects_int32_overflow),
+    ("test_reference_layout_solve_matches_dense", test_reference_layout_solve_matches_dense),
 ]:
     # Host-side analysis: one device suffices.
     add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=cpu_devices)
+
+for _name, _func in [
+    ("test_variable_solve_random_spd", test_variable_solve_random_spd),
+    ("test_variable_solve_frame_regularization", test_variable_solve_frame_regularization),
+    ("test_variable_solve_failure_takes_jacobi_step", test_variable_solve_failure_takes_jacobi_step),
+    ("test_all_six_mixed_matches_legacy_serial_kernel", test_all_six_mixed_matches_legacy_serial_kernel),
+    ("test_apply_variable_delta", test_apply_variable_delta),
+    ("test_variable_kernels_honor_deterministic_option", test_variable_kernels_honor_deterministic_option),
+]:
+    add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=devices)
 
 
 if __name__ == "__main__":
