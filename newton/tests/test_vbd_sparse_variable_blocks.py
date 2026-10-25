@@ -1069,7 +1069,7 @@ def test_cooperative_matches_serial(test, device):
     """The cooperative and serial kernels give the same factor and update up to float32 rounding.
 
     Rows of size 6 take the cooperative lane path, which repeats the serial arithmetic, so an
-    all-6 system agrees bitwise; wider rows take the 32 x 32 tile path.
+    all-6 system agrees bitwise; wider rows take the wide path.
     """
     serial = variable_kernels.launch_solve_articulation_variable_serial
     cooperative = variable_kernels.launch_solve_articulation_variable_cooperative
@@ -1112,7 +1112,7 @@ def test_cooperative_failure_matches_serial(test, device):
     diag = layout.articulation_diag_slots.numpy()
     row_offsets = layout.articulation_block_row_offsets.numpy()
     mixed = list(range(layout.rigid_articulation_count, layout.articulation_count))
-    # Indefinite modal block in a wide (tile path) row; the failure is in a later panel.
+    # Indefinite modal block in a wide-path row; the failure is in a later panel.
     start, end = _articulation_rows(layout, mixed[0])
     row = max(range(start, end), key=lambda r: block_dims[diag[r], 0])
     n = int(block_dims[diag[row], 0])
