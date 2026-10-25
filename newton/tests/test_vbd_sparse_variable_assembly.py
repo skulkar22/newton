@@ -1104,6 +1104,28 @@ def test_assembly_leaves_rigid_prefix_and_validates_inputs(test, device):
         assembly.assemble_articulation_variable_system(layout, model, joint_inputs=partial, **common)
 
 
+def test_assembly_overwrites_every_mixed_entry(test, device):
+    """Check that the assembly writes every stored mixed entry, so the system needs no zeroing between iterations.
+
+    Values and right-hand side pre-filled with NaN must give a finite mixed part that is bitwise
+    equal to the assembly into zero-filled storage.
+    """
+    model, _joints, capture, layout = _fixture(device)
+    grad, matrix = _elastic_blocks(capture, device, joint_terms=False)
+    value_start = 36 * layout.rigid_block_count
+    scalar_start = 6 * layout.rigid_body_row_count
+    results = {}
+    for fill in (0.0, float("nan")):
+        values = wp.full(layout.articulation_value_count, fill, dtype=float, device=device)
+        rhs = wp.full(layout.articulation_scalar_count, fill, dtype=float, device=device)
+        values_np, rhs_np, _terms = _assemble(capture, layout, model, device, grad, matrix, values, rhs)
+        results[fill == 0.0] = (values_np[value_start:], rhs_np[scalar_start:])
+    test.assertGreater(results[True][0].size, 0)
+    for zero_filled, nan_filled in zip(results[True], results[False], strict=True):
+        test.assertTrue(np.all(np.isfinite(nan_filled)))
+        np.testing.assert_array_equal(nan_filled.view(np.uint32), zero_filled.view(np.uint32))
+
+
 class TestVBDSparseVariableAssembly(unittest.TestCase):
     pass
 
@@ -1140,6 +1162,12 @@ add_function_test(
     TestVBDSparseVariableAssembly,
     "test_assembly_leaves_rigid_prefix_and_validates_inputs",
     test_assembly_leaves_rigid_prefix_and_validates_inputs,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSparseVariableAssembly,
+    "test_assembly_overwrites_every_mixed_entry",
+    test_assembly_overwrites_every_mixed_entry,
     devices=devices,
 )
 

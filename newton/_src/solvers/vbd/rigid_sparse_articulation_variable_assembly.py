@@ -14,23 +14,25 @@ negative gradient of the iterate's incremental potential.
 
 Per iterate, :func:`assemble_articulation_variable_system` runs:
 
-1. Zero the mixed part of the block values and right-hand side.
-2. :func:`scatter_elastic_body_block_variable`: the body-axes block of every reduced elastic
+1. :func:`scatter_elastic_body_block_variable`: the body-axes block of every reduced elastic
    body, assembled by :func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_blocks`
    with ``joint_terms=False`` (inertia, modal mass, stiffness and damping, inertial coupling,
    contacts, external forces), rotated to world axes, one thread per entry.
-3. :func:`assemble_articulation_body_diagonal_variable`: the rigid bodies of mixed
+2. :func:`assemble_articulation_body_diagonal_variable`: the rigid bodies of mixed
    articulations, with the 6 x 6 kernels' body diagonal (inertia, contacts, external forces).
-4. :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.evaluate_articulation_joint_terms`:
+3. :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.evaluate_articulation_joint_terms`:
    every joint of the mixed articulations once.
-5. :func:`assemble_articulation_joint_terms_variable`: the joint terms projected onto both
+4. :func:`assemble_articulation_joint_terms_variable`: the joint terms projected onto both
    endpoints' rows, ``g_i += J_i^T w_i`` and ``H_ij += J_i^T K_ij J_j`` with
    ``J_e = [I_6 | G_e]`` and ``G_e`` the modal attachment twists of
    :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.joint_endpoint_mode_twist`,
-   gathered per output entry in joint order (no atomics).
+   gathered per output entry in joint order (no atomics); it writes every entry of the
+   off-diagonal and fill slots and adds to the diagonal slots and right-hand side.
 
-Joint terms enter only through step 5, so neither the elastic blocks of step 2 nor the rigid
-diagonals of step 3 may contain them.
+Steps 1 and 2 overwrite every diagonal block and right-hand side row of the mixed rows and step 4
+writes every other entry, so the arrays need no zeroing between iterates. Joint terms enter
+only through step 4, so neither the elastic blocks of step 1 nor the rigid diagonals of step 2
+may contain them.
 
 Reference point of the elastic block. The local block solve applies its body-axes frame
 increment ``(dx_l, dw_l)`` as ``c_new = c + R dx_l`` and ``rot_new = exp(R dw_l) rot`` and keeps
@@ -482,9 +484,11 @@ def assemble_articulation_joint_terms_variable(
     diagonal slot, and for a slot coupling its parent and child rows the cross block
     ``J_p^T H_pc J_c`` (or its transpose when the parent row comes first in the articulation's
     order, since only the lower block triangle is stored). A parent that is not a body of the
-    articulation acts like the world. Each thread reads the value written by the body-block
-    assembly and adds the joints' contributions in the articulation's joint order, so the result
-    is deterministic and no atomics are used; every contribution is formed by the same
+    articulation acts like the world. A thread of a diagonal slot (or right-hand side) reads the
+    value written by the body-block assembly, a thread of an off-diagonal or fill slot starts from
+    zero, and both add the joints' contributions in the articulation's joint order and write the
+    entry, so the result is deterministic and no atomics are used; every contribution is formed
+    by the same
     expression for each entry (see :func:`_joint_self_entry`, :func:`_joint_self_rhs`,
     :func:`_joint_cross_entry`). Joints with ``evaluated == 0`` add nothing.
     """
@@ -552,7 +556,9 @@ def assemble_articulation_joint_terms_variable(
     a = e // C
     b = e - a * C
     index = articulation_block_value_offsets[slot] + e
-    value = values[index]
+    value = float(0.0)
+    if diagonal:
+        value = values[index]
     col_dim = articulation_row_dims[body_start + col_local]
     for j in range(joint_begin, joint_end):
         if terms[j].evaluated != 0:
@@ -611,8 +617,9 @@ def launch_articulation_joint_terms_variable(
 ) -> None:
     """Launch :func:`assemble_articulation_joint_terms_variable` over every block slot of the mixed articulations.
 
-    ``terms`` must hold the evaluated terms of ``layout.mixed_articulation_joints``. Launch only;
-    no-op without mixed articulations.
+    ``terms`` must hold the evaluated terms of ``layout.mixed_articulation_joints``. Writes every
+    entry of the off-diagonal and fill slots and adds onto the diagonal slots and the right-hand
+    side, which must hold the body-block assembly. Launch only; no-op without mixed articulations.
     """
     slot_count = layout.block_count - layout.rigid_block_count
     if layout.mixed_articulation_count == 0 or slot_count == 0:
@@ -709,10 +716,11 @@ def assemble_articulation_variable_system(
 ) -> tuple[wp.array, wp.array]:
     """Assemble the variable-size block system of every mixed articulation of ``layout``.
 
-    Zeroes the mixed part of ``values`` and ``rhs`` (the rigid prefix
-    ``[0, 36 * rigid_block_count)`` and ``[0, 6 * rigid_body_row_count)`` is not touched), then
-    writes the elastic body blocks, the rigid body diagonals, evaluates every joint of
-    ``layout.mixed_articulation_joints`` once into ``terms`` and adds the projected joint terms.
+    Overwrites the mixed part of ``values`` and ``rhs`` (the rigid prefix
+    ``[0, 36 * rigid_block_count)`` and ``[0, 6 * rigid_body_row_count)`` is not touched): writes
+    the elastic body blocks and the rigid body diagonals, evaluates every joint of
+    ``layout.mixed_articulation_joints`` once into ``terms`` and gathers the projected joint terms
+    into every slot.
     The result is ready for
     :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_variable_kernels.launch_solve_articulation_variable`,
     which adds the frame regularization. Launches only, no allocation or host synchronization, so
@@ -768,10 +776,6 @@ def assemble_articulation_variable_system(
         return values, rhs
     device = device if device is not None else values.device
 
-    # Rows and slots of the rigid prefix are all 6 x 6, so the mixed part starts at these offsets.
-    values[36 * layout.rigid_block_count :].zero_()
-    rhs[6 * layout.rigid_body_row_count :].zero_()
-
     launch_scatter_elastic_body_block_variable(
         layout,
         model.body_elastic_index,
@@ -816,27 +820,27 @@ def assemble_articulation_variable_system(
     )
 
     joint_count = layout.mixed_articulation_joints.shape[0]
-    if joint_count == 0:
-        return values, rhs
-    supplied = {
-        "dt": dt,
-        "joints": layout.mixed_articulation_joints,
-        "body_articulation_local": layout.body_articulation_local,
-        "body_q": body_q,
-        "body_com": model.body_com,
-        "elastic": elastic,
-    }
-    evaluator_inputs = [
-        supplied[arg.label] if arg.label in supplied else joint_inputs[arg.label]
-        for arg in evaluate_articulation_joint_terms.adj.args
-        if arg.label != "terms"
-    ]
-    wp.launch(
-        evaluate_articulation_joint_terms,
-        dim=joint_count,
-        inputs=evaluator_inputs,
-        outputs=[terms],
-        device=device,
-    )
+    if joint_count > 0:
+        supplied = {
+            "dt": dt,
+            "joints": layout.mixed_articulation_joints,
+            "body_articulation_local": layout.body_articulation_local,
+            "body_q": body_q,
+            "body_com": model.body_com,
+            "elastic": elastic,
+        }
+        evaluator_inputs = [
+            supplied[label] if label in supplied else joint_inputs[label]
+            for label in kernel_argument_labels(evaluate_articulation_joint_terms)
+            if label != "terms"
+        ]
+        wp.launch(
+            evaluate_articulation_joint_terms,
+            dim=joint_count,
+            inputs=evaluator_inputs,
+            outputs=[terms],
+            device=device,
+        )
+    # Also without joints: the gather writes the off-diagonal and fill slots.
     launch_articulation_joint_terms_variable(layout, body_q, elastic, terms, values, rhs, device)
     return values, rhs

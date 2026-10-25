@@ -1596,8 +1596,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.rigid_articulation_sparse_values = values_view.reshape((view_block_count, 6, 6)).view(mat66f)
                 self.rigid_articulation_sparse_rhs = rhs_view.reshape((view_row_count, 6)).view(vec6f)
                 self.rigid_articulation_sparse_delta = delta_view.reshape((view_row_count, 6)).view(vec6f)
-                # Zeroed every iteration. The coupled assembly zeroes the mixed values and right-hand
-                # side itself, and the coupled solve writes every mixed update component.
+                # Zeroed every iteration. The coupled assembly overwrites every stored entry of the
+                # mixed values and right-hand side, and the coupled solve writes every mixed update
+                # component.
                 self._rigid_articulation_sparse_zero_views = (values_view, rhs_view, delta_view)
                 if self.device.is_cuda:
                     self.rigid_articulation_sparse_values_scalar = self._rigid_articulation_sparse_values_scalar
