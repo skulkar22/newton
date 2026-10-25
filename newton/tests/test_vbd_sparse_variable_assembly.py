@@ -764,27 +764,14 @@ def test_projection_matches_numpy(test, device):
 
     values_wp = wp.array(values.astype(np.float32), dtype=float, device=device)
     rhs_wp = wp.array(rhs.astype(np.float32), dtype=float, device=device)
-    wp.launch(
-        assembly.assemble_articulation_joint_terms_variable,
-        dim=(len(terms), 2),
-        inputs=[
-            layout.rigid_joint_count,
-            layout.mixed_articulation_joints,
-            layout.articulation_joint_body_start,
-            layout.articulation_block_row_offsets,
-            layout.articulation_block_cols,
-            layout.articulation_diag_slots,
-            layout.articulation_row_dims,
-            layout.articulation_row_scalar_offsets,
-            layout.articulation_block_value_offsets,
-            layout.articulation_block_dims,
-            layout.body_articulation_local,
-            wp.array(body_q.astype(np.float32), dtype=wp.transform, device=device),
-            elastic,
-            wp.array(terms, dtype=JointEndpointTerms, device=device),
-        ],
-        outputs=[values_wp, rhs_wp],
-        device=device,
+    assembly.launch_articulation_joint_terms_variable(
+        layout,
+        wp.array(body_q.astype(np.float32), dtype=wp.transform, device=device),
+        elastic,
+        wp.array(terms, dtype=JointEndpointTerms, device=device),
+        values_wp,
+        rhs_wp,
+        device,
     )
     assembled = values_wp.numpy().astype(np.float64)
     assembled_rhs = rhs_wp.numpy().astype(np.float64)
@@ -828,27 +815,14 @@ def test_projection_matches_numpy(test, device):
     terms_on["evaluated"][list(inactive)] = 1
     values_on = wp.array(values.astype(np.float32), dtype=float, device=device)
     rhs_on = wp.array(rhs.astype(np.float32), dtype=float, device=device)
-    wp.launch(
-        assembly.assemble_articulation_joint_terms_variable,
-        dim=(len(terms), 2),
-        inputs=[
-            layout.rigid_joint_count,
-            layout.mixed_articulation_joints,
-            layout.articulation_joint_body_start,
-            layout.articulation_block_row_offsets,
-            layout.articulation_block_cols,
-            layout.articulation_diag_slots,
-            layout.articulation_row_dims,
-            layout.articulation_row_scalar_offsets,
-            layout.articulation_block_value_offsets,
-            layout.articulation_block_dims,
-            layout.body_articulation_local,
-            wp.array(body_q.astype(np.float32), dtype=wp.transform, device=device),
-            elastic,
-            wp.array(terms_on, dtype=JointEndpointTerms, device=device),
-        ],
-        outputs=[values_on, rhs_on],
-        device=device,
+    assembly.launch_articulation_joint_terms_variable(
+        layout,
+        wp.array(body_q.astype(np.float32), dtype=wp.transform, device=device),
+        elastic,
+        wp.array(terms_on, dtype=JointEndpointTerms, device=device),
+        values_on,
+        rhs_on,
+        device,
     )
     test.assertFalse(np.allclose(values_on.numpy(), values_wp.numpy()))
 

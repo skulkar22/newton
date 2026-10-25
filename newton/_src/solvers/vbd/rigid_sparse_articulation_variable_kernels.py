@@ -38,7 +38,7 @@ The factorization is right-looking. For each column ``k``: factor ``L_kk`` in pl
 ``L_ik = H_ik L_kk^-T`` for the column's entries (``articulation_block_col_*``), and apply the
 trailing updates ``H_ab -= L_ak L_bk^T`` listed in ``articulation_factor_update_*``. The
 column and update lists are the ones the 6 x 6 kernels use. No float atomics are used in
-the factorization or the solve; :func:`vb_add_block_entry_atomic` serves assembly only.
+the factorization or the solve.
 
 Failure policy: a pivot that is not positive or not finite, or a non-finite solution, sets
 ``factor_status`` (:data:`VB_FACTOR_INDEFINITE`, :data:`VB_SOLVE_NONFINITE`), increments the
@@ -128,27 +128,6 @@ def vb_block_entry_index(
 def vb_rhs_index(row_scalar_offsets: wp.array[wp.int32], row: int, k: int) -> int:
     """Return the flat index of component ``k`` of sparse row ``row`` in a vector."""
     return row_scalar_offsets[row] + k
-
-
-@wp.func
-def vb_add_block_entry_atomic(
-    values: wp.array[float],
-    block_value_offsets: wp.array[wp.int32],
-    block_dims: wp.array2d[wp.int32],
-    slot: int,
-    r: int,
-    c: int,
-    value: float,
-):
-    """Atomically add ``value`` to entry ``(r, c)`` of block slot ``slot`` (no-op for ``slot < 0``)."""
-    if slot >= 0:
-        wp.atomic_add(values, vb_block_entry_index(block_value_offsets, block_dims, slot, r, c), value)
-
-
-@wp.func
-def vb_add_rhs_atomic(rhs: wp.array[float], row_scalar_offsets: wp.array[wp.int32], row: int, k: int, value: float):
-    """Atomically add ``value`` to component ``k`` of sparse row ``row``."""
-    wp.atomic_add(rhs, vb_rhs_index(row_scalar_offsets, row, k), value)
 
 
 # ---------------------------------------------------------------------------

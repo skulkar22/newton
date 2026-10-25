@@ -981,8 +981,8 @@ def test_sparse_elastic_rejects_joint_mimics(test, device, backend):
 def test_elastic_articulation_honors_deterministic_option(test, device, backend):
     """Forward the requested deterministic mode to the reduced elastic kernel modules.
 
-    The elastic block assembly, the frame coupling, the sparse Schur scatter and the coupled
-    variable-size assembly accumulate with atomics, so their modules must receive the solver's
+    The elastic block assembly, the frame coupling and the sparse Schur scatter accumulate with
+    atomics, so these modules and the coupled variable-size modules must receive the solver's
     deterministic mode in both the local and the block-sparse articulation solve.
     """
     modules = (
@@ -1263,8 +1263,8 @@ def test_coupled_graph_capture_replicated_articulations(test, device):
 def test_coupled_run_to_run_deterministic(test, device):
     """Reproduce coupled trajectories bit for bit under ``DeterministicMode.RUN_TO_RUN``.
 
-    The middle link of the three-link elastic chain receives projected terms from two joints, which
-    the assembly accumulates with atomics.
+    The middle link of the three-link elastic chain receives projected terms from two joints, and
+    the elastic blocks it starts from are assembled with atomics.
     """
     runs = []
     for _ in range(2):
