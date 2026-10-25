@@ -59,6 +59,7 @@ from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import (
     joint_endpoint_mode_count,
     joint_endpoint_mode_shape,
     joint_endpoint_mode_twist,
+    mat66f,
     vec6f,
 )
 from newton._src.solvers.vbd.rigid_sparse_articulation_variable_kernels import (
@@ -267,8 +268,11 @@ def _endpoint_twist(
 def _joint_self_entry(
     elastic: SparseElasticJointData,
     joint: int,
-    t: JointEndpointTerms,
     is_parent: bool,
+    body: int,
+    K: mat66f,
+    attachment_offset: wp.vec3,
+    rotation_jacobian: wp.mat33,
     row_dim: int,
     body_q: wp.array[wp.transform],
     a: int,
@@ -276,37 +280,30 @@ def _joint_self_entry(
 ) -> float:
     """Entry ``(a, b)`` of ``J_e^T K_ee J_e`` for one endpoint of an evaluated joint (0 past the endpoint's rows).
 
-    ``row_dim`` is the size of the endpoint body's row; the endpoint projects onto its first
-    ``6 + m_e`` components. The expressions are ``K``, ``(K g_b)[a]``, ``(K^T g_a)[b]`` and
-    ``g_a . (K g_b)`` with ``g`` the mode twists of :func:`_endpoint_twist`.
+    ``body`` is the endpoint body and ``K``, ``attachment_offset`` and ``rotation_jacobian`` are its
+    ``hessian_*``, ``attachment_offset_*`` and ``rotation_jacobian_*`` terms; ``row_dim`` is the size
+    of the body's row, of which the endpoint projects onto the first ``6 + m_e`` components. The
+    expressions are ``K``, ``(K g_b)[a]``, ``(K^T g_a)[b]`` and ``g_a . (K g_b)`` with ``g`` the mode
+    twists of :func:`_endpoint_twist`.
     """
-    body = t.child
-    K = t.hessian_child
-    offset = t.attachment_offset_child
-    jacobian = t.rotation_jacobian_child
-    if is_parent:
-        body = t.parent
-        K = t.hessian_parent
-        offset = t.attachment_offset_parent
-        jacobian = t.rotation_jacobian_parent
     n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, body, is_parent), row_dim - 6)
     if a >= n or b >= n:
         return 0.0
     if a < 6 and b < 6:
         return K[a, b]
     R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
-    RJ = R * jacobian
+    RJ = R * rotation_jacobian
     if a < 6:
-        g_col = _endpoint_twist(elastic, joint, is_parent, R, RJ, offset, b - 6)
+        g_col = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, b - 6)
         Kg = K * g_col
         return Kg[a]
     if b < 6:
-        g_row = _endpoint_twist(elastic, joint, is_parent, R, RJ, offset, a - 6)
+        g_row = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, a - 6)
         gK = wp.transpose(K) * g_row
         return gK[b]
-    g_col = _endpoint_twist(elastic, joint, is_parent, R, RJ, offset, b - 6)
+    g_col = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, b - 6)
     Kg = K * g_col
-    g_row = _endpoint_twist(elastic, joint, is_parent, R, RJ, offset, a - 6)
+    g_row = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, a - 6)
     return wp.dot(g_row, Kg)
 
 
@@ -314,30 +311,27 @@ def _joint_self_entry(
 def _joint_self_rhs(
     elastic: SparseElasticJointData,
     joint: int,
-    t: JointEndpointTerms,
     is_parent: bool,
+    body: int,
+    wrench: vec6f,
+    attachment_offset: wp.vec3,
+    rotation_jacobian: wp.mat33,
     row_dim: int,
     body_q: wp.array[wp.transform],
     k: int,
 ) -> float:
-    """Component ``k`` of ``J_e^T w_e`` for one endpoint of an evaluated joint (0 past the endpoint's rows)."""
-    body = t.child
-    wrench = t.wrench_child
-    offset = t.attachment_offset_child
-    jacobian = t.rotation_jacobian_child
-    if is_parent:
-        body = t.parent
-        wrench = t.wrench_parent
-        offset = t.attachment_offset_parent
-        jacobian = t.rotation_jacobian_parent
+    """Component ``k`` of ``J_e^T w_e`` for one endpoint of an evaluated joint (0 past the endpoint's rows).
+
+    Arguments as in :func:`_joint_self_entry`, with ``wrench`` the endpoint's ``wrench_*`` term.
+    """
     n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, body, is_parent), row_dim - 6)
     if k >= n:
         return 0.0
     if k < 6:
         return wrench[k]
     R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
-    RJ = R * jacobian
-    g = _endpoint_twist(elastic, joint, is_parent, R, RJ, offset, k - 6)
+    RJ = R * rotation_jacobian
+    g = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, k - 6)
     return wp.dot(g, wrench)
 
 
@@ -345,40 +339,43 @@ def _joint_self_rhs(
 def _joint_cross_entry(
     elastic: SparseElasticJointData,
     joint: int,
-    t: JointEndpointTerms,
+    terms: wp.array[JointEndpointTerms],
+    j: int,
     parent_dim: int,
     child_dim: int,
     body_q: wp.array[wp.transform],
     a: int,
     b: int,
 ) -> float:
-    """Entry ``(a, b)`` (parent row ``a``, child column ``b``) of ``J_p^T H_pc J_c`` of an evaluated joint.
+    """Entry ``(a, b)`` (parent row ``a``, child column ``b``) of ``J_p^T H_pc J_c`` of the evaluated joint ``terms[j]``.
 
     0 past the endpoints' projected rows. The expressions are ``H``, ``(H g_c)[a]``,
-    ``(H^T g_p)[b]`` and ``(H^T g_p) . g_c``.
+    ``(H^T g_p)[b]`` and ``(H^T g_p) . g_c``. Only the fields an entry needs are read.
     """
-    parent_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, t.parent, True), parent_dim - 6)
-    child_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, t.child, False), child_dim - 6)
+    parent = terms[j].parent
+    child = terms[j].child
+    parent_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, parent, True), parent_dim - 6)
+    child_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, child, False), child_dim - 6)
     if a >= parent_n or b >= child_n:
         return 0.0
-    H = t.hessian_cross
+    H = terms[j].hessian_cross
     if a < 6 and b < 6:
         return H[a, b]
     if a < 6:
-        R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[t.child]))
-        RJ_c = R_c * t.rotation_jacobian_child
-        g_col = _endpoint_twist(elastic, joint, False, R_c, RJ_c, t.attachment_offset_child, b - 6)
+        R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[child]))
+        RJ_c = R_c * terms[j].rotation_jacobian_child
+        g_col = _endpoint_twist(elastic, joint, False, R_c, RJ_c, terms[j].attachment_offset_child, b - 6)
         Hg = H * g_col
         return Hg[a]
-    R_p = wp.quat_to_matrix(wp.transform_get_rotation(body_q[t.parent]))
-    RJ_p = R_p * t.rotation_jacobian_parent
-    g_row = _endpoint_twist(elastic, joint, True, R_p, RJ_p, t.attachment_offset_parent, a - 6)
+    R_p = wp.quat_to_matrix(wp.transform_get_rotation(body_q[parent]))
+    RJ_p = R_p * terms[j].rotation_jacobian_parent
+    g_row = _endpoint_twist(elastic, joint, True, R_p, RJ_p, terms[j].attachment_offset_parent, a - 6)
     gH = wp.transpose(H) * g_row
     if b < 6:
         return gH[b]
-    R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[t.child]))
-    RJ_c = R_c * t.rotation_jacobian_child
-    g_col = _endpoint_twist(elastic, joint, False, R_c, RJ_c, t.attachment_offset_child, b - 6)
+    R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[child]))
+    RJ_c = R_c * terms[j].rotation_jacobian_child
+    g_col = _endpoint_twist(elastic, joint, False, R_c, RJ_c, terms[j].attachment_offset_child, b - 6)
     return wp.dot(gH, g_col)
 
 
@@ -476,14 +473,37 @@ def assemble_articulation_joint_terms_variable(
         index = vb_rhs_index(articulation_row_scalar_offsets, row, k)
         value = rhs[index]
         for j in range(joint_begin, joint_end):
-            t = terms[j]
-            if t.evaluated != 0:
+            if terms[j].evaluated != 0:
                 joint = mixed_articulation_joints[j]
-                if t.parent >= 0:
-                    if body_articulation_local[t.parent] == row_local:
-                        value += _joint_self_rhs(elastic, joint, t, True, row_dim, body_q, k)
-                if body_articulation_local[t.child] == row_local:
-                    value += _joint_self_rhs(elastic, joint, t, False, row_dim, body_q, k)
+                parent = terms[j].parent
+                child = terms[j].child
+                if parent >= 0:
+                    if body_articulation_local[parent] == row_local:
+                        value += _joint_self_rhs(
+                            elastic,
+                            joint,
+                            True,
+                            parent,
+                            terms[j].wrench_parent,
+                            terms[j].attachment_offset_parent,
+                            terms[j].rotation_jacobian_parent,
+                            row_dim,
+                            body_q,
+                            k,
+                        )
+                if body_articulation_local[child] == row_local:
+                    value += _joint_self_rhs(
+                        elastic,
+                        joint,
+                        False,
+                        child,
+                        terms[j].wrench_child,
+                        terms[j].attachment_offset_child,
+                        terms[j].rotation_jacobian_child,
+                        row_dim,
+                        body_q,
+                        k,
+                    )
         rhs[index] = value
         return
 
@@ -493,23 +513,48 @@ def assemble_articulation_joint_terms_variable(
     value = values[index]
     col_dim = articulation_row_dims[body_start + col_local]
     for j in range(joint_begin, joint_end):
-        t = terms[j]
-        if t.evaluated != 0:
+        if terms[j].evaluated != 0:
             joint = mixed_articulation_joints[j]
+            parent = terms[j].parent
+            child = terms[j].child
             parent_local = int(-1)
-            if t.parent >= 0:
-                parent_local = body_articulation_local[t.parent]
-            child_local = body_articulation_local[t.child]
+            if parent >= 0:
+                parent_local = body_articulation_local[parent]
+            child_local = body_articulation_local[child]
             if diagonal:
                 if parent_local == row_local:
-                    value += _joint_self_entry(elastic, joint, t, True, row_dim, body_q, a, b)
+                    value += _joint_self_entry(
+                        elastic,
+                        joint,
+                        True,
+                        parent,
+                        terms[j].hessian_parent,
+                        terms[j].attachment_offset_parent,
+                        terms[j].rotation_jacobian_parent,
+                        row_dim,
+                        body_q,
+                        a,
+                        b,
+                    )
                 if child_local == row_local:
-                    value += _joint_self_entry(elastic, joint, t, False, row_dim, body_q, a, b)
+                    value += _joint_self_entry(
+                        elastic,
+                        joint,
+                        False,
+                        child,
+                        terms[j].hessian_child,
+                        terms[j].attachment_offset_child,
+                        terms[j].rotation_jacobian_child,
+                        row_dim,
+                        body_q,
+                        a,
+                        b,
+                    )
             elif parent_local >= 0:
                 if parent_local == row_local and child_local == col_local:
-                    value += _joint_cross_entry(elastic, joint, t, row_dim, col_dim, body_q, a, b)
+                    value += _joint_cross_entry(elastic, joint, terms, j, row_dim, col_dim, body_q, a, b)
                 elif child_local == row_local and parent_local == col_local:
-                    value += _joint_cross_entry(elastic, joint, t, col_dim, row_dim, body_q, b, a)
+                    value += _joint_cross_entry(elastic, joint, terms, j, col_dim, row_dim, body_q, b, a)
     values[index] = value
 
 
