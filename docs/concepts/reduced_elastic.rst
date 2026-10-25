@@ -341,11 +341,15 @@ Relevant options:
   :meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics`.
 
 With ``rigid_articulation_solve="block_sparse_joints"``, elastic links inside
-an articulation are solved in the articulation's direct factorization: their
-modes are eliminated exactly onto the frame blocks of the link and its joint
-neighbors. These links use ``rigid_articulation_relaxation`` and report no
-block metrics. See :ref:`Loop closure inside an articulation` for the joint
-features this mode does not support.
+an articulation are solved in the articulation's direct factorization: with the
+default ``rigid_articulation_elastic_solve="schur"`` their modes are eliminated
+exactly onto the frame blocks of the link and its joint neighbors, and their
+block metrics are NaN (not evaluated). These links use
+``rigid_articulation_relaxation``. The experimental
+``rigid_articulation_elastic_solve="coupled"`` backend is described with
+:class:`~newton.solvers.SolverVBD`. See
+:ref:`Loop closure inside an articulation` for the joint features this mode
+does not support.
 
 Each iteration factors every link's ``n x n`` modal block once and solves all
 of its right-hand sides (the modal residual and six columns per neighbor

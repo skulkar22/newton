@@ -317,13 +317,13 @@ def test_sparse_modal_fallback_checks_frame_schur(test, device):
     test.assertLess(float(np.max(np.abs(state_1.body_q.numpy()[0, :3] - base_start))), 0.05)
 
 
-def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
+def test_sparse_elastic_revalidates_narrow_model_flags(test, device, backend):
     """Reject unsupported elastic joint terms notified with the narrow model-change flags.
 
     Armature is notified with ``JOINT_DOF_INERTIAL_PROPERTIES``, damping and friction with
     ``JOINT_DOF_FORCE_PROPERTIES``, and mimic relationships with ``CONSTRAINT_PROPERTIES``; none of
     these sets the broad ``JOINT_DOF_PROPERTIES`` or ``JOINT_PROPERTIES`` bit. The local solve keeps
-    accepting the same changes.
+    accepting the same changes. Both ``rigid_articulation_elastic_solve`` backends revalidate.
     """
     flags = newton.ModelFlags
     for attribute, flag in (
@@ -333,7 +333,9 @@ def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
     ):
         for mode in (_SPARSE, "local"):
             model, _state, hinge = sparse_tests._make_leaf_link_model(device)
-            solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=mode)
+            solver = newton.solvers.SolverVBD(
+                model, iterations=2, rigid_articulation_solve=mode, rigid_articulation_elastic_solve=backend
+            )
             values = getattr(model, attribute).numpy()
             values[model.joint_qd_start.numpy()[hinge]] = 0.01
             getattr(model, attribute).assign(values)
@@ -344,7 +346,9 @@ def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
                 solver.notify_model_changed(flag)
 
     model, _state, hinge = sparse_tests._make_leaf_link_model(device)
-    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=_SPARSE)
+    solver = newton.solvers.SolverVBD(
+        model, iterations=2, rigid_articulation_solve=_SPARSE, rigid_articulation_elastic_solve=backend
+    )
     joint_type = model.joint_type.numpy()
     root = next(
         joint
@@ -421,10 +425,19 @@ for _name, _test in (
     ("test_sparse_modal_dense_solve_matches_tiled", test_sparse_modal_dense_solve_matches_tiled),
     ("test_sparse_modal_fallback_keeps_frames_definite", test_sparse_modal_fallback_keeps_frames_definite),
     ("test_sparse_modal_fallback_checks_frame_schur", test_sparse_modal_fallback_checks_frame_schur),
-    ("test_sparse_elastic_revalidates_narrow_model_flags", test_sparse_elastic_revalidates_narrow_model_flags),
     ("test_sparse_elastic_elastic_chain_converges_to_local", test_sparse_elastic_elastic_chain_converges_to_local),
 ):
+    # Schur-backend internals and convergence (the default rigid_articulation_elastic_solve).
     add_function_test(TestReducedElasticSparsePerformance, _name, _test, devices=devices)
+
+for _backend in ("schur", "coupled"):
+    add_function_test(
+        TestReducedElasticSparsePerformance,
+        f"test_sparse_elastic_revalidates_narrow_model_flags_{_backend}",
+        test_sparse_elastic_revalidates_narrow_model_flags,
+        devices=devices,
+        backend=_backend,
+    )
 
 add_function_test(
     TestReducedElasticSparsePerformance,
