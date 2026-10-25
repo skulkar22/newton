@@ -625,10 +625,14 @@ def test_layout_rejects_int32_overflow(test, device):
 def _variable_solvers(device):
     """Variable-block solve launchers to check on ``device``, as ``(name, launcher)`` pairs.
 
-    The serial kernel is device agnostic (one thread per articulation) and runs everywhere. A
-    cooperative CUDA kernel is to be added to this list for CUDA devices.
+    Both kernels run on every device: the serial kernel uses one thread per articulation, the
+    cooperative kernel one CTA per articulation (``block_dim = 1`` on the CPU, where its tile
+    operations run serially).
     """
-    return [("serial", launch_solve_articulation_variable)]
+    return [
+        ("serial", variable_kernels.launch_solve_articulation_variable_serial),
+        ("cooperative", variable_kernels.launch_solve_articulation_variable_cooperative),
+    ]
 
 
 def _articulation_rows(layout, articulation: int) -> tuple[int, int]:
@@ -1052,6 +1056,197 @@ def test_all_six_mixed_matches_legacy_serial_kernel(test, device):
 
 
 # ---------------------------------------------------------------------------
+# Cooperative backend
+# ---------------------------------------------------------------------------
+
+
+def _solver_outputs_equal(test, a, b, msg):
+    for key in ("values", "delta", "diag_backup", "status", "failures"):
+        np.testing.assert_array_equal(a[key], b[key], err_msg=f"{msg}: {key}")
+
+
+def test_cooperative_matches_serial(test, device):
+    """The cooperative and serial kernels give the same factor and update up to float32 rounding.
+
+    Rows of size 6 take the cooperative lane path, which repeats the serial arithmetic, so an
+    all-6 system agrees bitwise; wider rows take the 32 x 32 tile path.
+    """
+    serial = variable_kernels.launch_solve_articulation_variable_serial
+    cooperative = variable_kernels.launch_solve_articulation_variable_cooperative
+    for seed, decades in ((5, 0.0), (7, 2.0)):
+        _model, layout, systems, values, rhs = _solve_fixture(device, seed, decades)
+        a = _run_solve(serial, layout, values, rhs, device, frame_regularization=0.25)
+        b = _run_solve(cooperative, layout, values, rhs, device, frame_regularization=0.25)
+        np.testing.assert_array_equal(a["status"], b["status"])
+        test.assertEqual(a["failures"], b["failures"])
+        np.testing.assert_array_equal(a["diag_backup"], b["diag_backup"])
+        scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+        for art, system in systems.items():
+            start, end = _articulation_rows(layout, art)
+            segment = slice(scalar_offsets[start], scalar_offsets[end])
+            scale = system["scale"]
+            difference = np.linalg.norm(scale * (a["delta"][segment] - b["delta"][segment]))
+            test.assertLess(difference / np.linalg.norm(scale * a["delta"][segment]), 1.0e-5, f"articulation {art}")
+        # Untouched storage is identical.
+        rigid_values = layout.articulation_block_value_offsets.numpy()[layout.rigid_block_count]
+        np.testing.assert_array_equal(b["values"][:rigid_values], a["values"][:rigid_values])
+        np.testing.assert_array_equal(b["delta"][: scalar_offsets[layout.rigid_body_row_count]], 7.0)
+
+    mode_counts = [None, None, 0, None, 0, None, 0]
+    articulations = [[(-1, 0), (0, 1)], [(-1, 2), (2, 3), (3, 4), (4, 2), (3, 5), (5, 6)]]
+    model = _synthetic_model(device, mode_counts, articulations)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    rng = np.random.default_rng(21)
+    values, rhs = _scatter_system(layout, _random_system(layout, model, mode_counts, rng), rng)
+    a = _run_solve(serial, layout, values, rhs, device, frame_regularization=0.25)
+    b = _run_solve(cooperative, layout, values, rhs, device, frame_regularization=0.25)
+    _solver_outputs_equal(test, a, b, "all-6 system")
+
+
+def test_cooperative_failure_matches_serial(test, device):
+    """Indefinite, NaN and non-finite-solve articulations get the serial status, count and Jacobi step."""
+    _model, layout, _systems, values, rhs = _solve_fixture(device, 13)
+    value_offsets = layout.articulation_block_value_offsets.numpy()
+    block_dims = layout.articulation_block_dims.numpy()
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    diag = layout.articulation_diag_slots.numpy()
+    row_offsets = layout.articulation_block_row_offsets.numpy()
+    mixed = list(range(layout.rigid_articulation_count, layout.articulation_count))
+    # Indefinite modal block in a wide (tile path) row; the failure is in a later panel.
+    start, end = _articulation_rows(layout, mixed[0])
+    row = max(range(start, end), key=lambda r: block_dims[diag[r], 0])
+    n = int(block_dims[diag[row], 0])
+    test.assertGreater(n, 64)
+    block = values[value_offsets[diag[row]] : value_offsets[diag[row] + 1]].reshape(n, n)
+    block[n - 3, n - 3] -= 1.0e4
+    values[value_offsets[diag[row]] : value_offsets[diag[row] + 1]] = block.ravel()
+    # A NaN in an off-diagonal block.
+    start, end = _articulation_rows(layout, mixed[1])
+    off_slot = next(s for r in range(start, end) for s in range(row_offsets[r], row_offsets[r + 1]) if s != diag[r])
+    values[value_offsets[off_slot]] = np.nan
+    # A valid matrix with a non-finite right-hand side entry.
+    start, _end = _articulation_rows(layout, mixed[2])
+    rhs[scalar_offsets[start] + 2] = np.inf
+
+    serial = _run_solve(variable_kernels.launch_solve_articulation_variable_serial, layout, values, rhs, device)
+    cooperative = _run_solve(
+        variable_kernels.launch_solve_articulation_variable_cooperative, layout, values, rhs, device
+    )
+    np.testing.assert_array_equal(
+        cooperative["status"], [VB_FACTOR_INDEFINITE, VB_FACTOR_INDEFINITE, VB_SOLVE_NONFINITE]
+    )
+    np.testing.assert_array_equal(cooperative["status"], serial["status"])
+    test.assertEqual(cooperative["failures"], 3)
+    test.assertTrue(np.isfinite(cooperative["delta"]).all())
+    # The Jacobi step depends only on the saved diagonal and the right-hand side.
+    np.testing.assert_array_equal(cooperative["diag_backup"], serial["diag_backup"])
+    np.testing.assert_array_equal(cooperative["delta"], serial["delta"])
+
+
+def test_cooperative_shared_memory_under_budget(test, device):
+    """The cooperative CTA needs at most the documented budget and fits the device."""
+    required = variable_kernels.cooperative_shared_memory_bytes(device)
+    test.assertGreater(required, 0)
+    test.assertLessEqual(required, variable_kernels.VB_COOPERATIVE_SHARED_MEMORY_BUDGET)
+    test.assertLessEqual(required, wp.get_device(device).max_shared_memory_per_block)
+
+
+def test_cooperative_graph_capture_and_run_to_run(test, device):
+    """Graph replays and repeated launches of the cooperative solve are bitwise identical."""
+    _model, layout, _systems, values_np, rhs_np = _solve_fixture(device, 11)
+    pristine = wp.array(values_np.astype(np.float32), dtype=float, device=device)
+    values = wp.empty_like(pristine)
+    rhs = wp.array(rhs_np.astype(np.float32), dtype=float, device=device)
+    delta = wp.zeros(layout.articulation_scalar_count, dtype=float, device=device)
+    diag_backup = wp.zeros_like(delta)
+    status = wp.full(layout.mixed_articulation_count, -1, dtype=wp.int32, device=device)
+    failures = wp.zeros(1, dtype=wp.int32, device=device)
+
+    def solve():
+        wp.copy(values, pristine)
+        failures.zero_()
+        variable_kernels.launch_solve_articulation_variable(
+            layout, 0.5, rhs, values, diag_backup, status, failures, delta, device=device
+        )
+
+    def snapshot():
+        return [array.numpy().copy() for array in (values, delta, diag_backup, status, failures)]
+
+    solve()
+    reference = snapshot()
+    test.assertEqual(int(reference[4][0]), 0)
+    solve()
+    for got, expected in zip(snapshot(), reference, strict=True):
+        np.testing.assert_array_equal(got, expected)
+    with wp.ScopedCapture(device=device) as capture:
+        solve()
+    for _ in range(3):
+        # Clear the outputs so each replay has to rewrite them (the rigid prefix stays zero).
+        delta.zero_()
+        diag_backup.zero_()
+        status.fill_(-1)
+        wp.capture_launch(capture.graph)
+        for got, expected in zip(snapshot(), reference, strict=True):
+            np.testing.assert_array_equal(got, expected)
+
+
+def _batch_fixture(device, count: int, seed: int):
+    """``count`` mixed articulations of 2 to 5 bodies with heterogeneous modal counts (chains, loops)."""
+    rng = np.random.default_rng(seed)
+    choices = [None, 0, 1, 8, 26, 33, 70]
+    mode_counts, articulations = [], []
+    for _ in range(count):
+        size = int(rng.integers(2, 6))
+        first = len(mode_counts)
+        modes = [choices[int(i)] for i in rng.integers(0, len(choices), size=size)]
+        if all(m is None for m in modes):
+            modes[0] = 8
+        mode_counts.extend(modes)
+        joints = [(-1, first)] + [(first + i, first + i + 1) for i in range(size - 1)]
+        if size > 2 and rng.random() < 0.5:
+            joints.append((first + size - 1, first))
+        articulations.append(joints)
+    model = _synthetic_model(device, mode_counts, articulations)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    systems = _random_system(layout, model, mode_counts, rng)
+    values, rhs = _scatter_system(layout, systems, rng)
+    return layout, systems, values, rhs
+
+
+def test_cooperative_batch_of_heterogeneous_articulations(test, device):
+    """One launch solves 256 heterogeneous mixed articulations, each matching numpy."""
+    layout, systems, values, rhs = _batch_fixture(device, 256, 31)
+    test.assertEqual(layout.mixed_articulation_count, 256)
+    dims = set(layout.articulation_row_dims.numpy().tolist())
+    test.assertTrue({6, 7, 14, 32, 39, 76} <= dims, dims)
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    for name, launcher in _variable_solvers(device):
+        out = _run_solve(launcher, layout, values, rhs, device)
+        test.assertEqual(out["failures"], 0, name)
+        np.testing.assert_array_equal(out["status"], VB_FACTOR_OK)
+        worst = 0.0
+        for a, system in systems.items():
+            start, end = _articulation_rows(layout, a)
+            delta = out["delta"][scalar_offsets[start] : scalar_offsets[end]].astype(np.float64)
+            expected = np.linalg.solve(system["H"], system["rhs"])
+            worst = max(worst, np.linalg.norm(delta - expected) / np.linalg.norm(expected))
+        test.assertLess(worst, 1.0e-4, name)
+
+
+def test_dispatch_selects_backend_by_device(test, device):
+    """``launch_solve_articulation_variable`` runs the cooperative kernel on CUDA and the serial one on CPU."""
+    _model, layout, _systems, values, rhs = _solve_fixture(device, 5)
+    expected_launcher = (
+        variable_kernels.launch_solve_articulation_variable_cooperative
+        if wp.get_device(device).is_cuda
+        else variable_kernels.launch_solve_articulation_variable_serial
+    )
+    dispatched = _run_solve(launch_solve_articulation_variable, layout, values, rhs, device)
+    expected = _run_solve(expected_launcher, layout, values, rhs, device)
+    _solver_outputs_equal(test, dispatched, expected, "dispatch")
+
+
+# ---------------------------------------------------------------------------
 # Update application
 # ---------------------------------------------------------------------------
 
@@ -1225,6 +1420,7 @@ class TestVBDSparseVariableBlocks(unittest.TestCase):
 
 
 cpu_devices = [d for d in devices if not wp.get_device(d).is_cuda]
+cuda_devices = [d for d in devices if wp.get_device(d).is_cuda]
 
 for _name, _func in [
     ("test_all_rigid_layout_identical_under_both_backends", test_all_rigid_layout_identical_under_both_backends),
@@ -1247,8 +1443,19 @@ for _name, _func in [
     ("test_all_six_mixed_matches_legacy_serial_kernel", test_all_six_mixed_matches_legacy_serial_kernel),
     ("test_apply_variable_delta", test_apply_variable_delta),
     ("test_variable_kernels_honor_deterministic_option", test_variable_kernels_honor_deterministic_option),
+    ("test_cooperative_matches_serial", test_cooperative_matches_serial),
+    ("test_cooperative_failure_matches_serial", test_cooperative_failure_matches_serial),
+    ("test_cooperative_batch_of_heterogeneous_articulations", test_cooperative_batch_of_heterogeneous_articulations),
+    ("test_dispatch_selects_backend_by_device", test_dispatch_selects_backend_by_device),
 ]:
     add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=devices)
+
+for _name, _func in [
+    ("test_cooperative_shared_memory_under_budget", test_cooperative_shared_memory_under_budget),
+    ("test_cooperative_graph_capture_and_run_to_run", test_cooperative_graph_capture_and_run_to_run),
+]:
+    # Shared memory and graph capture are CUDA concepts.
+    add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=cuda_devices)
 
 
 if __name__ == "__main__":

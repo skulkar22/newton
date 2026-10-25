@@ -50,15 +50,50 @@ Frame regularization: the backend adds ``frame_regularization`` to the six frame
 entries of every row of a mixed articulation before factorization (the 6 x 6 kernels apply
 ``rigid_articulation_diagonal_regularization`` to the rigid prefix through the body Hessians).
 
-The serial kernel here runs one thread per mixed articulation and is the CPU backend; the
-helpers and the layout are device agnostic, so a cooperative CUDA kernel can use the same
-storage.
+Backends (:func:`launch_solve_articulation_variable` picks one by device):
+
+- CPU: :func:`solve_articulation_variable_serial`, one thread per mixed articulation.
+- CUDA: :data:`solve_articulation_variable_cooperative`, one CTA of
+  :data:`VB_COOPERATIVE_BLOCK_DIM` (128) threads per mixed articulation, the same elimination
+  order, column and update lists, regularization and failure policy. Column ``k`` takes the
+  *lane path* when ``n_k = 6``: lane 0 factors ``L_kk``; the column solves give one block row
+  and the trailing updates one destination entry to each lane, numbered across all blocks of
+  the column. In the substitutions each lane owns one vector component of the block row for the
+  off-diagonal products, and a 6 x 6 diagonal solve runs on lane 0. The lane path
+  repeats the serial arithmetic, so all-6 systems agree bitwise with the serial kernel. Wider
+  columns take the *tile path*: fixed 32 x 32 shared-memory panels of runtime-shaped views into
+  ``values`` (:func:`_vb_view`), zero filled past the block edge, with the padded diagonal of a
+  partial panel set to the identity each time the panel is loaded; panel Cholesky
+  (``tile_cholesky_inplace``), panel triangular solves, and ``tile_matmul`` updates. Bodies
+  are not padded to the largest modal count; only the last partial panel of a block is. Every
+  valid diagonal entry of every factored panel is checked, since ``tile_cholesky_inplace``
+  reports no failure. Control flow is uniform across the CTA: branches depend on block sizes or
+  on ``factor_status``, which single lanes write and all lanes read after a barrier. An explicit
+  ``__syncthreads`` follows every phase that stores to global memory (``tile_store`` issues
+  none). The kernel neither allocates nor synchronizes with the host, so it can be captured in
+  a CUDA graph; the tile path is accurate to float32 rounding, not bitwise equal to the serial
+  kernel. On the CPU the cooperative kernel runs with ``block_dim = 1`` (for testing).
+
+Shared memory of the cooperative kernel: one 32 x 32 ``float32`` tile is 4 KiB, and every
+tile expression in a function frame owns its own buffer. Each tile phase is therefore a
+separate ``wp.func``, so a CTA needs the largest phase frame instead of the sum, and every loop
+around a tile operation has a runtime trip count, so loop unrolling cannot duplicate tiles
+(compiling with ``max_unroll = 1`` gives the same size; the default unrolling keeps the lane
+path fast). The panel Cholesky frame holds seven panels plus 128 bytes: 28 800 bytes per CTA
+with Warp 1.18, under the design budget :data:`VB_COOPERATIVE_SHARED_MEMORY_BUDGET` (32 KiB;
+three CTAs fit in 100 KiB per SM). :func:`cooperative_shared_memory_bytes` reads the
+requirement from the compiled module and raises if it exceeds the device limit; the CUDA
+launcher calls it once per device. The cooperative kernel has its own Warp module
+(``module="unique"``), which keeps its libmathdx build (tens of seconds on a cold kernel
+cache) out of the module of the light kernels; it uses no float atomics, so it does not
+depend on the deterministic mode.
 """
 
 import warp as wp
 
 from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import (
     _apply_sparse_delta_value_to_body,
+    _block_sync,
     vec6f,
 )
 
@@ -411,6 +446,441 @@ def solve_articulation_variable_serial(
             delta[i] = step
 
 
+# ---------------------------------------------------------------------------
+# Cooperative CUDA kernel (one CTA per mixed articulation)
+# ---------------------------------------------------------------------------
+
+VB_COOPERATIVE_BLOCK_DIM = 128
+"""Threads per CTA of :data:`solve_articulation_variable_cooperative` on CUDA devices."""
+
+VB_COOPERATIVE_SHARED_MEMORY_BUDGET = 32 * 1024
+"""Design budget in bytes for the shared memory of one cooperative CTA (see the module docstring)."""
+
+_VB_TILE = wp.constant(32)
+_VB_LANE_MAX_DIM = wp.constant(6)
+
+
+@wp.func
+def _vb_view(values: wp.array[float], offset: int, rows: int, cols: int):
+    """Row-major ``rows x cols`` view of ``values[offset : offset + rows * cols]``.
+
+    The view aliases ``values`` (no copy); it is a valid tile source and target whose runtime
+    shape bounds ``tile_load`` zero fill and ``tile_store`` clipping. The layout guarantees that
+    every block lies inside the array (int32 offsets, checked when the layout is built).
+    """
+    return wp.array(ptr=values.ptr + wp.uint64(offset) * wp.uint64(4), shape=(rows, cols), dtype=float)
+
+
+@wp.func
+def _vb_pad_entry(index: float, valid: float) -> float:
+    """Diagonal padding of a partial panel: 1 for ``index >= valid``, else 0.
+
+    Used as ``tile_map(_vb_pad_entry, tile_arange(32), valid)`` and added to the diagonal of a
+    zero-filled partial diagonal panel, which makes the padded part the identity, so Cholesky
+    and triangular solves stay finite and leave the valid part unchanged. The tile is built
+    inline at each use: returning a register tile from a ``wp.func`` faults on CUDA in Warp 1.18.
+    """
+    if index >= valid:
+        return 1.0
+    return 0.0
+
+
+@wp.func
+def _vb_tile_potrf(A: wp.array2d[float]) -> int:
+    """Right-looking panel Cholesky of the square view ``A`` in place (all threads of the CTA).
+
+    Every valid diagonal entry of each factored panel is checked, since ``tile_cholesky_inplace``
+    reports no failure. Returns 1 if every pivot is positive and finite, else 0 (the factor is then
+    incomplete). The strict upper triangle of ``A`` is left unspecified.
+    """
+    n = A.shape[0]
+    panels = (n + _VB_TILE - 1) // _VB_TILE
+    ok = int(1)
+    for k in range(panels):
+        o = k * _VB_TILE
+        akk = wp.tile_load(A, shape=(_VB_TILE, _VB_TILE), offset=(o, o), storage="shared", bounds_check=True)
+        lkk = wp.tile_diag_add(akk, wp.tile_map(_vb_pad_entry, wp.tile_arange(_VB_TILE, dtype=float), float(n - o)))
+        wp.tile_cholesky_inplace(lkk)
+        for i in range(wp.min(_VB_TILE, n - o)):
+            if not _vb_pivot_ok(lkk[i, i]):
+                ok = 0
+        wp.tile_store(A, lkk, offset=(o, o), bounds_check=True)
+        if ok == 0:
+            break
+        for i in range(k + 1, panels):
+            aik = wp.tile_load(
+                A, shape=(_VB_TILE, _VB_TILE), offset=(i * _VB_TILE, o), storage="shared", bounds_check=True
+            )
+            x = wp.tile_lower_solve(lkk, wp.tile_transpose(aik))
+            wp.tile_store(A, wp.tile_transpose(x), offset=(i * _VB_TILE, o), bounds_check=True)
+        _block_sync()
+        for j in range(k + 1, panels):
+            for i in range(j, panels):
+                cij = wp.tile_load(
+                    A,
+                    shape=(_VB_TILE, _VB_TILE),
+                    offset=(i * _VB_TILE, j * _VB_TILE),
+                    storage="shared",
+                    bounds_check=True,
+                )
+                li = wp.tile_load(
+                    A, shape=(_VB_TILE, _VB_TILE), offset=(i * _VB_TILE, o), storage="shared", bounds_check=True
+                )
+                lj = wp.tile_load(
+                    A, shape=(_VB_TILE, _VB_TILE), offset=(j * _VB_TILE, o), storage="shared", bounds_check=True
+                )
+                wp.tile_matmul(li, wp.tile_transpose(lj), cij, alpha=-1.0)
+                wp.tile_store(A, cij, offset=(i * _VB_TILE, j * _VB_TILE), bounds_check=True)
+        _block_sync()
+    _block_sync()
+    return ok
+
+
+@wp.func
+def _vb_tile_right_solve_lower_transpose(L: wp.array2d[float], B: wp.array2d[float]):
+    """``B := B L^-T`` panel by panel (``L`` factored ``n_k x n_k``, ``B`` is ``n_i x n_k``)."""
+    nk = L.shape[0]
+    col_panels = (nk + _VB_TILE - 1) // _VB_TILE
+    row_panels = (B.shape[0] + _VB_TILE - 1) // _VB_TILE
+    for c in range(col_panels):
+        o = c * _VB_TILE
+        lcc = wp.tile_diag_add(
+            wp.tile_load(L, shape=(_VB_TILE, _VB_TILE), offset=(o, o), storage="shared", bounds_check=True),
+            wp.tile_map(_vb_pad_entry, wp.tile_arange(_VB_TILE, dtype=float), float(nk - o)),
+        )
+        for r in range(row_panels):
+            brc = wp.tile_load(
+                B, shape=(_VB_TILE, _VB_TILE), offset=(r * _VB_TILE, o), storage="shared", bounds_check=True
+            )
+            for p in range(c):
+                brp = wp.tile_load(
+                    B,
+                    shape=(_VB_TILE, _VB_TILE),
+                    offset=(r * _VB_TILE, p * _VB_TILE),
+                    storage="shared",
+                    bounds_check=True,
+                )
+                lcp = wp.tile_load(
+                    L, shape=(_VB_TILE, _VB_TILE), offset=(o, p * _VB_TILE), storage="shared", bounds_check=True
+                )
+                wp.tile_matmul(brp, wp.tile_transpose(lcp), brc, alpha=-1.0)
+            x = wp.tile_lower_solve(lcc, wp.tile_transpose(brc))
+            wp.tile_store(B, wp.tile_transpose(x), offset=(r * _VB_TILE, o), bounds_check=True)
+        _block_sync()
+
+
+@wp.func
+def _vb_tile_subtract_outer(C: wp.array2d[float], A: wp.array2d[float], B: wp.array2d[float], lower_only: int):
+    """``C -= A B^T`` panel by panel; with ``lower_only`` only panels on or below the diagonal."""
+    row_panels = (C.shape[0] + _VB_TILE - 1) // _VB_TILE
+    col_panels = (C.shape[1] + _VB_TILE - 1) // _VB_TILE
+    inner_panels = (A.shape[1] + _VB_TILE - 1) // _VB_TILE
+    for r in range(row_panels):
+        c_end = col_panels
+        if lower_only != 0:
+            c_end = wp.min(col_panels, r + 1)
+        for c in range(c_end):
+            crc = wp.tile_load(
+                C,
+                shape=(_VB_TILE, _VB_TILE),
+                offset=(r * _VB_TILE, c * _VB_TILE),
+                storage="shared",
+                bounds_check=True,
+            )
+            for p in range(inner_panels):
+                arp = wp.tile_load(
+                    A,
+                    shape=(_VB_TILE, _VB_TILE),
+                    offset=(r * _VB_TILE, p * _VB_TILE),
+                    storage="shared",
+                    bounds_check=True,
+                )
+                bcp = wp.tile_load(
+                    B,
+                    shape=(_VB_TILE, _VB_TILE),
+                    offset=(c * _VB_TILE, p * _VB_TILE),
+                    storage="shared",
+                    bounds_check=True,
+                )
+                wp.tile_matmul(arp, wp.tile_transpose(bcp), crc, alpha=-1.0)
+            wp.tile_store(C, crc, offset=(r * _VB_TILE, c * _VB_TILE), bounds_check=True)
+
+
+@wp.func
+def _vb_tile_lower_solve_vec(L: wp.array2d[float], y: wp.array2d[float]):
+    """Solve ``L y' = y`` in place panel by panel (``y`` is an ``n x 1`` view)."""
+    n = L.shape[0]
+    panels = (n + _VB_TILE - 1) // _VB_TILE
+    for k in range(panels):
+        o = k * _VB_TILE
+        yk = wp.tile_load(y, shape=(_VB_TILE, 1), offset=(o, 0), storage="shared", bounds_check=True)
+        for j in range(k):
+            yj = wp.tile_load(y, shape=(_VB_TILE, 1), offset=(j * _VB_TILE, 0), storage="shared", bounds_check=True)
+            lkj = wp.tile_load(
+                L, shape=(_VB_TILE, _VB_TILE), offset=(o, j * _VB_TILE), storage="shared", bounds_check=True
+            )
+            wp.tile_matmul(lkj, yj, yk, alpha=-1.0)
+        lkk = wp.tile_diag_add(
+            wp.tile_load(L, shape=(_VB_TILE, _VB_TILE), offset=(o, o), storage="shared", bounds_check=True),
+            wp.tile_map(_vb_pad_entry, wp.tile_arange(_VB_TILE, dtype=float), float(n - o)),
+        )
+        wp.tile_lower_solve_inplace(lkk, yk)
+        wp.tile_store(y, yk, offset=(o, 0), bounds_check=True)
+        # Required although the tests do not detect its removal (final2 mutation M2b): the next
+        # panel loads this part of y into tiles whose thread mapping is Warp-internal, and its
+        # loads reuse the shared buffers this panel's store still reads; not provably redundant.
+        _block_sync()
+
+
+@wp.func
+def _vb_tile_upper_solve_vec(L: wp.array2d[float], y: wp.array2d[float]):
+    """Solve ``L^T y' = y`` in place panel by panel (``y`` is an ``n x 1`` view)."""
+    n = L.shape[0]
+    panels = (n + _VB_TILE - 1) // _VB_TILE
+    for s in range(panels):
+        k = panels - 1 - s
+        o = k * _VB_TILE
+        yk = wp.tile_load(y, shape=(_VB_TILE, 1), offset=(o, 0), storage="shared", bounds_check=True)
+        for j in range(k + 1, panels):
+            yj = wp.tile_load(y, shape=(_VB_TILE, 1), offset=(j * _VB_TILE, 0), storage="shared", bounds_check=True)
+            ljk = wp.tile_load(
+                L, shape=(_VB_TILE, _VB_TILE), offset=(j * _VB_TILE, o), storage="shared", bounds_check=True
+            )
+            wp.tile_matmul(wp.tile_transpose(ljk), yj, yk, alpha=-1.0)
+        lkk = wp.tile_diag_add(
+            wp.tile_load(L, shape=(_VB_TILE, _VB_TILE), offset=(o, o), storage="shared", bounds_check=True),
+            wp.tile_map(_vb_pad_entry, wp.tile_arange(_VB_TILE, dtype=float), float(n - o)),
+        )
+        wp.tile_upper_solve_inplace(wp.tile_transpose(lkk), yk)
+        wp.tile_store(y, yk, offset=(o, 0), bounds_check=True)
+        _block_sync()
+
+
+@wp.func
+def _vb_first_lane_item(lane: int, base: int, threads: int) -> int:
+    """First item index ``i >= 0`` of a block whose items are numbered from ``base`` with ``(base + i) % threads == lane``."""
+    return ((lane - base) % threads + threads) % threads
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def solve_articulation_variable_cooperative(
+    rigid_articulation_count: int,
+    frame_regularization: float,
+    articulation_body_offsets: wp.array[wp.int32],
+    articulation_row_dims: wp.array[wp.int32],
+    articulation_row_scalar_offsets: wp.array[wp.int32],
+    articulation_block_value_offsets: wp.array[wp.int32],
+    articulation_block_dims: wp.array2d[wp.int32],
+    articulation_block_row_offsets: wp.array[wp.int32],
+    articulation_block_cols: wp.array[wp.int32],
+    articulation_block_col_offsets: wp.array[wp.int32],
+    articulation_block_col_rows: wp.array[wp.int32],
+    articulation_block_col_slots: wp.array[wp.int32],
+    articulation_factor_update_offsets: wp.array[wp.int32],
+    articulation_factor_update_dst_slots: wp.array[wp.int32],
+    articulation_factor_update_left_slots: wp.array[wp.int32],
+    articulation_factor_update_right_slots: wp.array[wp.int32],
+    articulation_diag_slots: wp.array[wp.int32],
+    rhs: wp.array[float],
+    values: wp.array[float],
+    diag_backup: wp.array[float],
+    factor_status: wp.array[wp.int32],
+    failure_count: wp.array[wp.int32],
+    delta: wp.array[float],
+):
+    """Factor and solve one mixed articulation per CTA (right-looking block Cholesky).
+
+    Launch with :func:`warp.launch_tiled`, ``dim = mixed_articulation_count`` and
+    ``block_dim = VB_COOPERATIVE_BLOCK_DIM``. Same arguments, storage, elimination order,
+    regularization and failure handling as :func:`solve_articulation_variable_serial`; see the
+    module docstring for the lane and tile paths.
+    """
+    tid, lane = wp.tid()
+    threads = wp.block_dim()
+    articulation = rigid_articulation_count + tid
+    body_start = articulation_body_offsets[articulation]
+    body_end = articulation_body_offsets[articulation + 1]
+    begin = articulation_row_scalar_offsets[body_start]
+    end = articulation_row_scalar_offsets[body_end]
+
+    # ``factor_status[tid]`` doubles as the CTA-uniform failure flag: it is written by single
+    # lanes and read by every lane after a barrier.
+    if lane == 0:
+        factor_status[tid] = VB_FACTOR_OK
+
+    # Regularize the frame rows and keep the diagonal for the Jacobi fallback.
+    for row in range(body_start, body_end):
+        n = articulation_row_dims[row]
+        diag_offset = articulation_block_value_offsets[articulation_diag_slots[row]]
+        vec_offset = articulation_row_scalar_offsets[row]
+        for k in range(lane, n, threads):
+            if k < 6:
+                values[diag_offset + k * n + k] = values[diag_offset + k * n + k] + frame_regularization
+            diag_backup[vec_offset + k] = values[diag_offset + k * n + k]
+    _block_sync()
+
+    for row_k in range(body_start, body_end):
+        n_k = articulation_row_dims[row_k]
+        diag_offset = articulation_block_value_offsets[articulation_diag_slots[row_k]]
+        if n_k <= _VB_LANE_MAX_DIM:
+            if lane == 0:
+                if _vb_cholesky_inplace(values, diag_offset, n_k) == 0:
+                    factor_status[tid] = VB_FACTOR_INDEFINITE
+        else:
+            ok = _vb_tile_potrf(_vb_view(values, diag_offset, n_k, n_k))
+            if ok == 0 and lane == 0:
+                factor_status[tid] = VB_FACTOR_INDEFINITE
+            for e in range(lane, n_k * n_k, threads):
+                r = e // n_k
+                if e - r * n_k > r:
+                    values[diag_offset + e] = 0.0
+        _block_sync()
+        if factor_status[tid] != VB_FACTOR_OK:
+            break
+
+        # Column blocks: L_ik = H_ik L_kk^-T.
+        col_begin = articulation_block_col_offsets[row_k]
+        col_end = articulation_block_col_offsets[row_k + 1]
+        if n_k <= _VB_LANE_MAX_DIM:
+            # One lane per block row, numbered across all blocks of the column.
+            base = int(0)
+            for entry in range(col_begin, col_end):
+                slot = articulation_block_col_slots[entry]
+                rows = articulation_block_dims[slot, 0]
+                offset = articulation_block_value_offsets[slot]
+                for r in range(_vb_first_lane_item(lane, base, threads), rows, threads):
+                    row_offset = offset + r * n_k
+                    for c in range(n_k):
+                        value = values[row_offset + c]
+                        for p in range(c):
+                            value = value - values[row_offset + p] * values[diag_offset + c * n_k + p]
+                        values[row_offset + c] = value / values[diag_offset + c * n_k + c]
+                base += rows
+        else:
+            for entry in range(col_begin, col_end):
+                slot = articulation_block_col_slots[entry]
+                _vb_tile_right_solve_lower_transpose(
+                    _vb_view(values, diag_offset, n_k, n_k),
+                    _vb_view(values, articulation_block_value_offsets[slot], articulation_block_dims[slot, 0], n_k),
+                )
+        _block_sync()
+
+        # Trailing updates H_ab -= L_ak L_bk^T; destinations within a column are distinct.
+        update_begin = articulation_factor_update_offsets[row_k]
+        update_end = articulation_factor_update_offsets[row_k + 1]
+        if n_k <= _VB_LANE_MAX_DIM:
+            # One lane per destination entry, numbered across all updates of the column.
+            base = int(0)
+            for entry in range(update_begin, update_end):
+                dst = articulation_factor_update_dst_slots[entry]
+                left = articulation_factor_update_left_slots[entry]
+                right = articulation_factor_update_right_slots[entry]
+                left_rows = articulation_block_dims[left, 0]
+                right_rows = articulation_block_dims[right, 0]
+                dst_offset = articulation_block_value_offsets[dst]
+                left_offset = articulation_block_value_offsets[left]
+                right_offset = articulation_block_value_offsets[right]
+                count = left_rows * right_rows
+                for e in range(_vb_first_lane_item(lane, base, threads), count, threads):
+                    r = e // right_rows
+                    c = e - r * right_rows
+                    if left != right or c <= r:
+                        accum = float(0.0)
+                        for p in range(n_k):
+                            accum = accum + values[left_offset + r * n_k + p] * values[right_offset + c * n_k + p]
+                        values[dst_offset + e] = values[dst_offset + e] - accum
+                base += count
+        else:
+            for entry in range(update_begin, update_end):
+                dst = articulation_factor_update_dst_slots[entry]
+                left = articulation_factor_update_left_slots[entry]
+                right = articulation_factor_update_right_slots[entry]
+                left_rows = articulation_block_dims[left, 0]
+                right_rows = articulation_block_dims[right, 0]
+                lower_only = int(0)
+                if left == right:
+                    lower_only = 1
+                _vb_tile_subtract_outer(
+                    _vb_view(values, articulation_block_value_offsets[dst], left_rows, right_rows),
+                    _vb_view(values, articulation_block_value_offsets[left], left_rows, n_k),
+                    _vb_view(values, articulation_block_value_offsets[right], right_rows, n_k),
+                    lower_only,
+                )
+        _block_sync()
+
+    if factor_status[tid] == VB_FACTOR_OK:
+        for i in range(begin + lane, end, threads):
+            delta[i] = rhs[i]
+        _block_sync()
+        # Forward substitution with the stored lower block rows; one lane per component.
+        for row in range(body_start, body_end):
+            n = articulation_row_dims[row]
+            vec_offset = articulation_row_scalar_offsets[row]
+            diag_slot = articulation_diag_slots[row]
+            slot_begin = articulation_block_row_offsets[row]
+            slot_end = articulation_block_row_offsets[row + 1]
+            for r in range(lane, n, threads):
+                for slot in range(slot_begin, slot_end):
+                    if slot != diag_slot:
+                        col_row = body_start + articulation_block_cols[slot]
+                        cols = articulation_row_dims[col_row]
+                        x_offset = articulation_row_scalar_offsets[col_row]
+                        offset = articulation_block_value_offsets[slot] + r * cols
+                        accum = float(0.0)
+                        for c in range(cols):
+                            accum = accum + values[offset + c] * delta[x_offset + c]
+                        delta[vec_offset + r] = delta[vec_offset + r] - accum
+            _block_sync()
+            diag_offset = articulation_block_value_offsets[diag_slot]
+            if n <= _VB_LANE_MAX_DIM:
+                if lane == 0:
+                    _vb_lower_solve(values, diag_offset, n, delta, vec_offset)
+            else:
+                _vb_tile_lower_solve_vec(_vb_view(values, diag_offset, n, n), _vb_view(delta, vec_offset, n, 1))
+            _block_sync()
+        # Back substitution with the column lists (L^T); one lane per component.
+        for rr in range(body_end - body_start):
+            row = body_end - 1 - rr
+            n = articulation_row_dims[row]
+            vec_offset = articulation_row_scalar_offsets[row]
+            col_begin = articulation_block_col_offsets[row]
+            col_end = articulation_block_col_offsets[row + 1]
+            for c in range(lane, n, threads):
+                for entry in range(col_begin, col_end):
+                    slot = articulation_block_col_slots[entry]
+                    below = body_start + articulation_block_col_rows[entry]
+                    rows = articulation_row_dims[below]
+                    x_offset = articulation_row_scalar_offsets[below]
+                    offset = articulation_block_value_offsets[slot]
+                    accum = float(0.0)
+                    for r in range(rows):
+                        accum = accum + values[offset + r * n + c] * delta[x_offset + r]
+                    delta[vec_offset + c] = delta[vec_offset + c] - accum
+            _block_sync()
+            diag_offset = articulation_block_value_offsets[articulation_diag_slots[row]]
+            if n <= _VB_LANE_MAX_DIM:
+                if lane == 0:
+                    _vb_upper_solve(values, diag_offset, n, delta, vec_offset)
+            else:
+                _vb_tile_upper_solve_vec(_vb_view(values, diag_offset, n, n), _vb_view(delta, vec_offset, n, 1))
+            _block_sync()
+        for i in range(begin + lane, end, threads):
+            if not wp.isfinite(delta[i]):
+                factor_status[tid] = VB_SOLVE_NONFINITE
+        _block_sync()
+
+    if factor_status[tid] != VB_FACTOR_OK:
+        if lane == 0:
+            wp.atomic_add(failure_count, 0, 1)
+        for i in range(begin + lane, end, threads):
+            d = diag_backup[i]
+            b = rhs[i]
+            step = float(0.0)
+            if _vb_pivot_ok(d) and wp.isfinite(b):
+                step = b / d
+            delta[i] = step
+
+
 @wp.kernel
 def apply_articulation_variable_delta(
     dt: float,
@@ -474,6 +944,121 @@ def apply_articulation_variable_delta(
             joint_qd[qd_start + mode] = (q_new - joint_q_prev[q_start + mode]) * inv_dt
 
 
+_cooperative_shared_memory: dict[str, int] = {}
+
+
+def cooperative_shared_memory_bytes(device=None) -> int:
+    """Load :data:`solve_articulation_variable_cooperative` on a CUDA ``device`` and return its shared memory per CTA.
+
+    Raises:
+        ValueError: If ``device`` is not a CUDA device.
+        RuntimeError: If the requirement exceeds the device's shared memory per block.
+    """
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        raise ValueError(f"cooperative_shared_memory_bytes needs a CUDA device, got {device.alias}")
+    cached = _cooperative_shared_memory.get(device.alias)
+    if cached is not None:
+        return cached
+    module_exec = solve_articulation_variable_cooperative.module.load(device, block_dim=VB_COOPERATIVE_BLOCK_DIM)
+    required = max(
+        (int(value) for key, value in module_exec.meta.items() if key.endswith("_smem_bytes")),
+        default=0,
+    )
+    limit = device.max_shared_memory_per_block
+    if required > limit:
+        raise RuntimeError(
+            f"solve_articulation_variable_cooperative needs {required} bytes of shared memory per CTA, "
+            f"more than the {limit} bytes available on {device.alias}"
+        )
+    _cooperative_shared_memory[device.alias] = required
+    return required
+
+
+def _solve_inputs(layout, frame_regularization: float, rhs: wp.array) -> list:
+    return [
+        layout.rigid_articulation_count,
+        frame_regularization,
+        layout.articulation_body_offsets,
+        layout.articulation_row_dims,
+        layout.articulation_row_scalar_offsets,
+        layout.articulation_block_value_offsets,
+        layout.articulation_block_dims,
+        layout.articulation_block_row_offsets,
+        layout.articulation_block_cols,
+        layout.articulation_block_col_offsets,
+        layout.articulation_block_col_rows,
+        layout.articulation_block_col_slots,
+        layout.articulation_factor_update_offsets,
+        layout.articulation_factor_update_dst_slots,
+        layout.articulation_factor_update_left_slots,
+        layout.articulation_factor_update_right_slots,
+        layout.articulation_diag_slots,
+        rhs,
+    ]
+
+
+def launch_solve_articulation_variable_serial(
+    layout,
+    frame_regularization: float,
+    rhs: wp.array,
+    values: wp.array,
+    diag_backup: wp.array,
+    factor_status: wp.array,
+    failure_count: wp.array,
+    delta: wp.array,
+    device=None,
+) -> None:
+    """Launch :func:`solve_articulation_variable_serial` on any device.
+
+    Same arguments as :func:`launch_solve_articulation_variable`.
+    """
+    if layout.mixed_articulation_count == 0:
+        return
+    wp.launch(
+        solve_articulation_variable_serial,
+        dim=layout.mixed_articulation_count,
+        inputs=_solve_inputs(layout, frame_regularization, rhs),
+        outputs=[values, diag_backup, factor_status, failure_count, delta],
+        device=device if device is not None else values.device,
+    )
+
+
+def launch_solve_articulation_variable_cooperative(
+    layout,
+    frame_regularization: float,
+    rhs: wp.array,
+    values: wp.array,
+    diag_backup: wp.array,
+    factor_status: wp.array,
+    failure_count: wp.array,
+    delta: wp.array,
+    device=None,
+) -> None:
+    """Launch :data:`solve_articulation_variable_cooperative`, one CTA per mixed articulation.
+
+    Uses ``block_dim = VB_COOPERATIVE_BLOCK_DIM`` on CUDA (the first call per device checks the
+    shared memory, see :func:`cooperative_shared_memory_bytes`) and ``block_dim = 1`` on the
+    CPU, where the tile operations run serially (a debugging path). Same arguments as
+    :func:`launch_solve_articulation_variable`.
+    """
+    if layout.mixed_articulation_count == 0:
+        return
+    device = wp.get_device(device if device is not None else values.device)
+    block_dim = 1
+    if device.is_cuda:
+        cooperative_shared_memory_bytes(device)
+        block_dim = VB_COOPERATIVE_BLOCK_DIM
+    wp.launch_tiled(
+        solve_articulation_variable_cooperative,
+        dim=[layout.mixed_articulation_count],
+        inputs=_solve_inputs(layout, frame_regularization, rhs),
+        outputs=[values, diag_backup, factor_status, failure_count, delta],
+        device=device,
+        block_dim=block_dim,
+    )
+
+
 def launch_solve_articulation_variable(
     layout,
     frame_regularization: float,
@@ -487,8 +1072,10 @@ def launch_solve_articulation_variable(
 ) -> None:
     """Factor and solve every mixed articulation of ``layout`` (no-op without mixed articulations).
 
-    Launches :func:`solve_articulation_variable_serial` (one thread per articulation) on every
-    device; this is the single dispatch point for a cooperative CUDA kernel.
+    Launches the cooperative kernel (one CTA per articulation) on CUDA devices and the serial
+    kernel (one thread per articulation) on the CPU. Neither allocates memory nor synchronizes
+    with the host, so the call can be captured in a CUDA graph once the kernel is loaded (call
+    :func:`cooperative_shared_memory_bytes` or launch once before capturing).
 
     Args:
         layout: Layout built with ``elastic_solve="coupled"``.
@@ -501,31 +1088,9 @@ def launch_solve_articulation_variable(
         delta: Solved update, shape [articulation_scalar_count]; only mixed rows are written.
         device: Launch device; defaults to the device of ``values``.
     """
-    if layout.mixed_articulation_count == 0:
-        return
-    wp.launch(
-        solve_articulation_variable_serial,
-        dim=layout.mixed_articulation_count,
-        inputs=[
-            layout.rigid_articulation_count,
-            frame_regularization,
-            layout.articulation_body_offsets,
-            layout.articulation_row_dims,
-            layout.articulation_row_scalar_offsets,
-            layout.articulation_block_value_offsets,
-            layout.articulation_block_dims,
-            layout.articulation_block_row_offsets,
-            layout.articulation_block_cols,
-            layout.articulation_block_col_offsets,
-            layout.articulation_block_col_rows,
-            layout.articulation_block_col_slots,
-            layout.articulation_factor_update_offsets,
-            layout.articulation_factor_update_dst_slots,
-            layout.articulation_factor_update_left_slots,
-            layout.articulation_factor_update_right_slots,
-            layout.articulation_diag_slots,
-            rhs,
-        ],
-        outputs=[values, diag_backup, factor_status, failure_count, delta],
-        device=device if device is not None else values.device,
-    )
+    device = wp.get_device(device if device is not None else values.device)
+    if device.is_cuda:
+        launcher = launch_solve_articulation_variable_cooperative
+    else:
+        launcher = launch_solve_articulation_variable_serial
+    launcher(layout, frame_regularization, rhs, values, diag_backup, factor_status, failure_count, delta, device)
