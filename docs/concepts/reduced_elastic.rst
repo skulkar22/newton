@@ -693,6 +693,11 @@ Warnings
        capture;
        :meth:`~newton.solvers.SolverVBD.rigid_articulation_elastic_solve_failure_count`
        counts every failure.
+   * - Coupled articulation solve uses the serial kernel (:class:`~newton.solvers.SolverVBD`)
+     - The device's shared memory per block is smaller than the cooperative
+       CUDA kernel of ``rigid_articulation_elastic_solve="coupled"`` needs, so
+       each mixed articulation is factored by one thread, which is slower for
+       wide elastic rows. Use a device with more shared memory per block.
    * - Could not Cholesky-factor the modal block (:class:`~newton.solvers.SolverVBD`)
      - In the block-sparse articulation solve with
        ``rigid_articulation_elastic_solve="schur"``, an elastic link's

@@ -1400,7 +1400,9 @@ Cost and memory of the coupled solve:
   thread block is fixed (59,280 bytes with Warp 1.18, independent of the mode
   count) and is checked against the device limit when the solver is
   constructed, so the mode count of a link is limited by device memory rather
-  than shared memory. The CPU uses one serial thread per mixed articulation.
+  than shared memory. A CUDA device with less shared memory per block uses the
+  serial kernel instead, with one warning. The CPU uses one serial thread per
+  mixed articulation.
 - The CUDA kernel uses many registers per thread, so one thread block runs per
   multiprocessor. It is designed for a few large articulations: a model with
   many more small mixed articulations than the device has multiprocessors runs

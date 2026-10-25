@@ -1002,7 +1002,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                   :meth:`rigid_articulation_elastic_solve_failure_count`; the solver warns once, at the
                   first failure. On
                   CUDA each articulation is factored by one 256-thread block using 32 x 32
-                  shared-memory tiles for blocks wider than six; on the CPU by one thread.
+                  shared-memory tiles for blocks wider than six (a device whose shared memory per block
+                  cannot fit it uses one thread per articulation, with one warning); on the CPU by one
+                  thread.
                 - ``"schur"``: comparison backend. Each elastic body's modal coordinates are eliminated
                   exactly onto its frame block and the frames of its joint neighbors, so every
                   articulation is solved with 6 x 6 blocks. Two elastic bodies joined directly
@@ -1865,14 +1867,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._coupled_failure_count = None
         self._coupled_failure_count_host = None
         self._coupled_failure_warned = False
+        self._coupled_cooperative = False
         self._coupled_status_articulations = np.zeros(0, dtype=np.int64)
         if layout is None or layout.mixed_articulation_count == 0:
             return
         device = self.device
-        # Compile the cooperative CUDA factor-and-solve and check its shared-memory budget before any
-        # graph capture; the CPU uses the serial kernel.
-        if device.is_cuda:
-            rigid_sparse_articulation_variable_kernels.cooperative_shared_memory_bytes(device)
+        # Compile the cooperative CUDA factor-and-solve and check its shared memory before any graph
+        # capture; a CUDA device that cannot fit it uses the serial kernel, as the CPU does.
+        self._coupled_cooperative = self._select_coupled_cooperative_solve(device)
         max_modes = int(model.elastic_max_mode_count)
         self._coupled_terms = wp.zeros(
             layout.mixed_articulation_joints.shape[0], dtype=JointEndpointTerms, device=device
@@ -1930,6 +1932,30 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if self.elastic_solver_metrics:
             self._coupled_metric_values = wp.zeros(layout.articulation_value_count, dtype=float, device=device)
             self._coupled_metric_rhs = wp.zeros(layout.articulation_scalar_count, dtype=float, device=device)
+
+    @staticmethod
+    def _select_coupled_cooperative_solve(device) -> bool:
+        """Return whether the coupled solve launches the cooperative CUDA kernel on ``device``.
+
+        The cooperative kernel is used on CUDA devices whose shared memory per block fits it. A
+        CUDA device that does not fit it uses the serial kernel (one thread per mixed
+        articulation) instead and warns once; the CPU always uses the serial kernel.
+        """
+        if not device.is_cuda:
+            return False
+        if rigid_sparse_articulation_variable_kernels.cooperative_kernel_fits(device):
+            return True
+        required = rigid_sparse_articulation_variable_kernels.cooperative_shared_memory_bytes(device)
+        warnings.warn(
+            f"SolverVBD's coupled articulation solve (rigid_articulation_elastic_solve='coupled') needs "
+            f"{required} bytes of shared memory per thread block for its cooperative CUDA kernel, but device "
+            f"'{device.alias}' provides {device.max_shared_memory_per_block}. The mixed rigid/elastic "
+            f"articulations are factored by the serial kernel (one thread per articulation) instead, which is "
+            f"slower for wide elastic rows.",
+            UserWarning,
+            stacklevel=4,
+        )
+        return False
 
     def _init_sparse_elastic_modal_solve(
         self, model: Model, layout, count: int, group_count: int, max_modes: int
@@ -7704,6 +7730,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._coupled_failure_count,
             delta,
             device=self.device,
+            cooperative=self._coupled_cooperative,
         )
         if metrics:
             wp.launch(

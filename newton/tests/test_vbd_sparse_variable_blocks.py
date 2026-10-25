@@ -10,6 +10,8 @@ model attributes the layout builder reads), which allows arbitrary modal counts.
 
 import itertools
 import unittest
+import unittest.mock
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -1246,6 +1248,50 @@ def test_dispatch_selects_backend_by_device(test, device):
     _solver_outputs_equal(test, dispatched, expected, "dispatch")
 
 
+def test_cooperative_kernel_falls_back_when_shared_memory_does_not_fit(test, device):
+    """Check that a CUDA device without enough shared memory per block selects the serial kernel with one warning.
+
+    The measured shared memory is replaced by a value above or below the limit of a stand-in
+    CUDA device, so the selection runs without a GPU.
+    """
+    fake_cuda = SimpleNamespace(is_cuda=True, alias="cuda:test", max_shared_memory_per_block=48 * 1024)
+    select = newton.solvers.SolverVBD._select_coupled_cooperative_solve
+    for required, fits in ((48 * 1024 + 1, False), (48 * 1024, True)):
+        with unittest.mock.patch.object(variable_kernels, "cooperative_shared_memory_bytes", return_value=required):
+            test.assertEqual(variable_kernels.cooperative_kernel_fits(fake_cuda), fits)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                test.assertEqual(select(fake_cuda), fits)
+        messages = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+        if fits:
+            test.assertEqual(messages, [])
+        else:
+            test.assertEqual(len(messages), 1)
+            for text in (str(required), str(48 * 1024), "cuda:test", "serial kernel"):
+                test.assertIn(text, messages[0])
+    cpu = wp.get_device("cpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        test.assertFalse(variable_kernels.cooperative_kernel_fits(cpu))
+        test.assertFalse(variable_kernels.cooperative_kernel_fits("cpu"))
+        test.assertFalse(select(cpu))
+    # A device alias is resolved (it used to raise AttributeError).
+    test.assertEqual(
+        variable_kernels.cooperative_kernel_fits(str(device)),
+        variable_kernels.cooperative_kernel_fits(wp.get_device(device)),
+    )
+
+    # The launcher honors an explicit serial selection.
+    _model, layout, _systems, values, rhs = _solve_fixture(device, 5)
+
+    def serial_selection(*args, **kwargs):
+        launch_solve_articulation_variable(*args, cooperative=False, **kwargs)
+
+    selected = _run_solve(serial_selection, layout, values, rhs, device)
+    expected = _run_solve(variable_kernels.launch_solve_articulation_variable_serial, layout, values, rhs, device)
+    _solver_outputs_equal(test, selected, expected, "serial selection")
+
+
 # ---------------------------------------------------------------------------
 # Update application
 # ---------------------------------------------------------------------------
@@ -1447,6 +1493,10 @@ for _name, _func in [
     ("test_cooperative_failure_matches_serial", test_cooperative_failure_matches_serial),
     ("test_cooperative_batch_of_heterogeneous_articulations", test_cooperative_batch_of_heterogeneous_articulations),
     ("test_dispatch_selects_backend_by_device", test_dispatch_selects_backend_by_device),
+    (
+        "test_cooperative_kernel_falls_back_when_shared_memory_does_not_fit",
+        test_cooperative_kernel_falls_back_when_shared_memory_does_not_fit,
+    ),
 ]:
     add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=devices)
 

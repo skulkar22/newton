@@ -90,13 +90,13 @@ and every tile expression in a function frame owns its own buffer, so each tile 
 separate ``wp.func`` (a CTA needs the largest phase frame instead of the sum) and every loop
 around a tile operation has a runtime trip count, so loop unrolling cannot duplicate tiles.
 :func:`cooperative_shared_memory_bytes` returns the sum, which must stay under the design
-budget :data:`VB_COOPERATIVE_SHARED_MEMORY_BUDGET` (64 KiB), and raises if it exceeds the
-device limit; the CUDA launcher calls it once per device. With 256 threads the kernel uses up to
-255 registers per thread, so one CTA runs per SM; the kernel targets few large articulations
-(one CTA each) rather than many small ones. The cooperative kernel has its own Warp module
-(``module="unique"``), which keeps its libmathdx build (tens of seconds on a cold kernel cache)
-out of the module of the light kernels; it uses no float atomics, so it does not depend on the
-deterministic mode.
+budget :data:`VB_COOPERATIVE_SHARED_MEMORY_BUDGET` (64 KiB). On a CUDA device with less shared
+memory per block (:func:`cooperative_kernel_fits`), the serial kernel is launched instead. With
+256 threads the kernel uses up to 255 registers per thread, so one CTA runs per SM; the kernel
+targets few large articulations (one CTA each) rather than many small ones. The cooperative
+kernel has its own Warp module (``module="unique"``), which keeps its libmathdx build (tens of
+seconds on a cold kernel cache) out of the module of the light kernels; it uses no float
+atomics, so it does not depend on the deterministic mode.
 """
 
 import logging
@@ -1488,11 +1488,11 @@ def cooperative_shared_memory_bytes(device=None) -> int:
     static shared memory of the native helpers (queried from the loaded kernel). Without the static
     query the sizes declared in the helpers (``_VB_STATIC_SHARED_MEMORY_ESTIMATE``) are used, and
     without the module metadata the design budget :data:`VB_COOPERATIVE_SHARED_MEMORY_BUDGET`;
-    either fallback is logged at debug level.
+    either fallback is logged at debug level. The result is not compared with the device limit;
+    see :func:`cooperative_kernel_fits`.
 
     Raises:
         ValueError: If ``device`` is not a CUDA device.
-        RuntimeError: If the requirement exceeds the device's shared memory per block.
     """
     device = wp.get_device(device)
     if not device.is_cuda:
@@ -1522,14 +1522,28 @@ def cooperative_shared_memory_bytes(device=None) -> int:
             )
             static = _VB_STATIC_SHARED_MEMORY_ESTIMATE
         required = dynamic + static
-    limit = device.max_shared_memory_per_block
-    if required > limit:
-        raise RuntimeError(
-            f"solve_articulation_variable_cooperative needs {required} bytes of shared memory per CTA, "
-            f"more than the {limit} bytes available on {device.alias}"
-        )
     _cooperative_shared_memory[device.alias] = required
     return required
+
+
+def _as_device(device):
+    """Return ``device`` resolved by :func:`warp.get_device` when it is an alias or ``None``, else unchanged."""
+    if device is None or isinstance(device, str):
+        return wp.get_device(device)
+    return device
+
+
+def cooperative_kernel_fits(device) -> bool:
+    """Return whether :data:`solve_articulation_variable_cooperative` fits the shared memory per block of ``device``.
+
+    ``device`` is a device or a device alias (``None`` for the default device). ``False`` for
+    devices that are not CUDA devices. On CUDA devices the kernel is loaded (see
+    :func:`cooperative_shared_memory_bytes`), so call this before any graph capture.
+    """
+    device = _as_device(device)
+    if not device.is_cuda:
+        return False
+    return cooperative_shared_memory_bytes(device) <= device.max_shared_memory_per_block
 
 
 def _solve_inputs(layout, frame_regularization: float, rhs: wp.array) -> list:
@@ -1594,10 +1608,13 @@ def launch_solve_articulation_variable_cooperative(
 ) -> None:
     """Launch :data:`solve_articulation_variable_cooperative`, one CTA per mixed articulation.
 
-    Uses ``block_dim = VB_COOPERATIVE_BLOCK_DIM`` on CUDA (the first call per device checks the
+    Uses ``block_dim = VB_COOPERATIVE_BLOCK_DIM`` on CUDA (the first call per device measures the
     shared memory, see :func:`cooperative_shared_memory_bytes`) and ``block_dim = 1`` on the
     CPU, where the tile operations and the native helpers run serially (a debugging path). Same
     arguments as :func:`launch_solve_articulation_variable`.
+
+    Raises:
+        RuntimeError: If the kernel does not fit the shared memory per block of a CUDA ``device``.
     """
     if layout.mixed_articulation_count == 0:
         return
@@ -1608,7 +1625,13 @@ def launch_solve_articulation_variable_cooperative(
             raise ValueError(
                 f"VB_COOPERATIVE_BLOCK_DIM must be a positive multiple of 64, got {VB_COOPERATIVE_BLOCK_DIM}"
             )
-        cooperative_shared_memory_bytes(device)
+        required = cooperative_shared_memory_bytes(device)
+        if required > device.max_shared_memory_per_block:
+            raise RuntimeError(
+                f"solve_articulation_variable_cooperative needs {required} bytes of shared memory per CTA, "
+                f"more than the {device.max_shared_memory_per_block} bytes available on {device.alias}; "
+                f"use launch_solve_articulation_variable_serial on this device."
+            )
         block_dim = VB_COOPERATIVE_BLOCK_DIM
     wp.launch_tiled(
         solve_articulation_variable_cooperative,
@@ -1630,13 +1653,15 @@ def launch_solve_articulation_variable(
     failure_count: wp.array,
     delta: wp.array,
     device=None,
+    cooperative: bool | None = None,
 ) -> None:
     """Factor and solve every mixed articulation of ``layout`` (no-op without mixed articulations).
 
-    Launches the cooperative kernel (one CTA per articulation) on CUDA devices and the serial
-    kernel (one thread per articulation) on the CPU. Neither allocates memory nor synchronizes
+    Launches the cooperative kernel (one CTA per articulation) on CUDA devices whose shared memory
+    per block fits it (:func:`cooperative_kernel_fits`), and the serial kernel (one thread per
+    articulation) on other CUDA devices and on the CPU. Neither allocates memory nor synchronizes
     with the host, so the call can be captured in a CUDA graph once the kernel is loaded (call
-    :func:`cooperative_shared_memory_bytes` or launch once before capturing).
+    :func:`cooperative_kernel_fits` or launch once before capturing).
 
     Args:
         layout: Layout built with ``elastic_solve="coupled"``.
@@ -1648,9 +1673,13 @@ def launch_solve_articulation_variable(
         failure_count: ``int32`` counter, shape [1]; incremented once per failed articulation.
         delta: Solved update, shape [articulation_scalar_count]; only mixed rows are written.
         device: Launch device; defaults to the device of ``values``.
+        cooperative: Whether to launch the cooperative kernel on a CUDA device; ``None`` uses
+            :func:`cooperative_kernel_fits`. Ignored on the CPU.
     """
     device = wp.get_device(device if device is not None else values.device)
-    if device.is_cuda:
+    if cooperative is None:
+        cooperative = cooperative_kernel_fits(device)
+    if device.is_cuda and cooperative:
         launcher = launch_solve_articulation_variable_cooperative
     else:
         launcher = launch_solve_articulation_variable_serial
