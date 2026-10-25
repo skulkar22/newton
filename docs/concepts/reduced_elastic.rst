@@ -340,54 +340,277 @@ Relevant options:
   ``elastic_solver_metrics`` enables
   :meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics`.
 
-With ``rigid_articulation_solve="block_sparse_joints"``, elastic links inside
-an articulation are solved in the articulation's direct factorization: with the
-default ``rigid_articulation_elastic_solve="schur"`` their modes are eliminated
-exactly onto the frame blocks of the link and its joint neighbors, and their
-block metrics are NaN (not evaluated). These links use
-``rigid_articulation_relaxation``. The experimental
-``rigid_articulation_elastic_solve="coupled"`` backend is described with
-:class:`~newton.solvers.SolverVBD`. See
-:ref:`Loop closure inside an articulation` for the joint features this mode
-does not support.
+With ``rigid_articulation_solve="block_sparse_joints"``, elastic links in an
+articulation with at least one other body are solved in the articulation's
+direct factorization (see :ref:`Loop closure inside an articulation` for the
+joint features this mode does not support) and use
+``rigid_articulation_relaxation``. With the default
+``rigid_articulation_elastic_solve="coupled"`` each such link is one block row
+of size ``6 + n``: its body-axes block (inertia, inertial coupling, modal mass,
+stiffness, and damping, contacts) is rotated to world axes about the center of
+mass, every joint adds its exact projection onto both bodies' frame and modal
+coordinates, and the whole articulation is factored at once with each row at
+its own size. Directly jointed elastic links are therefore coupled exactly. An
+articulation whose only body is an elastic link (for example from
+:meth:`~newton.ModelBuilder.add_body_elastic`) is left to the local block solve
+above and uses ``elastic_body_relaxation``.
 
-Each iteration factors every link's ``n x n`` modal block once and solves all
-of its right-hand sides (the modal residual and six columns per neighbor
-frame) in the same pass, before the articulation's frame system is factored.
-The modal blocks of all links in articulations are padded to the largest mode
-count among them. ``elastic_block_solver`` selects the factorization as for
-the local solve: the tiled path keeps one modal block in shared memory (about
-``4 * (n**2 + 7 * n)`` bytes, so a device with 101,376 bytes per block fits
-about 150 modes), and the dense path factors it in global memory. The cost per
-step is then close to the local solve's. Measured on an RTX PRO 6000 Blackwell
-GPU (Warp 1.18, 8 iterations, CUDA graph replay) for a rigid base carrying
-elastic beam links, with the local solve in parentheses:
+If the factorization of an articulation fails (a pivot that is not positive
+and finite, or a non-finite update), that articulation takes a diagonal
+(Jacobi) step for the iteration, its entry of
+:meth:`~newton.solvers.SolverVBD.rigid_articulation_elastic_solve_status` is
+set, and the solver warns (see the table below). Its block metrics are NaN.
+The diagonal step is not damped, so a system that stays indefinite can diverge
+over many steps. In a test that removes the mode-mode coupling of two hinged
+elastic beams from the assembled system, every factorization failed and the
+state was no longer finite after 32 steps. Fix the model, or raise
+``rigid_articulation_diagonal_regularization`` when the frame blocks are
+nearly singular.
+
+:meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics` is filled with
+NaN at the start of each step, and a NaN entry means the body was not
+evaluated. Locally solved links report the norms of their own block. Links in a
+coupled articulation report the norms of their rows of the whole articulation
+system, so ``H delta`` includes the joint coupling to the other bodies'
+updates and the frame regularization; frame rows are in world axes, which
+leaves the norms unchanged. Links solved with
+``rigid_articulation_elastic_solve="schur"``, links of an articulation whose
+factorization failed, and every link before the first step or when no iteration ran stay NaN.
+
+Accuracy of the articulation backends, as the maximum absolute difference of
+the body poses and joint coordinates (positions in m, quaternion components,
+and modal coordinates) over the trajectory from a local solve with 384
+iterations, measured with the scripts accompanying the change on the CPU with
+Warp 1.18.0. First, two directly hinged elastic beams (three modes
+each), 120 steps of 1/480 s, in which the largest change of any entry is 0.65:
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 35 35
+   :widths: 25 25 25 25
 
-   * - Modes per link
-     - 1 link [ms/step]
-     - 8 links [ms/step]
-   * - 32
-     - 1.6 (1.3)
-     - 2.2 (2.2)
-   * - 105
-     - 3.5 (2.9)
-     - 4.6 (4.9)
-   * - 151
-     - 5.2 (4.0)
-     - 6.9 (7.0)
+   * - Iterations
+     - ``"coupled"``
+     - ``"schur"``
+     - local
+   * - 12
+     - 8.7e-6
+     - 1.7e-2
+     -
+   * - 24
+     - 7.0e-6
+     - 1.0e-2
+     - 4.7e-4
+   * - 48
+     - 6.8e-6
+     - 4.3e-3
+     -
+   * - 96
+     - 8.5e-6
+     - 8.5e-4
+     - 4.8e-6
+   * - 192
+     - 8.6e-6
+     - 3.9e-5
+     -
+   * - 384
+     - 7.4e-6
+     - 6.0e-6
+     -
 
-On the CPU the sparse step costs 0.8 to 1.4 times the local step for the same
-cases (for example 51 ms against 37 ms for eight 151-mode links).
+The coupled solve reaches the ``float32`` floor of this measure at 12
+iterations; the Schur backend needs about 384. Second, seven articulations at
+24 iterations, 60 steps (1/120 s for the loop, with relaxation 0.65; 1/480 s
+otherwise):
 
-A link whose dense frame-and-mode block is not positive definite, typically
-because of an inconsistent modal mass or stiffness, cannot be eliminated. Its
-frame is then solved with its own frame rows only, and its modes take a
-diagonal (Jacobi) step after the frame solve, as the local block solve's
-fallback does; this converges slowly or not at all, and the solver warns once.
+.. list-table::
+   :header-rows: 1
+   :widths: 40 20 20 20
+
+   * - Articulation
+     - ``"coupled"``
+     - ``"schur"``
+     - local
+   * - Rigid base with an elastic leaf link
+     - 3.4e-7
+     - 5.2e-7
+     - 6.3e-7
+   * - Two directly hinged elastic links
+     - 2.5e-6
+     - 1.0e-2
+     - 4.2e-4
+   * - Elastic, rigid, elastic chain (1 and 3 modes)
+     - 1.6e-6
+     - 1.6e-6
+     - 1.8e-3
+   * - Elastic coupler and rocker loop
+     - 2.6e-5
+     - 2.6e-5
+     - 1.2e-1
+   * - Kinematic elastic parent with a rigid child
+     - 4.6e-6
+     - 4.6e-6
+     - 3.9e-6
+   * - Rigid base with two elastic leaves (2 and 5 modes)
+     - 1.1e-6
+     - 1.1e-6
+     - 6.4e-7
+   * - Three directly hinged elastic links (2, 4, 3 modes)
+     - 2.8e-5
+     - 6.9e-3
+     - 1.4e-3
+
+The same measures on a CUDA device are within about a factor of 2 of these values.
+
+Cost of the backends, measured with the benchmark scripts accompanying the
+change on one NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPU with Warp
+1.18.0; these are measurements of one device and these models, not
+guarantees. The models are revolute chains of beams: a
+chain of six rigid links with one or two elastic links, chains of elastic links
+only, a four-bar linkage whose coupler is elastic, and 64 copies of a chain in
+one model. Each backend ran 60 steps of 1/480 s at increasing iteration counts
+(4, 8, 12, 16, 24, 48, 96, 192); the iterations to target are the fewest whose
+largest difference from a local solve with 384 iterations, over every step and
+every body pose and joint coordinate (modal coordinates included), is at most
+1e-4, and the time to target is the time per step at that count, from a warmed
+CUDA graph replay in one process:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 20 25 15
+
+   * - Model
+     - Iterations to target (local / ``"schur"`` / ``"coupled"``)
+     - Time to target [ms/step] (local / ``"schur"`` / ``"coupled"``)
+     - ``"coupled"`` / best other
+   * - Rigid chain, one elastic link, 8 modes
+     - 12 / 8 / 8
+     - 1.45 / 1.38 / 1.03
+     - 0.75
+   * - Rigid chain, one elastic link, 32 modes
+     - 12 / 12 / 12
+     - 2.44 / 3.02 / 2.46
+     - 1.01
+   * - Rigid chain, one elastic link, 105 modes
+     - 12 / 8 / 8
+     - 5.27 / 4.31 / 3.66
+     - 0.85
+   * - Rigid chain, two elastic links, 8 modes
+     - 12 / 8 / 8
+     - 2.08 / 1.43 / 1.18
+     - 0.82
+   * - Rigid chain, two elastic links, 32 modes
+     - 12 / 8 / 8
+     - 3.56 / 2.12 / 1.99
+     - 0.94
+   * - Rigid chain, two elastic links, 105 modes
+     - 12 / 8 / 8
+     - 7.83 / 4.84 / 4.98
+     - 1.03
+   * - Two elastic links, 32 modes each
+     - 24 / 12 / 8
+     - 5.53 / 2.88 / 1.68
+     - 0.58
+   * - Two elastic links, 151 modes each
+     - 24 / 12 / 8
+     - 18.46 / 10.37 / 6.79
+     - 0.65
+   * - Four elastic links, 32 modes each
+     - 24 / 16 / 8
+     - 6.53 / 4.26 / 2.35
+     - 0.55
+   * - Four elastic links, 151 modes each
+     - 24 / 16 / 8
+     - 23.74 / 16.05 / 10.80
+     - 0.67
+   * - Four-bar with an elastic coupler, 32 modes
+     - 8 / 8 / 8
+     - 1.61 / 1.98 / 1.61
+     - 1.00
+   * - 64 copies of the one-link chain, 32 modes
+     - 12 / 12 / 12
+     - 3.87 / 4.34 / 3.94
+     - 1.02
+
+At a fixed 16 iterations, timed as the median of 5 fresh processes, a coupled
+iteration costs 1.08, 1.17, 1.20, and 1.33 times a local one for chains of
+three elastic links with 105 and 151 modes and of four elastic links with 105
+and 151 modes. Its time to target is nevertheless lower because it needs 8
+iterations where the local solve needs 24 and the Schur backend 16. The
+coupled CUDA kernel runs 256 threads per articulation with high register use,
+so it suits few large articulations; with many small ones occupancy drops. In a
+kernel micro-benchmark, factoring and solving 1,024 four-link chains with 8
+modes per link took 0.32 ms.
+
+An articulation whose only body is an elastic link uses the local block solve
+under ``"coupled"``, so its cost is that of the local solve (16 iterations,
+median of 5 fresh processes):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 20 20 20
+
+   * - Model
+     - ``"coupled"`` [ms/step]
+     - ``"schur"`` [ms/step]
+     - local [ms/step]
+   * - Standalone elastic link, 8 modes
+     - 0.716
+     - 1.053
+     - 0.716
+   * - Standalone elastic link, 32 modes
+     - 1.558
+     - 1.793
+     - 1.559
+   * - Standalone elastic link, 105 modes
+     - 3.982
+     - 4.562
+     - 3.989
+   * - Standalone elastic link, 151 modes
+     - 5.717
+     - 6.757
+     - 5.721
+
+Memory of the coupled factorization: the stored values (the lower block
+triangle with full diagonal blocks, after fill) against the dense system of
+``6 + m`` rows per body, and the solver arrays of the coupled and Schur
+backends. The CUDA kernel uses 59,280 bytes of shared memory per thread block
+in every case, as reported by the kernel at construction:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 16 16 12 22
+
+   * - Model
+     - Stored values
+     - Dense values
+     - Fill ratio
+     - Solver arrays [KiB] (``"coupled"`` / ``"schur"``)
+   * - Four elastic links, 151 modes each
+     - 172,543
+     - 394,384
+     - 0.44
+     - 686.7 / 437.1
+   * - Rigid chain, two elastic links, 105 modes
+     - 27,702
+     - 66,564
+     - 0.42
+     - 117.8 / 122.8
+
+The ``"schur"`` backend, kept for comparison, eliminates each link's modes
+onto the frame blocks of the link and its joint neighbors. Each iteration
+factors every link's ``n x n`` modal block once and solves all of its
+right-hand sides (the modal residual and six columns per neighbor frame) in
+the same pass, before the articulation's 6 x 6 frame system is factored; the
+modal blocks are padded to the largest mode count among the articulated links.
+``elastic_block_solver`` selects that factorization as for the local solve: the
+tiled path keeps one modal block in shared memory (about
+``4 * (n**2 + 7 * n)`` bytes), and the dense path factors it in global memory. A
+link whose frame-and-mode block is not positive definite cannot be
+eliminated: its frame is then solved with its own frame rows only, its modes
+take a diagonal (Jacobi) step after the frame solve, and the solver warns
+once. Under ``"schur"`` a joint between two elastic links replaces their
+mode-mode coupling by a conservative per-link term, which keeps the converged
+solution but slows convergence, as the tables above show.
 
 Approximations and limits
 -------------------------
@@ -412,10 +635,6 @@ Approximations and limits
   articulation solve rejects joint friction, passive joint damping, and joint
   armature on joints attached to elastic links, and rejects joint mimics
   anywhere in a model whose articulations contain elastic links.
-- **Elastic–elastic joints** in the block-sparse articulation solve replace the
-  mode–mode coupling by a conservative per-link term, which keeps the
-  converged solution but needs about four times as many iterations as the
-  local solve; see :ref:`Loop closure inside an articulation`.
 - **Precision.** States are ``float32``. With the displacement-form frame
   update, an elastic link far from the origin is as accurate as a rigid body
   there; with the absolute-pose update (joint mimics or
@@ -461,9 +680,23 @@ Warnings
    * - Block widths use the dense block solve (:class:`~newton.solvers.SolverVBD`)
      - A modal basis exceeds the tiled solve's shared memory; the slower dense
        solve is used. Pass ``elastic_block_solver="dense"`` to silence it.
+   * - Coupled articulation solve could not factor or solve (:class:`~newton.solvers.SolverVBD`)
+     - In the block-sparse articulation solve with
+       ``rigid_articulation_elastic_solve="coupled"``, an articulation's system
+       had a pivot that is not positive and finite, or a non-finite update, so
+       it took a diagonal step, which is not damped and can diverge if the
+       failure persists. Check the modal mass, stiffness, and damping and
+       :meth:`~newton.solvers.SolverVBD.rigid_articulation_elastic_solve_status`;
+       a larger ``rigid_articulation_diagonal_regularization`` can make the frame
+       blocks definite. Raised once per solver, at the first failure, by the
+       next ``step()`` or ``notify_model_changed()`` call outside CUDA graph
+       capture;
+       :meth:`~newton.solvers.SolverVBD.rigid_articulation_elastic_solve_failure_count`
+       counts every failure.
    * - Could not Cholesky-factor the modal block (:class:`~newton.solvers.SolverVBD`)
-     - In the block-sparse articulation solve, an elastic link's frame-and-mode
-       block is not positive definite, so its modes take a diagonal step
-       instead of being eliminated. Check the modal mass, stiffness, and frame
-       inertia. Reported by the next ``step()`` or ``notify_model_changed()``
-       call outside CUDA graph capture.
+     - In the block-sparse articulation solve with
+       ``rigid_articulation_elastic_solve="schur"``, an elastic link's
+       frame-and-mode block is not positive definite, so its modes take a
+       diagonal step instead of being eliminated. Check the modal mass,
+       stiffness, and frame inertia. Reported once by the next ``step()`` or
+       ``notify_model_changed()`` call outside CUDA graph capture.

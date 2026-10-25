@@ -987,15 +987,22 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
                 - ``"coupled"`` (default): one factorization per articulation with a ``(6 + m)`` block
                   per elastic body (``m`` modes), including the exact mode-mode coupling of directly
-                  jointed elastic bodies. Articulations without elastic bodies keep the 6 x 6 solve
-                  unchanged. An articulation whose only body is a reduced elastic body (for example
-                  from :meth:`~newton.ModelBuilder.add_body_elastic`) is solved by the local block
-                  solve instead and uses ``elastic_body_relaxation``. A factorization that fails (a
-                  pivot that is not positive, or a non-finite update) is replaced by a diagonal
+                  jointed elastic bodies. Blocks keep their own sizes (no padding to the largest mode
+                  count); the elimination order is weighted by block size. Each joint is evaluated
+                  once per iteration and projected exactly (``J^T K J``) onto both bodies; this equals
+                  the attachment-referred form of the local block solve except on the parent side of
+                  a :attr:`~newton.JointType.ROD` joint, whose force acts with the child anchor's lever
+                  arm. Articulations without elastic bodies keep the 6 x 6 solve unchanged. An
+                  articulation whose only body is a reduced elastic body (for example from
+                  :meth:`~newton.ModelBuilder.add_body_elastic`) is solved by the local block solve
+                  instead and uses ``elastic_body_relaxation``. A factorization that fails (a pivot
+                  that is not positive and finite, or a non-finite update) is replaced by a diagonal
                   (Jacobi) step for that articulation, recorded in
-                  :meth:`rigid_articulation_elastic_solve_status`, and reported by one warning per
-                  :meth:`step` call that follows failures. On CUDA this backend currently runs
-                  one serial thread per articulation.
+                  :meth:`rigid_articulation_elastic_solve_status` and counted by
+                  :meth:`rigid_articulation_elastic_solve_failure_count`; the solver warns once, at the
+                  first failure. On
+                  CUDA each articulation is factored by one 256-thread block using 32 x 32
+                  shared-memory tiles for blocks wider than six; on the CPU by one thread.
                 - ``"schur"``: comparison backend. Each elastic body's modal coordinates are eliminated
                   exactly onto its frame block and the frames of its joint neighbors, so every
                   articulation is solved with 6 x 6 blocks. Two elastic bodies joined directly
