@@ -73,7 +73,9 @@ def _capture(model, state, device, dt=1.0 / 240.0):
     The kernels of one iteration read the same iterate, so the copies are mutually consistent.
     ``evaluate_elastic_endpoint_joints`` is copied after its launch, so its output is included.
     """
-    solver = newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve=_SPARSE)
+    solver = newton.solvers.SolverVBD(
+        model, iterations=1, rigid_articulation_solve=_SPARSE, rigid_articulation_elastic_solve="schur"
+    )
     captured = {}
     launch = wp.launch
 

@@ -226,7 +226,7 @@ def _int32_array(values, device) -> wp.array[wp.int32]:
 
 
 def build_rigid_articulation_sparse_layout(
-    model, device: wp.context.Devicelike, *, elastic_solve: str = "schur"
+    model, device: wp.context.Devicelike, *, elastic_solve: str = "coupled"
 ) -> RigidArticulationSparseLayout | None:
     """Build the static sparse layout from Newton articulation ranges.
 
@@ -265,7 +265,8 @@ def build_rigid_articulation_sparse_layout(
     Args:
         model: The model whose articulations are analyzed.
         device: Device of the layout arrays.
-        elastic_solve: ``"schur"`` or ``"coupled"``; see above.
+        elastic_solve: ``"coupled"`` (default, as in :class:`~newton.solvers.SolverVBD`) or
+            ``"schur"``; see above.
 
     Raises:
         ValueError: If ``elastic_solve`` is unknown, the articulation ranges are

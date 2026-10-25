@@ -419,6 +419,8 @@ def _capture_model(model, device, *, perturb=(0.0, 0.0), state=None, dt=1.0 / 24
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     if perturb[0] > 0.0 or perturb[1] > 0.0:
         _perturb(state, *perturb)
+    # The captured 6 x 6 scatter kernel assembles elastic endpoints only under the Schur backend.
+    solver_kwargs.setdefault("rigid_articulation_elastic_solve", "schur")
     solver = newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve=_SPARSE, **solver_kwargs)
     return _capture_joint_inputs(solver, state, model.state(), model.control(), dt)
 

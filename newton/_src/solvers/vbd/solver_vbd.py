@@ -680,7 +680,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
-        rigid_articulation_elastic_solve: str = "schur",
+        rigid_articulation_elastic_solve: str = "coupled",
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
@@ -985,12 +985,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_articulation_elastic_solve: How ``"block_sparse_joints"`` solves articulations that
                 contain reduced elastic bodies; ignored by the ``"local"`` articulation solve.
 
-                - ``"schur"`` (default): each elastic body's modal coordinates are eliminated exactly
-                  onto its frame block and the frames of its joint neighbors, so every articulation is
-                  solved with 6 x 6 blocks. Two elastic bodies joined directly converge more slowly
-                  because their mode-mode coupling is replaced by a conservative per-body term.
-                - ``"coupled"``: one factorization per articulation with a ``(6 + m)`` block per
-                  elastic body (``m`` modes), including the exact mode-mode coupling of directly
+                - ``"coupled"`` (default): one factorization per articulation with a ``(6 + m)`` block
+                  per elastic body (``m`` modes), including the exact mode-mode coupling of directly
                   jointed elastic bodies. Articulations without elastic bodies keep the 6 x 6 solve
                   unchanged. An articulation whose only body is a reduced elastic body (for example
                   from :meth:`~newton.ModelBuilder.add_body_elastic`) is solved by the local block
@@ -1000,10 +996,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                   :meth:`rigid_articulation_elastic_solve_status`, and reported by one warning per
                   :meth:`step` call that follows failures. On CUDA this backend currently runs
                   one serial thread per articulation.
+                - ``"schur"``: comparison backend. Each elastic body's modal coordinates are eliminated
+                  exactly onto its frame block and the frames of its joint neighbors, so every
+                  articulation is solved with 6 x 6 blocks. Two elastic bodies joined directly
+                  converge more slowly because their mode-mode coupling is replaced by a conservative
+                  per-body term.
 
                 .. experimental::
                     ``rigid_articulation_elastic_solve`` and both of its values are experimental and
-                    may change or be removed without a deprecation period.
+                    may change or be removed without a deprecation period; ``"schur"`` is kept for
+                    comparison only.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
                 and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
                 dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
@@ -1797,19 +1799,28 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._sparse_elastic_body_count = count
         max_modes = int(model.elastic_max_mode_count)
         group_count = 0 if layout is None else layout.elastic_group_count
-        self._sparse_elastic_definite = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
-        self._sparse_elastic_z = wp.zeros(max(count * max_modes, 1), dtype=float, device=self.device)
-        self._sparse_elastic_b = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
-        self._sparse_elastic_w = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
+        # Schur-backend storage: the coupled layout lists no Schur elastic bodies (count == 0), so
+        # none of it is allocated under ``rigid_articulation_elastic_solve="coupled"``.
+        self._sparse_elastic_definite = None
+        self._sparse_elastic_z = None
+        self._sparse_elastic_b = None
+        self._sparse_elastic_w = None
         self._sparse_elastic_joint_data = None
         self._sparse_elastic_modal_solve = None
-        # Failed modal factorizations, counted on the device and mirrored to host memory once per
-        # step without synchronizing; see _warn_sparse_elastic_indefinite().
-        self._sparse_elastic_indefinite_count = wp.zeros(1, dtype=wp.int32, device=self.device)
-        self._sparse_elastic_indefinite_count_host = wp.zeros(
-            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
-        )
+        self._sparse_elastic_indefinite_count = None
+        self._sparse_elastic_indefinite_count_host = None
         self._sparse_elastic_indefinite_warned = False
+        if count > 0:
+            self._sparse_elastic_definite = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._sparse_elastic_z = wp.zeros(max(count * max_modes, 1), dtype=float, device=self.device)
+            self._sparse_elastic_b = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
+            self._sparse_elastic_w = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
+            # Failed modal factorizations, counted on the device and mirrored to host memory once per
+            # step without synchronizing; see _warn_sparse_elastic_indefinite().
+            self._sparse_elastic_indefinite_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._sparse_elastic_indefinite_count_host = wp.zeros(
+                1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+            )
         self._init_coupled_articulation_solve(model, layout)
         if layout is None:
             return

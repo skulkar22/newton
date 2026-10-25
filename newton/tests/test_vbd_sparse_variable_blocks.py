@@ -427,10 +427,10 @@ def _check_variable_layout_consistency(test, layout):
 def test_all_rigid_layout_identical_under_both_backends(test, device):
     """A rigid-only model has the same layout under both backends, with 6 x 6 offsets."""
     model = _rigid_model(device)
-    schur = build_rigid_articulation_sparse_layout(model, device)
-    explicit_schur = build_rigid_articulation_sparse_layout(model, device, elastic_solve="schur")
+    default = build_rigid_articulation_sparse_layout(model, device)
+    schur = build_rigid_articulation_sparse_layout(model, device, elastic_solve="schur")
     coupled = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
-    _assert_layouts_equal(test, schur, explicit_schur)
+    _assert_layouts_equal(test, default, coupled)
     _assert_layouts_equal(test, schur, coupled, skip=("elastic_solve",))
     test.assertEqual(coupled.elastic_solve, "coupled")
     test.assertEqual(coupled.rigid_articulation_count, coupled.articulation_count)
@@ -460,7 +460,7 @@ def test_unknown_elastic_solve_raises(test, device):
 def test_mixed_layout_partition_and_dims(test, device):
     """Real model: rigid prefix first, standalone elastic body left local, variable dims."""
     model, ids = _mixed_model(device)
-    schur = build_rigid_articulation_sparse_layout(model, device)
+    schur = build_rigid_articulation_sparse_layout(model, device, elastic_solve="schur")
     coupled = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
 
     # Schur keeps the model order, includes the standalone body, and uses 6 x 6 rows only.
