@@ -838,25 +838,16 @@ def _dense_elastic(matrix, elastic_index, width):
 
 
 def _launch_scatter(layout, model, capture, grad, matrix, values, rhs, device, body_inv_mass=None):
-    wp.launch(
-        assembly.scatter_elastic_body_block_variable,
-        dim=(layout.mixed_elastic_body_count, layout.articulation_max_row_dim),
-        inputs=[
-            layout.mixed_elastic_bodies,
-            layout.mixed_elastic_body_rows,
-            layout.articulation_row_dims,
-            layout.articulation_row_scalar_offsets,
-            layout.articulation_block_value_offsets,
-            layout.articulation_block_dims,
-            layout.articulation_diag_slots,
-            model.body_elastic_index,
-            capture["diag"]["body_q"],
-            body_inv_mass if body_inv_mass is not None else capture["diag"]["body_inv_mass"],
-            grad,
-            matrix,
-        ],
-        outputs=[values, rhs],
-        device=device,
+    assembly.launch_scatter_elastic_body_block_variable(
+        layout,
+        model.body_elastic_index,
+        capture["diag"]["body_q"],
+        body_inv_mass if body_inv_mass is not None else capture["diag"]["body_inv_mass"],
+        grad,
+        matrix,
+        values,
+        rhs,
+        device,
     )
 
 

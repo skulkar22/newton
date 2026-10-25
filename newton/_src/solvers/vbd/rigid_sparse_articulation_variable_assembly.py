@@ -18,7 +18,7 @@ Per iterate, :func:`assemble_articulation_variable_system` runs:
 2. :func:`scatter_elastic_body_block_variable`: the body-axes block of every reduced elastic
    body, assembled by :func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_blocks`
    with ``joint_terms=False`` (inertia, modal mass, stiffness and damping, inertial coupling,
-   contacts, external forces), rotated to world axes.
+   contacts, external forces), rotated to world axes, one thread per entry.
 3. :func:`assemble_articulation_body_diagonal_variable`: the rigid bodies of mixed
    articulations, with the 6 x 6 kernels' body diagonal (inertia, contacts, external forces).
 4. :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.evaluate_articulation_joint_terms`:
@@ -102,74 +102,116 @@ def scatter_elastic_body_block_variable(
     values: wp.array[float],
     rhs: wp.array[float],
 ):
-    """Write row ``r`` of a reduced elastic body's diagonal block and right-hand side in world axes.
+    """Write entry ``(r, c)`` of a reduced elastic body's diagonal block, or component ``r`` of its right-hand side, in world axes.
 
-    Launch with ``dim = (mixed_elastic_body_count, articulation_max_row_dim)`` after
-    :func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_blocks` (``joint_terms=False``)
-    and the elastic contact assembly. The body-axes block ``A`` (stored upper triangle) and gradient
-    ``g`` become ``T A T^T`` and ``-T g`` with ``T = diag(R, R, I_m)``, ``R`` the body rotation; see
-    the module docstring for why no point shift is needed. The diagonal block and the row's
-    right-hand side are overwritten, so this runs before any joint term is added. A static frame
+    Launched by :func:`launch_scatter_elastic_body_block_variable` with
+    ``dim = (mixed_elastic_body_count, articulation_max_row_dim, articulation_max_row_dim + 1)``
+    after :func:`~newton._src.solvers.vbd.reduced_elastic_kernels.assemble_elastic_blocks` (``joint_terms=False``)
+    and the elastic contact assembly; thread ``(e, r, c)`` writes block entry ``(r, c)`` for
+    ``c < n`` and right-hand side component ``r`` for ``c == n`` of body ``e`` (row size ``n``).
+    The body-axes block ``A`` (stored upper triangle) and gradient ``g`` become ``T A T^T`` and
+    ``-T g`` with ``T = diag(R, R, I_m)``, ``R`` the body rotation; see the module docstring for
+    why no point shift is needed. The diagonal block and the row's right-hand side are
+    overwritten, so this runs before any joint term is added. A static frame
     (``body_inv_mass == 0``) gets ``1e30 I_6`` on its frame block, zero frame-mode coupling and a zero
     frame right-hand side, as in the Schur backend; its modal rows are assembled normally.
     """
-    entry, r = wp.tid()
+    entry, r, c = wp.tid()
     row = mixed_elastic_body_rows[entry]
     n = articulation_row_dims[row]
-    if r >= n:
+    if r >= n or c > n:
         return
     body = mixed_elastic_bodies[entry]
     elastic_index = body_elastic_index[body]
-    slot = articulation_diag_slots[row]
     static_frame = body_inv_mass[body] == 0.0
     R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
 
+    if c == n:
+        rhs_value = float(0.0)
+        if r < 6:
+            bi = r // 3
+            i = r - 3 * bi
+            if not static_frame:
+                for k in range(3):
+                    rhs_value = rhs_value - R[i, k] * elastic_body_block_grad[elastic_index, 3 * bi + k]
+        else:
+            rhs_value = -elastic_body_block_grad[elastic_index, r]
+        rhs[vb_rhs_index(articulation_row_scalar_offsets, row, r)] = rhs_value
+        return
+
+    value = float(0.0)
     if r < 6:
         bi = r // 3
         i = r - 3 * bi
-        rhs_value = float(0.0)
-        if not static_frame:
+        if static_frame:
+            if c == r:
+                value = _STATIC_FRAME_DIAGONAL
+        elif c < 6:
+            bj = c // 3
+            j = c - 3 * bj
             for k in range(3):
-                rhs_value = rhs_value - R[i, k] * elastic_body_block_grad[elastic_index, 3 * bi + k]
-        rhs[vb_rhs_index(articulation_row_scalar_offsets, row, r)] = rhs_value
-        for c in range(n):
-            value = float(0.0)
-            if static_frame:
-                if c == r:
-                    value = _STATIC_FRAME_DIAGONAL
-            elif c < 6:
-                bj = c // 3
-                j = c - 3 * bj
-                for k in range(3):
-                    for kk in range(3):
-                        value = (
-                            value
-                            + R[i, k]
-                            * _elastic_block_entry(elastic_body_block_matrix, elastic_index, 3 * bi + k, 3 * bj + kk)
-                            * R[j, kk]
-                        )
-            else:
-                for k in range(3):
-                    value = value + R[i, k] * _elastic_block_entry(
-                        elastic_body_block_matrix, elastic_index, 3 * bi + k, c
+                for kk in range(3):
+                    value = (
+                        value
+                        + R[i, k]
+                        * _elastic_block_entry(elastic_body_block_matrix, elastic_index, 3 * bi + k, 3 * bj + kk)
+                        * R[j, kk]
                     )
-            values[vb_block_entry_index(articulation_block_value_offsets, articulation_block_dims, slot, r, c)] = value
+        else:
+            for k in range(3):
+                value = value + R[i, k] * _elastic_block_entry(elastic_body_block_matrix, elastic_index, 3 * bi + k, c)
+    elif c < 6:
+        if not static_frame:
+            bj = c // 3
+            j = c - 3 * bj
+            for kk in range(3):
+                value = (
+                    value + _elastic_block_entry(elastic_body_block_matrix, elastic_index, r, 3 * bj + kk) * R[j, kk]
+                )
     else:
-        rhs[vb_rhs_index(articulation_row_scalar_offsets, row, r)] = -elastic_body_block_grad[elastic_index, r]
-        for c in range(n):
-            value = float(0.0)
-            if c < 6:
-                if not static_frame:
-                    bj = c // 3
-                    j = c - 3 * bj
-                    for kk in range(3):
-                        value = (
-                            value
-                            + _elastic_block_entry(elastic_body_block_matrix, elastic_index, r, 3 * bj + kk) * R[j, kk]
-                        )
-            else:
-                value = _elastic_block_entry(elastic_body_block_matrix, elastic_index, r, c)
-            values[vb_block_entry_index(articulation_block_value_offsets, articulation_block_dims, slot, r, c)] = value
+        value = _elastic_block_entry(elastic_body_block_matrix, elastic_index, r, c)
+    slot = articulation_diag_slots[row]
+    values[vb_block_entry_index(articulation_block_value_offsets, articulation_block_dims, slot, r, c)] = value
+
+
+def launch_scatter_elastic_body_block_variable(
+    layout,
+    body_elastic_index: wp.array,
+    body_q: wp.array,
+    body_inv_mass: wp.array,
+    elastic_body_block_grad: wp.array,
+    elastic_body_block_matrix: wp.array,
+    values: wp.array,
+    rhs: wp.array,
+    device: wp.context.Devicelike = None,
+) -> None:
+    """Launch :func:`scatter_elastic_body_block_variable` over every reduced elastic body of the mixed articulations.
+
+    Launch only; no-op without such bodies.
+    """
+    if layout.mixed_elastic_body_count == 0:
+        return
+    n = layout.articulation_max_row_dim
+    wp.launch(
+        scatter_elastic_body_block_variable,
+        dim=(layout.mixed_elastic_body_count, n, n + 1),
+        inputs=[
+            layout.mixed_elastic_bodies,
+            layout.mixed_elastic_body_rows,
+            layout.articulation_row_dims,
+            layout.articulation_row_scalar_offsets,
+            layout.articulation_block_value_offsets,
+            layout.articulation_block_dims,
+            layout.articulation_diag_slots,
+            body_elastic_index,
+            body_q,
+            body_inv_mass,
+            elastic_body_block_grad,
+            elastic_body_block_matrix,
+        ],
+        outputs=[values, rhs],
+        device=device if device is not None else values.device,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -730,27 +772,17 @@ def assemble_articulation_variable_system(
     values[36 * layout.rigid_block_count :].zero_()
     rhs[6 * layout.rigid_body_row_count :].zero_()
 
-    if layout.mixed_elastic_body_count > 0:
-        wp.launch(
-            scatter_elastic_body_block_variable,
-            dim=(layout.mixed_elastic_body_count, layout.articulation_max_row_dim),
-            inputs=[
-                layout.mixed_elastic_bodies,
-                layout.mixed_elastic_body_rows,
-                layout.articulation_row_dims,
-                layout.articulation_row_scalar_offsets,
-                layout.articulation_block_value_offsets,
-                layout.articulation_block_dims,
-                layout.articulation_diag_slots,
-                model.body_elastic_index,
-                body_q,
-                body_inv_mass,
-                elastic_body_block_grad,
-                elastic_body_block_matrix,
-            ],
-            outputs=[values, rhs],
-            device=device,
-        )
+    launch_scatter_elastic_body_block_variable(
+        layout,
+        model.body_elastic_index,
+        body_q,
+        body_inv_mass,
+        elastic_body_block_grad,
+        elastic_body_block_matrix,
+        values,
+        rhs,
+        device,
+    )
 
     wp.launch(
         assemble_articulation_body_diagonal_variable,
