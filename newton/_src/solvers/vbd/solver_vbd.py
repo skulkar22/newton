@@ -1536,6 +1536,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # Routed tendon geometry and material state are shared with XPBD; VBD
         # evaluates their force and Hessian contributions natively.
         self._init_tendon_state(model, allocate_xpbd_lambdas=True)
+        if self.device.is_cuda and not self.tendon_material_direct:
+            # Spread independent tendon sweeps across more SMs for small batches.
+            self._tendon_material_block_dim = 32
         # Whether any tendon currently uses the ALM row. The per-tendon stiffness
         # guard can leave every tendon on the penalty row; the solver then follows
         # the tendon_alm=False path exactly. Resolved after the guard runs.
