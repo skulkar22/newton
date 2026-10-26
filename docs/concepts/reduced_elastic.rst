@@ -537,9 +537,10 @@ three elastic links with 105 and 151 modes and of four elastic links with 105
 and 151 modes. Its time to target is nevertheless lower because it needs 8
 iterations where the local solve needs 24 and the Schur backend 16. The
 coupled CUDA kernel runs 256 threads per articulation with high register use,
-so it suits few large articulations; with many small ones occupancy drops. In a
-kernel micro-benchmark, factoring and solving 1,024 four-link chains with 8
-modes per link took 0.32 ms.
+so it suits few large articulations. With more mixed articulations than the
+device has multiprocessors and rows that fit a warp's shared memory, the
+solver factors each articulation on one warp instead; many small articulations
+still cost more per iteration than the local solve.
 
 An articulation whose only body is an elastic link uses the local block solve
 under ``"coupled"``, so its cost is that of the local solve (16 iterations,

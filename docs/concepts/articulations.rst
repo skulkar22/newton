@@ -1404,9 +1404,14 @@ Cost and memory of the coupled solve:
   serial kernel instead, with one warning. The CPU uses one serial thread per
   mixed articulation.
 - The CUDA kernel uses many registers per thread, so one thread block runs per
-  multiprocessor. It is designed for a few large articulations: a model with
-  many more small mixed articulations than the device has multiprocessors runs
-  at lower occupancy.
+  multiprocessor. It is designed for a few large articulations. When a model
+  has more mixed articulations than the device has multiprocessors and every
+  wide row, with the rows below it, fits about 11 KiB of shared memory (for
+  example rows of up to about 40 modes next to a few rigid neighbors), each
+  articulation is instead factored by one 32-thread warp, which keeps all of
+  them in flight. Both kernels give the serial kernel's result up to float32
+  rounding. Many small mixed articulations still cost more per iteration than
+  the local solve.
 - Per iteration, the elastic blocks and the rigid body diagonals overwrite
   their rows, and the projected joint terms are gathered for each matrix
   entry in joint order without atomics, so the system is not cleared between

@@ -620,7 +620,7 @@ def test_layout_rejects_int32_overflow(test, device):
 
 
 def test_mixed_slot_gather_lists(test, device):
-    """Check the per-slot gather entries and joint lists and the endpoint twist offsets."""
+    """Check the per-slot gather entries and joint lists, the endpoint twist offsets and the wide-column statistics."""
     mode_counts = [*_SOLVE_MODE_COUNTS, None, 3, None]
     articulations = [*_SOLVE_ARTICULATIONS, [(-1, 14), (14, 15), (15, 16), (16, 14)]]
     model = _synthetic_model(device, mode_counts, articulations)
@@ -632,12 +632,15 @@ def test_mixed_slot_gather_lists(test, device):
     elastic_index = model.body_elastic_index.numpy()
     mode_count = model.elastic_mode_count.numpy()
     local = layout.body_articulation_local.numpy()
+    dims = layout.articulation_row_dims.numpy()
     block_dims = layout.articulation_block_dims.numpy()
     row_offsets = layout.articulation_block_row_offsets.numpy()
     cols = layout.articulation_block_cols.numpy()
     body_offsets = layout.articulation_body_offsets.numpy()
     joint_offsets = layout.articulation_joint_offsets.numpy()
     joints = layout.articulation_joints.numpy()
+    col_offsets = layout.articulation_block_col_offsets.numpy()
+    col_rows = layout.articulation_block_col_rows.numpy()
 
     counts, slot_rows, joint_lists = [], [], []
     for a in range(layout.rigid_articulation_count, layout.articulation_count):
@@ -676,6 +679,16 @@ def test_mixed_slot_gather_lists(test, device):
     np.testing.assert_array_equal(layout.mixed_joint_twist_offsets.numpy(), np.concatenate([[0], np.cumsum(twists)]))
     test.assertEqual(layout.mixed_twist_count, int(np.sum(twists)))
 
+    wide_rows, wide_footprint = 0, 0
+    for row in range(layout.rigid_body_row_count, layout.articulation_body_count):
+        if dims[row] > 6:
+            start = int(body_offsets[np.searchsorted(body_offsets, row, side="right") - 1])
+            below = int(sum(dims[start + r] for r in col_rows[col_offsets[row] : col_offsets[row + 1]]))
+            wide_rows = max(wide_rows, int(dims[row]) + below)
+            wide_footprint = max(wide_footprint, int(dims[row]) * (int(dims[row]) + max(below, 1)))
+    test.assertEqual(layout.mixed_max_wide_column_rows, wide_rows)
+    test.assertEqual(layout.mixed_max_wide_column_footprint, wide_footprint)
+
 
 # ---------------------------------------------------------------------------
 # Variable-block factorization and solve
@@ -685,13 +698,14 @@ def test_mixed_slot_gather_lists(test, device):
 def _variable_solvers(device):
     """Variable-block solve launchers to check on ``device``, as ``(name, launcher)`` pairs.
 
-    Both kernels run on every device: the serial kernel uses one thread per articulation, the
+    Every kernel runs on every device: the serial kernel uses one thread per articulation, the
     cooperative kernel one CTA per articulation (``block_dim = 1`` on the CPU, where its tile
-    operations run serially).
+    operations run serially) and the warp kernel one warp per articulation (one thread on the CPU).
     """
     return [
         ("serial", variable_kernels.launch_solve_articulation_variable_serial),
         ("cooperative", variable_kernels.launch_solve_articulation_variable_cooperative),
+        ("warp", variable_kernels.launch_solve_articulation_variable_warp),
     ]
 
 
@@ -1293,6 +1307,101 @@ def test_cooperative_batch_of_heterogeneous_articulations(test, device):
         test.assertLess(worst, 1.0e-4, name)
 
 
+def test_warp_matches_serial(test, device):
+    """The warp kernel repeats the serial kernel's operations in its order: same factor, update, backup and status bits.
+
+    Covers rows of size 6 to 163 (wide columns staged in shared memory and, past the warp's
+    shared memory, factored in global memory), frame regularization, scaled systems and a batch
+    of heterogeneous articulations.
+    """
+    serial = variable_kernels.launch_solve_articulation_variable_serial
+    warp = variable_kernels.launch_solve_articulation_variable_warp
+    for seed, decades in ((5, 0.0), (7, 2.0)):
+        _model, layout, _systems, values, rhs = _solve_fixture(device, seed, decades)
+        a = _run_solve(serial, layout, values, rhs, device, frame_regularization=0.25)
+        b = _run_solve(warp, layout, values, rhs, device, frame_regularization=0.25)
+        _solver_outputs_equal(test, a, b, f"seed {seed}")
+    layout, _systems, values, rhs = _batch_fixture(device, 64, 37)
+    _solver_outputs_equal(
+        test, _run_solve(serial, layout, values, rhs, device), _run_solve(warp, layout, values, rhs, device), "batch"
+    )
+
+
+def test_warp_failure_matches_serial(test, device):
+    """Indefinite, NaN and non-finite-solve articulations get the serial status, count and Jacobi step."""
+    _model, layout, _systems, values, rhs = _solve_fixture(device, 13)
+    value_offsets = layout.articulation_block_value_offsets.numpy()
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    diag = layout.articulation_diag_slots.numpy()
+    mixed = list(range(layout.rigid_articulation_count, layout.articulation_count))
+    # Indefinite modal entry in the row of size 32 (a column factored in shared memory on CUDA).
+    dims = layout.articulation_row_dims.numpy()
+    row = int(np.flatnonzero(dims == 32)[0])
+    values[value_offsets[diag[row]] + 31 * 32 + 31] -= 1.0e4
+    start, _end = _articulation_rows(layout, mixed[2])
+    rhs[scalar_offsets[start] + 2] = np.inf
+    serial = _run_solve(variable_kernels.launch_solve_articulation_variable_serial, layout, values, rhs, device)
+    warp = _run_solve(variable_kernels.launch_solve_articulation_variable_warp, layout, values, rhs, device)
+    np.testing.assert_array_equal(serial["status"], [VB_FACTOR_OK, VB_FACTOR_INDEFINITE, VB_SOLVE_NONFINITE])
+    test.assertEqual(warp["failures"], 2)
+    for key in ("status", "delta", "diag_backup"):
+        np.testing.assert_array_equal(warp[key], serial[key], err_msg=key)
+
+
+def test_warp_solve_preferred_rule(test, device):
+    """The warp kernel is preferred on CUDA for more mixed articulations than SMs whose wide columns fit its shared memory."""
+    _model, small, _systems, _values, _rhs = _solve_fixture(device, 5)
+    batch = _batch_fixture(device, 8, 3)[0]
+    for layout in (small, batch):
+        fits = (
+            layout.mixed_max_wide_column_footprint <= variable_kernels._VB_WARP_SCRATCH
+            and layout.mixed_max_wide_column_rows <= variable_kernels._VB_WARP_SCRATCH_ROWS
+        )
+        for sm_count in (1, layout.mixed_articulation_count - 1, layout.mixed_articulation_count):
+            fake = SimpleNamespace(is_cuda=True, sm_count=sm_count)
+            expected = fits and layout.mixed_articulation_count > sm_count
+            test.assertEqual(variable_kernels.warp_solve_preferred(layout, fake), expected, (sm_count, fits))
+        test.assertFalse(variable_kernels.warp_solve_preferred(layout, wp.get_device("cpu")))
+    # The fixture has a 163-wide row, which does not fit; small modal counts do.
+    test.assertFalse(variable_kernels.warp_solve_preferred(small, SimpleNamespace(is_cuda=True, sm_count=1)))
+    _model, tiny, _systems, _values, _rhs = _solve_fixture_small(device)
+    test.assertTrue(variable_kernels.warp_solve_preferred(tiny, SimpleNamespace(is_cuda=True, sm_count=1)))
+
+
+def _solve_fixture_small(device, count: int = 6, seed: int = 9):
+    """``count`` chains of three rigid bodies and one elastic body of 26 modes (row size 32)."""
+    mode_counts, articulations = [], []
+    for _ in range(count):
+        first = len(mode_counts)
+        mode_counts += [None, 26, None, None]
+        articulations.append([(-1, first), (first, first + 1), (first + 1, first + 2), (first + 2, first + 3)])
+    model = _synthetic_model(device, mode_counts, articulations)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    rng = np.random.default_rng(seed)
+    systems = _random_system(layout, model, mode_counts, rng)
+    values, rhs = _scatter_system(layout, systems, rng)
+    return model, layout, systems, values, rhs
+
+
+def test_dispatch_selects_warp_for_many_small_articulations(test, device):
+    """With more mixed articulations than SMs the dispatcher launches the warp kernel, which matches numpy."""
+    count = wp.get_device(device).sm_count + 4
+    _model, layout, systems, values, rhs = _solve_fixture_small(device, count)
+    test.assertTrue(variable_kernels.warp_solve_preferred(layout, device))
+    dispatched = _run_solve(launch_solve_articulation_variable, layout, values, rhs, device)
+    expected = _run_solve(variable_kernels.launch_solve_articulation_variable_warp, layout, values, rhs, device)
+    _solver_outputs_equal(test, dispatched, expected, "dispatch")
+    test.assertEqual(dispatched["failures"], 0)
+    scalar_offsets = layout.articulation_row_scalar_offsets.numpy()
+    worst = 0.0
+    for a, system in systems.items():
+        start, end = _articulation_rows(layout, a)
+        delta = dispatched["delta"][scalar_offsets[start] : scalar_offsets[end]].astype(np.float64)
+        reference = np.linalg.solve(system["H"], system["rhs"])
+        worst = max(worst, np.linalg.norm(delta - reference) / np.linalg.norm(reference))
+    test.assertLess(worst, 1.0e-4)
+
+
 def test_dispatch_selects_backend_by_device(test, device):
     """``launch_solve_articulation_variable`` runs the cooperative kernel on CUDA and the serial one on CPU."""
     _model, layout, _systems, values, rhs = _solve_fixture(device, 5)
@@ -1551,6 +1660,9 @@ for _name, _func in [
     ("test_cooperative_matches_serial", test_cooperative_matches_serial),
     ("test_cooperative_failure_matches_serial", test_cooperative_failure_matches_serial),
     ("test_cooperative_batch_of_heterogeneous_articulations", test_cooperative_batch_of_heterogeneous_articulations),
+    ("test_warp_matches_serial", test_warp_matches_serial),
+    ("test_warp_failure_matches_serial", test_warp_failure_matches_serial),
+    ("test_warp_solve_preferred_rule", test_warp_solve_preferred_rule),
     ("test_dispatch_selects_backend_by_device", test_dispatch_selects_backend_by_device),
     (
         "test_cooperative_kernel_falls_back_when_shared_memory_does_not_fit",
@@ -1562,6 +1674,10 @@ for _name, _func in [
 for _name, _func in [
     ("test_cooperative_shared_memory_under_budget", test_cooperative_shared_memory_under_budget),
     ("test_cooperative_graph_capture_and_run_to_run", test_cooperative_graph_capture_and_run_to_run),
+    (
+        "test_dispatch_selects_warp_for_many_small_articulations",
+        test_dispatch_selects_warp_for_many_small_articulations,
+    ),
 ]:
     # Shared memory and graph capture are CUDA concepts.
     add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=cuda_devices)

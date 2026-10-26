@@ -50,7 +50,7 @@ Frame regularization: the backend adds ``frame_regularization`` to the six frame
 entries of every row of a mixed articulation before factorization (the 6 x 6 kernels apply
 ``rigid_articulation_diagonal_regularization`` to the rigid prefix through the body Hessians).
 
-Backends (:func:`launch_solve_articulation_variable` picks one by device):
+Backends (:func:`launch_solve_articulation_variable` picks one by device and layout):
 
 - CPU: :func:`solve_articulation_variable_serial`, one thread per mixed articulation.
 - CUDA: :data:`solve_articulation_variable_cooperative`, one CTA of
@@ -82,6 +82,14 @@ Backends (:func:`launch_solve_articulation_variable` picks one by device):
   not bitwise equal to the serial kernel (its summation order differs). On the CPU the
   cooperative kernel runs with ``block_dim = 1`` (for testing); the native helpers then run
   their serial branch.
+- CUDA, many small articulations (:func:`warp_solve_preferred`: more mixed articulations than
+  SMs and every wide column fits :data:`_VB_WARP_SCRATCH` floats):
+  :func:`solve_articulation_variable_warp`, one warp per articulation and four per block, with the
+  serial kernel's operations in its order (lane path for ``n_k = 6`` as above; a wide column is
+  staged in the warp's shared memory and factored there, its diagonal solves run on lane 0 from
+  shared memory), so it agrees with the serial kernel to float32 rounding (bitwise for all-6
+  systems). It needs 46 KiB of static shared memory per block and no tile operations; on the CPU
+  it runs with one thread per articulation (for testing).
 
 Shared memory of the cooperative kernel: the native helpers reserve about 45 KiB of static
 shared memory (staging of the block updates for four groups, their job table, and two 32 x 33
@@ -93,9 +101,10 @@ around a tile operation has a runtime trip count, so loop unrolling cannot dupli
 budget :data:`VB_COOPERATIVE_SHARED_MEMORY_BUDGET` (64 KiB). On a CUDA device with less shared
 memory per block (:func:`cooperative_kernel_fits`), the serial kernel is launched instead. With
 256 threads the kernel uses up to 255 registers per thread, so one CTA runs per SM; the kernel
-targets few large articulations (one CTA each) rather than many small ones. The cooperative
-kernel has its own Warp module (``module="unique"``), which keeps its libmathdx build (tens of
-seconds on a cold kernel cache) out of the module of the light kernels; it uses no float
+targets few large articulations (one CTA each) rather than many small ones, for which the warp
+kernel is used. The cooperative kernel has its own Warp module (``module="unique"``), which
+keeps its libmathdx build (tens of seconds on a cold kernel cache) out of the module of the
+light kernels; it uses no float
 atomics, so it does not depend on the deterministic mode.
 """
 
@@ -106,6 +115,7 @@ import warp as wp
 from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import (
     _apply_sparse_delta_value_to_body,
     _block_sync,
+    _warp_sync,
     mat66f,
     vec6f,
 )
@@ -1381,6 +1391,520 @@ def solve_articulation_variable_cooperative(
             delta[i] = step
 
 
+# ---------------------------------------------------------------------------
+# Warp-per-articulation CUDA kernel (many small mixed articulations)
+# ---------------------------------------------------------------------------
+
+VB_WARP_THREADS = 32
+"""Threads per mixed articulation of :func:`solve_articulation_variable_warp` on CUDA devices (one warp)."""
+
+VB_WARP_BLOCK_DIM = 128
+"""CUDA block size of :func:`solve_articulation_variable_warp` (four articulations per block)."""
+
+
+_VB_WARP_SCRATCH = 2816
+"""Floats of the shared-memory scratch of each warp of :func:`solve_articulation_variable_warp`.
+
+The scratch also holds :data:`_VB_WARP_SCRATCH_ROWS` row offsets; four warps per block reserve
+46 KiB of static shared memory.
+"""
+
+_VB_WARP_SCRATCH_ROWS = 128
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+__shared__ __align__(16) float vb_warp_scratch[4][2816 + 128];
+return (wp::uint64)(&vb_warp_scratch[(threadIdx.x >> 5) & 3][0]);
+#else
+return 0;
+#endif
+""")
+def _vb_warp_scratch() -> wp.uint64:
+    """Address of the calling warp's shared-memory scratch (0 on the CPU).
+
+    :data:`_VB_WARP_SCRATCH` floats followed by :data:`_VB_WARP_SCRATCH_ROWS` ``int`` row offsets.
+    Needs blocks of four warps (:data:`VB_WARP_BLOCK_DIM`); the one static buffer is shared by all
+    warp helpers.
+    """
+    ...
+
+
+@wp.func_native("""
+// The diagonal block D (n x n at diag_offset, stride n) and the column's off-diagonal blocks
+// col_slots[col_begin:col_end] (rows x n, stride n) form a tall (n + below) x n matrix, tall row q
+// being row q of D for q < n and the off-diagonal rows in list order after it. It is factored
+// right-looking, one column j per step: the pivot, column j below it (L_ij = A_ij / L_jj), then
+// the rank-1 update A_ip -= L_ij L_pj of every tall row i >= p of each trailing column p, in the
+// order of the serial kernel's dot products. Lanes own trailing columns (consecutive lanes touch
+// consecutive entries of a row); warp barriers separate the phases.
+//
+// On CUDA the matrix is staged in the warp's shared scratch when it fits (only the lower triangle of
+// D is read and written back), with the global loads issued in batches: the GPU issues in order, so
+// a load that is used before the next one is issued exposes its full latency. Otherwise, and on the
+// CPU (threads == 1), it is factored in place in global memory.
+float* v = values.data;
+int below = 0;
+for (int e = col_begin; e < col_end; ++e)
+    below += *wp::address(block_dims, col_slots.data[e], 0);
+const int tall = n + below;
+int ok = 1;
+constexpr int BATCH = 8;
+#if defined(__CUDA_ARCH__)
+float* buf = reinterpret_cast<float*>(scratch);
+int* row_offset = reinterpret_cast<int*>(buf + 2816);
+if (tall * n <= 2816 && tall <= 128) {
+    for (int q = lane; q < n; q += threads)
+        row_offset[q] = diag_offset + q * n;
+    int q0 = n;
+    for (int e = col_begin; e < col_end; ++e) {
+        const int slot = col_slots.data[e];
+        const int rows = *wp::address(block_dims, slot, 0);
+        const int offset = value_offsets.data[slot];
+        for (int r = lane; r < rows; r += threads)
+            row_offset[q0 + r] = offset + r * n;
+        q0 += rows;
+    }
+    __syncwarp();
+    const int count = tall * n;
+    for (int f0 = 0; f0 < count; f0 += threads * BATCH) {
+        float staged[BATCH];
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const int f = f0 + u * threads + lane;
+            const int q = f / n;
+            const int c = f - q * n;
+            staged[u] = (f < count && (q >= n || c <= q)) ? v[row_offset[q] + c] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const int f = f0 + u * threads + lane;
+            if (f < count)
+                buf[f] = staged[u];
+        }
+    }
+    __syncwarp();
+    for (int j = 0; j < n; ++j) {
+        const float pivot = buf[j * n + j];
+        // Every lane read the same pivot after the last barrier, so the exit is warp-uniform.
+        if (!(pivot > 0.0f && wp::isfinite(pivot))) {
+            ok = 0;
+            break;
+        }
+        const float d = wp::sqrt(pivot);
+        __syncwarp();
+        for (int q = j + 1 + lane; q < tall; q += threads)
+            buf[q * n + j] = buf[q * n + j] / d;
+        if (lane == 0)
+            buf[j * n + j] = d;
+        __syncwarp();
+        for (int p = j + 1 + lane; p < n; p += threads) {
+            const float l_pj = buf[p * n + j];
+            for (int base = p; base < tall; base += BATCH) {
+                float l_ij[BATCH];
+                float a_ip[BATCH];
+#pragma unroll
+                for (int u = 0; u < BATCH; ++u) {
+                    const int q = wp::min(base + u, tall - 1);
+                    l_ij[u] = buf[q * n + j];
+                    a_ip[u] = buf[q * n + p];
+                }
+#pragma unroll
+                for (int u = 0; u < BATCH; ++u)
+                    if (base + u < tall)
+                        buf[(base + u) * n + p] = a_ip[u] - l_ij[u] * l_pj;
+            }
+        }
+        __syncwarp();
+    }
+    for (int f = lane; f < count; f += threads) {
+        const int q = f / n;
+        const int c = f - q * n;
+        if (q >= n || c <= q)
+            v[row_offset[q] + c] = buf[f];
+    }
+    __syncwarp();
+    return ok;
+}
+#endif
+auto global_row = [&](int q) -> float* {
+    if (q < n)
+        return v + diag_offset + q * n;
+    int r = q - n;
+    for (int e = col_begin; e < col_end; ++e) {
+        const int slot = col_slots.data[e];
+        const int rows = *wp::address(block_dims, slot, 0);
+        if (r < rows)
+            return v + value_offsets.data[slot] + r * n;
+        r -= rows;
+    }
+    return v;
+};
+for (int j = 0; j < n; ++j) {
+    const float pivot = global_row(j)[j];
+    if (!(pivot > 0.0f && wp::isfinite(pivot))) {
+        ok = 0;
+        break;
+    }
+    const float d = wp::sqrt(pivot);
+#if defined(__CUDA_ARCH__)
+    __syncwarp();
+#endif
+    for (int q = j + 1 + lane; q < tall; q += threads) {
+        float* r = global_row(q);
+        r[j] = r[j] / d;
+    }
+    if (lane == 0)
+        global_row(j)[j] = d;
+#if defined(__CUDA_ARCH__)
+    __syncwarp();
+#endif
+    for (int p = j + 1 + lane; p < n; p += threads) {
+        const float l_pj = global_row(p)[j];
+        for (int q = p; q < tall; ++q) {
+            float* r = global_row(q);
+            r[p] = r[p] - r[j] * l_pj;
+        }
+    }
+#if defined(__CUDA_ARCH__)
+    __syncwarp();
+#endif
+}
+return ok;
+""")
+def _vb_warp_factor_column(
+    values: wp.array[float],
+    diag_offset: int,
+    n: int,
+    col_begin: int,
+    col_end: int,
+    col_slots: wp.array[wp.int32],
+    value_offsets: wp.array[wp.int32],
+    block_dims: wp.array2d[wp.int32],
+    scratch: wp.uint64,
+    lane: int,
+    threads: int,
+) -> int:
+    """Factor a wide column on one warp: ``L_kk`` in place and ``L_ik = H_ik L_kk^-T`` for its column blocks.
+
+    The diagonal block (lower triangle) and the column blocks ``col_slots[col_begin:col_end]`` form
+    one tall matrix that is factored right-looking, one column per step with warp barriers between
+    the phases, in the warp's shared ``scratch`` when it fits and in global memory otherwise
+    (``threads`` lanes; on the CPU ``threads == 1``). The operations per entry are those of the
+    serial kernel (:func:`_vb_cholesky_inplace`, :func:`_vb_right_solve_lower_transpose`) in the
+    same order. Returns 1, or 0 at the first pivot that is not positive and finite (the factor is
+    then incomplete). The strict upper triangle of the diagonal block is not touched.
+    """
+    ...
+
+
+@wp.func_native("""
+// Lane 0 solves L y = x (upper == 0) or L^T y = x (upper != 0) in place for the factored n x n
+// diagonal block at diag_offset, in the serial kernel's order; on CUDA the lower triangle and the
+// vector are first staged in the warp's shared scratch (batched loads) when they fit. Ends with a
+// warp barrier.
+float* v = values.data;
+float* xv = x.data + x_offset;
+const float* L = v + diag_offset;
+float* y = xv;
+#if defined(__CUDA_ARCH__)
+constexpr int BATCH = 8;
+float* buf = reinterpret_cast<float*>(scratch);
+const bool staged = n * n + n <= 2816;
+if (staged) {
+    const int count = n * n;
+    for (int f0 = 0; f0 < count; f0 += threads * BATCH) {
+        float staged_value[BATCH];
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const int f = f0 + u * threads + lane;
+            const int i = f / n;
+            staged_value[u] = (f < count && f - i * n <= i) ? L[f] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const int f = f0 + u * threads + lane;
+            if (f < count)
+                buf[f] = staged_value[u];
+        }
+    }
+    for (int i = lane; i < n; i += threads)
+        buf[count + i] = xv[i];
+    __syncwarp();
+    L = buf;
+    y = buf + count;
+}
+#endif
+if (lane == 0) {
+    if (upper == 0) {
+        for (int i = 0; i < n; ++i) {
+            float value = y[i];
+            for (int j = 0; j < i; ++j)
+                value = value - L[i * n + j] * y[j];
+            y[i] = value / L[i * n + i];
+        }
+    } else {
+        for (int ii = 0; ii < n; ++ii) {
+            const int i = n - 1 - ii;
+            float value = y[i];
+            for (int j = i + 1; j < n; ++j)
+                value = value - L[j * n + i] * y[j];
+            y[i] = value / L[i * n + i];
+        }
+    }
+}
+#if defined(__CUDA_ARCH__)
+__syncwarp();
+if (staged) {
+    for (int i = lane; i < n; i += threads)
+        xv[i] = y[i];
+    __syncwarp();
+}
+#endif
+""")
+def _vb_warp_triangular_solve(
+    values: wp.array[float],
+    diag_offset: int,
+    n: int,
+    x: wp.array[float],
+    x_offset: int,
+    upper: int,
+    scratch: wp.uint64,
+    lane: int,
+    threads: int,
+):
+    """Solve ``L y = x`` (``upper == 0``) or ``L^T y = x`` in place with a factored ``n x n`` diagonal block (warp; ends with a warp barrier).
+
+    Lane 0 substitutes serially in the order of :func:`_vb_lower_solve` / :func:`_vb_upper_solve`,
+    with the operands staged in the warp's shared ``scratch`` when they fit.
+    """
+    ...
+
+
+@wp.kernel(enable_backward=False)
+def solve_articulation_variable_warp(
+    threads: int,
+    rigid_articulation_count: int,
+    frame_regularization: float,
+    articulation_body_offsets: wp.array[wp.int32],
+    articulation_row_dims: wp.array[wp.int32],
+    articulation_row_scalar_offsets: wp.array[wp.int32],
+    articulation_block_value_offsets: wp.array[wp.int32],
+    articulation_block_dims: wp.array2d[wp.int32],
+    articulation_block_row_offsets: wp.array[wp.int32],
+    articulation_block_cols: wp.array[wp.int32],
+    articulation_block_col_offsets: wp.array[wp.int32],
+    articulation_block_col_rows: wp.array[wp.int32],
+    articulation_block_col_slots: wp.array[wp.int32],
+    articulation_factor_update_offsets: wp.array[wp.int32],
+    articulation_factor_update_dst_slots: wp.array[wp.int32],
+    articulation_factor_update_left_slots: wp.array[wp.int32],
+    articulation_factor_update_right_slots: wp.array[wp.int32],
+    articulation_diag_slots: wp.array[wp.int32],
+    rhs: wp.array[float],
+    values: wp.array[float],
+    diag_backup: wp.array[float],
+    factor_status: wp.array[wp.int32],
+    failure_count: wp.array[wp.int32],
+    delta: wp.array[float],
+):
+    """Factor and solve one mixed articulation per group of ``threads`` consecutive threads (one warp on CUDA).
+
+    Launch with ``dim = mixed_articulation_count * threads``: :data:`VB_WARP_THREADS` on CUDA with a
+    block size that is a multiple of it (:data:`VB_WARP_BLOCK_DIM`), 1 on the CPU. Same arguments
+    (after ``threads``), storage, elimination order, regularization and failure handling as
+    :func:`solve_articulation_variable_serial`. Columns with ``n_k = 6`` take the lane path of
+    :data:`solve_articulation_variable_cooperative` (same operations as the serial kernel, so
+    all-6 systems agree bitwise with it); wider columns are factored by
+    :func:`_vb_warp_factor_column` and their trailing updates and the substitutions use one lane
+    per destination entry or vector component, with serial diagonal solves on lane 0. Barriers are
+    warp barriers; every branch around one is warp-uniform. Meant for many small articulations,
+    where one 256-thread CTA per articulation leaves most of the GPU idle.
+    """
+    tid = wp.tid()
+    t = tid // threads
+    lane = tid - t * threads
+    articulation = rigid_articulation_count + t
+    body_start = articulation_body_offsets[articulation]
+    body_end = articulation_body_offsets[articulation + 1]
+    begin = articulation_row_scalar_offsets[body_start]
+    end = articulation_row_scalar_offsets[body_end]
+
+    scratch = _vb_warp_scratch()
+    if lane == 0:
+        factor_status[t] = VB_FACTOR_OK
+
+    for i in range(begin + lane, end, threads):
+        row = body_start
+        while articulation_row_scalar_offsets[row + 1] <= i:
+            row += 1
+        n = articulation_row_dims[row]
+        diag_offset = articulation_block_value_offsets[articulation_diag_slots[row]]
+        k = i - articulation_row_scalar_offsets[row]
+        if k < 6:
+            values[diag_offset + k * n + k] = values[diag_offset + k * n + k] + frame_regularization
+        diag_backup[i] = values[diag_offset + k * n + k]
+    _warp_sync()
+
+    for row_k in range(body_start, body_end):
+        n_k = articulation_row_dims[row_k]
+        diag_offset = articulation_block_value_offsets[articulation_diag_slots[row_k]]
+        col_begin = articulation_block_col_offsets[row_k]
+        col_end = articulation_block_col_offsets[row_k + 1]
+        if n_k <= _VB_LANE_MAX_DIM:
+            Hkk = _vb_load66(values, diag_offset)
+            _warp_sync()
+            Lkk, ok = _vb_cholesky66_registers(Hkk)
+            if lane == 0:
+                for i in range(6):
+                    for j in range(6):
+                        values[diag_offset + i * 6 + j] = Lkk[i, j]
+                if ok == 0:
+                    factor_status[t] = VB_FACTOR_INDEFINITE
+            if ok == 1:
+                base = int(0)
+                for entry in range(col_begin, col_end):
+                    slot = articulation_block_col_slots[entry]
+                    rows = articulation_block_dims[slot, 0]
+                    offset = articulation_block_value_offsets[slot]
+                    for r in range(_vb_first_lane_item(lane, base, threads), rows, threads):
+                        row_offset = offset + r * 6
+                        x = vec6f(
+                            values[row_offset],
+                            values[row_offset + 1],
+                            values[row_offset + 2],
+                            values[row_offset + 3],
+                            values[row_offset + 4],
+                            values[row_offset + 5],
+                        )
+                        for c in range(6):
+                            value = x[c]
+                            for p in range(6):
+                                if p < c:
+                                    value = value - x[p] * Lkk[c, p]
+                            x[c] = value / Lkk[c, c]
+                        for c in range(6):
+                            values[row_offset + c] = x[c]
+                    base += rows
+        else:
+            ok = _vb_warp_factor_column(
+                values,
+                diag_offset,
+                n_k,
+                col_begin,
+                col_end,
+                articulation_block_col_slots,
+                articulation_block_value_offsets,
+                articulation_block_dims,
+                scratch,
+                lane,
+                threads,
+            )
+            if ok == 0 and lane == 0:
+                factor_status[t] = VB_FACTOR_INDEFINITE
+            for e in range(lane, n_k * n_k, threads):
+                r = e // n_k
+                if e - r * n_k > r:
+                    values[diag_offset + e] = 0.0
+        _warp_sync()
+        if factor_status[t] != VB_FACTOR_OK:
+            break
+
+        # Trailing updates H_ab -= L_ak L_bk^T, one lane per destination entry numbered across all
+        # updates of the column; destinations within a column are distinct.
+        base = int(0)
+        for entry in range(articulation_factor_update_offsets[row_k], articulation_factor_update_offsets[row_k + 1]):
+            dst = articulation_factor_update_dst_slots[entry]
+            left = articulation_factor_update_left_slots[entry]
+            right = articulation_factor_update_right_slots[entry]
+            left_rows = articulation_block_dims[left, 0]
+            right_rows = articulation_block_dims[right, 0]
+            dst_offset = articulation_block_value_offsets[dst]
+            left_offset = articulation_block_value_offsets[left]
+            right_offset = articulation_block_value_offsets[right]
+            count = left_rows * right_rows
+            for e in range(_vb_first_lane_item(lane, base, threads), count, threads):
+                r = e // right_rows
+                c = e - r * right_rows
+                if left != right or c <= r:
+                    accum = float(0.0)
+                    for p in range(n_k):
+                        accum = accum + values[left_offset + r * n_k + p] * values[right_offset + c * n_k + p]
+                    values[dst_offset + e] = values[dst_offset + e] - accum
+            base += count
+        _warp_sync()
+
+    if factor_status[t] == VB_FACTOR_OK:
+        for i in range(begin + lane, end, threads):
+            delta[i] = rhs[i]
+        _warp_sync()
+        for row in range(body_start, body_end):
+            n = articulation_row_dims[row]
+            vec_offset = articulation_row_scalar_offsets[row]
+            diag_slot = articulation_diag_slots[row]
+            slot_begin = articulation_block_row_offsets[row]
+            slot_end = articulation_block_row_offsets[row + 1]
+            for r in range(lane, n, threads):
+                for slot in range(slot_begin, slot_end):
+                    if slot != diag_slot:
+                        col_row = body_start + articulation_block_cols[slot]
+                        cols = articulation_row_dims[col_row]
+                        x_offset = articulation_row_scalar_offsets[col_row]
+                        offset = articulation_block_value_offsets[slot] + r * cols
+                        accum = float(0.0)
+                        for c in range(cols):
+                            accum = accum + values[offset + c] * delta[x_offset + c]
+                        delta[vec_offset + r] = delta[vec_offset + r] - accum
+            _warp_sync()
+            diag_offset = articulation_block_value_offsets[diag_slot]
+            if n <= _VB_LANE_MAX_DIM:
+                if lane == 0:
+                    _vb_lower_solve66_registers(values, diag_offset, delta, vec_offset)
+                _warp_sync()
+            else:
+                _vb_warp_triangular_solve(values, diag_offset, n, delta, vec_offset, 0, scratch, lane, threads)
+        for rr in range(body_end - body_start):
+            row = body_end - 1 - rr
+            n = articulation_row_dims[row]
+            vec_offset = articulation_row_scalar_offsets[row]
+            col_begin = articulation_block_col_offsets[row]
+            col_end = articulation_block_col_offsets[row + 1]
+            for c in range(lane, n, threads):
+                for entry in range(col_begin, col_end):
+                    slot = articulation_block_col_slots[entry]
+                    below = body_start + articulation_block_col_rows[entry]
+                    rows = articulation_row_dims[below]
+                    x_offset = articulation_row_scalar_offsets[below]
+                    offset = articulation_block_value_offsets[slot]
+                    accum = float(0.0)
+                    for r in range(rows):
+                        accum = accum + values[offset + r * n + c] * delta[x_offset + r]
+                    delta[vec_offset + c] = delta[vec_offset + c] - accum
+            _warp_sync()
+            diag_offset = articulation_block_value_offsets[articulation_diag_slots[row]]
+            if n <= _VB_LANE_MAX_DIM:
+                if lane == 0:
+                    _vb_upper_solve66_registers(values, diag_offset, delta, vec_offset)
+                _warp_sync()
+            else:
+                _vb_warp_triangular_solve(values, diag_offset, n, delta, vec_offset, 1, scratch, lane, threads)
+        for i in range(begin + lane, end, threads):
+            if not wp.isfinite(delta[i]):
+                factor_status[t] = VB_SOLVE_NONFINITE
+        _warp_sync()
+
+    if factor_status[t] != VB_FACTOR_OK:
+        if lane == 0:
+            wp.atomic_add(failure_count, 0, 1)
+        for i in range(begin + lane, end, threads):
+            d = diag_backup[i]
+            b = rhs[i]
+            step = float(0.0)
+            if _vb_pivot_ok(d) and wp.isfinite(b):
+                step = b / d
+            delta[i] = step
+
+
 @wp.kernel
 def apply_articulation_variable_delta(
     dt: float,
@@ -1643,6 +2167,56 @@ def launch_solve_articulation_variable_cooperative(
     )
 
 
+def warp_solve_preferred(layout, device) -> bool:
+    """Return whether :func:`launch_solve_articulation_variable` uses the warp kernel instead of the cooperative one.
+
+    ``device`` is a device or a device alias. True on a CUDA ``device`` when the layout has more mixed articulations than the device has SMs
+    and every wide column fits a warp's shared memory (``layout.mixed_max_wide_column_footprint``
+    and ``mixed_max_wide_column_rows``). The cooperative kernel runs one CTA per articulation and
+    one CTA per SM, so up to ``sm_count`` articulations take about one CTA latency, which is lower
+    than a warp's for wide rows; beyond that its CTAs run in waves while the warp kernel keeps
+    every articulation of a launch in flight. Columns that do not fit are factored in global
+    memory by the warp kernel, which is slow, so those layouts keep the cooperative kernel.
+    """
+    device = _as_device(device)
+    return (
+        device.is_cuda
+        and layout.mixed_articulation_count > device.sm_count
+        and layout.mixed_max_wide_column_footprint <= _VB_WARP_SCRATCH
+        and layout.mixed_max_wide_column_rows <= _VB_WARP_SCRATCH_ROWS
+    )
+
+
+def launch_solve_articulation_variable_warp(
+    layout,
+    frame_regularization: float,
+    rhs: wp.array,
+    values: wp.array,
+    diag_backup: wp.array,
+    factor_status: wp.array,
+    failure_count: wp.array,
+    delta: wp.array,
+    device=None,
+) -> None:
+    """Launch :func:`solve_articulation_variable_warp`, one warp per mixed articulation on CUDA.
+
+    One thread per articulation on the CPU (a debugging path). Same arguments as
+    :func:`launch_solve_articulation_variable`.
+    """
+    if layout.mixed_articulation_count == 0:
+        return
+    device = wp.get_device(device if device is not None else values.device)
+    threads = VB_WARP_THREADS if device.is_cuda else 1
+    wp.launch(
+        solve_articulation_variable_warp,
+        dim=layout.mixed_articulation_count * threads,
+        inputs=[threads, *_solve_inputs(layout, frame_regularization, rhs)],
+        outputs=[values, diag_backup, factor_status, failure_count, delta],
+        device=device,
+        block_dim=VB_WARP_BLOCK_DIM if device.is_cuda else 256,
+    )
+
+
 def launch_solve_articulation_variable(
     layout,
     frame_regularization: float,
@@ -1658,9 +2232,12 @@ def launch_solve_articulation_variable(
     """Factor and solve every mixed articulation of ``layout`` (no-op without mixed articulations).
 
     Launches the cooperative kernel (one CTA per articulation) on CUDA devices whose shared memory
-    per block fits it (:func:`cooperative_kernel_fits`), and the serial kernel (one thread per
-    articulation) on other CUDA devices and on the CPU. Neither allocates memory nor synchronizes
-    with the host, so the call can be captured in a CUDA graph once the kernel is loaded (call
+    per block fits it (:func:`cooperative_kernel_fits`), or on those devices the warp kernel (one
+    warp per articulation) when :func:`warp_solve_preferred` holds (more mixed articulations than
+    SMs, every wide column fits a warp's shared memory), and the serial kernel (one thread per
+    articulation) on other CUDA devices and on the CPU. All three give the serial kernel's result
+    up to float32 rounding (bitwise for all-6 systems). None allocates memory or synchronizes with
+    the host, so the call can be captured in a CUDA graph once the kernels are loaded (call
     :func:`cooperative_kernel_fits` or launch once before capturing).
 
     Args:
@@ -1673,14 +2250,18 @@ def launch_solve_articulation_variable(
         failure_count: ``int32`` counter, shape [1]; incremented once per failed articulation.
         delta: Solved update, shape [articulation_scalar_count]; only mixed rows are written.
         device: Launch device; defaults to the device of ``values``.
-        cooperative: Whether to launch the cooperative kernel on a CUDA device; ``None`` uses
-            :func:`cooperative_kernel_fits`. Ignored on the CPU.
+        cooperative: Whether to launch the cooperative (or warp) kernel on a CUDA device; ``None``
+            uses :func:`cooperative_kernel_fits`; ``False`` selects the serial kernel. Ignored on
+            the CPU.
     """
     device = wp.get_device(device if device is not None else values.device)
     if cooperative is None:
         cooperative = cooperative_kernel_fits(device)
     if device.is_cuda and cooperative:
-        launcher = launch_solve_articulation_variable_cooperative
+        if warp_solve_preferred(layout, device):
+            launcher = launch_solve_articulation_variable_warp
+        else:
+            launcher = launch_solve_articulation_variable_cooperative
     else:
         launcher = launch_solve_articulation_variable_serial
     launcher(layout, frame_regularization, rhs, values, diag_backup, factor_status, failure_count, delta, device)

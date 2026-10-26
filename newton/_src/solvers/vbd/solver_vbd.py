@@ -1003,8 +1003,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                   first failure. On
                   CUDA each articulation is factored by one 256-thread block using 32 x 32
                   shared-memory tiles for blocks wider than six (a device whose shared memory per block
-                  cannot fit it uses one thread per articulation, with one warning); on the CPU by one
-                  thread.
+                  cannot fit it uses one thread per articulation, with one warning), or, when there are
+                  more mixed articulations than the device has multiprocessors and every wide row fits a
+                  warp's shared memory, by one 32-thread warp; on the CPU by one thread.
                 - ``"schur"``: comparison backend. Each elastic body's modal coordinates are eliminated
                   exactly onto its frame block and the frames of its joint neighbors, so every
                   articulation is solved with 6 x 6 blocks. Two elastic bodies joined directly

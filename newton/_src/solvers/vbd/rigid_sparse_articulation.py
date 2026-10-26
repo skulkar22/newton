@@ -166,6 +166,14 @@ class RigidArticulationSparseLayout:
     """
     mixed_twist_count: int
     """Endpoint mode twists of the mixed joints, ``mixed_joint_twist_offsets[-1]`` (0 under ``"schur"``)."""
+    mixed_max_wide_column_rows: int
+    """Largest ``n_k + b_k`` over the mixed rows with ``n_k > 6``, where ``b_k`` is the number of scalar rows of the column's off-diagonal blocks (0 without such rows)."""
+    mixed_max_wide_column_footprint: int
+    """Largest ``n_k * (n_k + max(b_k, 1))`` over the mixed rows with ``n_k > 6`` (0 without such rows).
+
+    The scalars a warp of the variable-block solve stages to factor the column (see
+    :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_variable_kernels.warp_solve_preferred`).
+    """
     standalone_elastic_bodies: wp.array[wp.int32]
     """Reduced elastic bodies left to the local solve (``"coupled"`` only), shape [standalone_elastic_body_count].
 
@@ -700,6 +708,20 @@ def build_rigid_articulation_sparse_layout(
                 twist_counts.append(
                     int(elastic_mode_count[elastic_index]) if elastic_index >= 0 and endpoint >= 0 else 0
                 )
+    wide_rows = 0
+    wide_footprint = 0
+    if coupled:
+        for row in range(rigid_body_row_count, len(row_dims_host)):
+            n = int(row_dims_np[row])
+            if n <= 6:
+                continue
+            body_start = int(row_body_start[row])
+            below = sum(
+                int(row_dims_np[body_start + int(local_row)])
+                for local_row in block_col_rows_np[block_col_offsets_np[row] : block_col_offsets_np[row + 1]]
+            )
+            wide_rows = max(wide_rows, n + below)
+            wide_footprint = max(wide_footprint, n * (n + max(below, 1)))
     twist_offsets = np.zeros(len(twist_counts) + 1, dtype=np.int64)
     np.cumsum(np.asarray(twist_counts, dtype=np.int64), out=twist_offsets[1:])
     slot_entry_offsets = np.zeros(len(slot_entry_counts) + 1, dtype=np.int64)
@@ -793,6 +815,8 @@ def build_rigid_articulation_sparse_layout(
         mixed_slot_joints=_int32_array(slot_joints, device),
         mixed_joint_twist_offsets=_int32_array(twist_offsets, device),
         mixed_twist_count=int(twist_offsets[-1]),
+        mixed_max_wide_column_rows=wide_rows,
+        mixed_max_wide_column_footprint=wide_footprint,
         standalone_elastic_bodies=_int32_array(standalone_elastic_bodies_host, device),
         standalone_elastic_body_count=len(standalone_elastic_bodies_host),
     )
