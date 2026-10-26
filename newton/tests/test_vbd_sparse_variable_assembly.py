@@ -27,7 +27,7 @@ from newton._src.solvers.vbd import rigid_sparse_articulation_variable_assembly 
 from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData
 from newton._src.solvers.vbd.reduced_elastic_kernels import ElasticEndpointJointTerms
 from newton._src.solvers.vbd.rigid_sparse_articulation import build_rigid_articulation_sparse_layout
-from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import JointEndpointTerms, SparseElasticJointData
+from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import JointEndpointTerms, SparseElasticJointData, vec6f
 from newton._src.solvers.vbd.rigid_vbd_kernels import RigidForceElementAdjacencyInfo
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -143,6 +143,7 @@ def _assemble(capture, layout, model, device, grad, matrix, values=None, rhs=Non
         elastic=joint["elastic"],
         joint_inputs={name: joint[name] for name in assembly.JOINT_TERM_INPUT_NAMES},
         terms=terms,
+        twists=wp.zeros(assembly.twist_scratch_size(layout), dtype=vec6f, device=device),
         values=values,
         rhs=rhs,
         device=device,
@@ -771,6 +772,7 @@ def test_projection_matches_numpy(test, device):
         wp.array(body_q.astype(np.float32), dtype=wp.transform, device=device),
         elastic,
         wp.array(terms, dtype=JointEndpointTerms, device=device),
+        wp.zeros(assembly.twist_scratch_size(layout), dtype=vec6f, device=device),
         values_wp,
         rhs_wp,
         device,
@@ -822,6 +824,7 @@ def test_projection_matches_numpy(test, device):
         wp.array(body_q.astype(np.float32), dtype=wp.transform, device=device),
         elastic,
         wp.array(terms_on, dtype=JointEndpointTerms, device=device),
+        wp.zeros(assembly.twist_scratch_size(layout), dtype=vec6f, device=device),
         values_on,
         rhs_on,
         device,
@@ -1094,6 +1097,7 @@ def test_assembly_leaves_rigid_prefix_and_validates_inputs(test, device):
         "elastic_body_block_matrix": matrix,
         "elastic": capture["joint"]["elastic"],
         "terms": None,
+        "twists": None,
         "values": values,
         "rhs": rhs,
     }
@@ -1126,6 +1130,36 @@ def test_assembly_overwrites_every_mixed_entry(test, device):
     for zero_filled, nan_filled in zip(results[True], results[False], strict=True):
         test.assertTrue(np.all(np.isfinite(nan_filled)))
         np.testing.assert_array_equal(nan_filled.view(np.uint32), zero_filled.view(np.uint32))
+
+
+def test_precomputed_twists_match_on_the_fly(test, device):
+    """The gather gives the same bits with the endpoint mode twists precomputed or formed per entry."""
+    model, _joints, capture, layout = _fixture(device)
+    L = _Layout(layout)
+    rng = np.random.default_rng(23)
+    elastic = capture["joint"]["elastic"]
+    body_q_np = capture["joint"]["body_q"].numpy().astype(np.float64)
+    for b in range(body_q_np.shape[0]):
+        body_q_np[b, 3:7] = _matrix_to_quat(_rotvec_to_matrix(rng.normal(scale=0.8, size=3)))
+    body_q = wp.array(body_q_np.astype(np.float32), dtype=wp.transform, device=device)
+    terms = wp.array(_random_terms(rng, model, layout, L, {2}), dtype=JointEndpointTerms, device=device)
+    values0 = rng.normal(size=layout.articulation_value_count).astype(np.float32)
+    rhs0 = rng.normal(size=layout.articulation_scalar_count).astype(np.float32)
+    test.assertGreater(layout.mixed_twist_count, 0)
+    outputs = []
+    for threshold in (0, 2**31 - 1):
+        with mock.patch.object(assembly, "TWIST_PRECOMPUTE_MIN_ENTRIES", threshold):
+            test.assertEqual(assembly.precompute_twists(layout), threshold == 0)
+            values = wp.array(values0, dtype=float, device=device)
+            rhs = wp.array(rhs0, dtype=float, device=device)
+            twists = wp.zeros(assembly.twist_scratch_size(layout), dtype=vec6f, device=device)
+            assembly.launch_articulation_joint_terms_variable(
+                layout, body_q, elastic, terms, twists, values, rhs, device
+            )
+            outputs.append((values.numpy(), rhs.numpy()))
+    np.testing.assert_array_equal(outputs[0][0], outputs[1][0])
+    np.testing.assert_array_equal(outputs[0][1], outputs[1][1])
+    test.assertFalse(np.array_equal(outputs[0][0], values0))
 
 
 class TestVBDSparseVariableAssembly(unittest.TestCase):
@@ -1170,6 +1204,13 @@ add_function_test(
     TestVBDSparseVariableAssembly,
     "test_assembly_overwrites_every_mixed_entry",
     test_assembly_overwrites_every_mixed_entry,
+    devices=devices,
+)
+
+add_function_test(
+    TestVBDSparseVariableAssembly,
+    "test_precomputed_twists_match_on_the_fly",
+    test_precomputed_twists_match_on_the_fly,
     devices=devices,
 )
 

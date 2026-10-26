@@ -1879,6 +1879,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._coupled_terms = wp.zeros(
             layout.mixed_articulation_joints.shape[0], dtype=JointEndpointTerms, device=device
         )
+        self._coupled_twists = wp.zeros(
+            rigid_sparse_articulation_variable_assembly.twist_scratch_size(layout), dtype=vec6f, device=device
+        )
         # The diagonal backup and the metric copies below span the whole layout although only the
         # mixed suffix ([6 * rigid_body_row_count, ...) and [36 * rigid_block_count, ...)) is used:
         # the factor-and-solve and metrics kernels index them with the layout's global offsets, like
@@ -7697,6 +7700,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 name: named_inputs[name] for name in rigid_sparse_articulation_variable_assembly.JOINT_TERM_INPUT_NAMES
             },
             terms=self._coupled_terms,
+            twists=self._coupled_twists,
             values=values,
             rhs=rhs,
             device=self.device,

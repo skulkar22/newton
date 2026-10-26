@@ -132,6 +132,40 @@ class RigidArticulationSparseLayout:
     mixed_elastic_body_rows: wp.array[wp.int32]
     """Global sparse row of each entry of ``mixed_elastic_bodies``, shape [mixed_elastic_body_count]."""
     mixed_elastic_body_count: int
+    mixed_slot_entry_offsets: wp.array[wp.int32]
+    """Exclusive prefix sum of the gather entries of the mixed block slots, shape [block_count - rigid_block_count + 1].
+
+    Mixed slot ``s`` (global slot ``rigid_block_count + s``) of size ``R x C`` has ``R * C`` entries,
+    plus ``R`` right-hand side components for a diagonal slot; entry ``e`` of the slot is gather
+    entry ``mixed_slot_entry_offsets[s] + e``. ``[0]`` without mixed slots (always under ``"schur"``).
+    """
+    mixed_slot_entry_count: int
+    """Gather entries of all mixed block slots, ``mixed_slot_entry_offsets[-1]`` (0 under ``"schur"``)."""
+    mixed_slot_rows: wp.array[wp.int32]
+    """Global sparse row of each mixed block slot, shape [block_count - rigid_block_count]."""
+    mixed_slot_joint_offsets: wp.array[wp.int32]
+    """CSR offsets of ``mixed_slot_joints``, shape [block_count - rigid_block_count + 1]."""
+    mixed_slot_joints: wp.array[wp.int32]
+    """Joints that can add to each mixed block slot, as indices into ``mixed_articulation_joints``.
+
+    For the diagonal slot of a row: the joints of the articulation with the row's body as child,
+    or as parent; for an off-diagonal slot: the joints between the two rows' bodies (either
+    direction); fill slots have none. Each list is in the articulation's joint order, so a gather
+    over it adds the same contributions in the same order as one over all of the articulation's
+    joints. The endpoints are taken from ``joint_parent`` / ``joint_child``, a superset of the
+    evaluated endpoints.
+    """
+    mixed_joint_twist_offsets: wp.array[wp.int32]
+    """Offsets of the modal attachment twists of the mixed joints' endpoints, shape [2 * len(mixed_articulation_joints) + 1].
+
+    Entry ``2 * j + side`` (``side`` 0 for the parent, 1 for the child endpoint of
+    ``mixed_articulation_joints[j]``) starts the endpoint's ``m`` twists, one per mode of a reduced
+    elastic endpoint body with an endpoint sample (0 twists otherwise), in the scratch that
+    :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_variable_assembly.assemble_articulation_variable_system`
+    fills each iterate. ``[0]`` without mixed joints (always under ``"schur"``).
+    """
+    mixed_twist_count: int
+    """Endpoint mode twists of the mixed joints, ``mixed_joint_twist_offsets[-1]`` (0 under ``"schur"``)."""
     standalone_elastic_bodies: wp.array[wp.int32]
     """Reduced elastic bodies left to the local solve (``"coupled"`` only), shape [standalone_elastic_body_count].
 
@@ -613,6 +647,70 @@ def build_rigid_articulation_sparse_layout(
 
     rigid_body_row_count = int(articulation_body_offsets_np[rigid_group_count])
     rigid_joint_count = int(articulation_joint_offsets_np[rigid_group_count])
+    rigid_block_count = int(block_row_offsets_np[rigid_body_row_count])
+
+    # Gather entries and joint lists of the mixed block slots (see assemble_articulation_joint_terms_variable).
+    slot_entry_counts: list[int] = []
+    slot_rows: list[int] = []
+    slot_joint_offsets: list[int] = [0]
+    slot_joints: list[int] = []
+    if coupled:
+        for articulation in range(rigid_group_count, len(articulation_groups)):
+            body_start = int(articulation_body_offsets_np[articulation])
+            joint_begin = int(articulation_joint_offsets_np[articulation])
+            joint_end = int(articulation_joint_offsets_np[articulation + 1])
+            endpoint_locals = []
+            for j in range(joint_begin, joint_end):
+                joint_idx = int(articulation_joints_np[j])
+                parent = int(joint_parent[joint_idx])
+                child = int(joint_child[joint_idx])
+                parent_local = int(body_articulation_local_host[parent]) if parent >= 0 else -1
+                child_local = int(body_articulation_local_host[child]) if child >= 0 else -1
+                endpoint_locals.append((j - rigid_joint_count, parent_local, child_local))
+            for row in range(body_start, int(articulation_body_offsets_np[articulation + 1])):
+                row_local = row - body_start
+                for slot in range(int(block_row_offsets_np[row]), int(block_row_offsets_np[row + 1])):
+                    col_local = int(block_cols_np[slot])
+                    rows, cols = int(block_dims_np[slot, 0]), int(block_dims_np[slot, 1])
+                    slot_rows.append(row)
+                    if col_local == row_local:
+                        slot_entry_counts.append(rows * cols + rows)
+                        slot_joints.extend(
+                            j
+                            for j, parent_local, child_local in endpoint_locals
+                            if parent_local == row_local or child_local == row_local
+                        )
+                    else:
+                        slot_entry_counts.append(rows * cols)
+                        slot_joints.extend(
+                            j
+                            for j, parent_local, child_local in endpoint_locals
+                            if parent_local >= 0 and {parent_local, child_local} == {row_local, col_local}
+                        )
+                    slot_joint_offsets.append(len(slot_joints))
+    # Modal twist scratch of the mixed joints' endpoints (see assemble_articulation_joint_terms_variable).
+    twist_counts: list[int] = []
+    if coupled:
+        for joint_idx in articulation_joints_np[rigid_joint_count:]:
+            for body, endpoint in (
+                (int(joint_parent[joint_idx]), int(parent_endpoint[joint_idx])),
+                (int(joint_child[joint_idx]), int(child_endpoint[joint_idx])),
+            ):
+                elastic_index = int(body_elastic_index[body]) if body >= 0 else -1
+                twist_counts.append(
+                    int(elastic_mode_count[elastic_index]) if elastic_index >= 0 and endpoint >= 0 else 0
+                )
+    twist_offsets = np.zeros(len(twist_counts) + 1, dtype=np.int64)
+    np.cumsum(np.asarray(twist_counts, dtype=np.int64), out=twist_offsets[1:])
+    slot_entry_offsets = np.zeros(len(slot_entry_counts) + 1, dtype=np.int64)
+    np.cumsum(np.asarray(slot_entry_counts, dtype=np.int64), out=slot_entry_offsets[1:])
+    if max(int(slot_entry_offsets[-1]), 4 * int(twist_offsets[-1])) > _INT32_MAX:
+        raise ValueError(
+            f"The block-sparse articulation layout needs {int(slot_entry_offsets[-1])} gather entries and "
+            f"{4 * int(twist_offsets[-1])} endpoint twist vectors, which "
+            f"exceeds 32-bit indexing ({_INT32_MAX}). Reduce the articulation sizes or modal counts, or use "
+            f"rigid_articulation_solve='local'."
+        )
 
     return RigidArticulationSparseLayout(
         articulation_body_offsets=wp.array(articulation_body_offsets_np, dtype=wp.int32, device=device),
@@ -675,7 +773,7 @@ def build_rigid_articulation_sparse_layout(
         rigid_articulation_count=rigid_group_count,
         rigid_body_row_count=rigid_body_row_count,
         rigid_joint_count=rigid_joint_count,
-        rigid_block_count=int(block_row_offsets_np[rigid_body_row_count]),
+        rigid_block_count=rigid_block_count,
         mixed_articulation_count=len(articulation_groups) - rigid_group_count,
         articulation_row_dims=_int32_array(row_dims_np, device),
         articulation_row_scalar_offsets=_int32_array(row_scalar_offsets_np, device),
@@ -688,6 +786,13 @@ def build_rigid_articulation_sparse_layout(
         mixed_elastic_bodies=_int32_array(mixed_elastic_bodies_host, device),
         mixed_elastic_body_rows=_int32_array(mixed_elastic_body_rows_host, device),
         mixed_elastic_body_count=len(mixed_elastic_bodies_host),
+        mixed_slot_entry_offsets=_int32_array(slot_entry_offsets, device),
+        mixed_slot_entry_count=int(slot_entry_offsets[-1]),
+        mixed_slot_rows=_int32_array(slot_rows, device),
+        mixed_slot_joint_offsets=_int32_array(slot_joint_offsets, device),
+        mixed_slot_joints=_int32_array(slot_joints, device),
+        mixed_joint_twist_offsets=_int32_array(twist_offsets, device),
+        mixed_twist_count=int(twist_offsets[-1]),
         standalone_elastic_bodies=_int32_array(standalone_elastic_bodies_host, device),
         standalone_elastic_body_count=len(standalone_elastic_bodies_host),
     )

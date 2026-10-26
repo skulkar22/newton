@@ -61,7 +61,6 @@ from newton._src.solvers.vbd.rigid_sparse_articulation_kernels import (
     joint_endpoint_mode_count,
     joint_endpoint_mode_shape,
     joint_endpoint_mode_twist,
-    mat66f,
     vec6f,
 )
 from newton._src.solvers.vbd.rigid_sparse_articulation_variable_kernels import (
@@ -309,121 +308,6 @@ def _endpoint_twist(
 
 
 @wp.func
-def _joint_self_entry(
-    elastic: SparseElasticJointData,
-    joint: int,
-    is_parent: bool,
-    body: int,
-    K: mat66f,
-    attachment_offset: wp.vec3,
-    rotation_jacobian: wp.mat33,
-    row_dim: int,
-    body_q: wp.array[wp.transform],
-    a: int,
-    b: int,
-) -> float:
-    """Entry ``(a, b)`` of ``J_e^T K_ee J_e`` for one endpoint of an evaluated joint (0 past the endpoint's rows).
-
-    ``body`` is the endpoint body and ``K``, ``attachment_offset`` and ``rotation_jacobian`` are its
-    ``hessian_*``, ``attachment_offset_*`` and ``rotation_jacobian_*`` terms; ``row_dim`` is the size
-    of the body's row, of which the endpoint projects onto the first ``6 + m_e`` components. The
-    expressions are ``K``, ``(K g_b)[a]``, ``(K^T g_a)[b]`` and ``g_a . (K g_b)`` with ``g`` the mode
-    twists of :func:`_endpoint_twist`.
-    """
-    n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, body, is_parent), row_dim - 6)
-    if a >= n or b >= n:
-        return 0.0
-    if a < 6 and b < 6:
-        return K[a, b]
-    R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
-    RJ = R * rotation_jacobian
-    if a < 6:
-        g_col = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, b - 6)
-        Kg = K * g_col
-        return Kg[a]
-    if b < 6:
-        g_row = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, a - 6)
-        gK = wp.transpose(K) * g_row
-        return gK[b]
-    g_col = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, b - 6)
-    Kg = K * g_col
-    g_row = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, a - 6)
-    return wp.dot(g_row, Kg)
-
-
-@wp.func
-def _joint_self_rhs(
-    elastic: SparseElasticJointData,
-    joint: int,
-    is_parent: bool,
-    body: int,
-    wrench: vec6f,
-    attachment_offset: wp.vec3,
-    rotation_jacobian: wp.mat33,
-    row_dim: int,
-    body_q: wp.array[wp.transform],
-    k: int,
-) -> float:
-    """Component ``k`` of ``J_e^T w_e`` for one endpoint of an evaluated joint (0 past the endpoint's rows).
-
-    Arguments as in :func:`_joint_self_entry`, with ``wrench`` the endpoint's ``wrench_*`` term.
-    """
-    n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, body, is_parent), row_dim - 6)
-    if k >= n:
-        return 0.0
-    if k < 6:
-        return wrench[k]
-    R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
-    RJ = R * rotation_jacobian
-    g = _endpoint_twist(elastic, joint, is_parent, R, RJ, attachment_offset, k - 6)
-    return wp.dot(g, wrench)
-
-
-@wp.func
-def _joint_cross_entry(
-    elastic: SparseElasticJointData,
-    joint: int,
-    terms: wp.array[JointEndpointTerms],
-    j: int,
-    parent_dim: int,
-    child_dim: int,
-    body_q: wp.array[wp.transform],
-    a: int,
-    b: int,
-) -> float:
-    """Entry ``(a, b)`` (parent row ``a``, child column ``b``) of ``J_p^T H_pc J_c`` of the evaluated joint ``terms[j]``.
-
-    0 past the endpoints' projected rows. The expressions are ``H``, ``(H g_c)[a]``,
-    ``(H^T g_p)[b]`` and ``(H^T g_p) . g_c``. Only the fields an entry needs are read.
-    """
-    parent = terms[j].parent
-    child = terms[j].child
-    parent_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, parent, True), parent_dim - 6)
-    child_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, child, False), child_dim - 6)
-    if a >= parent_n or b >= child_n:
-        return 0.0
-    H = terms[j].hessian_cross
-    if a < 6 and b < 6:
-        return H[a, b]
-    if a < 6:
-        R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[child]))
-        RJ_c = R_c * terms[j].rotation_jacobian_child
-        g_col = _endpoint_twist(elastic, joint, False, R_c, RJ_c, terms[j].attachment_offset_child, b - 6)
-        Hg = H * g_col
-        return Hg[a]
-    R_p = wp.quat_to_matrix(wp.transform_get_rotation(body_q[parent]))
-    RJ_p = R_p * terms[j].rotation_jacobian_parent
-    g_row = _endpoint_twist(elastic, joint, True, R_p, RJ_p, terms[j].attachment_offset_parent, a - 6)
-    gH = wp.transpose(H) * g_row
-    if b < 6:
-        return gH[b]
-    R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[child]))
-    RJ_c = R_c * terms[j].rotation_jacobian_child
-    g_col = _endpoint_twist(elastic, joint, False, R_c, RJ_c, terms[j].attachment_offset_child, b - 6)
-    return wp.dot(gH, g_col)
-
-
-@wp.func
 def _last_le(offsets: wp.array[wp.int32], begin: int, end: int, value: int) -> int:
     """Largest ``i`` in ``[begin, end)`` with ``offsets[i] <= value`` (``offsets`` non-decreasing, ``offsets[begin] <= value``)."""
     lo = begin
@@ -437,173 +321,454 @@ def _last_le(offsets: wp.array[wp.int32], begin: int, end: int, value: int) -> i
     return lo
 
 
-def joint_term_entry_count(max_row_dim: int) -> int:
-    """Size of the second launch dimension of :func:`assemble_articulation_joint_terms_variable`.
-
-    A diagonal slot of row size ``n`` has ``n * n`` block entries followed by ``n`` right-hand side
-    components; an off-diagonal slot has at most ``n * n`` entries.
-    """
-    return max_row_dim * (max_row_dim + 1)
+@wp.func
+def _twist_index(twist_offsets: wp.array[wp.int32], j: int, is_parent: bool, mode: int) -> int:
+    """Index of mode ``mode`` of one endpoint of joint term ``j`` in each of the four parts of the twist scratch."""
+    side = 1
+    if is_parent:
+        side = 0
+    return twist_offsets[2 * j + side] + mode
 
 
 @wp.kernel
-def assemble_articulation_joint_terms_variable(
-    rigid_articulation_count: int,
-    rigid_joint_count: int,
-    rigid_body_row_count: int,
-    rigid_block_count: int,
-    articulation_body_offsets: wp.array[wp.int32],
-    articulation_joint_offsets: wp.array[wp.int32],
+def evaluate_joint_term_twists(
+    mixed_endpoint_count: int,
+    twist_count: int,
     mixed_articulation_joints: wp.array[wp.int32],
-    articulation_block_row_offsets: wp.array[wp.int32],
-    articulation_block_cols: wp.array[wp.int32],
-    articulation_row_dims: wp.array[wp.int32],
-    articulation_row_scalar_offsets: wp.array[wp.int32],
-    articulation_block_value_offsets: wp.array[wp.int32],
-    articulation_block_dims: wp.array2d[wp.int32],
-    body_articulation_local: wp.array[wp.int32],
+    twist_offsets: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     elastic: SparseElasticJointData,
     terms: wp.array[JointEndpointTerms],
-    values: wp.array[float],
-    rhs: wp.array[float],
+    twists: wp.array[vec6f],
 ):
-    """Add the projected joint terms to one entry of a mixed-articulation block slot or right-hand side.
+    """Form the modal attachment twist of one endpoint mode of an evaluated joint and its products with the joint's blocks.
 
     Launched by :func:`launch_articulation_joint_terms_variable` with
-    ``dim = (block_count - rigid_block_count, joint_term_entry_count(articulation_max_row_dim))``
-    after :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.evaluate_articulation_joint_terms`
-    on ``mixed_articulation_joints`` (``terms[j]`` belongs to ``mixed_articulation_joints[j]``).
-    Thread ``(s, e)`` owns entry ``e`` of slot ``rigid_block_count + s`` (row-major), and entry
-    ``R * C + k`` of a diagonal slot is component ``k`` of its row's right-hand side; threads
-    past the slot's size return.
-
-    With ``J_e = [I_6 | G_e]`` (``G_e`` empty for a rigid endpoint or an attachment without a modal
-    sample) each evaluated joint of the slot's articulation adds, for an endpoint whose body owns
-    the slot's row, its self block ``J_e^T K_ee J_e`` and right-hand side ``J_e^T w_e`` to the
-    diagonal slot, and for a slot coupling its parent and child rows the cross block
-    ``J_p^T H_pc J_c`` (or its transpose when the parent row comes first in the articulation's
-    order, since only the lower block triangle is stored). A parent that is not a body of the
-    articulation acts like the world. A thread of a diagonal slot (or right-hand side) reads the
-    value written by the body-block assembly, a thread of an off-diagonal or fill slot starts from
-    zero, and both add the joints' contributions in the articulation's joint order and write the
-    entry, so the result is deterministic and no atomics are used; every contribution is formed
-    by the same
-    expression for each entry (see :func:`_joint_self_entry`, :func:`_joint_self_rhs`,
-    :func:`_joint_cross_entry`). Joints with ``evaluated == 0`` add nothing.
+    ``dim = layout.mixed_twist_count`` before :func:`assemble_articulation_joint_terms_variable`.
+    Thread ``t`` owns mode ``k = t - twist_offsets[s]`` of endpoint ``s = 2 * j + side`` (``side``
+    0 for the parent) of joint term ``j`` and writes, at ``t`` of the four parts of ``twist_count``
+    vectors of ``twists``, the twist ``g`` of
+    :func:`_endpoint_twist`, ``K g`` and ``K^T g`` with ``K`` the endpoint's ``hessian_*`` block,
+    and ``H^T g`` (parent) or ``H g`` (child) with ``H = hessian_cross``: the expressions the gather
+    needs per entry, formed once per mode. Endpoints of joints with ``evaluated == 0`` or without an
+    evaluated body are skipped (the gather does not read them).
     """
-    s, e = wp.tid()
-    slot = rigid_block_count + s
-    R = articulation_block_dims[slot, 0]
-    C = articulation_block_dims[slot, 1]
-    if e >= R * C + R:
+    t = wp.tid()
+    s = _last_le(twist_offsets, 0, mixed_endpoint_count, t)
+    j = s // 2
+    is_parent = s - 2 * j == 0
+    mode = t - twist_offsets[s]
+    if terms[j].evaluated == 0:
         return
-    row = _last_le(
-        articulation_block_row_offsets, rigid_body_row_count, articulation_block_row_offsets.shape[0] - 1, slot
-    )
-    articulation = _last_le(
-        articulation_body_offsets, rigid_articulation_count, articulation_body_offsets.shape[0] - 1, row
-    )
-    body_start = articulation_body_offsets[articulation]
-    row_local = row - body_start
-    col_local = articulation_block_cols[slot]
-    diagonal = col_local == row_local
-    if e >= R * C and not diagonal:
-        return
-    joint_begin = articulation_joint_offsets[articulation] - rigid_joint_count
-    joint_end = articulation_joint_offsets[articulation + 1] - rigid_joint_count
-    row_dim = articulation_row_dims[row]
+    joint = mixed_articulation_joints[j]
+    if is_parent:
+        body = terms[j].parent
+        if body < 0:
+            return
+        R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
+        RJ = R * terms[j].rotation_jacobian_parent
+        g = _endpoint_twist(elastic, joint, True, R, RJ, terms[j].attachment_offset_parent, mode)
+        K = terms[j].hessian_parent
+        twists[t] = g
+        twists[1 * twist_count + t] = K * g
+        twists[2 * twist_count + t] = wp.transpose(K) * g
+        twists[3 * twist_count + t] = wp.transpose(terms[j].hessian_cross) * g
+    else:
+        body = terms[j].child
+        if body < 0:
+            return
+        R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
+        RJ = R * terms[j].rotation_jacobian_child
+        g = _endpoint_twist(elastic, joint, False, R, RJ, terms[j].attachment_offset_child, mode)
+        K = terms[j].hessian_child
+        twists[t] = g
+        twists[1 * twist_count + t] = K * g
+        twists[2 * twist_count + t] = wp.transpose(K) * g
+        twists[3 * twist_count + t] = terms[j].hessian_cross * g
 
-    if e >= R * C:
-        k = e - R * C
-        index = vb_rhs_index(articulation_row_scalar_offsets, row, k)
-        value = rhs[index]
-        for j in range(joint_begin, joint_end):
+
+@wp.func
+def _form_mode_vector(
+    elastic: SparseElasticJointData,
+    terms: wp.array[JointEndpointTerms],
+    j: int,
+    joint: int,
+    is_parent: bool,
+    mode: int,
+    kind: int,
+    body_q: wp.array[wp.transform],
+) -> vec6f:
+    """Form part ``kind`` of :func:`evaluate_joint_term_twists` for one endpoint mode of joint term ``j``.
+
+    ``kind`` 0 is the twist ``g``, 1 ``K g``, 2 ``K^T g`` (``K`` the endpoint's ``hessian_*``), 3
+    ``H^T g`` for the parent or ``H g`` for the child (``H = hessian_cross``); the same expressions
+    as the precomputation, so the same bits.
+    """
+    if is_parent:
+        R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[terms[j].parent]))
+        RJ = R * terms[j].rotation_jacobian_parent
+        g = _endpoint_twist(elastic, joint, True, R, RJ, terms[j].attachment_offset_parent, mode)
+        if kind == 0:
+            return g
+        if kind == 1:
+            return terms[j].hessian_parent * g
+        if kind == 2:
+            return wp.transpose(terms[j].hessian_parent) * g
+        return wp.transpose(terms[j].hessian_cross) * g
+    R = wp.quat_to_matrix(wp.transform_get_rotation(body_q[terms[j].child]))
+    RJ = R * terms[j].rotation_jacobian_child
+    g = _endpoint_twist(elastic, joint, False, R, RJ, terms[j].attachment_offset_child, mode)
+    if kind == 0:
+        return g
+    if kind == 1:
+        return terms[j].hessian_child * g
+    if kind == 2:
+        return wp.transpose(terms[j].hessian_child) * g
+    return terms[j].hessian_cross * g
+
+
+def _make_joint_terms_gather(precomputed: bool):
+    """Build the gather kernel; ``precomputed`` selects at compile time whether the entries read the twist scratch.
+
+    Two variants keep the per-entry twist formation out of the code of the precomputed one (a
+    runtime branch made that kernel 2.5x slower).
+    """
+
+    @wp.func
+    def _mode_vector(
+        elastic: SparseElasticJointData,
+        terms: wp.array[JointEndpointTerms],
+        j: int,
+        joint: int,
+        is_parent: bool,
+        mode: int,
+        kind: int,
+        body_q: wp.array[wp.transform],
+        twist_offsets: wp.array[wp.int32],
+        twist_count: int,
+        twists: wp.array[vec6f],
+    ) -> vec6f:
+        """Part ``kind`` of one endpoint mode of joint term ``j``: read from ``twists`` (precomputed variant) or formed here."""
+        if wp.static(precomputed):
+            return twists[kind * twist_count + _twist_index(twist_offsets, j, is_parent, mode)]
+        return _form_mode_vector(elastic, terms, j, joint, is_parent, mode, kind, body_q)
+
+    @wp.func
+    def _joint_self_entry(
+        elastic: SparseElasticJointData,
+        joint: int,
+        terms: wp.array[JointEndpointTerms],
+        j: int,
+        is_parent: bool,
+        body: int,
+        row_dim: int,
+        body_q: wp.array[wp.transform],
+        twist_offsets: wp.array[wp.int32],
+        twist_count: int,
+        twists: wp.array[vec6f],
+        a: int,
+        b: int,
+    ) -> float:
+        """Entry ``(a, b)`` of ``J_e^T K_ee J_e`` for one endpoint of the evaluated joint term ``j`` (0 past the endpoint's rows).
+
+        ``body`` is the endpoint body and ``K`` its ``hessian_*`` term; ``row_dim`` is the size of the
+        body's row, of which the endpoint projects onto the first ``6 + m_e`` components. The
+        expressions are ``K``, ``(K g_b)[a]``, ``(K^T g_a)[b]`` and ``g_a . (K g_b)`` with ``g`` the mode
+        twists of :func:`_endpoint_twist`, taken from :func:`_mode_vector` (precomputed by
+        :func:`evaluate_joint_term_twists` or formed here). ``K`` is read only for frame entries.
+        """
+        n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, body, is_parent), row_dim - 6)
+        if a >= n or b >= n:
+            return 0.0
+        if a < 6 and b < 6:
+            if is_parent:
+                return terms[j].hessian_parent[a, b]
+            return terms[j].hessian_child[a, b]
+        if a < 6:
+            return _mode_vector(
+                elastic, terms, j, joint, is_parent, b - 6, 1, body_q, twist_offsets, twist_count, twists
+            )[a]
+        if b < 6:
+            return _mode_vector(
+                elastic, terms, j, joint, is_parent, a - 6, 2, body_q, twist_offsets, twist_count, twists
+            )[b]
+        return wp.dot(
+            _mode_vector(elastic, terms, j, joint, is_parent, a - 6, 0, body_q, twist_offsets, twist_count, twists),
+            _mode_vector(elastic, terms, j, joint, is_parent, b - 6, 1, body_q, twist_offsets, twist_count, twists),
+        )
+
+    @wp.func
+    def _joint_self_rhs(
+        elastic: SparseElasticJointData,
+        joint: int,
+        terms: wp.array[JointEndpointTerms],
+        j: int,
+        is_parent: bool,
+        body: int,
+        row_dim: int,
+        body_q: wp.array[wp.transform],
+        twist_offsets: wp.array[wp.int32],
+        twist_count: int,
+        twists: wp.array[vec6f],
+        k: int,
+    ) -> float:
+        """Component ``k`` of ``J_e^T w_e`` for one endpoint of the evaluated joint term ``j`` (0 past the endpoint's rows).
+
+        Arguments as in :func:`_joint_self_entry`; ``w_e`` is the endpoint's ``wrench_*`` term.
+        """
+        n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, body, is_parent), row_dim - 6)
+        if k >= n:
+            return 0.0
+        wrench = terms[j].wrench_child
+        if is_parent:
+            wrench = terms[j].wrench_parent
+        if k < 6:
+            return wrench[k]
+        return wp.dot(
+            _mode_vector(elastic, terms, j, joint, is_parent, k - 6, 0, body_q, twist_offsets, twist_count, twists),
+            wrench,
+        )
+
+    @wp.func
+    def _joint_cross_entry(
+        elastic: SparseElasticJointData,
+        joint: int,
+        terms: wp.array[JointEndpointTerms],
+        j: int,
+        parent_dim: int,
+        child_dim: int,
+        body_q: wp.array[wp.transform],
+        twist_offsets: wp.array[wp.int32],
+        twist_count: int,
+        twists: wp.array[vec6f],
+        a: int,
+        b: int,
+    ) -> float:
+        """Entry ``(a, b)`` (parent row ``a``, child column ``b``) of ``J_p^T H_pc J_c`` of the evaluated joint ``terms[j]``.
+
+        0 past the endpoints' projected rows. The expressions are ``H``, ``(H g_c)[a]``,
+        ``(H^T g_p)[b]`` and ``(H^T g_p) . g_c``, with the products taken from :func:`_mode_vector`.
+        Only the fields an entry needs are read.
+        """
+        parent = terms[j].parent
+        child = terms[j].child
+        parent_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, parent, True), parent_dim - 6)
+        child_n = 6 + wp.min(joint_endpoint_mode_count(elastic, joint, child, False), child_dim - 6)
+        if a >= parent_n or b >= child_n:
+            return 0.0
+        if a < 6 and b < 6:
+            return terms[j].hessian_cross[a, b]
+        if a < 6:
+            return _mode_vector(elastic, terms, j, joint, False, b - 6, 3, body_q, twist_offsets, twist_count, twists)[
+                a
+            ]
+        gH = _mode_vector(elastic, terms, j, joint, True, a - 6, 3, body_q, twist_offsets, twist_count, twists)
+        if b < 6:
+            return gH[b]
+        return wp.dot(
+            gH, _mode_vector(elastic, terms, j, joint, False, b - 6, 0, body_q, twist_offsets, twist_count, twists)
+        )
+
+    @wp.kernel
+    def assemble_articulation_joint_terms_variable(
+        rigid_block_count: int,
+        mixed_slot_count: int,
+        mixed_slot_entry_offsets: wp.array[wp.int32],
+        mixed_slot_rows: wp.array[wp.int32],
+        mixed_slot_joint_offsets: wp.array[wp.int32],
+        mixed_slot_joints: wp.array[wp.int32],
+        mixed_articulation_joints: wp.array[wp.int32],
+        articulation_bodies: wp.array[wp.int32],
+        articulation_block_cols: wp.array[wp.int32],
+        articulation_row_dims: wp.array[wp.int32],
+        articulation_row_scalar_offsets: wp.array[wp.int32],
+        articulation_block_value_offsets: wp.array[wp.int32],
+        articulation_block_dims: wp.array2d[wp.int32],
+        body_articulation_local: wp.array[wp.int32],
+        body_q: wp.array[wp.transform],
+        elastic: SparseElasticJointData,
+        terms: wp.array[JointEndpointTerms],
+        twist_offsets: wp.array[wp.int32],
+        twist_count: int,
+        twists: wp.array[vec6f],
+        values: wp.array[float],
+        rhs: wp.array[float],
+    ):
+        """Add the projected joint terms to one entry of a mixed-articulation block slot or right-hand side.
+
+        Launched by :func:`launch_articulation_joint_terms_variable` with
+        ``dim = layout.mixed_slot_entry_count`` after
+        :func:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.evaluate_articulation_joint_terms`
+        on ``mixed_articulation_joints`` (``terms[j]`` belongs to ``mixed_articulation_joints[j]``) and,
+        for the precomputed variant, :func:`evaluate_joint_term_twists` (``twists``); the direct
+        variant forms the twists per entry. Thread ``t`` owns gather entry ``t``: entry
+        ``e = t - mixed_slot_entry_offsets[s]`` of mixed slot ``s`` (global slot
+        ``rigid_block_count + s``), row-major, where entry ``R * C + k`` of a diagonal slot is
+        component ``k`` of its row's right-hand side.
+
+        With ``J_e = [I_6 | G_e]`` (``G_e`` empty for a rigid endpoint or an attachment without a modal
+        sample) each evaluated joint of the slot's joint list (``mixed_slot_joints``) adds, for an
+        endpoint whose body owns the slot's row, its self block ``J_e^T K_ee J_e`` and right-hand side
+        ``J_e^T w_e`` to the diagonal slot, and for a slot coupling its parent and child rows the cross
+        block ``J_p^T H_pc J_c`` (or its transpose when the parent row comes first in the articulation's
+        order, since only the lower block triangle is stored). A parent that is not a body of the
+        articulation acts like the world. A thread of a diagonal slot (or right-hand side) reads the
+        value written by the body-block assembly, a thread of an off-diagonal or fill slot starts from
+        zero, and both add the listed joints' contributions in the articulation's joint order and write
+        the entry, so the result is deterministic and no atomics are used; every contribution is formed
+        by the same expression for each entry (see :func:`_joint_self_entry`, :func:`_joint_self_rhs`,
+        :func:`_joint_cross_entry`). The lists hold every joint of the articulation that can touch the
+        slot, so the result equals a gather over all of the articulation's joints. Joints with
+        ``evaluated == 0`` add nothing.
+        """
+        t = wp.tid()
+        s = _last_le(mixed_slot_entry_offsets, 0, mixed_slot_count, t)
+        e = t - mixed_slot_entry_offsets[s]
+        slot = rigid_block_count + s
+        R = articulation_block_dims[slot, 0]
+        C = articulation_block_dims[slot, 1]
+        row = mixed_slot_rows[s]
+        row_local = body_articulation_local[articulation_bodies[row]]
+        body_start = row - row_local
+        col_local = articulation_block_cols[slot]
+        diagonal = col_local == row_local
+        joint_begin = mixed_slot_joint_offsets[s]
+        joint_end = mixed_slot_joint_offsets[s + 1]
+        row_dim = articulation_row_dims[row]
+
+        if e >= R * C:
+            k = e - R * C
+            index = vb_rhs_index(articulation_row_scalar_offsets, row, k)
+            value = rhs[index]
+            for jj in range(joint_begin, joint_end):
+                j = mixed_slot_joints[jj]
+                if terms[j].evaluated != 0:
+                    joint = mixed_articulation_joints[j]
+                    parent = terms[j].parent
+                    child = terms[j].child
+                    if parent >= 0:
+                        if body_articulation_local[parent] == row_local:
+                            value += _joint_self_rhs(
+                                elastic,
+                                joint,
+                                terms,
+                                j,
+                                True,
+                                parent,
+                                row_dim,
+                                body_q,
+                                twist_offsets,
+                                twist_count,
+                                twists,
+                                k,
+                            )
+                    if body_articulation_local[child] == row_local:
+                        value += _joint_self_rhs(
+                            elastic,
+                            joint,
+                            terms,
+                            j,
+                            False,
+                            child,
+                            row_dim,
+                            body_q,
+                            twist_offsets,
+                            twist_count,
+                            twists,
+                            k,
+                        )
+            rhs[index] = value
+            return
+
+        a = e // C
+        b = e - a * C
+        index = articulation_block_value_offsets[slot] + e
+        value = float(0.0)
+        if diagonal:
+            value = values[index]
+        col_dim = articulation_row_dims[body_start + col_local]
+        for jj in range(joint_begin, joint_end):
+            j = mixed_slot_joints[jj]
             if terms[j].evaluated != 0:
                 joint = mixed_articulation_joints[j]
                 parent = terms[j].parent
                 child = terms[j].child
+                parent_local = int(-1)
                 if parent >= 0:
-                    if body_articulation_local[parent] == row_local:
-                        value += _joint_self_rhs(
+                    parent_local = body_articulation_local[parent]
+                child_local = body_articulation_local[child]
+                if diagonal:
+                    if parent_local == row_local:
+                        value += _joint_self_entry(
                             elastic,
                             joint,
+                            terms,
+                            j,
                             True,
                             parent,
-                            terms[j].wrench_parent,
-                            terms[j].attachment_offset_parent,
-                            terms[j].rotation_jacobian_parent,
                             row_dim,
                             body_q,
-                            k,
+                            twist_offsets,
+                            twist_count,
+                            twists,
+                            a,
+                            b,
                         )
-                if body_articulation_local[child] == row_local:
-                    value += _joint_self_rhs(
-                        elastic,
-                        joint,
-                        False,
-                        child,
-                        terms[j].wrench_child,
-                        terms[j].attachment_offset_child,
-                        terms[j].rotation_jacobian_child,
-                        row_dim,
-                        body_q,
-                        k,
-                    )
-        rhs[index] = value
-        return
+                    if child_local == row_local:
+                        value += _joint_self_entry(
+                            elastic,
+                            joint,
+                            terms,
+                            j,
+                            False,
+                            child,
+                            row_dim,
+                            body_q,
+                            twist_offsets,
+                            twist_count,
+                            twists,
+                            a,
+                            b,
+                        )
+                elif parent_local >= 0:
+                    if parent_local == row_local and child_local == col_local:
+                        value += _joint_cross_entry(
+                            elastic, joint, terms, j, row_dim, col_dim, body_q, twist_offsets, twist_count, twists, a, b
+                        )
+                    elif child_local == row_local and parent_local == col_local:
+                        value += _joint_cross_entry(
+                            elastic, joint, terms, j, col_dim, row_dim, body_q, twist_offsets, twist_count, twists, b, a
+                        )
+        values[index] = value
 
-    a = e // C
-    b = e - a * C
-    index = articulation_block_value_offsets[slot] + e
-    value = float(0.0)
-    if diagonal:
-        value = values[index]
-    col_dim = articulation_row_dims[body_start + col_local]
-    for j in range(joint_begin, joint_end):
-        if terms[j].evaluated != 0:
-            joint = mixed_articulation_joints[j]
-            parent = terms[j].parent
-            child = terms[j].child
-            parent_local = int(-1)
-            if parent >= 0:
-                parent_local = body_articulation_local[parent]
-            child_local = body_articulation_local[child]
-            if diagonal:
-                if parent_local == row_local:
-                    value += _joint_self_entry(
-                        elastic,
-                        joint,
-                        True,
-                        parent,
-                        terms[j].hessian_parent,
-                        terms[j].attachment_offset_parent,
-                        terms[j].rotation_jacobian_parent,
-                        row_dim,
-                        body_q,
-                        a,
-                        b,
-                    )
-                if child_local == row_local:
-                    value += _joint_self_entry(
-                        elastic,
-                        joint,
-                        False,
-                        child,
-                        terms[j].hessian_child,
-                        terms[j].attachment_offset_child,
-                        terms[j].rotation_jacobian_child,
-                        row_dim,
-                        body_q,
-                        a,
-                        b,
-                    )
-            elif parent_local >= 0:
-                if parent_local == row_local and child_local == col_local:
-                    value += _joint_cross_entry(elastic, joint, terms, j, row_dim, col_dim, body_q, a, b)
-                elif child_local == row_local and parent_local == col_local:
-                    value += _joint_cross_entry(elastic, joint, terms, j, col_dim, row_dim, body_q, b, a)
-    values[index] = value
+    return assemble_articulation_joint_terms_variable
+
+
+assemble_articulation_joint_terms_variable = _make_joint_terms_gather(True)
+"""Gather kernel reading the twists precomputed by :func:`evaluate_joint_term_twists` (see the variant's docstring)."""
+assemble_articulation_joint_terms_variable_direct = _make_joint_terms_gather(False)
+"""Gather kernel forming the twists per entry (``twist_offsets``, ``twist_count`` and ``twists`` are not read)."""
+
+
+TWIST_PRECOMPUTE_MIN_ENTRIES = 65536
+"""Gather entries (``layout.mixed_slot_entry_count``) from which the endpoint mode twists are precomputed.
+
+Below it the gather forms the twists it needs per entry, which costs less than the extra launch of
+:func:`evaluate_joint_term_twists` for small systems (both give the same bits).
+"""
+
+
+def precompute_twists(layout) -> bool:
+    """Whether :func:`launch_articulation_joint_terms_variable` precomputes the endpoint mode twists for ``layout``."""
+    return layout.mixed_twist_count > 0 and layout.mixed_slot_entry_count >= TWIST_PRECOMPUTE_MIN_ENTRIES
+
+
+def twist_scratch_size(layout) -> int:
+    """Length of the ``twists`` scratch (``vec6f``) of :func:`launch_articulation_joint_terms_variable` for ``layout``.
+
+    Four parts of ``layout.mixed_twist_count`` vectors (twists and their products), at least 1.
+    """
+    return max(4 * layout.mixed_twist_count, 1)
 
 
 def launch_articulation_joint_terms_variable(
@@ -611,31 +776,54 @@ def launch_articulation_joint_terms_variable(
     body_q: wp.array,
     elastic: SparseElasticJointData,
     terms: wp.array,
+    twists: wp.array,
     values: wp.array,
     rhs: wp.array,
     device: wp.context.Devicelike = None,
 ) -> None:
-    """Launch :func:`assemble_articulation_joint_terms_variable` over every block slot of the mixed articulations.
+    """Launch :func:`evaluate_joint_term_twists` and :func:`assemble_articulation_joint_terms_variable` for the mixed articulations.
 
-    ``terms`` must hold the evaluated terms of ``layout.mixed_articulation_joints``. Writes every
+    ``terms`` must hold the evaluated terms of ``layout.mixed_articulation_joints``; ``twists`` is
+    scratch of :func:`twist_scratch_size` ``vec6f`` entries, overwritten when the twists are
+    precomputed (:func:`precompute_twists`; otherwise the gather forms them). The gather writes every
     entry of the off-diagonal and fill slots and adds onto the diagonal slots and the right-hand
-    side, which must hold the body-block assembly. Launch only; no-op without mixed articulations.
+    side, which must hold the body-block assembly; it runs one thread per block entry or
+    right-hand side component of the mixed slots (``layout.mixed_slot_entry_count``). Launches
+    only; no-op without mixed articulations.
     """
     slot_count = layout.block_count - layout.rigid_block_count
     if layout.mixed_articulation_count == 0 or slot_count == 0:
         return
+    device = device if device is not None else values.device
+    precompute = precompute_twists(layout)
+    if precompute:
+        wp.launch(
+            evaluate_joint_term_twists,
+            dim=layout.mixed_twist_count,
+            inputs=[
+                layout.mixed_joint_twist_offsets.shape[0] - 1,
+                layout.mixed_twist_count,
+                layout.mixed_articulation_joints,
+                layout.mixed_joint_twist_offsets,
+                body_q,
+                elastic,
+                terms,
+            ],
+            outputs=[twists],
+            device=device,
+        )
     wp.launch(
-        assemble_articulation_joint_terms_variable,
-        dim=(slot_count, joint_term_entry_count(layout.articulation_max_row_dim)),
+        assemble_articulation_joint_terms_variable if precompute else assemble_articulation_joint_terms_variable_direct,
+        dim=layout.mixed_slot_entry_count,
         inputs=[
-            layout.rigid_articulation_count,
-            layout.rigid_joint_count,
-            layout.rigid_body_row_count,
             layout.rigid_block_count,
-            layout.articulation_body_offsets,
-            layout.articulation_joint_offsets,
+            slot_count,
+            layout.mixed_slot_entry_offsets,
+            layout.mixed_slot_rows,
+            layout.mixed_slot_joint_offsets,
+            layout.mixed_slot_joints,
             layout.mixed_articulation_joints,
-            layout.articulation_block_row_offsets,
+            layout.articulation_bodies,
             layout.articulation_block_cols,
             layout.articulation_row_dims,
             layout.articulation_row_scalar_offsets,
@@ -645,9 +833,12 @@ def launch_articulation_joint_terms_variable(
             body_q,
             elastic,
             terms,
+            layout.mixed_joint_twist_offsets,
+            layout.mixed_twist_count,
+            twists,
         ],
         outputs=[values, rhs],
-        device=device if device is not None else values.device,
+        device=device,
     )
 
 
@@ -710,6 +901,7 @@ def assemble_articulation_variable_system(
     elastic: SparseElasticJointData,
     joint_inputs: Mapping[str, Any],
     terms: wp.array,
+    twists: wp.array,
     values: wp.array,
     rhs: wp.array,
     device: wp.context.Devicelike = None,
@@ -754,6 +946,7 @@ def assemble_articulation_variable_system(
             ``body_articulation_local``, ``body_q``, ``body_com``, ``elastic`` and ``terms``.
         terms: Scratch, shape [len(layout.mixed_articulation_joints)], dtype
             :class:`~newton._src.solvers.vbd.rigid_sparse_articulation_kernels.JointEndpointTerms`.
+        twists: Scratch, shape [twist_scratch_size(layout)], dtype ``vec6f``.
         values: Block values, shape [layout.articulation_value_count].
         rhs: Right-hand side, shape [layout.articulation_scalar_count].
         device: Launch device; defaults to the device of ``values``.
@@ -842,5 +1035,5 @@ def assemble_articulation_variable_system(
             device=device,
         )
     # Also without joints: the gather writes the off-diagonal and fill slots.
-    launch_articulation_joint_terms_variable(layout, body_q, elastic, terms, values, rhs, device)
+    launch_articulation_joint_terms_variable(layout, body_q, elastic, terms, twists, values, rhs, device)
     return values, rhs

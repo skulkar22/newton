@@ -619,6 +619,64 @@ def test_layout_rejects_int32_overflow(test, device):
     build_rigid_articulation_sparse_layout(model, device, elastic_solve="schur")
 
 
+def test_mixed_slot_gather_lists(test, device):
+    """Check the per-slot gather entries and joint lists and the endpoint twist offsets."""
+    mode_counts = [*_SOLVE_MODE_COUNTS, None, 3, None]
+    articulations = [*_SOLVE_ARTICULATIONS, [(-1, 14), (14, 15), (15, 16), (16, 14)]]
+    model = _synthetic_model(device, mode_counts, articulations)
+    layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="coupled")
+    parent = model.joint_parent.numpy()
+    child = model.joint_child.numpy()
+    parent_endpoint = model.joint_parent_elastic_endpoint.numpy()
+    child_endpoint = model.joint_child_elastic_endpoint.numpy()
+    elastic_index = model.body_elastic_index.numpy()
+    mode_count = model.elastic_mode_count.numpy()
+    local = layout.body_articulation_local.numpy()
+    block_dims = layout.articulation_block_dims.numpy()
+    row_offsets = layout.articulation_block_row_offsets.numpy()
+    cols = layout.articulation_block_cols.numpy()
+    body_offsets = layout.articulation_body_offsets.numpy()
+    joint_offsets = layout.articulation_joint_offsets.numpy()
+    joints = layout.articulation_joints.numpy()
+
+    counts, slot_rows, joint_lists = [], [], []
+    for a in range(layout.rigid_articulation_count, layout.articulation_count):
+        start = int(body_offsets[a])
+        ends = []
+        for j in range(int(joint_offsets[a]), int(joint_offsets[a + 1])):
+            p, c = int(parent[joints[j]]), int(child[joints[j]])
+            ends.append((j - layout.rigid_joint_count, local[p] if p >= 0 else -1, local[c]))
+        for row in range(start, int(body_offsets[a + 1])):
+            for slot in range(row_offsets[row], row_offsets[row + 1]):
+                r, c = row - start, int(cols[slot])
+                rows, columns = block_dims[slot]
+                slot_rows.append(row)
+                if r == c:
+                    counts.append(rows * columns + rows)
+                    joint_lists.append([j for j, pl, cl in ends if r in (pl, cl)])
+                else:
+                    counts.append(rows * columns)
+                    joint_lists.append([j for j, pl, cl in ends if pl >= 0 and {pl, cl} == {r, c}])
+    test.assertEqual(len(counts), layout.block_count - layout.rigid_block_count)
+    np.testing.assert_array_equal(layout.mixed_slot_entry_offsets.numpy(), np.concatenate([[0], np.cumsum(counts)]))
+    test.assertEqual(layout.mixed_slot_entry_count, int(np.sum(counts)))
+    np.testing.assert_array_equal(layout.mixed_slot_rows.numpy(), slot_rows)
+    joint_offsets_stored = layout.mixed_slot_joint_offsets.numpy()
+    stored_joints = layout.mixed_slot_joints.numpy()
+    for s, expected in enumerate(joint_lists):
+        test.assertEqual(stored_joints[joint_offsets_stored[s] : joint_offsets_stored[s + 1]].tolist(), expected)
+    # A fill slot has no joint (the loop of the last articulation creates one).
+    test.assertIn([], joint_lists)
+
+    twists = []
+    for joint in layout.mixed_articulation_joints.numpy():
+        for body, endpoint in ((parent[joint], parent_endpoint[joint]), (child[joint], child_endpoint[joint])):
+            e = elastic_index[body] if body >= 0 else -1
+            twists.append(int(mode_count[e]) if e >= 0 and endpoint >= 0 else 0)
+    np.testing.assert_array_equal(layout.mixed_joint_twist_offsets.numpy(), np.concatenate([[0], np.cumsum(twists)]))
+    test.assertEqual(layout.mixed_twist_count, int(np.sum(twists)))
+
+
 # ---------------------------------------------------------------------------
 # Variable-block factorization and solve
 # ---------------------------------------------------------------------------
@@ -1478,6 +1536,7 @@ for _name, _func in [
     ("test_weighted_order_reduces_to_minimum_degree", test_weighted_order_reduces_to_minimum_degree),
     ("test_layout_rejects_int32_overflow", test_layout_rejects_int32_overflow),
     ("test_reference_layout_solve_matches_dense", test_reference_layout_solve_matches_dense),
+    ("test_mixed_slot_gather_lists", test_mixed_slot_gather_lists),
 ]:
     # Host-side analysis: one device suffices.
     add_function_test(TestVBDSparseVariableBlocks, _name, _func, devices=cpu_devices)
