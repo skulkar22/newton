@@ -3,6 +3,7 @@
 1. [Update cost before/after the device-side update](#1-update-cost) (WP-D.2-5: device kernels, shared
    factorization, in-place solver refresh, device trigger and pre-stress).
 2. [Tangent assembly](#2-tangent-assembly-warptetassembler) (WP-D.1: `WarpTetAssembler`).
+3. [Warpack eigensolver backends](#3-warpack-eigensolver-backends-reromeigen_warpackpy) (`rerom/eigen_warpack.py`).
 
 For an end-to-end accuracy and cost comparison on a small mesh (fixed basis vs re-ROM vs an implicit FE
 reference), run `examples/beam_swing.py` (see `README.md`).
@@ -219,3 +220,57 @@ Column definitions:
   cached in the Warp kernel cache afterwards.
 * The numpy reference times (22.4 ms beam) are at the low end of the 23-34 ms recorded earlier
   for the M1 beam.
+
+## 3. Warpack eigensolver backends (`rerom/eigen_warpack.py`)
+
+[Warpack](https://github.com/alecjacobson/warpack) (Alec Jacobson, MIT) at `a8b945de`, cuDSS 0.8.0 through
+nvmath-python 1.0.0 (`nvidia-cudss-cu13` 0.8.0.10), Warp 1.18.0, float64, physical GPU 1 (idle), 27 Oct 2026. Host load
+average 2-19 during the runs (partly the cuDSS OpenMP reordering itself): upper bounds. Full tables, commands, raw
+JSON and logs: the experiment directory `exp-re-rom/gpu_eigen_proto/` (`RESULTS.md`) next to this worktree.
+
+### Accuracy
+
+Per pencil (beam 6k, panel 22.5k, solid block 28.8k, panel 88k; clamped and free; m = 12 and 30) against the CPU
+`RestrictedArpackBackend`, `WarpackKrylovBackend` and `WarpackLOBPCGBackend` meet:
+
+| quantity | criterion | worst case |
+|---|---|---|
+| relative eigenvalue error | ≤ 1e-7 | 6.2e-10 |
+| `‖(I − B Yᵀ)(K v − λ M v)‖ / ‖K v‖` | ≤ 1e-6 | 1.2e-8 (ARPACK's own floor: up to 1.0e-8) |
+| M-orthonormality | ≤ 1e-10 | 2.4e-14 |
+| principal angle of the lowest-m span (clusters as subspaces) | ≤ 1e-5 rad | 2.0e-10 |
+| Sturm count | equal to the reference and to a SuperLU Haynsworth count | 16/16 |
+
+M1 swing (469 updates at 0.2 deg, cuda, device path) with `WarpackKrylovBackend`:
+
+- the same 469 update steps;
+- tip within 7.0e-7 L of the ARPACK run;
+- run-to-run variation 5e-7 L (atomic reductions), at the 1-ulp floor.
+
+### Cost per update [ms, median]
+
+Device path, Warp assembler, cuda. The beam row is the M1 swing (mean of steady updates); the panel rows follow the
+section 1 protocol (`bench_update.py` model, 5 repeats).
+
+| case | eigensolver | factorization | eigensolve | projection | total |
+| --- | --- | ---: | ---: | ---: | ---: |
+| beam 6,075 DOF (M1 swing) | subspace | 18.4 | 10.5 | 7.8 | 41.1 |
+| beam 6,075 DOF (M1 swing) | ARPACK | 23.1 | 38.3 | 7.6 | 73.4 |
+| beam 6,075 DOF (M1 swing) | Warpack Krylov-Schur | 3.6 | 20.9 | 6.5 | **35.3** |
+| panel 22,509 DOF | subspace | 382 | 84 | 67 | 548 |
+| panel 22,509 DOF | ARPACK | 417 | 1,170 | 119 | 1,695 |
+| panel 22,509 DOF | Warpack Krylov-Schur | 17 | 58 | 24 | **112** |
+| panel 88,209 DOF | subspace | 3,746 | 474 | 257 | 4,535 |
+| panel 88,209 DOF | ARPACK | 3,929 | 4,525 | 289 | 8,801 |
+| panel 88,209 DOF | Warpack Krylov-Schur | 57 | 132 | 112 | **351** |
+
+* **Factorization** with Warpack is the numeric cuDSS factorization at the Ritz shift (shared with the Ritz solves)
+  plus the Sturm refactorization. The symbolic analyses run once per body. The first update costs 76 ms (beam, M1)
+  to 600 ms (88k).
+* **Kernel compilation.** The first Warp kernel compilation of a machine adds about 31 s once; it is cached afterwards.
+* **Warm-started LOBPCG** (`WarpackLOBPCGBackend`) is slower everywhere measured: 90 ms per update on M1 and 619 ms
+  at 88k. It needs 9-17 iterations from the previous basis.
+* **Size-matched to the external 28.8k-DOF table** (Alec's measurement; not a reproduction). On a 28.8k-DOF solid
+  block, refactorization plus a cold Krylov-Schur solve takes 57-112 ms (m = 12-30), against 2.1-4.1 s for CPU
+  ARPACK + SuperLU on this machine.
+
