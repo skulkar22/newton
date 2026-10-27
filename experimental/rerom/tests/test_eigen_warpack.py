@@ -37,6 +37,27 @@ GPU = "cuda:0"
 SKIP = unittest.skipUnless(HAVE_CUDA and HAVE_WARPACK, "needs CUDA, warpack and nvmath-python (cuDSS)")
 
 
+class TestSturmPerturbedPivots(unittest.TestCase):
+    def test_perturbed_pivots_skip_the_count(self):
+        """A Sturm factorization with perturbed pivots returns no inertia count (check skipped, recorded), an
+        unperturbed one returns ``below + d`` (stubbed pencil; no CUDA, Warpack or cuDSS needed)."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        backend = object.__new__(ew.WarpackKrylovBackend)
+        backend.sturm_check = True
+        vals = np.array([1.0, 2.0, 3.0, 10.0, 11.0])
+        for pivots, expected in ((2, (None, None)), (0, (3 + 6, 6.5))):
+            with self.subTest(perturbed_pivots=pivots):
+                aux = SimpleNamespace(perturbed_pivots=pivots, timings={"factorization": 0.0})
+                p = SimpleNamespace(
+                    d=6, factor=lambda name, tau, a=aux: a, restriction={"aux": {"negA": 0, "negS": 0, "below": 3}}
+                )
+                info = {}
+                self.assertEqual(backend._sturm(p, vals, 3, info), expected)
+                self.assertEqual(info["sturm"]["perturbed_pivots"], pivots)
+                self.assertEqual("warning" in info["sturm"], pivots > 0)
+
+
 def _pencil(kind: str, young=1.0e9):
     """Pre-stressed beam tangent (rigid rotations not in its null space) on the free DOFs."""
     asm = beam_assembler(young=young)

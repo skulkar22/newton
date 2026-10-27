@@ -922,7 +922,10 @@ class _WarpackBackendBase:
         }
         info["t_factor"] = info.get("t_factor", 0.0) + aux.timings["factorization"]
         if aux.perturbed_pivots:
-            info["sturm"]["warning"] = "perturbed pivots: count not certified"
+            # cuDSS replaced tiny pivots: the LDL^T inertia is not certified, so no count is returned and the
+            # controller's eigen-result validation warns that the Sturm check was skipped
+            info["sturm"]["warning"] = "perturbed pivots: count not certified, Sturm check skipped"
+            return None, None
         return int(r["below"]) + p.d, tau
 
     def _finish(self, p, vals_dev, X, count, t0, info) -> newton.ModalEigenResult:
