@@ -223,13 +223,17 @@ class FreeBodyAdapter(BodyAdapter):
         def get_solver():
             # ONE restricted factorization shared by the subspace iteration, Ritz vectors and modal derivatives
             if "f" not in shared:
-                # the symmetric factorization (with inertia count) is needed only to share it with ARPACK;
-                # the subspace iteration always shared the pivoting LU
-                shared["f"] = (
-                    shared_restricted_solver(Kf, Mf, Yf)
-                    if o.shared_factorization and isinstance(ctrl.eigen_backend, RestrictedArpackBackend)
-                    else ShiftedRestrictedSolver(Kf, Mf, Yf)
-                )
+                if o.restricted_solver_factory is not None:
+                    # opt-in (e.g. a GPU factorization kept across updates); device_tangent: assembler BSR values
+                    shared["f"] = o.restricted_solver_factory(Kf, Mf, Yf, device_tangent=ctx.get("K_T_device"))
+                else:
+                    # the symmetric factorization (with inertia count) is needed only to share it with ARPACK;
+                    # the subspace iteration always shared the pivoting LU
+                    shared["f"] = (
+                        shared_restricted_solver(Kf, Mf, Yf)
+                        if o.shared_factorization and isinstance(ctrl.eigen_backend, RestrictedArpackBackend)
+                        else ShiftedRestrictedSolver(Kf, Mf, Yf)
+                    )
                 factor["t"] += shared["f"].factor_time
             return shared["f"]
 
@@ -1529,6 +1533,13 @@ class ReROMController:
                 "stage": stage,
                 "eigen_residual": v.eigen_residual_tol is not None,
             }
+            if (
+                self.basis_options.restricted_solver_factory is not None
+                and stiffness_override is None
+                and (g.f_int is not None)
+            ):
+                # device BSR values of K_T (overwritten by the next device assembly) for the opt-in factory
+                ctx["K_T_device"] = dev.device_assembler.tangent_values_device()
             res = self.adapter.rebuild(self, ctx)
             Phi_new, mode_mass, lam = res["Phi"], res["mode_mass"], res["lam"]
             mass_new, com_new, I_new = res["rigid"]

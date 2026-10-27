@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -171,6 +173,13 @@ class BasisOptions:
             roundoff). On the device path the old velocity is recomputed on the host (O(N m)).
         velocity_enrichment_tol: Relative M-norm of the residual (against the full candidate space) below which
             nothing is replaced.
+        restricted_solver_factory: Free-body adapter, opt-in. ``f(Kf, Mf, Yf, *, device_tangent=None)`` returning the
+            update's shared restricted solver (a :class:`rerom.eigen.ShiftedRestrictedSolver` duck: ``solve``,
+            ``sigma``, ``factor_time``) in place of the host SuperLU one, for example a
+            :class:`rerom.eigen_warpack.WarpackContext` (one GPU factorization per update kept across updates).
+            ``device_tangent`` is the device assembler's BSR values of the full ``K_T`` (device update path, Warp
+            assembler) or ``None``. Backends with ``accepts_restricted_factorization = True`` receive the same
+            object as ``factorization``. ``None`` (default) keeps the host factorization.
     """
 
     n_ritz: int = 2
@@ -188,6 +197,7 @@ class BasisOptions:
     shared_factorization: bool = True
     velocity_enrichment: bool = False
     velocity_enrichment_tol: float = 1.0e-8
+    restricted_solver_factory: Callable[..., Any] | None = None
 
 
 @dataclass(kw_only=True)

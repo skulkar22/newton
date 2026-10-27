@@ -384,10 +384,17 @@ def solve_restricted_eigen(
             prev = prev - Yf @ (Yf.T @ (Mf @ prev))
         backend.previous_vectors = prev
     device = getattr(backend, "device", "cpu")
-    K_in = modal_sparse.to_backend_matrix(sp.csc_matrix(Kf), device=device)
-    M_in = modal_sparse.to_backend_matrix(sp.csc_matrix(Mf), device=device)
     t0 = time.perf_counter()
-    res = backend.solve(K_in, M_in, int(count), deflation=Yf)
+    if getattr(backend, "accepts_restricted_factorization", False):
+        # opt-in: the backend uses the update's shared restricted solver (e.g. rerom.eigen_warpack) and its
+        # device copy of the pencil; the host matrices are passed unconverted
+        res = backend.solve(Kf, Mf, int(count), deflation=Yf, factorization=shared_solver())
+        info.update(getattr(backend, "last_info", {}))
+    else:
+        K_in = modal_sparse.to_backend_matrix(sp.csc_matrix(Kf), device=device)
+        M_in = modal_sparse.to_backend_matrix(sp.csc_matrix(Mf), device=device)
+        t0 = time.perf_counter()
+        res = backend.solve(K_in, M_in, int(count), deflation=Yf)
     values, vectors = modal_sparse.validate_eigen_result(
         res,
         size=int(Kf.shape[0]),

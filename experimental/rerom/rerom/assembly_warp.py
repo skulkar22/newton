@@ -521,6 +521,14 @@ class WarpTetAssembler:
                 self._csc_cache = cache
         return cache
 
+    def tangent_values_device(self) -> wp.array:
+        """Device BSR values ``(nnz_blocks,)`` ``mat33d`` of the last assembled tangent (no copy).
+
+        The internal buffer of :meth:`evaluate` / :meth:`evaluate_device`, on the pattern
+        :attr:`block_offsets` / :attr:`block_columns`; the next assembly overwrites it.
+        """
+        return self._values_view(self._K)
+
     def block_values_numpy(self, K: wps.BsrMatrix) -> np.ndarray:
         """Device-to-host copy of the BSR values, shape (nnz_blocks, 3, 3) float64."""
         return _host_copy(self._values_view(K))
