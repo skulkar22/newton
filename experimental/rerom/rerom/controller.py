@@ -1953,6 +1953,15 @@ class ReROMController:
 
         ``T = K_S(q_n) + D``; ``Phi <- Phi Q``, ``q <- Q^T q``, ``Lambda <- eig T``,
         ``g0 <- Q^T (f_tot(q_n) - T q_n)``; modal arrays rewritten in place, no assembly or eigensolve.
+
+        The indefinite guard applies as at an update: ``eig T`` is the raw spectrum (:attr:`lam_raw`) and the
+        guarded one the operational spectrum (:attr:`lam`, written to the solver). With
+        :attr:`IndefiniteGuard.CLAMP` the IMEX split is shifted in the clamped directions
+        (``D += diag(Lambda_op - Lambda_raw)``, ``c -= that shift times q_n``, ``W_ref`` adjusted) so that
+        ``f_tot(q_n)`` and the model energy at ``q_n`` are unchanged and ``f_tot'(q_n) = Lambda_op``: the clamped
+        model is the target and the remainder does not restore the negative stiffness. With
+        :attr:`IndefiniteGuard.REJECT` a materially negative ``eig T`` skips the fold: nothing is written, the
+        skip is recorded in :attr:`folds` (``"skipped": "negative_stiffness"``) and the fold interval restarts.
         """
         if self.nl_model is None:
             raise RuntimeError("fold needs nonlinear_force")
@@ -1963,6 +1972,19 @@ class ReROMController:
         T = r["T"]
         t1 = time.perf_counter()
         lam_new, Q = np.linalg.eigh(T)  # Phi^T M Phi = I: standard problem
+        if self.policy.guard_indefinite is IndefiniteGuard.REJECT:
+            scale = max(float(np.max(np.abs(lam_new))), 1.0e-300)
+            if float(lam_new.min()) < -self.policy.validation.negative_stiffness_tol * scale:
+                info = {
+                    "step": self.step_count,
+                    "since_update": self.steps_since_update,
+                    "skipped": RejectReason.NEGATIVE_STIFFNESS.value,
+                    "lam_min": float(lam_new.min()),
+                    "timings": {"total": time.perf_counter() - t0},
+                }
+                self.folds.append(info)
+                self.steps_since_fold = 0
+                return info
         for j in range(m):  # keep an identity-like Q (readable logs)
             if Q[np.argmax(np.abs(Q[:, j])), j] < 0:
                 Q[:, j] = -Q[:, j]
@@ -1972,6 +1994,15 @@ class ReROMController:
         self._nl_c = Q.T @ self._nl_c
         self._nl_D = Q.T @ self._nl_D @ Q
         self._nl_D = 0.5 * (self._nl_D + self._nl_D.T)
+        lam_op, clamp = self._operational_spectrum(lam_new)
+        if clamp is not None:
+            # clamped directions: make the guarded tangent the IMEX target at q_n, keeping f_tot(q_n) and W(q_n)
+            shift = lam_op - lam_new
+            self._nl_D = self._nl_D + np.diag(shift)
+            self._nl_c = self._nl_c - shift * q_new
+            self.W_ref = self.W_ref + 0.5 * float(np.sum(shift * q_new * q_new))
+            clamp["source"] = "fold"
+            self.clamp_log.append(clamp)
         self.nl_model.rotate(Q)
         Phi_new = self.Phi @ Q
         t2 = time.perf_counter()
@@ -1980,14 +2011,14 @@ class ReROMController:
         mode_mass = np.diag(mode_mass_matrix).copy()
         integrals = _reduced_inertia_from_pairs(self.r_ref, to_nodal(Phi_new, self.N), to_nodal(mass_modes, self.N))
         t3 = time.perf_counter()
-        damping = 2.0 * self.damping_ratio * np.sqrt(np.maximum(mode_mass * lam_new * mode_mass, 0.0))
+        damping = self._modal_damping(mode_mass, lam_op)
         arrays = io.ModelArrays(self.model)
-        io.write_modal_arrays(arrays, self.layout, mode_mass, lam_new, damping, mode_mass_matrix, integrals)
+        io.write_modal_arrays(arrays, self.layout, mode_mass, lam_op, damping, mode_mass_matrix, integrals)
         io.rotate_sample_rows(arrays, self.layout, Q)
         arrays.flush()
         io.write_body_state(state, self.layout, q=q_new, qd=qd_new)
         self.Phi = Phi_new
-        self.lam = lam_new  # folds re-diagonalize the operational tangent and write it unguarded
+        self.lam = lam_op
         self.lam_raw = lam_new.copy()
         self.g0 = g_new
         self._fnl = np.zeros(m)
@@ -2019,6 +2050,8 @@ class ReROMController:
             "K_exp_norm": float(np.linalg.norm(r["K_exp"], 2)),
             "lam_min": float(lam_new.min()),
             "lam_max": float(lam_new.max()),
+            "lam_operational_min": float(lam_op.min()),
+            "clamp": clamp,
             "rotation_offdiag": float(np.linalg.norm(Q - np.diag(np.diag(Q)))),
         }
         self.folds.append(info)

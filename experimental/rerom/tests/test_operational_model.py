@@ -210,5 +210,70 @@ class TestUpdateEnergies(unittest.TestCase):
         self.assertEqual(info["W_rel_error_model"], info["W_rel_error"])
 
 
+class TestFoldGuard(unittest.TestCase):
+    def _folding(self, path, guard):
+        asm = beam_assembler(young=2.0e6)
+        gen, _b, model, body, fixed = build_cantilever(asm, 8, damping_ratio=0.0, clamped=True)
+        solver = newton.solvers.SolverVBD(model, iterations=16)
+        control = model.control()
+        ctrl = free_controller(
+            model,
+            solver,
+            body,
+            asm,
+            gen,
+            fixed=fixed,
+            n_ritz=2,
+            trigger=rerom.RotationTrigger(theta_tol=None),
+            nonlinear_force=rerom.NonlinearForceOptions(interval=1),
+            policy=rerom.UpdatePolicy(path=path, guard_indefinite=guard),
+        )
+        s0, _ = run(solver, model.state(), model.state(), control, 30, 2.0e-3, ctrl, state_arg=True)
+        # injected indefinite hyper-reduced tangent (a negative direction the fold re-diagonalizes)
+        ctrl._nl_D = ctrl._nl_D.copy()
+        ctrl._nl_D[0, 0] -= 3.0 * ctrl.lam[0]
+        return ctrl, model, s0, control
+
+    def test_clamp_fold_writes_no_negative_stiffness(self):
+        """CLAMP + fold: eig(T) has a negative value, the written stiffness stays positive, lam_raw keeps the raw
+        value, f_tot and the model energy at q_n are unchanged and f_tot'(q_n) is the operational spectrum."""
+        for path in PATHS:
+            with self.subTest(path=path.value):
+                ctrl, model, s0, control = self._folding(path, rerom.IndefiniteGuard.CLAMP)
+                q, _ = ctrl.read_modes(s0)
+                q = q.astype(np.float64)
+                f_before = ctrl.nl_evaluate(q)["f_tot"]
+                w_before = ctrl.rom_energies(q)[1]
+                Phi_old = ctrl.Phi.copy()
+                info = ctrl.fold(s0, control)
+                m = ctrl.m
+                lam_w, _, _ = _written(model, m)
+                self.assertTrue(np.all(lam_w > 0.0))
+                self.assertLess(info["lam_min"], 0.0)
+                self.assertLess(float(ctrl.lam_raw.min()), 0.0)
+                np.testing.assert_allclose(ctrl.lam, lam_w, rtol=2.0e-6)
+                self.assertEqual(ctrl.clamp_log[-1]["source"], "fold")
+                Q = Phi_old.T @ (ctrl.M @ ctrl.Phi)  # the fold rotation (M-orthonormal bases)
+                q_rot = Q.T @ q
+                r = ctrl.nl_evaluate(q_rot, need_tangent=True)
+                scale = float(np.max(np.abs(ctrl.lam)))
+                np.testing.assert_allclose(r["T"], np.diag(ctrl.lam), atol=1.0e-6 * scale)
+                np.testing.assert_allclose(r["f_tot"], Q.T @ f_before, atol=1.0e-8 * float(np.linalg.norm(f_before)))
+                self.assertAlmostEqual(ctrl.rom_energies(q_rot)[1], w_before, delta=1.0e-9 * max(abs(w_before), 1.0))
+
+    def test_reject_guard_skips_the_fold(self):
+        for path in PATHS:
+            with self.subTest(path=path.value):
+                ctrl, model, s0, control = self._folding(path, rerom.IndefiniteGuard.REJECT)
+                k0 = model.elastic_mode_stiffness.numpy().copy()
+                Phi0, jq0 = ctrl.Phi.copy(), s0.joint_q.numpy().copy()
+                info = ctrl.fold(s0, control)
+                self.assertEqual(info["skipped"], "negative_stiffness")
+                np.testing.assert_array_equal(model.elastic_mode_stiffness.numpy(), k0)
+                np.testing.assert_array_equal(ctrl.Phi, Phi0)
+                np.testing.assert_array_equal(s0.joint_q.numpy(), jq0)
+                self.assertEqual(ctrl.steps_since_fold, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
