@@ -83,6 +83,7 @@ from .options import (
     BasisOptions,
     IndefiniteGuard,
     NonlinearForceOptions,
+    RejectReason,
     RestRotationMode,
     TransferMode,
     TriggerOptions,
@@ -101,8 +102,27 @@ __all__ = [
     "UpdateSync",
 ]
 
-INTERFACE_COND_MAX = 1.0e12
-"""Largest accepted condition number of ``F G^-1 F^T`` in the interface-constrained velocity transfer."""
+UPDATE_STAGES = ("assembly", "basis", "interface_map", "transfer", "commit")
+"""Stages of a candidate update, in order; ``relinearize(debug={"reject_at": stage})`` forces a rejection there.
+
+``assembly``: reference, internal force and tangent evaluated and checked; ``basis``: new basis built
+(adapter); ``interface_map``: endpoint / interface-frame maps and adapter state staged (adapter);
+``transfer``: transferred state and integrals computed, candidate validated; ``commit``: immediately before the
+first write."""
+
+
+class _UpdateRejected(Exception):
+    """A candidate update failed a check (or a forced rejection); nothing has been written."""
+
+    def __init__(self, reason: RejectReason, stage: str, detail: str = ""):
+        super().__init__(f"{reason.value} at {stage}: {detail}")
+        self.reason = reason
+        self.stage = stage
+        self.detail = detail
+
+
+def _no_stage(_name: str) -> None:
+    """Stage hook of an adapter called outside :meth:`ReROMController.relinearize`."""
 
 
 # ----------------------------------------------------------------------------------------------
@@ -132,9 +152,15 @@ class BodyAdapter:
         """Return the new basis and state for the update context ``ctx`` (see :meth:`ReROMController.relinearize`).
 
         ``lam`` is the raw restricted spectrum of the new basis; the controller derives the operational
-        spectrum (:class:`~rerom.IndefiniteGuard`) and the modal damping from it.
+        spectrum (:class:`~rerom.IndefiniteGuard`) and the modal damping from it. ``rebuild`` must not mutate
+        the adapter, the controller or the model: adapter state that changes with the update is returned as
+        ``"adapter_state"`` and applied by :meth:`commit` once the candidate is accepted. ``ctx["stage"](name)``
+        marks a stage of :data:`UPDATE_STAGES` (it raises to reject the candidate there).
         """
         raise NotImplementedError
+
+    def commit(self, ctrl: ReROMController, staged: dict | None) -> None:
+        """Apply the adapter state staged by :meth:`rebuild` after the candidate was accepted."""
 
 
 class FreeBodyAdapter(BodyAdapter):
@@ -174,6 +200,7 @@ class FreeBodyAdapter(BodyAdapter):
         K_T, f_int, x_new = ctx["K_T"], ctx["f_int"], ctx["x_new"]
         timings = ctx["timings"]
         debug = ctx["debug"]
+        stage = ctx.get("stage", _no_stage)
         t1 = time.perf_counter()
 
         # ---- restricted eigenproblem ------------------------------------------------------------
@@ -300,8 +327,9 @@ class FreeBodyAdapter(BodyAdapter):
                 f_ext = M @ np.tile(ctx["R"].T @ g, N)
             cands.append(("f_ext", f_ext))
             cands.append(("M v", M @ (ctrl.Phi @ ctx["qd"])))
-            if ctrl._qdd_est is not None:
-                cands.append(("M a", M @ (ctrl.Phi @ ctrl._qdd_est)))
+            qdd_est = ctx.get("qdd_est")
+            if qdd_est is not None:
+                cands.append(("M a", M @ (ctrl.Phi @ qdd_est)))
             ritz_vecs = ritz_enrichment(block, cands, solve_r, o.n_ritz, krylov=o.ritz_krylov, M=M)
             ritz_kept = len(ritz_vecs)
             block.fill(V, n_eig, m)
@@ -316,7 +344,11 @@ class FreeBodyAdapter(BodyAdapter):
         mode_mass_matrix = Phi_new.T @ mass_modes
         mode_mass = np.diag(mode_mass_matrix).copy()
         lam = np.diag(Phi_new.T @ (K_T @ Phi_new)) / mode_mass
+        eigen_residual = None
+        if ctx.get("eigen_residual") and do_rebasis:
+            eigen_residual = _eigen_residual(K_T, M, V[:, : min(m, V.shape[1])], np.asarray(vals)[: min(m, V.shape[1])])
         t2 = time.perf_counter()
+        stage("basis")
         f_outside = factor["t"] - f_in_eig
         timings["eigen"] = t2 - t1 - t_cmp
         timings["factorization"] = float(eig_info.get("t_factor", 0.0)) + factor["t"]
@@ -337,52 +369,21 @@ class FreeBodyAdapter(BodyAdapter):
         if debug.get("keep_endpoint_psi") and ep_idx.size:
             arr = ctx["arrays"].get("elastic_endpoint_psi")
             ep_psi = np.stack([arr[ep.endpoint * lay.Mx + np.arange(m)] for ep in lay.endpoints])
+        stage("interface_map")
+        info = {
+            "eigen_raw": np.asarray(vals).tolist(),
+            "negative_eigenvalues": int(np.count_nonzero(np.asarray(vals) < 0.0)),
+            "eigen_info": {k: v for k, v in eig_info.items() if k != "sigma_tries"},
+            "ritz": ritz_info,
+            "ritz_kept": ritz_kept,
+            "md_kept": md_kept,
+            **({"eigen_compare": eig_compare} if eig_compare is not None else {}),
+            **({"eigen_residual_max": eigen_residual} if eigen_residual is not None else {}),
+        }
 
         # ---- state projection: rigid part -> frame twist (about com_new), remainder -> qd ----------
-        if ctx.get("device_projection"):
-            # device path (rerom.update_kernels): only the rigid Gram matrix about com_new is formed here
-            dynamic = not (ctrl.constrained or not lay.frame_dynamic)
-            return {
-                "transfer_mode": TransferMode.FREE if dynamic else TransferMode.PRESCRIBED_FRAME,
-                "Phi": Phi_new,
-                "mass_modes": mass_modes,
-                "mode_mass_matrix": mode_mass_matrix,
-                "mode_mass": mode_mass,
-                "lam": lam,
-                "rigid": (mass_new, com_new, I_new),
-                "ep_phi": ep_phi,
-                "ep_psi": ep_psi,
-                "map_shapes": True,
-                "projection": {"mode": 0 if dynamic else 1, "G": (Yraw.T @ (M @ Yraw)) if dynamic else None},
-                "v_c": None,
-                "omega": None,
-                "qd": None,
-                "u_el_old": None,
-                "t_samples": t2,
-                "solver": get_solver,
-                "info": {
-                    "eigen_raw": np.asarray(vals).tolist(),
-                    "negative_eigenvalues": int(np.count_nonzero(np.asarray(vals) < 0.0)),
-                    "eigen_info": {k: v for k, v in eig_info.items() if k != "sigma_tries"},
-                    "ritz": ritz_info,
-                    "ritz_kept": ritz_kept,
-                    "md_kept": md_kept,
-                    **({"eigen_compare": eig_compare} if eig_compare is not None else {}),
-                },
-            }
-        R, u_local, qd = ctx["R"], ctx["u_local"], ctx["qd"]
         prescribed = ctrl.constrained or not lay.frame_dynamic
-        if prescribed:
-            omega_l = R.T @ ctx["omega"]
-            t_vec = R.T @ ctx["v_c"] + np.cross(omega_l, com_new - ctrl.com)
-            w_vec = omega_l
-            u_rig = u_local - ctrl.Phi @ qd
-        else:
-            coeff, u_rig = split_rigid_velocity(u_local, Yraw, M)
-            t_vec, w_vec = coeff[:3], coeff[3:]
-        u_el_old = u_local - u_rig
-        qd_new = project_modal_velocity(u_el_old, Phi_new, M, mode_mass_matrix)
-        return {
+        out = {
             "transfer_mode": TransferMode.PRESCRIBED_FRAME if prescribed else TransferMode.FREE,
             "Phi": Phi_new,
             "mass_modes": mass_modes,
@@ -393,22 +394,46 @@ class FreeBodyAdapter(BodyAdapter):
             "ep_phi": ep_phi,
             "ep_psi": ep_psi,
             "map_shapes": True,
-            "v_c": R @ t_vec,
-            "omega": R @ w_vec,
-            "qd": qd_new,
-            "u_el_old": u_el_old,
             "t_samples": t2,
             "solver": get_solver,
-            "info": {
-                "eigen_raw": np.asarray(vals).tolist(),
-                "negative_eigenvalues": int(np.count_nonzero(np.asarray(vals) < 0.0)),
-                "eigen_info": {k: v for k, v in eig_info.items() if k != "sigma_tries"},
-                "ritz": ritz_info,
-                "ritz_kept": ritz_kept,
-                "md_kept": md_kept,
-                **({"eigen_compare": eig_compare} if eig_compare is not None else {}),
-            },
+            "info": info,
         }
+        if ctx.get("device_projection"):
+            # device path (rerom.update_kernels): only the rigid Gram matrix about com_new is formed here; the host
+            # transfer is evaluated only on request (transfer-energy budget)
+            out["projection"] = {"mode": 1 if prescribed else 0, "G": None if prescribed else (Yraw.T @ (M @ Yraw))}
+            out.update(v_c=None, omega=None, qd=None, u_el_old=None)
+            if ctx.get("host_transfer"):
+                out["host_transfer"] = self._host_transfer(ctrl, ctx, Phi_new, mode_mass_matrix, com_new, Yraw)
+            return out
+        out.update(self._host_transfer(ctrl, ctx, Phi_new, mode_mass_matrix, com_new, Yraw))
+        return out
+
+    @staticmethod
+    def _old_elastic_velocity(ctrl, ctx, com_new, Yraw):
+        """Frame twist ``(t, w)`` (body frame, about ``com_new``) and old elastic nodal velocity of the transfer.
+
+        Free dynamic frame: M-orthogonal split of ``u_local`` into the rigid motions of ``r_new``; clamped basis or
+        kinematic frame: the frame twist is kept and the old elastic velocity is ``Phi_old qd``.
+        """
+        R, u_local, qd = ctx["R"], ctx["u_local"], ctx["qd"]
+        if ctrl.constrained or not ctrl.layout.frame_dynamic:
+            omega_l = R.T @ ctx["omega"]
+            t_vec = R.T @ ctx["v_c"] + np.cross(omega_l, com_new - ctrl.com)
+            w_vec = omega_l
+            u_rig = u_local - ctrl.Phi @ qd
+        else:
+            coeff, u_rig = split_rigid_velocity(u_local, Yraw, ctrl.M)
+            t_vec, w_vec = coeff[:3], coeff[3:]
+        return t_vec, w_vec, u_local - u_rig
+
+    @classmethod
+    def _host_transfer(cls, ctrl, ctx, Phi_new, mode_mass_matrix, com_new, Yraw) -> dict:
+        """Host state transfer: frame twist (world) and the M-orthogonal projection of the old elastic velocity."""
+        R = ctx["R"]
+        t_vec, w_vec, u_el_old = cls._old_elastic_velocity(ctrl, ctx, com_new, Yraw)
+        qd_new = project_modal_velocity(u_el_old, Phi_new, ctrl.M, mode_mass_matrix)
+        return {"v_c": R @ t_vec, "omega": R @ w_vec, "qd": qd_new, "u_el_old": u_el_old}
 
 
 class InterfaceBodyAdapter(BodyAdapter):
@@ -453,6 +478,11 @@ class InterfaceBodyAdapter(BodyAdapter):
         if self.offset is not None and sum(self.ep_is_tip) != 1:
             raise ValueError(f"expected one tip endpoint at the offset, found {self.ep_is_tip}")
 
+    def commit(self, ctrl, staged):
+        """Apply the staged tip position, frame map and endpoint offset of an accepted update."""
+        for key, value in (staged or {}).items():
+            setattr(self, key, value)
+
     def tip_frame_body(self, q):
         """Body-frame tip-frame position and rotation vector (linear, as the Newton endpoint) at ``q``."""
         if self.frame_map is None:
@@ -467,6 +497,7 @@ class InterfaceBodyAdapter(BodyAdapter):
         q, qd, R = ctx["q"], ctx["qd"], ctx["R"]
         K_T, f_int, x_new = ctx["K_T"], ctx["f_int"], ctx["x_new"]
         timings = ctx["timings"]
+        stage = ctx.get("stage", _no_stage)
         t1 = time.perf_counter()
         u_el_old = ctrl.Phi @ qd
         fdot = self.frame_map @ qd if self.frame_map is not None else None
@@ -501,15 +532,25 @@ class InterfaceBodyAdapter(BodyAdapter):
         timings["ritz"] = binfo["t_ritz"]
         timings["projection"] = binfo["t_rayleigh"]
         timings["basis"] = t2 - t1
+        stage("basis")
 
         mass_modes = M @ Phi_new
         mode_mass_matrix = Phi_new.T @ mass_modes
         mode_mass = np.diag(mode_mass_matrix).copy()
         # state projection: frame twist kept, interface velocities preserved (minimum kinetic energy in the
         # reduced metric; the Euclidean formula for the M-orthonormal CB basis). Affine, not energy-contracting.
-        qd_new, transfer_info = transfer_modal_velocity(
-            u_el_old, Phi_new, M, mode_mass_matrix, F=F_new, fdot=fdot, cond_max=INTERFACE_COND_MAX
-        )
+        try:
+            qd_new, transfer_info = transfer_modal_velocity(
+                u_el_old,
+                Phi_new,
+                M,
+                mode_mass_matrix,
+                F=F_new,
+                fdot=fdot,
+                cond_max=ctrl.policy.validation.interface_cond_max,
+            )
+        except (ValueError, np.linalg.LinAlgError) as err:
+            raise _UpdateRejected(RejectReason.INTERFACE_CONSTRAINT, "transfer", str(err)) from err
         mass_new, com_new, I_new = rigid_properties(M, x_new)
         omega_l = R.T @ ctx["omega"]
         t_vec = R.T @ ctx["v_c"] + np.cross(omega_l, com_new - ctrl.com)
@@ -521,15 +562,18 @@ class InterfaceBodyAdapter(BodyAdapter):
             if is_tip:
                 ep_phi[i] = F_new[:3].T
                 ep_psi[i] = F_new[3:].T
+        staged: dict[str, Any] = {}
         if self.offset is not None:
             # the offset follows the tip frame (linearised like Newton's endpoint update at this q)
-            self.offset = self.offset + np.cross(self.frame_map[3:] @ q, self.offset)
+            offset_new = self.offset + np.cross(self.frame_map[3:] @ q, self.offset)
+            staged["offset"] = offset_new
             for i, is_tip in enumerate(self.ep_is_tip):
                 if is_tip:
-                    ep_phi[i] = ep_phi[i] + np.cross(ep_psi[i], self.offset)
+                    ep_phi[i] = ep_phi[i] + np.cross(ep_psi[i], offset_new)
         if F_new is not None:
-            self.tip_pos = tip_pos_new
-            self.frame_map = F_new
+            staged["tip_pos"] = tip_pos_new
+            staged["frame_map"] = F_new
+        stage("interface_map")
         fdot_after = (F_new @ qd_new) if F_new is not None else None
         mode = TransferMode.INTERFACE_CONSTRAINED if F_new is not None else TransferMode.PRESCRIBED_FRAME
         return {
@@ -544,6 +588,7 @@ class InterfaceBodyAdapter(BodyAdapter):
             "ep_psi": ep_psi,
             "map_shapes": True,
             "projection": {"mode": 2, "G": None},
+            "adapter_state": staged,
             "v_c": R @ t_vec,
             "omega": ctx["omega"],
             "qd": qd_new,
@@ -561,6 +606,17 @@ class InterfaceBodyAdapter(BodyAdapter):
                 "interface_schur_condition": transfer_info.get("schur_condition"),
             },
         }
+
+
+def _eigen_residual(K, M, V: np.ndarray, vals: np.ndarray) -> float:
+    """Largest relative eigen residual ``|K v - lam M v| / max(|K v|, |lam| |M v|)`` of the pairs ``(vals, V)``."""
+    if V.shape[1] == 0:
+        return 0.0
+    KV = K @ V
+    MV = M @ V
+    r = np.linalg.norm(KV - MV * vals[None, :], axis=0)
+    scale = np.maximum(np.linalg.norm(KV, axis=0), np.abs(vals) * np.linalg.norm(MV, axis=0))
+    return float(np.max(r / np.maximum(scale, 1.0e-300)))
 
 
 class _GatheredArrays:
@@ -736,6 +792,11 @@ class ReROMController:
             "suppressed_by": None,
         }
         self._tet_rest: tuple[np.ndarray, np.ndarray] | None = None
+        self.rejections: list[dict] = []
+        self.consecutive_rejections = 0
+        self._retry_after_step: int | None = None
+        self._updates_blocked = False
+        self.validity_alarms: dict[str, Any] = {"count": 0, "last_step": None, "last_reason": None}
 
         # IMEX hyper-reduced remainder, folding
         self.nl_options = nonlinear_force
@@ -819,8 +880,11 @@ class ReROMController:
             self._in_contact = bool(in_contact)
 
     def request_update(self) -> None:
-        """Force an update at the next :meth:`poll` (reason ``"requested"``), bypassing the trigger."""
+        """Force an update attempt at the next :meth:`poll` (reason ``"requested"``), bypassing the trigger, the
+        rejection back-off and a rejection-limit block."""
         self._update_requested = True
+        self._retry_after_step = None
+        self._updates_blocked = False
 
     def frozen(self) -> bool:
         """Whether the update policy currently forbids updates."""
@@ -832,7 +896,13 @@ class ReROMController:
         return p.freeze_from_step is not None and self.step_count >= p.freeze_from_step
 
     def update_suppression(self) -> str | None:
-        """Controller-side gate besides :meth:`frozen` that suppresses triggers now (``None``: none)."""
+        """Controller-side gate besides :meth:`frozen` that suppresses triggers now (``None``: none):
+        ``"rejection_limit"`` after ``ValidationOptions.max_consecutive_rejections`` rejections in a row (until
+        :meth:`request_update`), ``"rejection_backoff"`` for ``backoff_steps`` steps after a rejection."""
+        if self._updates_blocked:
+            return "rejection_limit"
+        if self._retry_after_step is not None and self.step_count < self._retry_after_step:
+            return "rejection_backoff"
         return None
 
     def note_accuracy_unverified(self, reason: str, suppressed_by: str, metrics: dict | None = None) -> None:
@@ -1114,14 +1184,27 @@ class ReROMController:
             if self._update_requested:
                 self._update_requested = False
                 return True, "requested", {}
-            return self.trigger.evaluate(self, state, self.steps_since_update)
+            fire, reason, metrics = self.trigger.evaluate(self, state, self.steps_since_update)
+            if fire and reason.startswith("validity"):
+                a = self.validity_alarms
+                a["count"] += 1
+                a["last_step"] = self.step_count
+                a["last_reason"] = reason
+                # validity alarms bypass the trigger gates, but not the rejection back-off: rebuilding at the same
+                # invalid state again would be rejected again
+                blocked = self.update_suppression()
+                if blocked is not None:
+                    self.note_accuracy_unverified(reason, blocked, metrics)
+                    return False, "", metrics
+            return fire, reason, metrics
         finally:
             self._unbind()
 
     def after_step(self, state, control, dt: float) -> bool:
         """Record history, evaluate the trigger, re-linearize when it fires (fold otherwise when due).
 
-        Returns True on an update.
+        Returns True on an accepted update (a rejected candidate returns False and is logged in
+        :attr:`rejections`).
         """
         log: dict[str, Any] = {"step": self.step_count + 1}
         t_tr = time.perf_counter()
@@ -1135,10 +1218,12 @@ class ReROMController:
             info = self.relinearize(state, control)
             info["trigger"] = reason
             info["trigger_metrics"] = metrics
-            log["update"] = True
             log["t_update"] = info["timings"]["total"]
-            self.step_log.append(log)
-            return True
+            if info["accepted"]:
+                log["update"] = True
+                self.step_log.append(log)
+                return True
+            log["update_rejected"] = info["reason"]
         if self.fold_interval is not None and self.steps_since_fold >= self.fold_interval:
             finfo = self.fold(state, control)
             log["t_fold"] = finfo["timings"]["total"]
@@ -1148,32 +1233,48 @@ class ReROMController:
     # ------------------------------------------------------------------------------------------
     # update
     # ------------------------------------------------------------------------------------------
+    @property
+    def rejection_count(self) -> int:
+        """Number of rejected candidate updates so far."""
+        return len(self.rejections)
+
     def relinearize(
         self, state, control=None, *, stiffness_override=None, rebasis: bool | None = None, debug=None
     ) -> dict:
-        """Re-linearize at ``r_new = r_ref + Phi q`` and rewrite the Model/state in place.
+        """Re-linearize at ``r_new = r_ref + Phi q`` and rewrite the Model/state in place, transactionally.
+
+        The candidate (reference, basis, raw/operational spectra, pre-stress, inertia, sample/endpoint maps,
+        transferred state and adapter state) is built without writing anything, checked against
+        :class:`~rerom.ValidationOptions` (``UpdatePolicy.validation``) and then committed. A failed check returns
+        ``{"accepted": False, "reason": ..., "stage": ..., "detail": ...}`` (a :class:`~rerom.RejectReason` value
+        and a stage of :data:`UPDATE_STAGES`), logs it in :attr:`rejections` and leaves the Model, the State,
+        ``control``, the controller record and the adapter unchanged; the trigger then backs off for
+        ``backoff_steps`` steps. Rolling the solver state back and retrying a step is not implemented.
 
         Args:
             state: Current state (rewritten: ``q = 0``, projected velocities).
             control: When given, the new pre-stress is written to ``control.joint_f``.
             stiffness_override: ``(W, f_int, K)`` replacing the assembler evaluation (tests).
             rebasis: Overrides :attr:`BasisOptions.rebasis` for this call (free-body adapter).
-            debug: Diagnostics switches ``keep_basis`` / ``keep_endpoint_psi`` (free-body adapter).
+            debug: Diagnostics switches ``keep_basis`` / ``keep_endpoint_psi`` (free-body adapter) and
+                ``reject_at`` (a stage name: force a rejection there; tests).
 
-        Returns the per-update diagnostics (also appended to :attr:`stats`): wall-clock split ``timings``;
-        raw (``eigenvalues``, ``lam_raw_min``) and operational (``eigenvalues_operational``,
+        Returns the per-update diagnostics (also appended to :attr:`stats`): ``accepted``, wall-clock split
+        ``timings``; raw (``eigenvalues``, ``lam_raw_min``) and operational (``eigenvalues_operational``,
         ``lam_operational_min``) spectra and the clamp record; the transfer mode (:class:`~rerom.TransferMode`);
         nodal kinetic energy ``KE_before`` / ``KE_after`` and the signed ``delta_KE`` [J]; the projection
         residual ``velocity_projection_residual_energy = 1/2 e^T M e`` (alias ``KE_lost_projection``, an energy
         loss only in :attr:`TransferMode.FREE`); linear/angular momentum before/after with absolute (``dP``,
         ``dL``) and relative (``dP_rel``, ``dL_rel``) changes; the maximum nodal position change; the interface
-        velocity mismatch (interface adapter); nonlinear vs ROM strain energy. Model mass offsets (armature) are
-        not part of the nodal energies and momenta.
+        velocity mismatch (interface adapter); ``det_f_min`` of the new reference; nonlinear vs ROM strain
+        energy. Model mass offsets (armature) are not part of the nodal energies and momenta.
         """
         if self._dev is not None:
             return self._relinearize_device(state, control, stiffness_override, rebasis, debug)
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
+        debug = debug or {}
+        stage = self._stage_hook(debug)
         arrays = io.ModelArrays(self.model)
         self._bind(state)
         try:
@@ -1187,62 +1288,85 @@ class ReROMController:
         finally:
             self._unbind()
 
-        # ---- 1. nonlinear evaluation ---------------------------------------------------------------
-        if stiffness_override is None:
-            W_nl, f_int, K_T = self.assembler.evaluate(x_new.reshape(-1), need_tangent=True)
-        else:
-            W_nl, f_int, K_T = stiffness_override
-        f_int = np.asarray(f_int, dtype=np.float64)
-        K_T = host_sparse(K_T)
-        K_T = 0.5 * (K_T + K_T.T)
-        t1 = time.perf_counter()
-        timings["assembly"] = t1 - t0
+        try:
+            # ---- 1. nonlinear evaluation -----------------------------------------------------------
+            self._check_finite(RejectReason.NON_FINITE, "assembly", modal_state=(q, qd, v_c, omega))
+            det_f_min = self._check_reference(x_new)
+            if stiffness_override is None:
+                W_nl, f_int, K_T = self.assembler.evaluate(x_new.reshape(-1), need_tangent=True)
+            else:
+                W_nl, f_int, K_T = stiffness_override
+            f_int = np.asarray(f_int, dtype=np.float64)
+            K_T = host_sparse(K_T)
+            K_T = 0.5 * (K_T + K_T.T)
+            self._check_finite(RejectReason.NON_FINITE, "assembly", W=W_nl, f_int=f_int, K_T=K_T.data)
+            t1 = time.perf_counter()
+            timings["assembly"] = t1 - t0
+            stage("assembly")
 
-        # ---- 2. basis + state projection (adapter) ------------------------------------------------
-        ctx = {
-            "state": state,
-            "q": q,
-            "qd": qd,
-            "R": R,
-            "v_c": v_c,
-            "omega": omega,
-            "x_new": x_new,
-            "u_local": u_local,
-            "f_int": f_int,
-            "K_T": K_T,
-            "timings": timings,
-            "arrays": arrays,
-            "rebasis": rebasis,
-            "debug": debug or {},
-        }
-        res = self.adapter.rebuild(self, ctx)
-        Phi_new, mode_mass, lam = res["Phi"], res["mode_mass"], res["lam"]
-        mass_new, com_new, I_new = res["rigid"]
-        g0 = Phi_new.T @ f_int
-        t2 = time.perf_counter()
+            # ---- 2. basis + state projection (adapter) --------------------------------------------
+            ctx = {
+                "state": state,
+                "q": q,
+                "qd": qd,
+                "R": R,
+                "v_c": v_c,
+                "omega": omega,
+                "x_new": x_new,
+                "u_local": u_local,
+                "f_int": f_int,
+                "K_T": K_T,
+                "timings": timings,
+                "arrays": arrays,
+                "rebasis": rebasis,
+                "debug": debug,
+                "qdd_est": self._qdd_est,
+                "stage": stage,
+                "eigen_residual": self.policy.validation.eigen_residual_tol is not None,
+            }
+            res = self.adapter.rebuild(self, ctx)
+            Phi_new, mode_mass, lam = res["Phi"], res["mode_mass"], res["lam"]
+            mass_new, com_new, I_new = res["rigid"]
+            g0 = Phi_new.T @ f_int
+            t2 = time.perf_counter()
 
-        # ---- 3. integrals / samples -----------------------------------------------------------------
-        nodal_phi = to_nodal(Phi_new, self.N)
-        integrals = _reduced_inertia_from_pairs(x_new, nodal_phi, to_nodal(res["mass_modes"], self.N))
-        rp_phi = self.map_samples(self.layout.render_samples, nodal_phi)
-        sh_phi = self.map_samples(self.layout.shape_samples, nodal_phi) if self.layout.shape_samples.size else None
-        t3 = time.perf_counter()
-        timings["integrals"] = t3 - t2 + (t2 - res["t_samples"] if "t_samples" in res else 0.0)
+            # ---- 3. integrals / samples -------------------------------------------------------------
+            nodal_phi = to_nodal(Phi_new, self.N)
+            integrals = _reduced_inertia_from_pairs(x_new, nodal_phi, to_nodal(res["mass_modes"], self.N))
+            rp_phi = self.map_samples(self.layout.render_samples, nodal_phi)
+            sh_phi = self.map_samples(self.layout.shape_samples, nodal_phi) if self.layout.shape_samples.size else None
+            t3 = time.perf_counter()
+            timings["integrals"] = t3 - t2 + (t2 - res["t_samples"] if "t_samples" in res else 0.0)
 
-        # kinetic energy bookkeeping
-        qd_new = res["qd"]
-        u_el_old = res["u_el_old"]
-        M = self.M
-        resid = u_el_old - Phi_new @ qd_new
-        ke_lost = 0.5 * float(resid @ (M @ resid))
-        ke_el = 0.5 * float(u_el_old @ (M @ u_el_old))
-        W_rom, W_rom_model = self.rom_energies(q)
+            # kinetic energy bookkeeping
+            qd_new = res["qd"]
+            u_el_old = res["u_el_old"]
+            M = self.M
+            resid = u_el_old - Phi_new @ qd_new
+            ke_lost = 0.5 * float(resid @ (M @ resid))
+            ke_el = 0.5 * float(u_el_old @ (M @ u_el_old))
+            W_rom, W_rom_model = self.rom_energies(q)
 
-        # operational spectrum (what the solver steps) and its damping
-        lam_op, clamp = self._operational_spectrum(lam)
-        damping = self._modal_damping(mode_mass, lam_op)
+            # operational spectrum (what the solver steps) and its damping
+            lam_op, clamp = self._operational_spectrum(lam)
+            damping = self._modal_damping(mode_mass, lam_op)
 
-        # ---- 4. rewrite model (one gather / one scatter per array) and state -------------------------
+            # ---- candidate checks --------------------------------------------------------------------
+            self._check_candidate(res, g0, lam_op, damping)
+            self._check_finite(
+                RejectReason.NON_FINITE,
+                "transfer",
+                integrals=[np.asarray(v, dtype=np.float64) for v in integrals if v is not None],
+                render=rp_phi,
+                shape=sh_phi,
+            )
+            self._check_transfer(res, Phi_new, com_new, before["KE"], x_new, R)
+            stage("transfer")
+            stage("commit")
+        except _UpdateRejected as rej:
+            return self._reject(rej, t0, timings)
+
+        # ---- 4. commit: rewrite model (one gather / one scatter per array) and state ----------------
         if clamp is not None:
             self.clamp_log.append(clamp)
         io.write_modal_arrays(arrays, self.layout, mode_mass, lam_op, damping, res["mode_mass_matrix"], integrals)
@@ -1261,6 +1385,7 @@ class ReROMController:
         io.write_body_state(state, self.layout, q=0.0, v_c=res["v_c"], omega=res["omega"], qd=qd_new)
 
         # controller record
+        self.adapter.commit(self, res.get("adapter_state"))
         com_old = self.com
         self.r_ref = x_new
         self.Phi = Phi_new
@@ -1289,6 +1414,7 @@ class ReROMController:
         after = self.nodal_momentum(state)
         position_change = float(np.max(np.linalg.norm(self.world_field(state) - x_world_before, axis=1)))
         info = {
+            "accepted": True,
             "body": self.body,
             "step": self.step_count,
             "interval": self.steps_since_update,
@@ -1304,15 +1430,14 @@ class ReROMController:
                 (p_frame, R, mass_new, com_new, I_new),
                 position_change,
             ),
+            "det_f_min": det_f_min,
             "q_norm_before": float(np.linalg.norm(q)),
             "com_shift": float(np.linalg.norm(com_new - com_old)),
             **res["info"],
         }
         if nl_info:
             info["nl_model"] = nl_info
-        self.stats.append(info)
-        self.steps_since_update = 0
-        self.trigger.on_update(self)
+        self._accepted(info)
         return info
 
     def _relinearize_device(self, state, control, stiffness_override, rebasis, debug) -> dict:
@@ -1321,60 +1446,84 @@ class ReROMController:
         t0 = time.perf_counter()
         dev = self._dev
         lay = self.layout
+        debug = debug or {}
+        stage = self._stage_hook(debug)
+        v = self.policy.validation
 
         # ---- 1. recovery + assembly on the device, ONE packed device-to-host copy -------------------
         g = dev.gather(state, need_assembly=stiffness_override is None)
         q, qd, v_c, omega = g.q, g.qd, g.v_c, g.omega
         R = quat_to_matrix(g.quat)
         x_new = g.x_new.copy()
-        self._qdd_est = g.qdd.copy() if self._dev_qdd_valid else None
-        if stiffness_override is not None:
-            W_nl, f_int, K_T = stiffness_override
-        elif g.f_int is not None:
-            if g.inverted:
-                raise FloatingPointError("inverted element(s): det F <= 0")
-            W_nl, f_int, K_T = g.W, g.f_int, dev.device_assembler.scipy_from_block_values(g.K_values, "csr")
-        else:  # host assembler: evaluate at the gathered reference
-            W_nl, f_int, K_T = self.assembler.evaluate(x_new.reshape(-1), need_tangent=True)
-        f_int = np.asarray(f_int, dtype=np.float64)
-        K_T = host_sparse(K_T)
-        K_T = 0.5 * (K_T + K_T.T)
-        t1 = time.perf_counter()
-        timings["assembly"] = t1 - t0
+        try:
+            self._check_finite(RejectReason.NON_FINITE, "assembly", modal_state=(q, qd, v_c, omega))
+            det_f_min = self._check_reference(x_new)
+            if stiffness_override is not None:
+                W_nl, f_int, K_T = stiffness_override
+            elif g.f_int is not None:
+                if g.inverted:
+                    if v.det_f_floor is None:
+                        raise FloatingPointError("inverted element(s): det F <= 0")
+                    raise _UpdateRejected(RejectReason.INVERTED_ELEMENT, "assembly", "device assembly: det F <= 0")
+                W_nl, f_int, K_T = g.W, g.f_int, dev.device_assembler.scipy_from_block_values(g.K_values, "csr")
+            else:  # host assembler: evaluate at the gathered reference
+                W_nl, f_int, K_T = self.assembler.evaluate(x_new.reshape(-1), need_tangent=True)
+            f_int = np.asarray(f_int, dtype=np.float64)
+            K_T = host_sparse(K_T)
+            K_T = 0.5 * (K_T + K_T.T)
+            self._check_finite(RejectReason.NON_FINITE, "assembly", W=W_nl, f_int=f_int, K_T=K_T.data)
+            t1 = time.perf_counter()
+            timings["assembly"] = t1 - t0
+            stage("assembly")
 
-        # ---- 2. basis (host; the adapter skips the state projection) --------------------------------
-        ctx = {
-            "state": state,
-            "q": q,
-            "qd": qd,
-            "R": R,
-            "v_c": v_c,
-            "omega": omega,
-            "x_new": x_new,
-            "u_local": None,
-            "f_int": f_int,
-            "K_T": K_T,
-            "timings": timings,
-            "arrays": _GatheredArrays(self.model, g.gravity, lay.world),
-            "rebasis": rebasis,
-            "debug": debug or {},
-            "device_projection": True,
-        }
-        res = self.adapter.rebuild(self, ctx)
-        Phi_new, mode_mass, lam = res["Phi"], res["mode_mass"], res["lam"]
-        mass_new, com_new, I_new = res["rigid"]
-        g0 = Phi_new.T @ f_int
-        t2 = time.perf_counter()
+            # ---- 2. basis (host; the adapter skips the state projection) ----------------------------
+            host_transfer = v.transfer_energy_budget is not None
+            ctx = {
+                "state": state,
+                "q": q,
+                "qd": qd,
+                "R": R,
+                "v_c": v_c,
+                "omega": omega,
+                "x_new": x_new,
+                "u_local": self._host_local_velocity(R, v_c, omega, qd, x_new) if host_transfer else None,
+                "f_int": f_int,
+                "K_T": K_T,
+                "timings": timings,
+                "arrays": _GatheredArrays(self.model, g.gravity, lay.world),
+                "rebasis": rebasis,
+                "debug": debug,
+                "device_projection": True,
+                "host_transfer": host_transfer,
+                "qdd_est": g.qdd.copy() if self._dev_qdd_valid else None,
+                "stage": stage,
+                "eigen_residual": v.eigen_residual_tol is not None,
+            }
+            res = self.adapter.rebuild(self, ctx)
+            Phi_new, mode_mass, lam = res["Phi"], res["mode_mass"], res["lam"]
+            mass_new, com_new, I_new = res["rigid"]
+            g0 = Phi_new.T @ f_int
+            t2 = time.perf_counter()
 
-        # operational spectrum (what the solver steps) and its damping
-        lam_op, clamp = self._operational_spectrum(lam)
-        damping = self._modal_damping(mode_mass, lam_op)
+            # operational spectrum (what the solver steps) and its damping
+            lam_op, clamp = self._operational_spectrum(lam)
+            damping = self._modal_damping(mode_mass, lam_op)
 
-        # ---- 3. ONE packed host-to-device copy, rewrite kernels in place ------------------------------
+            # ---- candidate checks --------------------------------------------------------------------
+            proj = res["projection"]
+            mode = int(proj["mode"])
+            self._check_candidate(res, g0, lam_op, damping)
+            if mode == 2 or host_transfer:
+                tr = res if mode == 2 else res["host_transfer"]
+                self._check_transfer(tr, Phi_new, com_new, 0.5 * float(g.moments[6]), x_new, R)
+            stage("transfer")
+            stage("commit")
+        except _UpdateRejected as rej:
+            return self._reject(rej, t0, timings)
+
+        # ---- 3. commit: ONE packed host-to-device copy, rewrite kernels in place -----------------------
         if clamp is not None:
             self.clamp_log.append(clamp)
-        proj = res["projection"]
-        mode = int(proj["mode"])
         mass_total = mass_new + self.mass_offset
         inertia_total = I_new + self.inertia_offset
         dynamic = lay.frame_dynamic
@@ -1420,6 +1569,7 @@ class ReROMController:
                 )
         if self.rest_propagator is not None:
             self.rest_propagator.fix()
+        self.adapter.commit(self, res.get("adapter_state"))
         com_old = self.com
         self.r_ref = x_new
         self.Phi = Phi_new
@@ -1463,6 +1613,7 @@ class ReROMController:
             P_a, L_a = nan3, nan3
             ke_after = ke_el = ke_lost = position_change = float("nan")
         info = {
+            "accepted": True,
             "body": self.body,
             "step": self.step_count,
             "interval": self.steps_since_update,
@@ -1478,6 +1629,7 @@ class ReROMController:
                 (p, R, mass_new, com_new, I_new),
                 position_change,
             ),
+            "det_f_min": det_f_min,
             "q_norm_before": float(np.linalg.norm(q)),
             "com_shift": float(np.linalg.norm(com_new - com_old)),
             "update_path": "device",
@@ -1486,10 +1638,154 @@ class ReROMController:
         }
         if nl_info:
             info["nl_model"] = nl_info
+        self._accepted(info)
+        return info
+
+    # ------------------------------------------------------------------------------------------
+    # candidate validation, rejection and acceptance bookkeeping
+    # ------------------------------------------------------------------------------------------
+    @staticmethod
+    def _stage_hook(debug: dict) -> Callable[[str], None]:
+        """Stage marker of one update: raises a forced rejection at ``debug["reject_at"]``."""
+        target = debug.get("reject_at")
+        if target is not None and target not in UPDATE_STAGES:
+            raise ValueError(f"reject_at must be one of {UPDATE_STAGES}, got {target!r}")
+
+        def stage(name: str) -> None:
+            if name == target:
+                raise _UpdateRejected(RejectReason.FORCED, name, "forced by debug['reject_at']")
+
+        return stage
+
+    @staticmethod
+    def _check_finite(reason: RejectReason, stage: str, **arrays) -> None:
+        """Reject when any of the named arrays (or nested tuples / lists of arrays) is not finite."""
+        for name, value in arrays.items():
+            items = value if isinstance(value, (tuple, list)) else (value,)
+            for item in items:
+                if item is not None and not np.all(np.isfinite(np.asarray(item, dtype=np.float64))):
+                    raise _UpdateRejected(reason, stage, f"non-finite {name}")
+
+    def _check_reference(self, x_new: np.ndarray) -> float | None:
+        """``det F`` check of the candidate reference (all elements); returns the minimum (``None``: no mesh)."""
+        floor = self.policy.validation.det_f_floor
+        if floor is None:
+            return None
+        det_min = self.min_det_f(x_new.reshape(-1))
+        if det_min is not None and not det_min > floor:
+            raise _UpdateRejected(
+                RejectReason.INVERTED_ELEMENT, "assembly", f"min det F = {det_min:.3e} <= floor {floor:.3e}"
+            )
+        return det_min
+
+    def _check_candidate(self, res: dict, g0: np.ndarray, lam_op: np.ndarray, damping: np.ndarray) -> None:
+        """Basis, spectrum, inertia and map checks of a candidate (:class:`~rerom.ValidationOptions`)."""
+        v = self.policy.validation
+        mass_new, com_new, I_new = res["rigid"]
+        self._check_finite(
+            RejectReason.NON_FINITE,
+            "transfer",
+            basis=res["Phi"],
+            spectrum=res["lam"],
+            operational_spectrum=lam_op,
+            damping=damping,
+            prestress=g0,
+            rigid=(np.array([mass_new]), com_new, I_new),
+            endpoint_maps=(res["ep_phi"], res["ep_psi"]),
+            state=(res.get("qd"), res.get("v_c"), res.get("omega")),
+        )
+        mass_total = mass_new + self.mass_offset
+        mode_mass = np.asarray(res["mode_mass"])
+        if not mass_total > 0.0 or np.any(mode_mass <= 0.0):
+            raise _UpdateRejected(RejectReason.NON_POSITIVE_MASS, "transfer", "rigid or modal mass <= 0")
+        if self.layout.frame_dynamic and np.linalg.eigvalsh(0.5 * (I_new + I_new.T) + self.inertia_offset)[0] <= 0.0:
+            raise _UpdateRejected(RejectReason.NON_POSITIVE_MASS, "transfer", "rigid inertia not positive definite")
+        G = np.asarray(res["mode_mass_matrix"], dtype=np.float64)
+        w = np.linalg.eigvalsh(0.5 * (G + G.T)) if G.size else np.ones(1)
+        if not w[0] > v.rank_tol:
+            raise _UpdateRejected(RejectReason.BASIS_RANK, "transfer", f"min Gram eigenvalue {w[0]:.3e}")
+        orth = float(np.max(np.abs(G - np.eye(G.shape[0])))) if G.size else 0.0
+        if not orth <= v.orthonormality_tol:
+            raise _UpdateRejected(RejectReason.BASIS_NOT_M_ORTHONORMAL, "transfer", f"max |Phi^T M Phi - I| {orth:.3e}")
+        resid = res["info"].get("eigen_residual_max")
+        if v.eigen_residual_tol is not None and resid is not None and not resid <= v.eigen_residual_tol:
+            raise _UpdateRejected(RejectReason.EIGEN_RESIDUAL, "transfer", f"eigen residual {resid:.3e}")
+        if self.policy.guard_indefinite is IndefiniteGuard.REJECT:
+            lam = np.asarray(res["lam"], dtype=np.float64)
+            raw = np.asarray(res["info"].get("eigen_raw", []), dtype=np.float64)
+            vals = np.concatenate([lam, raw]) if raw.size else lam
+            scale = max(float(np.max(np.abs(vals))), 1.0e-300)
+            if float(np.min(vals)) < -v.negative_stiffness_tol * scale:
+                raise _UpdateRejected(
+                    RejectReason.NEGATIVE_STIFFNESS,
+                    "transfer",
+                    f"restricted tangent eigenvalue {float(np.min(vals)):.6e} (scale {scale:.3e})",
+                )
+
+    def _check_transfer(self, tr: dict, Phi_new, com_new, ke_before: float, x_new: np.ndarray, R: np.ndarray) -> None:
+        """Transfer-energy budget of :class:`~rerom.ValidationOptions` on a host transfer ``tr`` (``v_c``, ``omega``
+        world, ``qd``) about the candidate reference ``(x_new, com_new, Phi_new)``."""
+        budget = self.policy.validation.transfer_energy_budget
+        if budget is None:
+            return
+        ke_after = self._kinetic_energy(R, tr["v_c"], tr["omega"], tr["qd"], x_new, com_new, Phi_new)
+        delta = ke_after - ke_before
+        if not abs(delta) <= budget * max(ke_before, 1.0e-300):
+            raise _UpdateRejected(
+                RejectReason.TRANSFER_ENERGY,
+                "transfer",
+                f"delta_KE {delta:.6e} J beyond budget {budget:g} x KE_before {ke_before:.6e} J",
+            )
+
+    def _kinetic_energy(self, R, v_c, omega, qd, x, com, Phi) -> float:
+        """Nodal kinetic energy of a frame twist (world ``v_c`` at ``com``, ``omega``) plus ``Phi qd`` at ``x``."""
+        u = self._host_local_velocity(R, v_c, omega, qd, x, com=com, Phi=Phi)
+        return 0.5 * float(u @ (self.M @ u))
+
+    def _host_local_velocity(self, R, v_c, omega, qd, x, *, com=None, Phi=None) -> np.ndarray:
+        """Body-frame nodal velocity ``R^T v_c + w x (x - c) + Phi qd`` from given state values (host)."""
+        c = self.com if com is None else com
+        P = self.Phi if Phi is None else Phi
+        x = np.asarray(x, dtype=np.float64).reshape(-1, 3)
+        u = (R.T @ v_c)[None, :] + np.cross((R.T @ omega)[None, :], x - c[None, :])
+        return u.reshape(-1) + P @ qd
+
+    def _reject(self, rej: _UpdateRejected, t0: float, timings: dict) -> dict:
+        """Log a rejected candidate, start the back-off and return the rejection record (nothing was written)."""
+        v = self.policy.validation
+        self.consecutive_rejections += 1
+        self._retry_after_step = self.step_count + max(int(v.backoff_steps), 0)
+        limit = v.max_consecutive_rejections
+        if limit is not None and self.consecutive_rejections >= limit and not self._updates_blocked:
+            self._updates_blocked = True
+            warnings.warn(
+                f"re-ROM body {self.body}: {self.consecutive_rejections} consecutive update rejections (last: "
+                f"{rej.reason.value} at {rej.stage}); updates stop until request_update(), accuracy is unverified",
+                stacklevel=3,
+            )
+        timings["total"] = time.perf_counter() - t0
+        record = {
+            "accepted": False,
+            "body": self.body,
+            "step": self.step_count,
+            "reason": rej.reason.value,
+            "stage": rej.stage,
+            "detail": rej.detail,
+            "consecutive_rejections": self.consecutive_rejections,
+            "updates_blocked": self._updates_blocked,
+            "timings": timings,
+        }
+        self.rejections.append(record)
+        return record
+
+    def _accepted(self, info: dict) -> None:
+        """Bookkeeping of an accepted update."""
         self.stats.append(info)
         self.steps_since_update = 0
+        self.consecutive_rejections = 0
+        self._retry_after_step = None
+        self._updates_blocked = False
         self.trigger.on_update(self)
-        return info
 
     def _operational_spectrum(self, lam: np.ndarray) -> tuple[np.ndarray, dict | None]:
         """Operational spectrum of the raw restricted spectrum ``lam`` under :attr:`UpdatePolicy.guard_indefinite`
@@ -1763,6 +2059,7 @@ class MultiFrameController:
             )
         self.rest = io.JointRestPropagator(chain.model)
         self.events: list[dict] = []
+        self.rejections: list[dict] = []
         self.step_count = 0
 
     # ---- rest rotations --------------------------------------------------------------------------
@@ -1788,7 +2085,11 @@ class MultiFrameController:
         io.write_modal_joint_f(control, [(c.layout, c.modal_joint_force()) for c in self.ctrls])
 
     def update(self, state, control, bodies, reasons=None) -> list[dict]:
-        """Update the given controllers (indices), fix rest rotations, write pre-stress and notify once."""
+        """Update the given controllers (indices), fix rest rotations, write pre-stress and notify once.
+
+        Returns the accepted updates; rejected candidates are logged in each controller's ``rejections`` and in
+        :attr:`rejections` and change nothing.
+        """
         infos = []
         for k, i in enumerate(bodies):
             c = self.ctrls[i]
@@ -1797,6 +2098,9 @@ class MultiFrameController:
                 info = c.relinearize(state, control)
             if reasons is not None:
                 info["trigger"], info["trigger_metrics"] = reasons[k]
+            if not info["accepted"]:
+                self.rejections.append(info)
+                continue
             infos.append(info)
         if infos:
             t = time.perf_counter()

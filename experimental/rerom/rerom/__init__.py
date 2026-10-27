@@ -8,7 +8,8 @@ Controllers     :class:`ReROMController` (one body, :class:`BodyAdapter` strateg
                 :class:`FreeBodyAdapter`, :class:`InterfaceBodyAdapter`, :class:`MultiFrameController`
 Options         :class:`BasisOptions`, :class:`TriggerOptions`, :class:`UpdatePolicy`,
                 :class:`NonlinearForceOptions`; enums :class:`RestRotationMode`, :class:`IndefiniteGuard`,
-                :class:`UpdateSync`, :class:`UpdatePath`, :class:`TransferMode`
+                :class:`UpdateSync`, :class:`UpdatePath`, :class:`TransferMode`, :class:`RejectReason`;
+                :class:`ValidationOptions` (transactional update checks)
 Triggers        :class:`RotationTrigger`, :class:`EnergyMismatchTrigger`, :class:`ResidualTrigger`,
                 :class:`ValidityTrigger`, :class:`CompositeTrigger` (OR of triggers)
 Assembly        :class:`TangentAssembler` (protocol), :class:`NumpyTetAssembler`, :class:`TetMesh`,
@@ -46,11 +47,13 @@ from .options import (
     BasisOptions,
     IndefiniteGuard,
     NonlinearForceOptions,
+    RejectReason,
     RestRotationMode,
     TransferMode,
     TriggerOptions,
     UpdatePath,
     UpdatePolicy,
+    ValidationOptions,
 )
 from .triggers import (
     CompositeTrigger,
@@ -78,6 +81,7 @@ __all__ = [
     "NumpyTetAssembler",
     "PrescribedMotionReference",
     "ReROMController",
+    "RejectReason",
     "ResidualTrigger",
     "RestRotationMode",
     "RestrictedArpackBackend",
@@ -92,6 +96,7 @@ __all__ = [
     "UpdatePath",
     "UpdatePolicy",
     "UpdateSync",
+    "ValidationOptions",
     "ValidityTrigger",
     "build_cb_chain",
     "cb_basis",

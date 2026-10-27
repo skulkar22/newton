@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -11,11 +11,13 @@ __all__ = [
     "BasisOptions",
     "IndefiniteGuard",
     "NonlinearForceOptions",
+    "RejectReason",
     "RestRotationMode",
     "TransferMode",
     "TriggerOptions",
     "UpdatePath",
     "UpdatePolicy",
+    "ValidationOptions",
 ]
 
 
@@ -77,6 +79,40 @@ class IndefiniteGuard(enum.Enum):
     (``f_tot'(0) = Lambda_op``) all use it, so the remainder never restores the clamped negative stiffness.
     The physical (raw) tangent is no longer represented in the clamped directions; this is a regularization,
     not a physically accurate treatment of an unstable state."""
+    REJECT = "reject"
+    """Reject the candidate update (:attr:`RejectReason.NEGATIVE_STIFFNESS`) when the raw restricted spectrum
+    (eigensolve and Rayleigh-Ritz values) has an eigenvalue below
+    ``-ValidationOptions.negative_stiffness_tol * max|lambda|``; the previous basis stays in place. Smaller
+    (roundoff-level) negative values are written as they are, like :attr:`KEEP`. A negative restricted tangent
+    eigenvalue is a conservative rejection signal for an intended stable equilibrium, not a proof of a physical
+    instability (contact or constraints may stabilize the structure)."""
+
+
+class RejectReason(enum.Enum):
+    """Deterministic reason codes of a rejected candidate update (``controller.rejections``)."""
+
+    NON_FINITE = "non_finite"
+    """A candidate quantity (modal state, reference, force, tangent, basis, spectrum, inertia, maps, transferred
+    state) is not finite."""
+    INVERTED_ELEMENT = "inverted_element"
+    """``min det F`` of the candidate reference is at or below ``ValidationOptions.det_f_floor``."""
+    NON_POSITIVE_MASS = "non_positive_mass"
+    """Rigid mass, rigid inertia (dynamic frame) or a modal mass of the candidate is not positive."""
+    BASIS_RANK = "basis_rank"
+    """The candidate basis is rank deficient (Gram eigenvalue at or below ``ValidationOptions.rank_tol``)."""
+    BASIS_NOT_M_ORTHONORMAL = "basis_not_m_orthonormal"
+    """``max |Phi^T M Phi - I|`` exceeds ``ValidationOptions.orthonormality_tol``."""
+    EIGEN_RESIDUAL = "eigen_residual"
+    """The eigensolver residual exceeds ``ValidationOptions.eigen_residual_tol`` (free-body adapter)."""
+    NEGATIVE_STIFFNESS = "negative_stiffness"
+    """:attr:`IndefiniteGuard.REJECT` and a materially negative restricted tangent eigenvalue."""
+    INTERFACE_CONSTRAINT = "interface_constraint"
+    """The interface-constrained transfer is singular or ill-conditioned
+    (``cond(F G^-1 F^T) > ValidationOptions.interface_cond_max``)."""
+    TRANSFER_ENERGY = "transfer_energy"
+    """``|delta_KE|`` of the transfer exceeds ``ValidationOptions.transfer_energy_budget * KE_before``."""
+    FORCED = "forced"
+    """Rejection forced through ``relinearize(debug={"reject_at": stage})`` (tests, diagnostics)."""
 
 
 class TransferMode(enum.Enum):
@@ -172,6 +208,50 @@ class TriggerOptions:
 
 
 @dataclass(kw_only=True)
+class ValidationOptions:
+    """Checks of a candidate update before it is committed (see :meth:`rerom.ReROMController.relinearize`).
+
+    A candidate (reference, basis, spectra, pre-stress, inertia, sample/endpoint maps, transferred state and
+    adapter state) is built without touching the Model, the State, the controller or the adapter. A failed
+    check rejects it with a :class:`RejectReason`: nothing is written, the rejection is logged in
+    ``controller.rejections`` and no new attempt is made for ``backoff_steps`` steps (also not for validity
+    alarms). After ``max_consecutive_rejections`` rejections without an accepted update, attempts stop until
+    :meth:`rerom.ReROMController.request_update`. Suppressed accuracy alarms are recorded in
+    ``controller.accuracy_unverified``.
+
+    Retaining the old basis only prevents this rewrite; it does not make the already advanced state accurate.
+    Rolling the solver state back and retrying with a smaller step (a checkpoint of the state, contacts and
+    solver caches) is not implemented.
+
+    Attributes:
+        det_f_floor: Reject when the minimum ``det F`` over all elements of the candidate reference is at or
+            below this value (``None``: no check; the device path then raises on inverted elements as before).
+        orthonormality_tol: Maximum ``|Phi^T M Phi - I|`` of the candidate basis.
+        rank_tol: Minimum eigenvalue of the candidate's modal Gram matrix ``Phi^T M Phi``.
+        eigen_residual_tol: Maximum relative residual ``|K v - lam M v| / max(|K v|, |lam| |M v|)`` of the
+            eigenpairs the basis was built from (free-body adapter; ``None``: not computed, the default).
+        negative_stiffness_tol: Scale of :attr:`IndefiniteGuard.REJECT`: reject when an eigenvalue is below
+            ``-negative_stiffness_tol * max|lambda|``.
+        interface_cond_max: Maximum condition number of ``F G^-1 F^T`` in the interface-constrained transfer.
+        transfer_energy_budget: Reject when ``|delta_KE| > budget * KE_before`` for the nodal kinetic energy of the
+            transfer (``None``: no check, the default). On the device path the transfer is then also evaluated on
+            the host (O(N m) per update).
+        backoff_steps: Steps without a new attempt after a rejection.
+        max_consecutive_rejections: Stop attempting after this many rejections in a row (``None``: never).
+    """
+
+    det_f_floor: float | None = 0.0
+    orthonormality_tol: float = 1.0e-6
+    rank_tol: float = 1.0e-10
+    eigen_residual_tol: float | None = None
+    negative_stiffness_tol: float = 1.0e-8
+    interface_cond_max: float = 1.0e12
+    transfer_energy_budget: float | None = None
+    backoff_steps: int = 10
+    max_consecutive_rejections: int | None = 5
+
+
+@dataclass(kw_only=True)
 class UpdatePolicy:
     """When updates are allowed and how they are written.
 
@@ -194,6 +274,7 @@ class UpdatePolicy:
         path: :class:`UpdatePath` (default :attr:`UpdatePath.DEVICE`).
         diagnostics: Device path: read the momentum / kinetic-energy bookkeeping of each update (one small
             extra device-to-host copy). ``False`` leaves those ``info`` entries ``nan``.
+        validation: :class:`ValidationOptions` of the transactional update.
     """
 
     freeze_after_release: bool = False
@@ -207,6 +288,7 @@ class UpdatePolicy:
     notify: bool = True
     path: UpdatePath = UpdatePath.DEVICE
     diagnostics: bool = True
+    validation: ValidationOptions = field(default_factory=ValidationOptions)
 
 
 @dataclass(kw_only=True)
