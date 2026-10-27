@@ -22,8 +22,10 @@ from _fixtures import (
     HAVE_CUDA,
     PrestressedQuadraticAssembler,
     beam_assembler,
+    build_cantilever,
     build_free_beam,
     free_controller,
+    run,
     set_modal_coordinates,
 )
 
@@ -156,6 +158,56 @@ class TestOperationalSpectrum(unittest.TestCase):
             ctrl.relinearize(state, stiffness_override=override)
         self.assertTrue(np.any(ctrl.lam < 0.0))
         np.testing.assert_array_equal(ctrl.lam, ctrl.lam_raw)
+
+
+class TestUpdateEnergies(unittest.TestCase):
+    def _sagging_cantilever(self, path, nonlinear_force):
+        asm = beam_assembler(young=2.0e6)  # soft: large sag, visible nonlinear remainder
+        gen, _b, model, body, fixed = build_cantilever(asm, 8, damping_ratio=0.0, clamped=True)
+        solver = newton.solvers.SolverVBD(model, iterations=16)
+        control = model.control()
+        ctrl = free_controller(
+            model,
+            solver,
+            body,
+            asm,
+            gen,
+            fixed=fixed,
+            n_ritz=2,
+            trigger=rerom.RotationTrigger(theta_tol=None),
+            nonlinear_force=nonlinear_force,
+            policy=rerom.UpdatePolicy(path=path),
+        )
+        s0, _ = run(solver, model.state(), model.state(), control, 60, 2.0e-3, ctrl, state_arg=True)
+        return ctrl, s0, control
+
+    def test_imex_update_reports_the_model_energy(self):
+        """With the IMEX remainder (full element set) the update reports the corrected model's energy, which is the
+        nonlinear energy at the update point, next to the quadratic model energy, which is not."""
+        for path in PATHS:
+            with self.subTest(path=path.value):
+                ctrl, s0, control = self._sagging_cantilever(path, rerom.NonlinearForceOptions(interval=1))
+                q, _ = ctrl.read_modes(s0)
+                quadratic = ctrl.W_ref + float(ctrl.g0 @ q) + 0.5 * float(np.sum(ctrl.lam * q * q))
+                model_energy = ctrl.rom_strain_energy(s0)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    info = ctrl.relinearize(s0, control)
+                W = info["W_nonlinear"]
+                self.assertEqual(info["W_rom_quadratic"], quadratic)
+                self.assertEqual(info["W_rom"], info["W_rom_quadratic"])
+                self.assertAlmostEqual(info["W_rom_model"], model_energy, delta=1.0e-12 * abs(W))
+                # quadratic model off by ~57 % here; the corrected model reproduces W to roundoff (~1e-8 relative)
+                self.assertLess(abs(info["W_rel_error_model"]), 1.0e-6)
+                self.assertGreater(abs(info["W_rel_error"]), 0.1)
+
+    def test_plain_update_model_energy_is_quadratic(self):
+        ctrl, s0, control = self._sagging_cantilever(rerom.UpdatePath.HOST, None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info = ctrl.relinearize(s0, control)
+        self.assertEqual(info["W_rom_model"], info["W_rom_quadratic"])
+        self.assertEqual(info["W_rel_error_model"], info["W_rel_error"])
 
 
 if __name__ == "__main__":

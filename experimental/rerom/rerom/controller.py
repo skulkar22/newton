@@ -914,10 +914,22 @@ class ReROMController:
         operational spectrum :attr:`lam`, or the potential of the hyper-reduced modal force with
         ``nonlinear_force``. Its gradient is the modal force the solver steps."""
         q, _ = self.read_modes(state)
-        if self.nl_model is not None:
-            W, _, _ = self.nl_model.evaluate(q, need_energy=True)
-            return self.W_ref + float(self._nl_c @ q) + 0.5 * float(q @ (self._nl_D @ q)) + W - self._nl_W0
-        return self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
+        return self.rom_energies(q)[1]
+
+    def rom_energies(self, q: np.ndarray) -> tuple[float, float]:
+        """``(W_quadratic, W_model)`` the ROM assigns to modal coordinates ``q`` about the current reference.
+
+        ``W_quadratic = W_ref + g0.q + 1/2 sum lambda q^2`` (operational spectrum) is the linear model the solver
+        steps implicitly. ``W_model`` is the potential of the force the ROM actually applies: with the IMEX
+        remainder (``nonlinear_force``) it is ``W_ref + c.q + 1/2 q^T D q + W_S(q) - W_S(0)`` with the weighted
+        element energies ``W_S`` of the hyper-reduced element set; otherwise it equals ``W_quadratic``. Neither
+        includes the work error of the time-lagged remainder."""
+        q = np.asarray(q, dtype=np.float64)
+        quadratic = self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
+        if self.nl_model is None:
+            return quadratic, quadratic
+        W, _, _ = self.nl_model.evaluate(q, need_energy=True)
+        return quadratic, self.W_ref + float(self._nl_c @ q) + 0.5 * float(q @ (self._nl_D @ q)) + W - self._nl_W0
 
     def nonlinear_strain_energy(self, state) -> float:
         """Assembler (nonlinear, total-Lagrangian) strain energy of the current full field."""
@@ -1181,7 +1193,7 @@ class ReROMController:
         resid = u_el_old - Phi_new @ qd_new
         ke_lost = 0.5 * float(resid @ (M @ resid))
         ke_el = 0.5 * float(u_el_old @ (M @ u_el_old))
-        W_rom = self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
+        W_rom, W_rom_model = self.rom_energies(q)
 
         # operational spectrum (what the solver steps) and its damping
         lam_op, clamp = self._operational_spectrum(lam)
@@ -1241,9 +1253,7 @@ class ReROMController:
             "eigenvalues": lam.tolist(),
             **self._spectrum_info(lam, lam_op, clamp),
             "g0_norm": float(np.linalg.norm(g0)),
-            "W_nonlinear": float(W_nl),
-            "W_rom": W_rom,
-            "W_rel_error": (W_rom - float(W_nl)) / max(abs(float(W_nl)), 1.0e-30),
+            **self._energy_info(float(W_nl), W_rom, W_rom_model),
             **self._transfer_info(
                 res,
                 (before["KE"], after["KE"], ke_lost, ke_el),
@@ -1352,7 +1362,7 @@ class ReROMController:
         )
         t3 = time.perf_counter()
         timings["integrals"] = t3 - t2 + (t2 - res["t_samples"] if "t_samples" in res else 0.0)
-        W_rom = self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
+        W_rom, W_rom_model = self.rom_energies(q)
 
         # ---- 4. host bookkeeping, rest rotations, solver refresh ---------------------------------------
         self.last_joint_rest_mismatch = 0.0
@@ -1417,9 +1427,7 @@ class ReROMController:
             "eigenvalues": lam.tolist(),
             **self._spectrum_info(lam, lam_op, clamp),
             "g0_norm": float(np.linalg.norm(g0)),
-            "W_nonlinear": float(W_nl),
-            "W_rom": W_rom,
-            "W_rel_error": (W_rom - float(W_nl)) / max(abs(float(W_nl)), 1.0e-30),
+            **self._energy_info(float(W_nl), W_rom, W_rom_model),
             **self._transfer_info(
                 res,
                 (ke_total, ke_after, ke_lost, ke_el),
@@ -1461,6 +1469,23 @@ class ReROMController:
         if self.damping_ratio == 0.0:
             return np.zeros_like(mode_mass)
         return 2.0 * self.damping_ratio * np.sqrt(np.maximum(mode_mass * lam * mode_mass, 0.0))
+
+    @staticmethod
+    def _energy_info(W_nl: float, W_quadratic: float, W_model: float) -> dict:
+        """Strain energies at the update point: nonlinear (assembler), quadratic ROM and model ROM (IMEX).
+
+        ``W_rom`` / ``W_rel_error`` are the quadratic model (kept for compatibility); ``W_rom_model`` /
+        ``W_rel_error_model`` describe the corrected model when the IMEX remainder is active.
+        """
+        scale = max(abs(W_nl), 1.0e-30)
+        return {
+            "W_nonlinear": W_nl,
+            "W_rom": W_quadratic,
+            "W_rom_quadratic": W_quadratic,
+            "W_rom_model": W_model,
+            "W_rel_error": (W_quadratic - W_nl) / scale,
+            "W_rel_error_model": (W_model - W_nl) / scale,
+        }
 
     @staticmethod
     def _transfer_info(res: dict, energies: tuple, momenta: tuple, frame: tuple, position_change: float) -> dict:
