@@ -58,13 +58,24 @@ class UpdatePath(enum.Enum):
 
 
 class IndefiniteGuard(enum.Enum):
-    """What to do with non-positive tangent eigenvalues of the updated basis."""
+    """What to do with non-positive tangent eigenvalues of the updated basis.
+
+    The controller keeps two spectra: the *raw* one (``controller.lam_raw``, the restricted tangent in the new
+    basis, logged with its negative values) and the *operational* one (``controller.lam``), which is what the
+    solver steps. Every consumer (written modal stiffness, modal damping, ROM strain energy, the IMEX linear
+    term and remainder, :class:`~rerom.ResidualTrigger`) uses the operational spectrum.
+    """
 
     KEEP = "keep"
-    """Write them as they are (counted in ``info["negative_eigenvalues"]``)."""
+    """Write them as they are (counted in ``info["negative_eigenvalues"]``); operational == raw."""
     CLAMP = "clamp"
     """Raise them to ``UpdatePolicy.clamp_floor_ratio`` times the smallest positive one (SolverVBD needs a
-    positive modal stiffness for some joint solves); clamps are logged in ``controller.clamp_log``."""
+    positive modal stiffness for some joint solves); clamps are logged in ``controller.clamp_log``.
+
+    The clamped spectrum *is* the operational model: the ROM energy, the damping and the IMEX split
+    (``f_tot'(0) = Lambda_op``) all use it, so the remainder never restores the clamped negative stiffness.
+    The physical (raw) tangent is no longer represented in the clamped directions; this is a regularization,
+    not a physically accurate treatment of an unstable state."""
 
 
 @dataclass(kw_only=True)

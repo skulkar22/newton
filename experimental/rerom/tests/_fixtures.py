@@ -67,6 +67,51 @@ class LinearElementAssembler(LinearStubAssembler):
         return We, fe.reshape(-1, 4, 3), (Ke.reshape(-1, 4, 3, 4, 3) if need_tangent else None)
 
 
+class PrestressedQuadraticAssembler(LinearStubAssembler):
+    """Quadratic energy about the rest mesh with the stress and tangent of a prescribed deformed state.
+
+    ``W(x) = W_c + f_c.u + 1/2 u^T K_c u`` with ``u = x - X`` and ``(W_c, f_c, K_c)`` the element terms of the
+    inner assembler at ``x_c`` (for example a 2 % axially compressed beam, whose restricted tangent is
+    indefinite). Element and global terms are consistent, so a re-linearization anywhere sees the same
+    (indefinite) tangent without a ``stiffness_override`` and the IMEX hyper-reduced force is exactly linear.
+    """
+
+    def __init__(self, inner, x_c):
+        super().__init__(inner)
+        Xc = np.asarray(x_c, dtype=np.float64).reshape(-1, 3)
+        We, fe, Ke = inner.element_terms(Xc[inner.mesh.tets], None, need_tangent=True)
+        self.We0, self.fe0 = We, fe.reshape(-1, 12)
+        self.Ke0 = Ke.reshape(-1, 12, 12)
+        self.Xe = inner.mesh.nodes[inner.mesh.tets]
+        self.W0, self.f0, self.K = inner.evaluate(Xc.reshape(-1))
+
+    def evaluate(self, x_flat, *, need_tangent=True):
+        u = np.asarray(x_flat) - self.X
+        f = self.f0 + self.K @ u
+        return self.W0 + float(self.f0 @ u) + 0.5 * float(u @ (self.K @ u)), f, (self.K if need_tangent else None)
+
+    def element_terms(self, x_elem, element_ids=None, *, need_tangent=True):
+        sl = slice(None) if element_ids is None else element_ids
+        Ke, fe0 = self.Ke0[sl], self.fe0[sl]
+        u = (np.asarray(x_elem) - self.Xe[sl]).reshape(-1, 12)
+        Ku = np.einsum("eij,ej->ei", Ke, u)
+        fe = fe0 + Ku
+        We = self.We0[sl] + np.einsum("ei,ei->e", fe0, u) + 0.5 * np.einsum("ei,ei->e", u, Ku)
+        return We, fe.reshape(-1, 4, 3), (Ke.reshape(-1, 4, 3, 4, 3) if need_tangent else None)
+
+
+def set_modal_coordinates(state, ctrl, q=None, qd=None):
+    """Write the body's modal coordinates / velocities into ``state`` (float32)."""
+    if q is not None:
+        jq = state.joint_q.numpy()
+        jq[ctrl.q_start + 7 : ctrl.q_start + 7 + ctrl.m] = q
+        state.joint_q.assign(jq)
+    if qd is not None:
+        jqd = state.joint_qd.numpy()
+        jqd[ctrl.qd_start + 6 : ctrl.qd_start + 6 + ctrl.m] = qd
+        state.joint_qd.assign(jqd)
+
+
 def beam_mesh(nx=12, ny=2, nz=2, length=1.0, width=0.06, height=0.04, young=1.0e9, density=1000.0):
     return rerom.make_beam_mesh(length, width, height, nx, ny, nz, density=density, young=young, poisson=0.3)
 

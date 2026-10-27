@@ -124,7 +124,11 @@ class BodyAdapter:
         """Called once by the controller after its bookkeeping is set up."""
 
     def rebuild(self, ctrl: ReROMController, ctx: dict) -> dict:
-        """Return the new basis and state for the update context ``ctx`` (see :meth:`ReROMController.relinearize`)."""
+        """Return the new basis and state for the update context ``ctx`` (see :meth:`ReROMController.relinearize`).
+
+        ``lam`` is the raw restricted spectrum of the new basis; the controller derives the operational
+        spectrum (:class:`~rerom.IndefiniteGuard`) and the modal damping from it.
+        """
         raise NotImplementedError
 
 
@@ -328,7 +332,6 @@ class FreeBodyAdapter(BodyAdapter):
         if debug.get("keep_endpoint_psi") and ep_idx.size:
             arr = ctx["arrays"].get("elastic_endpoint_psi")
             ep_psi = np.stack([arr[ep.endpoint * lay.Mx + np.arange(m)] for ep in lay.endpoints])
-        damping = 2.0 * ctrl.damping_ratio * np.sqrt(np.maximum(mode_mass * lam * mode_mass, 0.0))
 
         # ---- state projection: rigid part -> frame twist (about com_new), remainder -> qd ----------
         if ctx.get("device_projection"):
@@ -340,7 +343,6 @@ class FreeBodyAdapter(BodyAdapter):
                 "mode_mass_matrix": mode_mass_matrix,
                 "mode_mass": mode_mass,
                 "lam": lam,
-                "damping": damping,
                 "rigid": (mass_new, com_new, I_new),
                 "ep_phi": ep_phi,
                 "ep_psi": ep_psi,
@@ -379,7 +381,6 @@ class FreeBodyAdapter(BodyAdapter):
             "mode_mass_matrix": mode_mass_matrix,
             "mode_mass": mode_mass,
             "lam": lam,
-            "damping": damping,
             "rigid": (mass_new, com_new, I_new),
             "ep_phi": ep_phi,
             "ep_psi": ep_psi,
@@ -527,7 +528,6 @@ class InterfaceBodyAdapter(BodyAdapter):
             "mode_mass_matrix": mode_mass_matrix,
             "mode_mass": mode_mass,
             "lam": lam,
-            "damping": np.zeros(m),
             "rigid": (mass_new, com_new, I_new),
             "ep_phi": ep_phi,
             "ep_psi": ep_psi,
@@ -694,9 +694,11 @@ class ReROMController:
         self.inertia_offset = body_inertia - I0
         self.com = body_com
 
-        # ROM energy bookkeeping / pre-stress
+        # ROM energy bookkeeping / pre-stress; ``lam`` is the operational spectrum (what the solver steps),
+        # ``lam_raw`` the restricted tangent spectrum of the last update (diagnostics, negative values kept)
         self.g0 = np.zeros(self.m)
         self.lam = kk / np.maximum(mm, 1.0e-30)
+        self.lam_raw = self.lam.copy()
         self.W_ref = 0.0
         self._dev: DeviceUpdater | None = None
         self.modal_force = np.zeros(self.m)  # user modal joint_f added to -g0 by apply_prestress
@@ -895,8 +897,9 @@ class ReROMController:
         return {"P": P, "L": L, "KE": 0.5 * float(u @ (self.M @ u))}
 
     def rom_strain_energy(self, state) -> float:
-        """Strain energy the current ROM assigns (``W_ref + g0.q + 1/2 sum lambda q^2``, or the potential of
-        the hyper-reduced modal force with ``nonlinear_force``)."""
+        """Strain energy the current (operational) ROM assigns: ``W_ref + g0.q + 1/2 sum lambda q^2`` with the
+        operational spectrum :attr:`lam`, or the potential of the hyper-reduced modal force with
+        ``nonlinear_force``. Its gradient is the modal force the solver steps."""
         q, _ = self.read_modes(state)
         if self.nl_model is not None:
             W, _, _ = self.nl_model.evaluate(q, need_energy=True)
@@ -920,7 +923,11 @@ class ReROMController:
     # ------------------------------------------------------------------------------------------
     def _init_nl_model(self, K_T=None) -> dict:
         """(Re)build ``f_tot(q) = c + F_S(q) + D q`` about ``r_ref``/``Phi`` with ``c = g0 - F_S(0)``,
-        ``D = diag(Lambda) - K_S(0)`` (``K_S(0) = Phi^T K_T Phi`` from the assembled tangent for the full set)."""
+        ``D = diag(Lambda) - K_S(0)`` (``K_S(0) = Phi^T K_T Phi`` from the assembled tangent for the full set).
+
+        ``Lambda`` is the operational spectrum, so ``f_tot'(0) = Lambda`` and the lagged remainder has zero
+        derivative at the reference also when :attr:`IndefiniteGuard.CLAMP` raised raw eigenvalues: the clamped
+        model is the target force, the remainder does not restore the raw negative stiffness."""
         t0 = time.perf_counter()
         hr = self.nl_model
         hr.set_basis(self.r_ref, self.Phi)
@@ -946,8 +953,8 @@ class ReROMController:
         }
 
     def nl_evaluate(self, q: np.ndarray, *, need_tangent: bool = False) -> dict:
-        """Hyper-reduced modal force at ``q``: ``f_tot``, ``f_lin = g0 + Lambda q``, remainder ``f_nl`` and
-        optionally the remainder Jacobian ``K_exp`` and the full tangent ``T``."""
+        """Hyper-reduced modal force at ``q``: ``f_tot``, ``f_lin = g0 + Lambda q`` (operational ``Lambda``),
+        remainder ``f_nl`` and optionally the remainder Jacobian ``K_exp`` and the full tangent ``T``."""
         if self.nl_model is None:
             raise RuntimeError("nonlinear_force is not enabled")
         q = np.asarray(q, dtype=np.float64)
@@ -1157,11 +1164,14 @@ class ReROMController:
         ke_el = 0.5 * float(u_el_old @ (M @ u_el_old))
         W_rom = self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
 
+        # operational spectrum (what the solver steps) and its damping
+        lam_op, clamp = self._operational_spectrum(lam)
+        damping = self._modal_damping(mode_mass, lam_op)
+
         # ---- 4. rewrite model (one gather / one scatter per array) and state -------------------------
-        lam_written = self._guard_indefinite(lam)
-        io.write_modal_arrays(
-            arrays, self.layout, mode_mass, lam_written, res["damping"], res["mode_mass_matrix"], integrals
-        )
+        if clamp is not None:
+            self.clamp_log.append(clamp)
+        io.write_modal_arrays(arrays, self.layout, mode_mass, lam_op, damping, res["mode_mass_matrix"], integrals)
         if self.layout.endpoints:
             rotations = io.move_endpoint_frames(arrays, self.layout, q, res["ep_phi"], res["ep_psi"])
             self.last_joint_rest_mismatch = 0.0
@@ -1182,7 +1192,8 @@ class ReROMController:
         self.Phi = Phi_new
         self.com = com_new
         self.g0 = g0
-        self.lam = lam
+        self.lam = lam_op
+        self.lam_raw = lam
         self.W_ref = float(W_nl)
         self._qd_hist = (qd_new, self._qd_hist[1]) if self._qd_hist is not None else None
         self._qdd_est = None
@@ -1208,6 +1219,7 @@ class ReROMController:
             "interval": self.steps_since_update,
             "timings": timings,
             "eigenvalues": lam.tolist(),
+            **self._spectrum_info(lam, lam_op, clamp),
             "g0_norm": float(np.linalg.norm(g0)),
             "W_nonlinear": float(W_nl),
             "W_rom": W_rom,
@@ -1286,8 +1298,13 @@ class ReROMController:
         g0 = Phi_new.T @ f_int
         t2 = time.perf_counter()
 
+        # operational spectrum (what the solver steps) and its damping
+        lam_op, clamp = self._operational_spectrum(lam)
+        damping = self._modal_damping(mode_mass, lam_op)
+
         # ---- 3. ONE packed host-to-device copy, rewrite kernels in place ------------------------------
-        lam_written = self._guard_indefinite(lam)
+        if clamp is not None:
+            self.clamp_log.append(clamp)
         proj = res["projection"]
         mode = int(proj["mode"])
         mass_total = mass_new + self.mass_offset
@@ -1302,8 +1319,8 @@ class ReROMController:
             inv_mass=(1.0 / mass_total if mass_total > 0 else 0.0) if dynamic else 0.0,
             inv_inertia=np.linalg.inv(inertia_total) if dynamic else np.zeros((3, 3)),
             mode_mass=mode_mass,
-            stiffness=lam_written * mode_mass,
-            damping=res["damping"],
+            stiffness=lam_op * mode_mass,
+            damping=damping,
             prestress=self.modal_force - g0,
             qd_given=res["qd"] if mode == 2 else None,
             v_c_given=res["v_c"] if mode == 2 else None,
@@ -1340,7 +1357,8 @@ class ReROMController:
         self.Phi = Phi_new
         self.com = com_new
         self.g0 = g0
-        self.lam = lam
+        self.lam = lam_op
+        self.lam_raw = lam
         self.W_ref = float(W_nl)
         self._qd_hist = None
         self._qdd_est = None
@@ -1381,6 +1399,7 @@ class ReROMController:
             "interval": self.steps_since_update,
             "timings": timings,
             "eigenvalues": lam.tolist(),
+            **self._spectrum_info(lam, lam_op, clamp),
             "g0_norm": float(np.linalg.norm(g0)),
             "W_nonlinear": float(W_nl),
             "W_rom": W_rom,
@@ -1410,20 +1429,37 @@ class ReROMController:
         self.trigger.on_update(self)
         return info
 
-    def _guard_indefinite(self, lam: np.ndarray) -> np.ndarray:
+    def _operational_spectrum(self, lam: np.ndarray) -> tuple[np.ndarray, dict | None]:
+        """Operational spectrum of the raw restricted spectrum ``lam`` under :attr:`UpdatePolicy.guard_indefinite`
+        and the clamp record (``None`` when nothing was clamped). Pure: the caller logs the record."""
         if self.policy.guard_indefinite is IndefiniteGuard.CLAMP and np.any(lam <= 0.0):
             pos = lam[lam > 0.0]
             floor = self.policy.clamp_floor_ratio * float(pos.min()) if pos.size else 1.0
-            self.clamp_log.append(
-                {
-                    "step": self.step_count,
-                    "lam_min": float(lam.min()),
-                    "floor": floor,
-                    "count": int(np.count_nonzero(lam <= 0.0)),
-                }
-            )
-            return np.maximum(lam, floor)
-        return lam
+            record = {
+                "step": self.step_count,
+                "lam_min": float(lam.min()),
+                "floor": floor,
+                "count": int(np.count_nonzero(lam <= 0.0)),
+                "reason": "non_positive_raw_eigenvalue",
+            }
+            return np.maximum(lam, floor), record
+        return lam, None
+
+    def _modal_damping(self, mode_mass: np.ndarray, lam: np.ndarray) -> np.ndarray:
+        """Modal damping ``2 zeta sqrt(m k)`` of the operational spectrum ``lam``."""
+        if self.damping_ratio == 0.0:
+            return np.zeros_like(mode_mass)
+        return 2.0 * self.damping_ratio * np.sqrt(np.maximum(mode_mass * lam * mode_mass, 0.0))
+
+    def _spectrum_info(self, lam_raw: np.ndarray, lam_op: np.ndarray, clamp: dict | None) -> dict:
+        """Raw and operational spectrum diagnostics of an update (``eigenvalues`` stays the raw spectrum)."""
+        return {
+            "eigenvalues_operational": np.asarray(lam_op).tolist(),
+            "lam_raw_min": float(np.min(lam_raw)) if np.size(lam_raw) else float("nan"),
+            "lam_operational_min": float(np.min(lam_op)) if np.size(lam_op) else float("nan"),
+            "indefinite_guard": self.policy.guard_indefinite.value,
+            "clamp": clamp,
+        }
 
     def _notify(self) -> None:
         if not self.policy.notify:
@@ -1489,7 +1525,8 @@ class ReROMController:
         arrays.flush()
         io.write_body_state(state, self.layout, q=q_new, qd=qd_new)
         self.Phi = Phi_new
-        self.lam = lam_new
+        self.lam = lam_new  # folds re-diagonalize the operational tangent and write it unguarded
+        self.lam_raw = lam_new.copy()
         self.g0 = g_new
         self._fnl = np.zeros(m)
         self._fnl_step = self.step_count

@@ -1,0 +1,162 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Raw vs operational tangent spectrum (IndefiniteGuard.CLAMP) and the energies of the operational model.
+
+Every consumer of the modal stiffness (solver arrays, damping, ROM strain energy, the IMEX linear term and
+remainder, event energies) must describe the same operational model; the raw spectrum is kept for diagnostics.
+"""
+
+from __future__ import annotations
+
+import _fixtures  # noqa: F401  (puts the rerom package on sys.path)
+
+# isort: split
+
+import unittest
+import warnings
+
+import numpy as np
+import rerom
+from _fixtures import (
+    HAVE_CUDA,
+    PrestressedQuadraticAssembler,
+    beam_assembler,
+    build_free_beam,
+    free_controller,
+    set_modal_coordinates,
+)
+
+import newton
+
+FREE_FLIGHT_YOUNG = 1.0e7
+COMPRESSION = np.array([0.98, 1.0, 1.0])  # 2 % axial compression: indefinite restricted tangent
+DAMPING_RATIO = 0.05
+PATHS = (rerom.UpdatePath.HOST, rerom.UpdatePath.DEVICE)
+
+
+def _devices():
+    return ["cpu", "cuda:0"] if HAVE_CUDA else ["cpu"]
+
+
+def _dyadic_q(m, scale=2.0**-7):
+    """Modal coordinates exactly representable in float32 (central differences of a quadratic stay exact)."""
+    return scale * np.array([(-1.0) ** i * 2.0 ** -(i % 3) for i in range(m)])
+
+
+def _clamped_update(path, *, device="cpu", override=True, nonlinear_force=None, m=6):
+    """Free beam re-linearized at an indefinite (2 % compressed) tangent with IndefiniteGuard.CLAMP."""
+    inner = beam_assembler(young=FREE_FLIGHT_YOUNG)
+    x_c = inner.mesh.nodes * COMPRESSION
+    asm = inner if override else PrestressedQuadraticAssembler(inner, x_c)
+    gen, _b, model, state, body = build_free_beam(inner, m, damping_ratio=DAMPING_RATIO, shape=False, device=device)
+    solver = newton.solvers.SolverVBD(model, iterations=4)
+    policy = rerom.UpdatePolicy(guard_indefinite=rerom.IndefiniteGuard.CLAMP, path=path)
+    ctrl = free_controller(model, solver, body, asm, gen, policy=policy, nonlinear_force=nonlinear_force)
+    control = model.control()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        info = ctrl.relinearize(
+            state, control, stiffness_override=inner.evaluate(x_c.reshape(-1)) if override else None
+        )
+    return ctrl, model, state, info
+
+
+def _written(model, m):
+    mm = model.elastic_mode_mass.numpy()[:m].astype(np.float64)
+    return (
+        model.elastic_mode_stiffness.numpy()[:m].astype(np.float64) / mm,
+        model.elastic_mode_damping.numpy()[:m].astype(np.float64),
+        mm,
+    )
+
+
+def _fd_gradient(ctrl, state, q, h):
+    """Central-difference gradient of ``ctrl.rom_strain_energy`` at ``q`` (float32-exact steps)."""
+    g = np.zeros(ctrl.m)
+    for i in range(ctrl.m):
+        e = np.zeros(ctrl.m)
+        e[i] = h
+        set_modal_coordinates(state, ctrl, q=q + e)
+        wp_ = ctrl.rom_strain_energy(state)
+        set_modal_coordinates(state, ctrl, q=q - e)
+        wm = ctrl.rom_strain_energy(state)
+        g[i] = (wp_ - wm) / (2.0 * h)
+    set_modal_coordinates(state, ctrl, q=q)
+    return g
+
+
+class TestOperationalSpectrum(unittest.TestCase):
+    def test_clamp_writes_and_stores_the_operational_spectrum(self):
+        """CLAMP (stiffness_override): the controller's ``lam`` is what the solver steps, ``lam_raw`` keeps the
+        negative raw values, and the damping is computed from the operational spectrum."""
+        for device in _devices():
+            for path in PATHS:
+                with self.subTest(device=device, path=path.value):
+                    ctrl, model, _state, info = _clamped_update(path, device=device)
+                    m = ctrl.m
+                    lam_w, c_w, mm = _written(model, m)
+                    raw = np.asarray(info["eigenvalues"])
+                    self.assertTrue(np.any(raw < 0.0))
+                    self.assertTrue(np.all(ctrl.lam > 0.0))
+                    np.testing.assert_allclose(ctrl.lam, lam_w, rtol=2.0e-6)
+                    c_expected = 2.0 * DAMPING_RATIO * np.sqrt(mm * ctrl.lam * mm)
+                    np.testing.assert_allclose(c_w, c_expected, rtol=2.0e-6)
+                    np.testing.assert_array_equal(raw, ctrl.lam_raw)
+                    np.testing.assert_allclose(info["eigenvalues_operational"], ctrl.lam)
+                    self.assertLess(info["lam_raw_min"], 0.0)
+                    self.assertGreater(info["lam_operational_min"], 0.0)
+                    self.assertEqual(info["clamp"]["count"], int(np.count_nonzero(ctrl.lam_raw <= 0.0)))
+
+    def test_energy_gradient_is_the_operational_force(self):
+        """Away from q = 0 the ROM strain energy's gradient is ``g0 + Lambda_op q`` (what the solver steps)."""
+        for path in PATHS:
+            with self.subTest(path=path.value):
+                ctrl, model, state, _ = _clamped_update(path)
+                m = ctrl.m
+                lam_w, _, _ = _written(model, m)
+                q = _dyadic_q(m)
+                grad = _fd_gradient(ctrl, state, q, 2.0**-9)
+                force = ctrl.g0 + lam_w * q
+                scale = float(np.max(np.abs(force)))
+                np.testing.assert_allclose(grad, force, atol=1.0e-5 * scale)
+
+    def test_clamp_with_imex_uses_one_operational_split(self):
+        """CLAMP + IMEX: ``f_tot'(0) = Lambda_op`` (the remainder does not restore the raw negative stiffness),
+        ``f_lin`` uses the operational spectrum, and the model energy is the potential of ``f_tot``."""
+        for path in PATHS:
+            with self.subTest(path=path.value):
+                ctrl, model, state, info = _clamped_update(
+                    path, override=False, nonlinear_force=rerom.NonlinearForceOptions(interval=1)
+                )
+                m = ctrl.m
+                lam_w, _, _ = _written(model, m)
+                self.assertTrue(np.any(np.asarray(info["eigenvalues"]) < 0.0))
+                scale = float(np.max(np.abs(lam_w)))
+                r0 = ctrl.nl_evaluate(np.zeros(m), need_tangent=True)
+                np.testing.assert_allclose(r0["T"], np.diag(lam_w), atol=1.0e-6 * scale)
+                self.assertLess(float(np.max(np.abs(r0["K_exp"]))), 1.0e-6 * scale)
+                q = _dyadic_q(m)
+                r = ctrl.nl_evaluate(q)
+                np.testing.assert_allclose(r["f_lin"], ctrl.g0 + lam_w * q, rtol=1.0e-6)
+                # quadratic assembler: the operational remainder vanishes identically
+                self.assertLess(float(np.linalg.norm(r["f_nl"])), 1.0e-6 * float(np.linalg.norm(r["f_lin"])))
+                grad = _fd_gradient(ctrl, state, q, 2.0**-9)
+                np.testing.assert_allclose(grad, r["f_tot"], atol=1.0e-5 * float(np.max(np.abs(r["f_tot"]))))
+
+    def test_keep_guard_is_unchanged(self):
+        """KEEP: operational == raw (negative values written as they are)."""
+        inner = beam_assembler(young=FREE_FLIGHT_YOUNG)
+        gen, _b, model, state, body = build_free_beam(inner, 6, shape=False)
+        solver = newton.solvers.SolverVBD(model, iterations=4)
+        ctrl = free_controller(model, solver, body, inner, gen, policy=rerom.UpdatePolicy(path=rerom.UpdatePath.HOST))
+        override = inner.evaluate((inner.mesh.nodes * COMPRESSION).reshape(-1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ctrl.relinearize(state, stiffness_override=override)
+        self.assertTrue(np.any(ctrl.lam < 0.0))
+        np.testing.assert_array_equal(ctrl.lam, ctrl.lam_raw)
+
+
+if __name__ == "__main__":
+    unittest.main()
