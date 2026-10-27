@@ -1959,7 +1959,8 @@ class ReROMController:
         :attr:`IndefiniteGuard.CLAMP` the IMEX split is shifted in the clamped directions
         (``D += diag(Lambda_op - Lambda_raw)``, ``c -= that shift times q_n``, ``W_ref`` adjusted) so that
         ``f_tot(q_n)`` and the model energy at ``q_n`` are unchanged and ``f_tot'(q_n) = Lambda_op``: the clamped
-        model is the target and the remainder does not restore the negative stiffness. With
+        model is the target and the remainder does not restore the negative stiffness. The cached remainder is set to
+        its value at ``q_n`` (``-shift q_n``), so the step force stays ``f_tot(q_n)``. With
         :attr:`IndefiniteGuard.REJECT` a materially negative ``eig T`` skips the fold: nothing is written, the
         skip is recorded in :attr:`folds` (``"skipped": "negative_stiffness"``) and the fold interval restarts.
         """
@@ -1995,12 +1996,16 @@ class ReROMController:
         self._nl_D = Q.T @ self._nl_D @ Q
         self._nl_D = 0.5 * (self._nl_D + self._nl_D.T)
         lam_op, clamp = self._operational_spectrum(lam_new)
+        f_nl_new = np.zeros(m)
         if clamp is not None:
             # clamped directions: make the guarded tangent the IMEX target at q_n, keeping f_tot(q_n) and W(q_n)
             shift = lam_op - lam_new
             self._nl_D = self._nl_D + np.diag(shift)
             self._nl_c = self._nl_c - shift * q_new
             self.W_ref = self.W_ref + 0.5 * float(np.sum(shift * q_new * q_new))
+            # g0 + Lambda_op q_n = f_tot(q_n) + shift q_n: the lagged remainder at q_n is -shift q_n (g0 stays the
+            # pre-stress written to control.joint_f)
+            f_nl_new = -shift * q_new
             clamp["source"] = "fold"
             self.clamp_log.append(clamp)
         self.nl_model.rotate(Q)
@@ -2021,7 +2026,7 @@ class ReROMController:
         self.lam = lam_op
         self.lam_raw = lam_new.copy()
         self.g0 = g_new
-        self._fnl = np.zeros(m)
+        self._fnl = f_nl_new
         self._fnl_step = self.step_count
         if self._qd_hist is not None:
             self._qd_hist = (Q.T @ self._qd_hist[0], self._qd_hist[1])

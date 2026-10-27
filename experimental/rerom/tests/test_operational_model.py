@@ -259,6 +259,12 @@ class TestFoldGuard(unittest.TestCase):
                 scale = float(np.max(np.abs(ctrl.lam)))
                 np.testing.assert_allclose(r["T"], np.diag(ctrl.lam), atol=1.0e-6 * scale)
                 np.testing.assert_allclose(r["f_tot"], Q.T @ f_before, atol=1.0e-8 * float(np.linalg.norm(f_before)))
+                # the cached (lagged) remainder is the remainder at q_n, so the step force is f_tot(q_n)
+                fscale = float(np.linalg.norm(r["f_tot"]))
+                np.testing.assert_allclose(ctrl._fnl, r["f_nl"], atol=1.0e-9 * fscale)
+                f_step = ctrl.g0 + ctrl.lam * q_rot + ctrl._fnl
+                np.testing.assert_allclose(f_step, r["f_tot"], atol=1.0e-9 * fscale)
+                np.testing.assert_allclose(-ctrl.modal_joint_force(), ctrl.g0 + ctrl._fnl, atol=1.0e-12 * fscale)
                 self.assertAlmostEqual(ctrl.rom_energies(q_rot)[1], w_before, delta=1.0e-9 * max(abs(w_before), 1.0))
 
     def test_reject_guard_skips_the_fold(self):
