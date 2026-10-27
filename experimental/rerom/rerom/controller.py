@@ -75,6 +75,7 @@ from .numerics import (
     split_rigid_velocity,
     static_modal_derivatives,
     tangent_derivative,
+    tet_edge_determinants,
     to_nodal,
     transfer_modal_velocity,
 )
@@ -593,7 +594,8 @@ class ReROMController:
         adapter: :class:`FreeBodyAdapter` or :class:`InterfaceBodyAdapter`.
         mode_count: Number of modes (must equal the body's Newton mode count; default: basis columns).
         basis: :class:`~rerom.BasisOptions`.
-        trigger: A :class:`~rerom.Trigger` (default: :class:`~rerom.RotationTrigger`, 4 deg).
+        trigger: A :class:`~rerom.Trigger` (default: :class:`~rerom.RotationTrigger`, 0.5 deg; see its docstring
+            for why the tolerance is geometry dependent, and :class:`~rerom.CompositeTrigger`).
         policy: :class:`~rerom.UpdatePolicy`.
         eigensolver: ``"arpack"`` (default), ``"subspace"``, ``"dense"``, ``"auto"``, a
             ``newton.ModalEigensolver`` or a ``newton.ModalEigensolverBackend`` instance (see :mod:`rerom.eigen`).
@@ -727,6 +729,13 @@ class ReROMController:
         self._released = False
         self._in_contact = False
         self._update_requested = False
+        self.accuracy_unverified: dict[str, Any] = {
+            "count": 0,
+            "last_step": None,
+            "last_reason": None,
+            "suppressed_by": None,
+        }
+        self._tet_rest: tuple[np.ndarray, np.ndarray] | None = None
 
         # IMEX hyper-reduced remainder, folding
         self.nl_options = nonlinear_force
@@ -821,6 +830,40 @@ class ReROMController:
         if p.freeze_in_contact and self._in_contact:
             return True
         return p.freeze_from_step is not None and self.step_count >= p.freeze_from_step
+
+    def update_suppression(self) -> str | None:
+        """Controller-side gate besides :meth:`frozen` that suppresses triggers now (``None``: none)."""
+        return None
+
+    def note_accuracy_unverified(self, reason: str, suppressed_by: str, metrics: dict | None = None) -> None:
+        """Record an accuracy alarm that a gate (``suppressed_by``: ``"min_interval"``, ``"budget"``, ``"freeze"``,
+        ...) suppressed: :attr:`accuracy_unverified` counts them and keeps the last step and reason. The
+        linearization error of the current state is then not bounded by the trigger's criterion."""
+        a = self.accuracy_unverified
+        a["count"] += 1
+        a["last_step"] = self.step_count
+        a["last_reason"] = reason
+        a["suppressed_by"] = suppressed_by
+
+    def min_det_f(self, x: np.ndarray, element_ids: np.ndarray | None = None) -> float | None:
+        """Minimum ``det F`` of the linear tets at body-frame positions ``x`` against the assembler's rest mesh
+        (``None`` when the assembler has no tet mesh). ``element_ids`` restricts the elements."""
+        if self._tet_rest is None:
+            mesh = getattr(self.assembler, "mesh", None)
+            if mesh is None or not hasattr(mesh, "tets") or not hasattr(mesh, "nodes"):
+                return None
+            tets = np.asarray(mesh.tets, dtype=np.int64)
+            if tets.ndim != 2 or tets.shape[1] != 4:
+                return None
+            self._tet_rest = (tets, tet_edge_determinants(np.asarray(mesh.nodes), tets))
+        tets, rest = self._tet_rest
+        if element_ids is not None:
+            ids = np.asarray(element_ids, dtype=np.int64)
+            tets, rest = tets[ids], rest[ids]
+        if tets.shape[0] == 0:
+            return None
+        det = tet_edge_determinants(x, tets) / rest
+        return float(np.min(det)) if np.all(np.isfinite(det)) else float("-inf")
 
     def effective_min_interval(self, trigger_min_interval: int) -> int:
         """The trigger's minimum interval, or the policy's post-release one once released."""

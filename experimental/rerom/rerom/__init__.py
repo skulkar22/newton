@@ -9,7 +9,8 @@ Controllers     :class:`ReROMController` (one body, :class:`BodyAdapter` strateg
 Options         :class:`BasisOptions`, :class:`TriggerOptions`, :class:`UpdatePolicy`,
                 :class:`NonlinearForceOptions`; enums :class:`RestRotationMode`, :class:`IndefiniteGuard`,
                 :class:`UpdateSync`, :class:`UpdatePath`, :class:`TransferMode`
-Triggers        :class:`RotationTrigger`, :class:`EnergyMismatchTrigger`, :class:`ResidualTrigger`
+Triggers        :class:`RotationTrigger`, :class:`EnergyMismatchTrigger`, :class:`ResidualTrigger`,
+                :class:`ValidityTrigger`, :class:`CompositeTrigger` (OR of triggers)
 Assembly        :class:`TangentAssembler` (protocol), :class:`NumpyTetAssembler`, :class:`TetMesh`,
                 :func:`make_beam_mesh`, :func:`make_flexure_mesh`, :func:`default_assembler`
 Eigensolvers    :class:`RestrictedArpackBackend`, :class:`RestrictedSubspaceBackend`,
@@ -51,7 +52,14 @@ from .options import (
     UpdatePath,
     UpdatePolicy,
 )
-from .triggers import EnergyMismatchTrigger, ResidualTrigger, RotationTrigger, Trigger
+from .triggers import (
+    CompositeTrigger,
+    EnergyMismatchTrigger,
+    ResidualTrigger,
+    RotationTrigger,
+    Trigger,
+    ValidityTrigger,
+)
 
 __all__ = [
     "BaseMotion",
@@ -59,6 +67,7 @@ __all__ = [
     "BodyAdapter",
     "CBChain",
     "CBSegment",
+    "CompositeTrigger",
     "EnergyMismatchTrigger",
     "FreeBodyAdapter",
     "FullFEReference",
@@ -83,6 +92,7 @@ __all__ = [
     "UpdatePath",
     "UpdatePolicy",
     "UpdateSync",
+    "ValidityTrigger",
     "build_cb_chain",
     "cb_basis",
     "default_assembler",

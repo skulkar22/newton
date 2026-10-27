@@ -19,7 +19,7 @@ re-diagonalization :func:`rayleigh_ritz` (``Phi^T M Phi = I``, ``Phi^T K Phi`` d
 modal derivatives  :func:`tangent_derivative`, :func:`static_modal_derivatives`
 state projection   :func:`split_rigid_velocity`, :func:`project_modal_velocity`,
                    :func:`constrain_frame_velocity`, :func:`transfer_modal_velocity`
-diagnostics        :func:`compare_eigen`, :func:`imex_spectral_radius`
+diagnostics        :func:`compare_eigen`, :func:`imex_spectral_radius`, :func:`tet_edge_determinants`
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ __all__ = [
     "split_rigid_velocity",
     "static_modal_derivatives",
     "tangent_derivative",
+    "tet_edge_determinants",
     "to_nodal",
     "transfer_modal_velocity",
 ]
@@ -562,6 +563,16 @@ def transfer_modal_velocity(
 # ----------------------------------------------------------------------------------------------
 # diagnostics
 # ----------------------------------------------------------------------------------------------
+
+
+def tet_edge_determinants(x: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    """``det[x1 - x0, x2 - x0, x3 - x0]`` of every tetrahedron (six times the signed volume), (E,).
+
+    ``det F`` of a linear tet is the ratio of this value at the current and at the rest positions.
+    """
+    x = np.asarray(x, dtype=np.float64).reshape(-1, 3)
+    e = x[tets[:, 1:]] - x[tets[:, :1]]  # (E, 3, 3), rows are the edges
+    return np.einsum("ei,ei->e", e[:, 0], np.cross(e[:, 1], e[:, 2]))
 
 
 def compare_eigen(vals_ref, V_ref, vals, V, M, n: int) -> dict:

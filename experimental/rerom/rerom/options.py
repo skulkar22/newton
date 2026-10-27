@@ -146,6 +146,9 @@ class BasisOptions:
 class TriggerOptions:
     """Gating shared by all triggers (checked in this order before the trigger's own criterion).
 
+    Validity checks (:class:`~rerom.ValidityTrigger`, also inside a :class:`~rerom.CompositeTrigger`) run
+    before any gating and are never suppressed by it.
+
     Attributes:
         min_interval: Never fire before this many steps since the last update.
         max_updates: Update budget; no trigger fires once the controller made this many updates.
@@ -153,6 +156,10 @@ class TriggerOptions:
         check_every: Evaluate the criterion only every ``check_every`` steps.
         n_sample_elements: Deterministic element sample of sampled criteria (``None``: all elements).
         element_ids: Explicit element sample (overrides ``n_sample_elements``).
+        audit_suppressed: When the minimum interval, the budget, a freeze hook or a rejection back-off suppresses
+            the trigger, still evaluate the accuracy criterion (on the ``check_every`` cadence) and record a fired
+            alarm in ``controller.accuracy_unverified`` instead of dropping it silently. The criterion is read-only,
+            so this changes no trajectory, only the cost of suppressed steps.
     """
 
     min_interval: int = 1
@@ -161,6 +168,7 @@ class TriggerOptions:
     check_every: int = 1
     n_sample_elements: int | None = 512
     element_ids: np.ndarray | None = None
+    audit_suppressed: bool = True
 
 
 @dataclass(kw_only=True)

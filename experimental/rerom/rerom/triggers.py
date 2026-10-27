@@ -1,8 +1,20 @@
 """Update triggers of the re-ROM controller.
 
 Every trigger shares the gating of :class:`~rerom.options.TriggerOptions` (minimum interval, update
-budget, the controller's freeze hooks, maximum interval, check cadence) and then applies its own
-criterion. ``evaluate(ctrl, state, steps_since) -> (fire, reason, metrics)``.
+budget, the controller's freeze hooks and rejection back-off, maximum interval, check cadence) and then
+applies its own criterion. ``evaluate(ctrl, state, steps_since) -> (fire, reason, metrics)``.
+
+Two kinds of alarm are distinguished:
+
+- *validity* (:meth:`Trigger.check_validity`, :class:`ValidityTrigger`): the current state is not a valid
+  configuration of the model (non-finite modal state, inverted or collapsing elements). Validity alarms run
+  before and bypass every gate.
+- *accuracy* (:meth:`Trigger.check`): the linearization is getting stale. When a gate suppresses the trigger,
+  the criterion is still evaluated (``TriggerOptions.audit_suppressed``) and a fired alarm is recorded in
+  ``controller.accuracy_unverified`` rather than dropped.
+
+:class:`CompositeTrigger` combines triggers with OR logic (for example a cheap rotation proxy, an energy
+Taylor-defect check and a validity check).
 """
 
 from __future__ import annotations
@@ -17,30 +29,76 @@ import numpy as np
 from .numerics import host_sparse, imex_spectral_radius
 from .options import TriggerOptions
 
-__all__ = ["EnergyMismatchTrigger", "ResidualTrigger", "RotationTrigger", "Trigger"]
+__all__ = [
+    "CompositeTrigger",
+    "EnergyMismatchTrigger",
+    "ResidualTrigger",
+    "RotationTrigger",
+    "Trigger",
+    "ValidityTrigger",
+]
+
+
+def _element_sample(options: TriggerOptions, ctrl) -> np.ndarray | None:
+    """Element sample of ``options`` (``element_ids``, else a deterministic ``n_sample_elements`` sample;
+    ``None``: all elements)."""
+    if options.element_ids is not None:
+        return np.asarray(options.element_ids)
+    n_el = int(ctrl.assembler.mesh.tets.shape[0]) if hasattr(ctrl.assembler, "mesh") else None
+    n_s = options.n_sample_elements
+    if n_el is None or n_s is None or n_el <= n_s:
+        return None
+    return np.unique(np.linspace(0, n_el - 1, n_s).astype(np.int64))
 
 
 @dataclass(kw_only=True)
 class Trigger:
-    """Base class: shared gating, then :meth:`check` (the trigger's own criterion)."""
+    """Base class: validity checks, shared gating, then :meth:`check` (the trigger's own accuracy criterion)."""
 
     options: TriggerOptions = field(default_factory=TriggerOptions)
 
     def evaluate(self, ctrl, state, steps_since: int) -> tuple[bool, str, dict]:
-        """Apply the gating of :attr:`options` and the controller's freeze hooks, then :meth:`check`."""
-        metrics: dict[str, float] = {}
+        """Validity checks (never gated), then the gating of :attr:`options` and the controller's freeze hooks and
+        rejection back-off, then :meth:`check`.
+
+        A suppressed trigger still evaluates its criterion when ``options.audit_suppressed`` (on the
+        ``check_every`` cadence) and reports a fired alarm to ``ctrl.note_accuracy_unverified``; it does not fire.
+        """
+        metrics: dict[str, Any] = {}
         o = self.options
-        if steps_since < ctrl.effective_min_interval(o.min_interval):
-            return False, "", metrics
-        if o.max_updates is not None and ctrl.update_count >= o.max_updates:
-            return False, "", metrics
-        if ctrl.frozen():
+        reason = self.check_validity(ctrl, state, metrics)
+        if reason:
+            return True, reason, metrics
+        suppressed = self._suppression(ctrl, steps_since)
+        if suppressed is not None:
+            if o.audit_suppressed and steps_since % max(o.check_every, 1) == 0:
+                fire, why, metrics = self.check(ctrl, state, steps_since, metrics)
+                if fire:
+                    note = getattr(ctrl, "note_accuracy_unverified", None)
+                    if note is not None:
+                        note(why, suppressed, metrics)
             return False, "", metrics
         if o.max_interval is not None and steps_since >= o.max_interval:
             return True, "max_interval", metrics
         if steps_since % max(o.check_every, 1) != 0:
             return False, "", metrics
         return self.check(ctrl, state, steps_since, metrics)
+
+    def _suppression(self, ctrl, steps_since: int) -> str | None:
+        """Name of the gate that suppresses the trigger now (``None``: not suppressed)."""
+        o = self.options
+        if steps_since < ctrl.effective_min_interval(o.min_interval):
+            return "min_interval"
+        if o.max_updates is not None and ctrl.update_count >= o.max_updates:
+            return "budget"
+        if ctrl.frozen():
+            return "freeze"
+        blocked = getattr(ctrl, "update_suppression", None)
+        return blocked() if blocked is not None else None
+
+    def check_validity(self, ctrl, state, metrics: dict) -> str | None:
+        """Validity criterion, evaluated before and regardless of the gating: the alarm reason, or ``None``."""
+        return None
 
     def check(self, ctrl, state, steps_since: int, metrics: dict) -> tuple[bool, str, dict]:
         """The trigger's own criterion (gating already passed)."""
@@ -59,9 +117,21 @@ class RotationTrigger(Trigger):
     ``options.n_sample_elements`` elements (all elements when the mesh is smaller). On the device update
     path with a device tangent assembler the check runs as kernels (:meth:`DeviceUpdater.rotation_check
     <rerom.update_kernels.DeviceUpdater.rotation_check>`) with one 3-value device-to-host read per check.
+
+    The rotation angle is a cheap *proxy* for the linearization error, and the tolerance it needs depends on
+    geometry and slenderness (the spurious membrane energy of a linearly rotated segment scales like
+    ``(L/h)^2 theta^2``), mode content and time step; no angle is universally safe. The default 0.5 deg
+    follows the package's slender-beam evidence: on the branch's own coarse beam example (189 nodes, 12 modes,
+    StVK, E = 10 MPa, gravity release, 0.6 s against backward-Euler FE on the same mesh) the former 4 deg
+    default gave 16.95 % L tip RMS error with 12 updates, 0.5 deg gave 0.22 % L with 109 updates and 0.2 deg
+    0.03 % L with 228 updates (external re-ROM review, 26 Oct 2026, E1; dt, VBD iteration and eigensolver
+    controls did not change the 4 deg result). Pass ``theta_tol=math.radians(4.0)`` for the former default.
+    A rotation criterion is blind to stretch without rotation (pure extension has zero polar rotation):
+    combine it with :class:`EnergyMismatchTrigger` and :class:`ValidityTrigger` in a :class:`CompositeTrigger`
+    where that matters.
     """
 
-    theta_tol: float | None = math.radians(4.0)
+    theta_tol: float | None = math.radians(0.5)
     disp_tol: float | None = None
     char_length: float | None = None
     _sample: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -117,11 +187,7 @@ class RotationTrigger(Trigger):
             return self.options.element_ids
         if self._sample is not None:
             return self._sample
-        n_el = int(ctrl.assembler.mesh.tets.shape[0]) if hasattr(ctrl.assembler, "mesh") else None
-        n_s = self.options.n_sample_elements
-        if n_el is None or n_s is None or n_el <= n_s:
-            return None
-        self._sample = np.unique(np.linspace(0, n_el - 1, n_s).astype(np.int64))
+        self._sample = _element_sample(self.options, ctrl)
         return self._sample
 
 
@@ -188,6 +254,93 @@ class EnergyMismatchTrigger(Trigger):
         if ratio > self.tol:
             return True, "energy", metrics
         return False, "", metrics
+
+
+@dataclass(kw_only=True)
+class ValidityTrigger(Trigger):
+    """Validity alarm: non-finite modal state, or ``det F`` of a sampled element at or below ``det_f_floor``.
+
+    The check runs before the gating of :class:`~rerom.options.TriggerOptions` and is never suppressed by the
+    minimum interval, the update budget, a freeze hook or a rejection back-off. It has no accuracy criterion of
+    its own; use it inside a :class:`CompositeTrigger`. ``det F`` is evaluated on the linear field
+    ``r_ref + Phi q`` against the rest mesh on ``options.element_ids`` or ``options.n_sample_elements`` elements
+    (``n_sample_elements=None``: all), one host read of the modal state per check (also on the device path).
+    A large element rotation is not an inversion test; ``det F`` is.
+
+    Attributes:
+        det_f_floor: Alarm when the minimum ``det F`` is at or below this value (``None``: no ``det F`` check).
+        check_finite: Alarm on non-finite modal coordinates or velocities.
+    """
+
+    det_f_floor: float | None = 0.0
+    check_finite: bool = True
+    _sample: np.ndarray | None = field(default=None, init=False, repr=False)
+    _sampled: bool = field(default=False, init=False, repr=False)
+
+    def check_validity(self, ctrl, state, metrics):
+        q, qd = ctrl.read_modes(state)
+        if self.check_finite and not (np.all(np.isfinite(q)) and np.all(np.isfinite(qd))):
+            metrics["finite"] = 0.0
+            return "validity_non_finite"
+        if self.det_f_floor is not None:
+            if not self._sampled:
+                self._sample = _element_sample(self.options, ctrl)
+                self._sampled = True
+            det_min = ctrl.min_det_f(ctrl.r_ref.reshape(-1) + ctrl.Phi @ q, self._sample)
+            if det_min is not None:
+                metrics["det_f_min"] = det_min
+                if not det_min > self.det_f_floor:
+                    return "validity_det_f"
+        return None
+
+
+@dataclass(kw_only=True)
+class CompositeTrigger(Trigger):
+    """OR of child triggers under one gating (this trigger's :attr:`options`; the children's own gating options
+    are not used).
+
+    Validity checks of all children run first and bypass the gating. Then every child's accuracy criterion is
+    evaluated (no short circuit), so the metrics of all children are reported; ``metrics["fired"]`` lists the
+    reasons that fired and the returned reason joins them with ``"+"``. Metric names that collide between
+    children are prefixed with the child index (``"1.theta_max"``).
+
+    Attributes:
+        triggers: Child triggers, for example ``[RotationTrigger(), EnergyMismatchTrigger(), ValidityTrigger()]``.
+    """
+
+    triggers: list[Trigger] = field(default_factory=list)
+
+    @staticmethod
+    def _merge(metrics: dict, child: dict, index: int) -> None:
+        for k, v in child.items():
+            metrics[k if k not in metrics else f"{index}.{k}"] = v
+
+    def check_validity(self, ctrl, state, metrics):
+        reasons = []
+        for i, t in enumerate(self.triggers):
+            m: dict = {}
+            r = t.check_validity(ctrl, state, m)
+            self._merge(metrics, m, i)
+            if r:
+                reasons.append(r)
+        if reasons:
+            metrics["fired"] = reasons
+            return "+".join(reasons)
+        return None
+
+    def check(self, ctrl, state, steps_since, metrics):
+        fired = []
+        for i, t in enumerate(self.triggers):
+            fire, reason, m = t.check(ctrl, state, steps_since, {})
+            self._merge(metrics, m, i)
+            if fire:
+                fired.append(reason)
+        metrics["fired"] = fired
+        return bool(fired), "+".join(fired), metrics
+
+    def on_update(self, ctrl):
+        for t in self.triggers:
+            t.on_update(ctrl)
 
 
 @dataclass(kw_only=True)
