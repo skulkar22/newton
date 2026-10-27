@@ -83,6 +83,7 @@ from .options import (
     IndefiniteGuard,
     NonlinearForceOptions,
     RestRotationMode,
+    TransferMode,
     TriggerOptions,
     UpdatePath,
     UpdatePolicy,
@@ -341,6 +342,7 @@ class FreeBodyAdapter(BodyAdapter):
             # device path (rerom.update_kernels): only the rigid Gram matrix about com_new is formed here
             dynamic = not (ctrl.constrained or not lay.frame_dynamic)
             return {
+                "transfer_mode": TransferMode.FREE if dynamic else TransferMode.PRESCRIBED_FRAME,
                 "Phi": Phi_new,
                 "mass_modes": mass_modes,
                 "mode_mass_matrix": mode_mass_matrix,
@@ -368,7 +370,8 @@ class FreeBodyAdapter(BodyAdapter):
                 },
             }
         R, u_local, qd = ctx["R"], ctx["u_local"], ctx["qd"]
-        if ctrl.constrained or not lay.frame_dynamic:
+        prescribed = ctrl.constrained or not lay.frame_dynamic
+        if prescribed:
             omega_l = R.T @ ctx["omega"]
             t_vec = R.T @ ctx["v_c"] + np.cross(omega_l, com_new - ctrl.com)
             w_vec = omega_l
@@ -379,6 +382,7 @@ class FreeBodyAdapter(BodyAdapter):
         u_el_old = u_local - u_rig
         qd_new = project_modal_velocity(u_el_old, Phi_new, M, mode_mass_matrix)
         return {
+            "transfer_mode": TransferMode.PRESCRIBED_FRAME if prescribed else TransferMode.FREE,
             "Phi": Phi_new,
             "mass_modes": mass_modes,
             "mode_mass_matrix": mode_mass_matrix,
@@ -501,7 +505,7 @@ class InterfaceBodyAdapter(BodyAdapter):
         mode_mass_matrix = Phi_new.T @ mass_modes
         mode_mass = np.diag(mode_mass_matrix).copy()
         # state projection: frame twist kept, interface velocities preserved (minimum kinetic energy in the
-        # reduced metric; the Euclidean formula for the M-orthonormal CB basis)
+        # reduced metric; the Euclidean formula for the M-orthonormal CB basis). Affine, not energy-contracting.
         qd_new, transfer_info = transfer_modal_velocity(
             u_el_old, Phi_new, M, mode_mass_matrix, F=F_new, fdot=fdot, cond_max=INTERFACE_COND_MAX
         )
@@ -526,7 +530,9 @@ class InterfaceBodyAdapter(BodyAdapter):
             self.tip_pos = tip_pos_new
             self.frame_map = F_new
         fdot_after = (F_new @ qd_new) if F_new is not None else None
+        mode = TransferMode.INTERFACE_CONSTRAINED if F_new is not None else TransferMode.PRESCRIBED_FRAME
         return {
+            "transfer_mode": mode,
             "Phi": Phi_new,
             "mass_modes": mass_modes,
             "mode_mass_matrix": mode_mass_matrix,
@@ -549,6 +555,7 @@ class InterfaceBodyAdapter(BodyAdapter):
                 "held_names": binfo.get("held_names"),
                 "frame_map_residual": binfo.get("frame_map_residual"),
                 "tip_frame_velocity_change": None if fdot is None else float(np.max(np.abs(fdot_after - fdot))),
+                "interface_velocity_mismatch": transfer_info.get("interface_velocity_mismatch"),
                 "interface_transfer_metric": transfer_info.get("metric"),
                 "interface_schur_condition": transfer_info.get("schur_condition"),
             },
@@ -1098,9 +1105,15 @@ class ReROMController:
             rebasis: Overrides :attr:`BasisOptions.rebasis` for this call (free-body adapter).
             debug: Diagnostics switches ``keep_basis`` / ``keep_endpoint_psi`` (free-body adapter).
 
-        Returns the per-update diagnostics (also appended to :attr:`stats`): wall-clock split ``timings``,
-        eigenvalues, kinetic energy before/after and lost in the projection, nonlinear vs ROM strain energy,
-        momentum before/after.
+        Returns the per-update diagnostics (also appended to :attr:`stats`): wall-clock split ``timings``;
+        raw (``eigenvalues``, ``lam_raw_min``) and operational (``eigenvalues_operational``,
+        ``lam_operational_min``) spectra and the clamp record; the transfer mode (:class:`~rerom.TransferMode`);
+        nodal kinetic energy ``KE_before`` / ``KE_after`` and the signed ``delta_KE`` [J]; the projection
+        residual ``velocity_projection_residual_energy = 1/2 e^T M e`` (alias ``KE_lost_projection``, an energy
+        loss only in :attr:`TransferMode.FREE`); linear/angular momentum before/after with absolute (``dP``,
+        ``dL``) and relative (``dP_rel``, ``dL_rel``) changes; the maximum nodal position change; the interface
+        velocity mismatch (interface adapter); nonlinear vs ROM strain energy. Model mass offsets (armature) are
+        not part of the nodal energies and momenta.
         """
         if self._dev is not None:
             return self._relinearize_device(state, control, stiffness_override, rebasis, debug)
@@ -1110,11 +1123,12 @@ class ReROMController:
         self._bind(state)
         try:
             q, qd = self.read_modes(state)
-            _p, quat, v_c, omega = self.read_frame(state)
+            p_frame, quat, v_c, omega = self.read_frame(state)
             R = quat_to_matrix(quat)
             x_new = self.r_ref + (self.Phi @ q).reshape(-1, 3)
             before = self.nodal_momentum(state)
             u_local = self.local_velocity(state)
+            x_world_before = self.world_field(state)
         finally:
             self._unbind()
 
@@ -1166,7 +1180,6 @@ class ReROMController:
         M = self.M
         resid = u_el_old - Phi_new @ qd_new
         ke_lost = 0.5 * float(resid @ (M @ resid))
-        ke_total = 0.5 * float(u_local @ (M @ u_local))
         ke_el = 0.5 * float(u_el_old @ (M @ u_el_old))
         W_rom = self.W_ref + float(self.g0 @ q) + 0.5 * float(np.sum(self.lam * q * q))
 
@@ -1219,6 +1232,7 @@ class ReROMController:
         timings["total"] = t4 - t0 - timings.get("eigen_compare_excluded", 0.0)
 
         after = self.nodal_momentum(state)
+        position_change = float(np.max(np.linalg.norm(self.world_field(state) - x_world_before, axis=1)))
         info = {
             "body": self.body,
             "step": self.step_count,
@@ -1230,18 +1244,13 @@ class ReROMController:
             "W_nonlinear": float(W_nl),
             "W_rom": W_rom,
             "W_rel_error": (W_rom - float(W_nl)) / max(abs(float(W_nl)), 1.0e-30),
-            "KE_before": before["KE"],
-            "KE_after": after["KE"],
-            "KE_lost_projection": ke_lost,
-            "KE_elastic_before": ke_el,
-            "KE_lost_fraction_total": ke_lost / max(ke_total, 1.0e-30),
-            "KE_lost_fraction_elastic": ke_lost / max(ke_el, 1.0e-30),
-            "P_before": before["P"].tolist(),
-            "P_after": after["P"].tolist(),
-            "L_before": before["L"].tolist(),
-            "L_after": after["L"].tolist(),
-            "dP": float(np.linalg.norm(after["P"] - before["P"])),
-            "dL": float(np.linalg.norm(after["L"] - before["L"])),
+            **self._transfer_info(
+                res,
+                (before["KE"], after["KE"], ke_lost, ke_el),
+                (before["P"], after["P"], before["L"], after["L"]),
+                (p_frame, R, mass_new, com_new, I_new),
+                position_change,
+            ),
             "q_norm_before": float(np.linalg.norm(q)),
             "com_shift": float(np.linalg.norm(com_new - com_old)),
             **res["info"],
@@ -1395,10 +1404,11 @@ class ReROMController:
         if diag is not None:
             P_a, L_a = world(diag[:3], diag[3:6])
             ke_after, ke_el, ke_lost = 0.5 * float(diag[6]), float(diag[7]), float(diag[8])
+            position_change = float(diag[10])
         else:
             nan3 = np.full(3, np.nan)
             P_a, L_a = nan3, nan3
-            ke_after = ke_el = ke_lost = float("nan")
+            ke_after = ke_el = ke_lost = position_change = float("nan")
         info = {
             "body": self.body,
             "step": self.step_count,
@@ -1410,18 +1420,13 @@ class ReROMController:
             "W_nonlinear": float(W_nl),
             "W_rom": W_rom,
             "W_rel_error": (W_rom - float(W_nl)) / max(abs(float(W_nl)), 1.0e-30),
-            "KE_before": ke_total,
-            "KE_after": ke_after,
-            "KE_lost_projection": ke_lost,
-            "KE_elastic_before": ke_el,
-            "KE_lost_fraction_total": ke_lost / max(ke_total, 1.0e-30),
-            "KE_lost_fraction_elastic": ke_lost / max(ke_el, 1.0e-30),
-            "P_before": P_b.tolist(),
-            "P_after": P_a.tolist(),
-            "L_before": L_b.tolist(),
-            "L_after": L_a.tolist(),
-            "dP": float(np.linalg.norm(P_a - P_b)),
-            "dL": float(np.linalg.norm(L_a - L_b)),
+            **self._transfer_info(
+                res,
+                (ke_total, ke_after, ke_lost, ke_el),
+                (P_b, P_a, L_b, L_a),
+                (p, R, mass_new, com_new, I_new),
+                position_change,
+            ),
             "q_norm_before": float(np.linalg.norm(q)),
             "com_shift": float(np.linalg.norm(com_new - com_old)),
             "update_path": "device",
@@ -1456,6 +1461,52 @@ class ReROMController:
         if self.damping_ratio == 0.0:
             return np.zeros_like(mode_mass)
         return 2.0 * self.damping_ratio * np.sqrt(np.maximum(mode_mass * lam * mode_mass, 0.0))
+
+    @staticmethod
+    def _transfer_info(res: dict, energies: tuple, momenta: tuple, frame: tuple, position_change: float) -> dict:
+        """State-transfer diagnostics of an update (both paths; nodal field, excluding model mass offsets).
+
+        ``energies = (KE_before, KE_after, residual, KE_elastic_before)``, ``momenta = (P0, P1, L0, L1)`` (world,
+        about the world origin), ``frame = (p, R, mass, com, inertia)`` of the new reference.
+        ``delta_KE`` is the signed kinetic energy change [J]; ``velocity_projection_residual_energy`` the
+        energy norm ``1/2 e^T M e`` of the velocity left out by the projection. They agree (``delta_KE =
+        -residual``) only for :attr:`TransferMode.FREE`; ``KE_lost_projection`` is a backward-compatible alias of
+        the residual and is an energy *loss* only in that mode. Relative momentum changes divide by
+        ``max(|P|, sqrt(2 m KE))`` and ``max(|L|, sqrt(2 KE J))`` (``J = tr(I)/2 + m |c|^2``, world origin):
+        Cauchy-Schwarz bounds of the momenta, finite also when the body is at rest.
+        """
+        ke0, ke1, ke_lost, ke_el = (float(v) for v in energies)
+        P0, P1, L0, L1 = (np.asarray(v, dtype=np.float64) for v in momenta)
+        p, R, mass, com, inertia = frame
+        dP = float(np.linalg.norm(P1 - P0))
+        dL = float(np.linalg.norm(L1 - L0))
+        ke_ref = max(ke0, 0.0)
+        c_world = np.asarray(p, dtype=np.float64) + R @ np.asarray(com, dtype=np.float64)
+        J = 0.5 * float(np.trace(inertia)) + float(mass) * float(c_world @ c_world)
+        P_scale = max(float(np.linalg.norm(P0)), math.sqrt(2.0 * float(mass) * ke_ref), 1.0e-300)
+        L_scale = max(float(np.linalg.norm(L0)), math.sqrt(2.0 * ke_ref * max(J, 0.0)), 1.0e-300)
+        mode = res.get("transfer_mode")
+        return {
+            "transfer_mode": mode.value if mode is not None else None,
+            "KE_before": ke0,
+            "KE_after": ke1,
+            "delta_KE": ke1 - ke0,
+            "velocity_projection_residual_energy": ke_lost,
+            "KE_lost_projection": ke_lost,
+            "KE_elastic_before": ke_el,
+            "KE_lost_fraction_total": ke_lost / max(ke0, 1.0e-30),
+            "KE_lost_fraction_elastic": ke_lost / max(ke_el, 1.0e-30),
+            "P_before": P0.tolist(),
+            "P_after": P1.tolist(),
+            "L_before": L0.tolist(),
+            "L_after": L1.tolist(),
+            "dP": dP,
+            "dL": dL,
+            "dP_rel": dP / P_scale,
+            "dL_rel": dL / L_scale,
+            "position_change_max": float(position_change),
+            "interface_velocity_mismatch": res.get("info", {}).get("interface_velocity_mismatch"),
+        }
 
     def _spectrum_info(self, lam_raw: np.ndarray, lam_op: np.ndarray, clamp: dict | None) -> dict:
         """Raw and operational spectrum diagnostics of an update (``eigenvalues`` stays the raw spectrum)."""

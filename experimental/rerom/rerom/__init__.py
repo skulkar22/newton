@@ -8,7 +8,7 @@ Controllers     :class:`ReROMController` (one body, :class:`BodyAdapter` strateg
                 :class:`FreeBodyAdapter`, :class:`InterfaceBodyAdapter`, :class:`MultiFrameController`
 Options         :class:`BasisOptions`, :class:`TriggerOptions`, :class:`UpdatePolicy`,
                 :class:`NonlinearForceOptions`; enums :class:`RestRotationMode`, :class:`IndefiniteGuard`,
-                :class:`UpdateSync`, :class:`UpdatePath`
+                :class:`UpdateSync`, :class:`UpdatePath`, :class:`TransferMode`
 Triggers        :class:`RotationTrigger`, :class:`EnergyMismatchTrigger`, :class:`ResidualTrigger`
 Assembly        :class:`TangentAssembler` (protocol), :class:`NumpyTetAssembler`, :class:`TetMesh`,
                 :func:`make_beam_mesh`, :func:`make_flexure_mesh`, :func:`default_assembler`
@@ -46,6 +46,7 @@ from .options import (
     IndefiniteGuard,
     NonlinearForceOptions,
     RestRotationMode,
+    TransferMode,
     TriggerOptions,
     UpdatePath,
     UpdatePolicy,
@@ -76,6 +77,7 @@ __all__ = [
     "ShiftedRestrictedSolver",
     "TangentAssembler",
     "TetMesh",
+    "TransferMode",
     "Trigger",
     "TriggerOptions",
     "UpdatePath",

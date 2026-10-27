@@ -12,6 +12,7 @@ __all__ = [
     "IndefiniteGuard",
     "NonlinearForceOptions",
     "RestRotationMode",
+    "TransferMode",
     "TriggerOptions",
     "UpdatePath",
     "UpdatePolicy",
@@ -76,6 +77,23 @@ class IndefiniteGuard(enum.Enum):
     (``f_tot'(0) = Lambda_op``) all use it, so the remainder never restores the clamped negative stiffness.
     The physical (raw) tangent is no longer represented in the clamped directions; this is a regularization,
     not a physically accurate treatment of an unstable state."""
+
+
+class TransferMode(enum.Enum):
+    """How the state was transferred to the new basis at an update (``info["transfer_mode"]``)."""
+
+    FREE = "free"
+    """Free dynamic frame: M-orthogonal split into the rigid motions of the new reference and the new modal
+    span. Momentum is preserved and the nodal kinetic energy can only decrease, by
+    ``velocity_projection_residual_energy`` (then equal to ``-delta_KE``)."""
+    PRESCRIBED_FRAME = "prescribed_frame"
+    """Constrained basis or kinematic frame: the frame twist is kept and only the modal velocity is projected.
+    ``velocity_projection_residual_energy`` is the energy norm of the modal velocity error, not the kinetic
+    energy change (the old elastic and rigid velocities need not be M-orthogonal)."""
+    INTERFACE_CONSTRAINED = "interface_constrained"
+    """Craig-Bampton interface body: frame twist kept, modal velocity projected and then corrected so that the
+    interface-frame velocity is preserved. The correction is affine (a nonzero prescribed interface velocity),
+    so the kinetic energy can increase; ``delta_KE`` is the signed change."""
 
 
 @dataclass(kw_only=True)

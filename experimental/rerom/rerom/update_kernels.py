@@ -332,6 +332,15 @@ def _node_norm_kernel(x: wp.array[wp.vec3d], r_ref: wp.array[wp.vec3d], out: wp.
 
 
 @wp.kernel
+def _max_reduce_kernel(partial: wp.array[wp.float64], chunks: int, out: wp.array[wp.float64], offset: int):
+    """``out[offset] = max_c partial[c]`` (non-negative partials)."""
+    k = wp.float64(0.0)
+    for c in range(chunks):
+        k = wp.max(k, partial[c])
+    out[offset] = k
+
+
+@wp.kernel
 def _max_partial_kernel(a: wp.array[wp.float64], n: int, chunks: int, partial: wp.array[wp.float64]):
     c = wp.tid()
     r = _chunk_range(c, n, chunks)
@@ -1046,8 +1055,8 @@ class DeviceUpdater:
         width = max(9 * m * m, 15 * m, m, 7)
         self.partial = wp.zeros(CHUNKS * width, dtype=wp.float64, device=dev)
         self.theta = wp.zeros(max(self.n_ep, 1), dtype=wp.vec3d, device=dev)
-        # diagnostics: [P_l after (3), L_l after (3), uMu after, KE_el, KE_lost, spread]
-        self.diag = wp.zeros(10, dtype=wp.float64, device=dev)
+        # diagnostics: [P_l after (3), L_l after (3), uMu after, KE_el, KE_lost, spread, max |x_after - x_before|]
+        self.diag = wp.zeros(11, dtype=wp.float64, device=dev)
 
         # staging (device -> host)
         asm = getattr(ctrl.assembler, "inner", ctrl.assembler)  # unwrap rerom.assembly.HostTangentAssembler
@@ -1469,9 +1478,13 @@ class DeviceUpdater:
             self.write_prestress(control)
         if not diagnostics:
             return None
-        # after-update momenta of the new state (q = 0, x = r_new)
+        # after-update momenta of the new state (q = 0, x = r_new) and the nodal position change (body frame;
+        # the frame pose is not written, so this is the world change too) against r_ref = x_before
         self._recover(state, True)
         self._moments(self.diag, 0)
+        self._launch(_node_norm_kernel, N, [self.x, self.r_ref, self._node_norm])
+        self._launch(_max_partial_kernel, CHUNKS, [self._node_norm, N, CHUNKS, self._disp_partial])
+        self._launch(_max_reduce_kernel, 1, [self._disp_partial, CHUNKS, self.diag, 10])
         return self.diag.numpy().copy()
 
     # ------------------------------------------------------------------------------------------

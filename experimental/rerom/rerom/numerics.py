@@ -521,6 +521,7 @@ def transfer_modal_velocity(
     fdot: np.ndarray | None = None,
     identity_tol: float = 1.0e-12,
     cond_max: float | None = None,
+    energies: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """Modal velocity of the new basis ``Phi`` for the old elastic nodal velocity ``u_el``.
 
@@ -530,7 +531,11 @@ def transfer_modal_velocity(
     identity is treated as the identity, which keeps M-orthonormal bases on the Euclidean formula.
 
     Returns ``(qd, info)``; ``info`` holds ``metric`` (``"identity"`` / ``"mass"``), ``schur_condition`` and
-    ``interface_velocity_mismatch`` (``max |F qd - fdot|``) when ``F`` is given.
+    ``interface_velocity_mismatch`` (``max |F qd - fdot|``) when ``F`` is given, and with ``energies`` the
+    elastic kinetic energies ``KE_before = 1/2 u_el^T M u_el``, ``KE_after = 1/2 v^T M v`` (``v = Phi qd``),
+    the signed ``delta_KE = KE_after - KE_before`` and ``velocity_projection_residual_energy = 1/2 e^T M e``
+    (``e = u_el - v``). Only the unconstrained projection guarantees ``delta_KE = -residual``; the
+    interface correction is affine and can raise the energy.
     """
     qd = project_modal_velocity(u_el, Phi, M, mode_mass_matrix)
     info: dict = {}
@@ -540,6 +545,17 @@ def transfer_modal_velocity(
         info["metric"] = "identity" if identity else "mass"
         qd = constrain_frame_velocity(qd, F, fdot, G=None if identity else G, cond_max=cond_max, info=info)
         info["interface_velocity_mismatch"] = float(np.max(np.abs(F @ qd - fdot))) if fdot.size else 0.0
+    if energies:
+        v = Phi @ qd
+        e = u_el - v
+        ke0 = 0.5 * float(u_el @ (M @ u_el))
+        ke1 = 0.5 * float(v @ (M @ v))
+        info.update(
+            KE_before=ke0,
+            KE_after=ke1,
+            delta_KE=ke1 - ke0,
+            velocity_projection_residual_energy=0.5 * float(e @ (M @ e)),
+        )
     return qd, info
 
 
