@@ -161,6 +161,16 @@ class BasisOptions:
             The subspace iteration always shared its (pivoting) factorization, so the option does not change
             it. ``False`` reproduces the legacy ARPACK path bit for bit (ARPACK at ``default_shift``, a
             separate pivoting LU for the Ritz solves).
+        velocity_enrichment: Free-body adapter, opt-in. Keep the current elastic velocity representable across the
+            update: when the old elastic velocity (its part outside the rigid motions of the new reference, or
+            ``Phi_old qd`` for a clamped basis) has an M-orthogonal residual against the candidate space, the
+            candidate space is diagonalized once, its highest-frequency Rayleigh-Ritz direction is evicted and the
+            residual of the old velocity against the remaining ``m - 1`` directions is appended before the final
+            Rayleigh-Ritz step. The mode count stays fixed; the cost is the highest retained frequency direction
+            (which may carry load or eigenmode content). The transfer then loses no kinetic energy (up to
+            roundoff). On the device path the old velocity is recomputed on the host (O(N m)).
+        velocity_enrichment_tol: Relative M-norm of the residual (against the full candidate space) below which
+            nothing is replaced.
     """
 
     n_ritz: int = 2
@@ -176,6 +186,8 @@ class BasisOptions:
     damping_ratio: float | None = None
     eigen_compare: bool = False
     shared_factorization: bool = True
+    velocity_enrichment: bool = False
+    velocity_enrichment_tol: float = 1.0e-8
 
 
 @dataclass(kw_only=True)

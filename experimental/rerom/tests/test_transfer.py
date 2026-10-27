@@ -193,5 +193,43 @@ class TestTransferEnergyDiagnostics(unittest.TestCase):
                 self.assertAlmostEqual(info["delta_KE"], info["KE_after"] - info["KE_before"], places=12)
 
 
+class TestVelocityEnrichment(unittest.TestCase):
+    def test_enrichment_removes_the_free_switch_loss(self):
+        """The review's free switch (eigen-only and 2 Ritz vectors): with velocity enrichment the projection residual
+        drops to roundoff while momentum stays preserved; without it the eigen-only switch loses ~1e-3 of the
+        elastic kinetic energy."""
+        for device in _devices():
+            for path in PATHS:
+                for n_ritz in (0, 2):
+                    with self.subTest(device=device, path=path.value, n_ritz=n_ritz):
+                        _, plain = _switch(path, device, n_ritz=n_ritz)
+                        basis = rerom.BasisOptions(n_ritz=n_ritz, velocity_enrichment=True)
+                        ctrl, info = _switch(path, device, basis=basis)
+                        self.assertTrue(info["velocity_enrichment"]["applied"])
+                        self.assertGreater(info["velocity_enrichment"]["residual_rel"], 1.0e-6)
+                        self.assertEqual(ctrl.Phi.shape[1], ctrl.m)
+                        frac = info["velocity_projection_residual_energy"] / info["KE_elastic_before"]
+                        self.assertLess(frac, 1.0e-9)
+                        self.assertGreater(plain["KE_lost_fraction_elastic"], 1.0e3 * max(frac, 1.0e-15))
+                        self.assertLess(abs(info["delta_KE"]), 1.0e-5 * info["KE_before"])
+                        self.assertLess(info["dP_rel"], 1.0e-5)
+                        self.assertLess(info["dL_rel"], 1.0e-5)
+                        if n_ritz == 0:
+                            self.assertGreater(plain["KE_lost_fraction_elastic"], 1.0e-4)
+
+    def test_enrichment_is_off_by_default_and_a_no_op_for_a_represented_velocity(self):
+        self.assertFalse(rerom.BasisOptions().velocity_enrichment)
+        # beam at rest: no velocity, nothing replaced
+        asm = beam_assembler(young=FREE_FLIGHT_YOUNG)
+        gen, _b, model, state, body = build_free_beam(asm, 6, shape=False)
+        solver = newton.solvers.SolverVBD(model, iterations=4)
+        basis = rerom.BasisOptions(n_ritz=0, velocity_enrichment=True)
+        ctrl = free_controller(model, solver, body, asm, gen, basis=basis, policy=rerom.UpdatePolicy(path=PATHS[0]))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info = ctrl.relinearize(state)
+        self.assertFalse(info["velocity_enrichment"]["applied"])
+
+
 if __name__ == "__main__":
     unittest.main()

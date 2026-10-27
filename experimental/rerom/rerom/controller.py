@@ -337,6 +337,9 @@ class FreeBodyAdapter(BodyAdapter):
             basis = block.columns[:, :m]
             if basis.shape[1] < m:
                 raise RuntimeError("could not assemble m independent basis vectors")
+        enrichment = None
+        if o.velocity_enrichment:
+            basis, enrichment = self._enrich_velocity(ctrl, ctx, basis, K_T, com_new, Yraw)
         _, Phi_new, _ = rayleigh_ritz(basis, K_T, M)
         if debug.get("keep_basis"):
             Phi_new = ctrl.Phi.copy()
@@ -379,6 +382,7 @@ class FreeBodyAdapter(BodyAdapter):
             "md_kept": md_kept,
             **({"eigen_compare": eig_compare} if eig_compare is not None else {}),
             **({"eigen_residual_max": eigen_residual} if eigen_residual is not None else {}),
+            **({"velocity_enrichment": enrichment} if enrichment is not None else {}),
         }
 
         # ---- state projection: rigid part -> frame twist (about com_new), remainder -> qd ----------
@@ -408,6 +412,30 @@ class FreeBodyAdapter(BodyAdapter):
             return out
         out.update(self._host_transfer(ctrl, ctx, Phi_new, mode_mass_matrix, com_new, Yraw))
         return out
+
+    @classmethod
+    def _enrich_velocity(cls, ctrl, ctx, basis, K_T, com_new, Yraw) -> tuple[np.ndarray, dict]:
+        """:attr:`BasisOptions.velocity_enrichment`: replace the highest-frequency Rayleigh-Ritz direction of the
+        candidate space ``basis`` by the M-orthogonal residual of the old elastic velocity (see the option)."""
+        M = ctrl.M
+        _, _, u_el = cls._old_elastic_velocity(ctrl, ctx, com_new, Yraw)
+        norm = math.sqrt(max(float(u_el @ (M @ u_el)), 0.0))
+        info: dict[str, Any] = {"applied": False, "residual_rel": 0.0}
+        if norm == 0.0:
+            return basis, info
+        lam_b, P, _ = rayleigh_ritz(basis, K_T, M)  # M-orthonormal, ascending Rayleigh quotients
+        r_full = u_el - P @ (P.T @ (M @ u_el))
+        rel = math.sqrt(max(float(r_full @ (M @ r_full)), 0.0)) / norm
+        info["residual_rel"] = rel
+        if rel <= ctrl.basis_options.velocity_enrichment_tol:
+            return basis, info
+        kept = P[:, :-1]
+        r = u_el
+        for _ in range(2):  # two-pass Gram-Schmidt against the kept directions
+            r = r - kept @ (kept.T @ (M @ r))
+        rn = math.sqrt(max(float(r @ (M @ r)), 0.0))
+        info.update(applied=True, evicted_rayleigh_quotient=float(lam_b[-1]))
+        return np.column_stack([kept, r / rn]), info
 
     @staticmethod
     def _old_elastic_velocity(ctrl, ctx, com_new, Yraw):
@@ -1478,6 +1506,7 @@ class ReROMController:
 
             # ---- 2. basis (host; the adapter skips the state projection) ----------------------------
             host_transfer = v.transfer_energy_budget is not None
+            need_velocity = host_transfer or self.basis_options.velocity_enrichment
             ctx = {
                 "state": state,
                 "q": q,
@@ -1486,7 +1515,7 @@ class ReROMController:
                 "v_c": v_c,
                 "omega": omega,
                 "x_new": x_new,
-                "u_local": self._host_local_velocity(R, v_c, omega, qd, x_new) if host_transfer else None,
+                "u_local": self._host_local_velocity(R, v_c, omega, qd, x_new) if need_velocity else None,
                 "f_int": f_int,
                 "K_T": K_T,
                 "timings": timings,
