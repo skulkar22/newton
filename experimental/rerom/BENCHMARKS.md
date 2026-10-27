@@ -258,8 +258,8 @@ Per pencil (beam 6k, panel 22.5k, solid block 28.8k, panel 88k; clamped and free
 
 ARPACK's own residual floor on these pencils reaches 1.0e-8. The native path runs `CuDSSInverse` without residual
 correction (`refinement_steps=0`). Warpack's default single step for indefinite factors broke the cancellation of the
-rigid restriction at the near-singular free-body shift: the rigid overlap of a restricted solve rose from 2.5e-11 to
-2.6e-9, and Krylov-Schur stalled at 9/12 pairs on the free test beam.
+rigid restriction at the near-singular free-body shift: the relative rigid overlap of a restricted solve rose from
+about 2e-11 to 3e-9 to 7e-9 (two runs), and Krylov-Schur stalled at 9/12 pairs on the free test beam.
 
 M1 swing (469 updates at 0.2 deg, cuda, device path) with `WarpackKrylovBackend`:
 

@@ -26,11 +26,12 @@ Sparse factorization (``WarpackContext(factorization=...)``), always the symmetr
   refreshes the values and runs the binding's numeric refactorization (``CudssSolver.refactor``). The Sturm
   count reads ``CuDSSInverse.inertia()``. No residual-correction step by default (``refinement_steps=0``, as
   Warpack's own completeness certificate uses): Warpack's default single step for an indefinite factor breaks
-  the exact cancellation of the rigid restriction at the near-singular free-body Ritz shift (rigid overlap of a
-  restricted solve 2.5e-11 -> 2.6e-9 relative, Krylov-Schur stalled at 9/12 pairs on the free test beam). ``CuDSSInverse`` fixes the RHS width at setup (width 1 here, what
-  the shift-invert Krylov-Schur applies), so blocks of other widths (rigid restriction, LOBPCG
-  preconditioner, Ritz and modal-derivative solves) are solved row by row on the same factorization, as
-  Warpack's own shift operators do; no second factorization is made.
+  the exact cancellation of the rigid restriction at the near-singular free-body Ritz shift (relative rigid
+  overlap of a restricted solve about 2e-11 without, 3e-9 to 7e-9 with it in two runs; Krylov-Schur stalled at
+  9/12 pairs on the free test beam). ``CuDSSInverse`` fixes the RHS width at setup (width 1 here, what the
+  shift-invert Krylov-Schur applies), so blocks of other widths (rigid restriction, LOBPCG preconditioner, Ritz
+  and modal-derivative solves) are solved row by row on the same factorization, as Warpack's own shift
+  operators do; no second factorization is made.
 - ``"nvmath"`` (:class:`CudssFactor`): this package's adapter of the same Warpack inverse protocol (``n``,
   ``device``, ``width``, ``apply(rows, out)``) on cuDSS 0.8 through ``nvmath-python``'s low-level bindings
   (``nvidia-cudss-cu13``), with one block solve for any RHS width. It was the only path before the binding
