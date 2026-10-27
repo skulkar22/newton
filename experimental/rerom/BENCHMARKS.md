@@ -223,37 +223,49 @@ Column definitions:
 
 ## 3. Warpack eigensolver backends (`rerom/eigen_warpack.py`)
 
-[Warpack](https://github.com/alecjacobson/warpack) (Alec Jacobson, MIT) at `a8b945de`, cuDSS 0.8.0 through
-nvmath-python 1.0.0 (`nvidia-cudss-cu13` 0.8.0.10), Warp 1.18.0, float64, physical GPU 1 (idle), 27 Oct 2026. Host load
-average 2-19 during the runs (partly the cuDSS OpenMP reordering itself): upper bounds. Full tables, commands, raw
-JSON and logs: the experiment directory `exp-re-rom/gpu_eigen_proto/` (`RESULTS.md`) next to this worktree.
+[Warpack](https://github.com/alecjacobson/warpack) (Alec Jacobson, MIT) at `a8b945de`, Warp 1.18.0, float64, physical
+GPU 1 (idle), 27 Oct 2026. Two factorizations of the same package code, measured in one session:
 
-Provenance of the factorization: Warpack's own cuDSS binding (`warp-cudss`) was not installed in the measuring
-environment, so the shift-invert factorization and the Sturm/inertia count come from this package's `CudssFactor`
-adapter on cuDSS 0.8.0 through nvmath-python, which follows Warpack's inverse protocol (the Krylov-Schur and LOBPCG
-solvers are Warpack's). Warpack's own test suite in that environment: 86 passed, 2 skipped, and its 37
-cuDSS-dependent tests failed at import with `ModuleNotFoundError: No module named 'warp_cudss'`. When cuDSS reports
-perturbed pivots in the Sturm factorization the count is not certified: the backend returns no inertia count and the
-Sturm check is skipped with a warning. Warpack is by Alec Jacobson.
+- **native**: Warpack's own `CuDSSInverse` on its pinned `warp-cudss` binding (`alecjacobson/warp-cuDSS` at
+  `e1d1be41`, `direct_url.json` verified), cuDSS 0.8.0.10 (`nvidia-cudss-cu12`, the loaded `libcudss.so.0` checked);
+- **adapter**: this package's `CudssFactor` on cuDSS 0.8.0.10 through nvmath-python 1.0.0 (`nvidia-cudss-cu13`), in
+  the unchanged environment of the earlier measurement.
+
+The CPU rows were rerun in the same session. Host load average 1-14 during the runs (partly SuperLU and the cuDSS
+reordering themselves), so the numbers are upper bounds. Full tables, commands, raw JSON and logs:
+`exp-re-rom/gpu_eigen_proto/RESULTS_NATIVE.md` next to this worktree.
+
+Warpack's own test suite with the binding: on the 11-file subset that previously gave 86 passed, 37 failed
+(`No module named 'warp_cudss'`), 2 skipped, it now gives 120 passed, 3 failed, 2 skipped. The 3 failures are CuPy
+reference tests (`libcublas.so.13` missing in that environment). The full suite gives 3,179 passed, 93 failed,
+287 skipped. None of the failures involves cuDSS: they are missing upstream Warp FSAI/block-Jacobi, Ada-only
+specializations on this sm_120 GPU, and the CuPy libraries. When cuDSS reports perturbed pivots in the Sturm
+factorization the count is not certified: the backend returns no inertia count and the Sturm check is skipped with a
+warning.
 
 ### Accuracy
 
 Per pencil (beam 6k, panel 22.5k, solid block 28.8k, panel 88k; clamped and free; m = 12 and 30) against the CPU
-`RestrictedArpackBackend`, `WarpackKrylovBackend` and `WarpackLOBPCGBackend` meet:
+`RestrictedArpackBackend`, `WarpackKrylovBackend` and `WarpackLOBPCGBackend` meet with both factorizations:
 
-| quantity | criterion | worst case |
-|---|---|---|
-| relative eigenvalue error | ≤ 1e-7 | 6.2e-10 |
-| `‖(I − B Yᵀ)(K v − λ M v)‖ / ‖K v‖` | ≤ 1e-6 | 1.2e-8 (ARPACK's own floor: up to 1.0e-8) |
-| M-orthonormality | ≤ 1e-10 | 2.4e-14 |
-| principal angle of the lowest-m span (clusters as subspaces) | ≤ 1e-5 rad | 2.0e-10 |
-| Sturm count | equal to the reference and to a SuperLU Haynsworth count | 16/16 |
+| quantity | criterion | worst case, native | worst case, adapter |
+|---|---|---|---|
+| relative eigenvalue error | ≤ 1e-7 | 6.2e-10 | 6.1e-10 |
+| `‖(I − B Yᵀ)(K v − λ M v)‖ / ‖K v‖` | ≤ 1e-6 | 1.9e-8 | 1.3e-8 |
+| M-orthonormality | ≤ 1e-10 | 2.7e-14 | 2.8e-14 |
+| principal angle of the lowest-m span (clusters as subspaces) | ≤ 1e-5 rad | 2.7e-10 | 1.8e-10 |
+| Sturm count | equal to the reference and to a SuperLU Haynsworth count | 16/16 | 16/16 |
+
+ARPACK's own residual floor on these pencils reaches 1.0e-8. The native path runs `CuDSSInverse` without residual
+correction (`refinement_steps=0`). Warpack's default single step for indefinite factors broke the cancellation of the
+rigid restriction at the near-singular free-body shift: the rigid overlap of a restricted solve rose from 2.5e-11 to
+2.6e-9, and Krylov-Schur stalled at 9/12 pairs on the free test beam.
 
 M1 swing (469 updates at 0.2 deg, cuda, device path) with `WarpackKrylovBackend`:
 
-- the same 469 update steps;
-- tip within 7.0e-7 L of the ARPACK run;
-- run-to-run variation 5e-7 L (atomic reductions), at the 1-ulp floor.
+- the same 469 update steps with both factorizations;
+- tip within 5.7e-7 L (native) and 1.3e-6 L (adapter) of the ARPACK run;
+- tip RMS against backward Euler 0.3907 %, as with ARPACK.
 
 ### Cost per update [ms, median]
 
@@ -262,23 +274,31 @@ section 1 protocol (`bench_update.py` model, 5 repeats).
 
 | case | eigensolver | factorization | eigensolve | projection | total |
 | --- | --- | ---: | ---: | ---: | ---: |
-| beam 6,075 DOF (M1 swing) | subspace | 18.4 | 10.5 | 7.8 | 41.1 |
-| beam 6,075 DOF (M1 swing) | ARPACK | 23.1 | 38.3 | 7.6 | 73.4 |
-| beam 6,075 DOF (M1 swing) | Warpack Krylov-Schur | 3.6 | 20.9 | 6.5 | **35.3** |
-| panel 22,509 DOF | subspace | 382 | 84 | 67 | 548 |
-| panel 22,509 DOF | ARPACK | 417 | 1,170 | 119 | 1,695 |
-| panel 22,509 DOF | Warpack Krylov-Schur | 17 | 58 | 24 | **112** |
-| panel 88,209 DOF | subspace | 3,746 | 474 | 257 | 4,535 |
-| panel 88,209 DOF | ARPACK | 3,929 | 4,525 | 289 | 8,801 |
-| panel 88,209 DOF | Warpack Krylov-Schur | 57 | 132 | 112 | **351** |
+| beam 6,075 DOF (M1 swing) | subspace | 18.2 | 10.3 | 7.6 | 40.6 |
+| beam 6,075 DOF (M1 swing) | ARPACK | 19.7 | 38.6 | 7.3 | 70.1 |
+| beam 6,075 DOF (M1 swing) | Warpack Krylov-Schur, native | 3.7 | 20.7 | 6.2 | **34.6** |
+| beam 6,075 DOF (M1 swing) | Warpack Krylov-Schur, adapter | 3.6 | 20.8 | 6.2 | 34.6 |
+| panel 22,509 DOF | subspace | 385 | 81 | 66 | 544 |
+| panel 22,509 DOF | ARPACK | 423 | 1,415 | 103 | 1,956 |
+| panel 22,509 DOF | Warpack Krylov-Schur, native | 17 | 57 | 24 | **110** |
+| panel 22,509 DOF | Warpack Krylov-Schur, adapter | 17 | 58 | 33 | 117 |
+| panel 88,209 DOF | subspace | 3,600 | 455 | 242 | 4,359 |
+| panel 88,209 DOF | ARPACK | 3,815 | 4,250 | 260 | 8,332 |
+| panel 88,209 DOF | Warpack Krylov-Schur, native | 57 | 128 | 105 | **341** |
+| panel 88,209 DOF | Warpack Krylov-Schur, adapter | 57 | 132 | 109 | 354 |
 
 * **Factorization** with Warpack is the numeric cuDSS factorization at the Ritz shift (shared with the Ritz solves)
-  plus the Sturm refactorization. The symbolic analyses run once per body. The first update costs 76 ms (beam, M1)
-  to 600 ms (88k).
+  plus the Sturm refactorization. Native and adapter refactorizations take the same time (1.6 ms beam, 27 ms at 88k).
+  Setup runs once per body: the native `CuDSSInverse` construction includes a first numeric factorization. The first
+  update costs 87 ms native / 75 ms adapter (beam, M1) and 829 / 621 ms at 88k.
+* **Fixed right-hand-side width.** `CuDSSInverse` fixes its width at setup, so the native path solves other widths
+  row by row on the same factorization. A 12-row solve takes 2.5 ms native and 0.35 ms adapter on the beam, and
+  10.4 ms native and 2.6 ms adapter at 88k. The Krylov-Schur update does not notice (its shift-invert applies one
+  row). The warm-started LOBPCG, whose preconditioner is a block, does.
 * **Kernel compilation.** The first Warp kernel compilation of a machine adds about 31 s once; it is cached afterwards.
-* **Warm-started LOBPCG** (`WarpackLOBPCGBackend`) is slower everywhere measured: 90 ms per update on M1 and 619 ms
-  at 88k. It needs 9-17 iterations from the previous basis.
+* **Warm-started LOBPCG** (`WarpackLOBPCGBackend`) is slower everywhere measured: 89 ms (adapter) / 123 ms (native)
+  per update on M1, and 615 / 835 ms at 88k.
 * **Size-matched to the external 28.8k-DOF table** (Alec's measurement; not a reproduction). On a 28.8k-DOF solid
-  block, refactorization plus a cold Krylov-Schur solve takes 57-112 ms (m = 12-30), against 2.1-4.1 s for CPU
-  ARPACK + SuperLU on this machine.
+  block, refactorization plus a cold Krylov-Schur solve takes 56-116 ms native (m = 12-30), against 2.3-3.8 s for CPU
+  ARPACK + SuperLU in the same session.
 

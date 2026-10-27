@@ -205,13 +205,15 @@ the inverse of the restricted pencil for a pre-stressed `K_T`. The restricted ba
 ### Warpack backends (optional, experimental): `rerom/eigen_warpack.py`
 
 [Warpack](https://github.com/alecjacobson/warpack) is Alec Jacobson's device-resident sparse eigensolver library for
-Warp (MIT licence). `rerom/eigen_warpack.py` runs it on the update's pencil, with cuDSS 0.8 (through
-`nvmath-python`) for the sparse factorization; both are optional and imported lazily (a clear `ImportError` otherwise):
+Warp (MIT licence). `rerom/eigen_warpack.py` runs it on the update's pencil, with cuDSS 0.8 for the sparse
+factorization through Warpack's own `CuDSSInverse` and its `warp-cudss` binding (`pip install '<warpack checkout>[cudss]'`).
+All of it is optional and imported lazily (a clear `ImportError` otherwise):
 
 ```python
 from rerom import eigen_warpack as ew
 
 ctx = ew.WarpackContext(device="cuda:0", assembler=warp_assembler, free_dofs=free_dofs)  # one per body
+# factorization="auto" (default): "warpack" (CuDSSInverse) when warp-cudss is importable, else "nvmath" (adapter)
 ctrl = rerom.ReROMController(
     ...,
     basis=rerom.BasisOptions(n_ritz=2, restricted_solver_factory=ctx),
@@ -232,13 +234,29 @@ ctrl = rerom.ReROMController(
   inverse, because a pre-stressed `K_T` does not keep the rigid motions invariant (Warpack's own rigid-mode
   `constraints` assume they are).
 
-Provenance of the factorization: Warpack's own cuDSS binding (`warp-cudss`) was not installed in the measuring
-environment, so the shift-invert factorization and the Sturm/inertia count come from this package's `CudssFactor`
-adapter on cuDSS 0.8.0 through nvmath-python, which follows Warpack's inverse protocol (the Krylov-Schur and LOBPCG
-solvers are Warpack's). Warpack's own test suite in that environment: 86 passed, 2 skipped, and its 37
-cuDSS-dependent tests failed at import with `ModuleNotFoundError: No module named 'warp_cudss'`. When cuDSS reports
+Factorization (`WarpackContext(factorization=...)`):
+
+* `"warpack"` (`NativeCudssFactor`, the default when available): Warpack's `CuDSSInverse` on its pinned `warp-cudss`
+  binding (`e1d1be41`, cuDSS 0.8.0.10, `nvidia-cudss-cu12`). One setup per pattern, then per update the binding's
+  numeric refactorization; the Sturm count reads `CuDSSInverse.inertia()`. `CuDSSInverse` fixes the right-hand-side
+  width at setup (1 here, what Krylov-Schur applies), so the rigid restriction, the LOBPCG preconditioner and the Ritz
+  and modal-derivative solves run row by row on the same factorization (no second factorization). No residual
+  correction by default (`refinement_steps=0`): Warpack's default single step for indefinite factors broke the rigid
+  restriction's cancellation at the near-singular free-body shift (Krylov-Schur stalled at 9/12 pairs on the free
+  test beam).
+* `"nvmath"` (`CudssFactor`): this package's adapter of Warpack's inverse protocol on cuDSS 0.8.0 through
+  nvmath-python (`nvidia-cudss-cu13`), with one block solve for any width. It was the only path before the binding
+  was installable, stays as the alternative and is the fallback of `"auto"`. Both binaries are `libcudss.so.0`: in
+  one process the first one loaded serves both.
+
+Both pass the same accuracy gates, and the Krylov-Schur update costs the same with either. Warpack's own test suite
+with the binding: 120 passed, 3 failed, 2 skipped on the 11-file subset that previously gave 86 passed, 37 failed
+(`No module named 'warp_cudss'`). The 3 failures are CuPy reference tests (`libcublas.so.13` missing in that
+environment). Full suite: 3,179 passed, 93 failed, 287 skipped. None of the failures involves cuDSS: they are missing
+upstream Warp FSAI/block-Jacobi, Ada-only specializations on this sm_120 GPU, and the CuPy libraries. When cuDSS reports
 perturbed pivots in the Sturm factorization the count is not certified: the backend returns no inertia count and the
-Sturm check is skipped with a warning. Warpack is by Alec Jacobson.
+Sturm check is skipped with a warning. Warpack is by Alec Jacobson; the `warp-cudss` binding comes from his
+repository `alecjacobson/warp-cuDSS`.
 
 Without these options nothing changes (the defaults are bit-identical). Measured accuracy and cost: `BENCHMARKS.md`
 section 3.
