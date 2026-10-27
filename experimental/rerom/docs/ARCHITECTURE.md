@@ -5,6 +5,13 @@ phase-1/2 re-ROM experiments (recorded outside this repository, see section 7). 
 external controller (`rerom.ReROMController`) around `SolverVBD`; this note describes how the same mechanics
 would look if owned by Newton.
 
+Since the note was written, the external controller also gained a transactional update contract (candidate
+built without side effects, validated against `ValidationOptions`, committed or rejected with a `RejectReason`;
+raw vs operational tangent spectrum; signed transfer-energy and momentum diagnostics; composite and validity
+triggers with a 0.5 deg rotation default), see [`../README.md`](../README.md), "Update safety and diagnostics".
+An integrated version should keep that contract (section 3, step 3c). Two items stay open: a solver-state
+checkpoint for rollback/retry after a rejected update, and static load directions for contact/applied loads.
+
 Since the note was written, several rows of the "Today" column below moved to the device in this package:
 `rerom/assembly_warp.py` (`WarpTetAssembler`, Warp tangent assembly into a BSR matrix),
 `rerom/update_kernels.py` (`DeviceUpdater`: in-place rewrite kernels, device trigger and pre-stress) and the in-place
@@ -52,8 +59,10 @@ Bodies without `adaptive=True` add no arrays and take the existing fixed-basis p
    a. assemble f_int, K_T on device (per-tet kernel, BSR);
    b. eigensolver backend: lowest m−n_ritz tangent modes with rigid deflation (free body) or interface frames
       held (CB body); Ritz: K_T⁻¹ f_int, K_T⁻¹ f_ext (shared factorization);
-   c. small Rayleigh–Ritz re-diagonalization (m×m) so M_red = I, K_red = diag; indefinite guard: if any
-      eigenvalue < 0, keep the previous basis for this step and log;
+   c. small Rayleigh–Ritz re-diagonalization (m×m) so M_red = I, K_red = diag; validate the candidate (finite,
+      det F, mass, rank and M-orthonormality, interface conditioning, optional energy budget; indefinite guard:
+      reject a materially negative restricted eigenvalue) and keep the previous basis with a reason code when a
+      check fails, all before the first write (the external controller does this today);
    d. device kernels: r_ref ← r_ref + Φq; g₀ ← Φ_newᵀ f_int; inertia integrals; endpoint/render/shape φ,ψ;
       rigid mass/COM/inertia; momentum-consistent state transfer; q ← 0;
    e. in-place refresh of the elastic mass-solve data; rest frames untouched (solver-owned).
@@ -87,7 +96,12 @@ Bodies without `adaptive=True` add no arrays and take the existing fixed-basis p
   3–6×. Panels and compliant parts in quasi-static motion amortize (7–19 updates per 3,000 steps).
 - Static Ritz vectors are essential (eigen-only or re-referencing without them locks).
 - Triggers must be gated by contact and settling (worn-headphones limit cycle) and updates must be refused
-  when the rebuilt tangent is indefinite (cushion press).
+  when the rebuilt tangent is indefinite (cushion press). Gates must not hide validity problems (non-finite
+  state, inverted elements) or silently drop accuracy alarms (budget exhausted: accuracy unverified).
+- A rotation tolerance is geometry dependent: 4 deg was badly inaccurate on the coarse example beam where
+  0.5 deg was not; rotation is blind to pure stretch, so combine it with an energy/residual check.
+- A changed basis loses the velocity outside its span at every switch; the interface-constrained transfer is
+  affine and can add kinetic energy. Log signed transfer energy, not only a projection residual.
 - A reduced body jointed to moving bodies at both ends converges slowly in SolverVBD (10³–10⁴ iterations);
   per-joint rest frames are required for updates in articulations.
 

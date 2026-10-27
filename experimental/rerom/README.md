@@ -20,7 +20,7 @@ result tracks large deformation far better than one fixed basis, at the cost of 
 2. Large deformation makes that basis wrong: linear modes stretch under rotation, and the tangent stiffness
    changes with stress.
 3. re-ROM keeps the full nodal field outside the Model and, when a trigger fires (element rotation, energy
-   mismatch, IMEX residual), re-linearizes about the current shape `r_new = r_ref + Phi q`.
+   mismatch, IMEX residual, validity), re-linearizes about the current shape `r_new = r_ref + Phi q`.
 4. It evaluates the nonlinear internal force and tangent `K_T(r_new)`, computes tangent eigenmodes on the
    complement of the rigid motions, and adds static Ritz vectors (`K_T^-1 f_int`, `K_T^-1 f_ext`, Krylov).
 5. A Rayleigh-Ritz rotation makes the basis M-orthonormal and `K_T`-diagonal.
@@ -30,14 +30,16 @@ result tracks large deformation far better than one fixed basis, at the cost of 
 8. The pre-stress `g0 = Phi^T f_int(r_new)` enters through the modal rows of `control.joint_f`.
 9. Craig-Bampton bodies with interface frames use the same machinery with constraint modes from `K_T`.
 10. An optional IMEX hyper-reduced remainder adds the lagged nonlinear modal force between updates.
+11. Every update is a transaction: the candidate is built without writing anything, validated, then committed
+    or rejected with a reason code (see "Update safety and diagnostics").
 
 ## Layout
 
 | module | contents |
 |---|---|
 | `rerom/controller.py` | `ReROMController` (one body) with the `BodyAdapter` strategy: `FreeBodyAdapter`, `InterfaceBodyAdapter`; `MultiFrameController` (thin aggregate for CB chains) |
-| `rerom/options.py` | keyword-only `BasisOptions`, `TriggerOptions`, `UpdatePolicy`, `NonlinearForceOptions`; enums `RestRotationMode`, `IndefiniteGuard` |
-| `rerom/triggers.py` | `RotationTrigger`, `EnergyMismatchTrigger`, `ResidualTrigger` on a shared gating base `Trigger` |
+| `rerom/options.py` | keyword-only `BasisOptions`, `TriggerOptions`, `UpdatePolicy`, `ValidationOptions`, `NonlinearForceOptions`; enums `RestRotationMode`, `IndefiniteGuard`, `TransferMode`, `RejectReason` |
+| `rerom/triggers.py` | `RotationTrigger`, `EnergyMismatchTrigger`, `ResidualTrigger`, `ValidityTrigger`, `CompositeTrigger` on a shared gating base `Trigger` |
 | `rerom/numerics.py` | the shared numerics (rigid vectors, M-orthonormal blocks, Ritz/Krylov enrichment, Rayleigh-Ritz, modal derivatives, state projection, quaternions) |
 | `rerom/eigen.py` | the eigensolver seam: `resolve_backend`, `RestrictedArpackBackend`, `RestrictedSubspaceBackend`, `ShiftedRestrictedSolver` |
 | `rerom/model_io.py` | every `Model`/`State`/`Control` array read and write of the host path (batched), joint rest-rotation propagation |
@@ -205,11 +207,72 @@ All option groups are keyword-only dataclasses in `rerom/options.py`; the docstr
 
 | group | main fields | default behavior |
 |---|---|---|
-| `BasisOptions` | `n_ritz`, `modal_derivatives`, `ritz_krylov`, `rebasis`, `shared_factorization`, `subspace_iterations`, `eig_margin`, `damping_ratio` | 2 static Ritz vectors (`K_T^-1 f_int`, `K_T^-1 f_ext`, then Krylov), the rest tangent eigenmodes; one factorization of `K_T - sigma M` per update |
-| `TriggerOptions` (on every trigger) | `min_interval`, `max_updates`, `max_interval`, `check_every`, `n_sample_elements`, `element_ids` | check every step, no budget, 512 sampled elements |
-| triggers | `RotationTrigger(theta_tol, disp_tol)`, `EnergyMismatchTrigger`, `ResidualTrigger` | `RotationTrigger` at 4 deg element rotation since the last reference |
-| `UpdatePolicy` | `path` (`UpdatePath.DEVICE` / `HOST`), `freeze_in_contact`, `freeze_after_release`, `freeze_from_step`, `guard_indefinite` (`IndefiniteGuard.KEEP` / `CLAMP`), `rest_rotation` (`RestRotationMode`), `notify`, `diagnostics` | device path, no freezes, negative tangent eigenvalues written as they are, joint rest rotations kept by counter-rotation |
+| `BasisOptions` | `n_ritz`, `modal_derivatives`, `ritz_krylov`, `rebasis`, `shared_factorization`, `subspace_iterations`, `eig_margin`, `damping_ratio`, `velocity_enrichment` | 2 static Ritz vectors (`K_T^-1 f_int`, `K_T^-1 f_ext`, then Krylov), the rest tangent eigenmodes; one factorization of `K_T - sigma M` per update; no velocity enrichment |
+| `TriggerOptions` (on every trigger) | `min_interval`, `max_updates`, `max_interval`, `check_every`, `n_sample_elements`, `element_ids`, `audit_suppressed` | check every step, no budget, 512 sampled elements; suppressed alarms recorded |
+| triggers | `RotationTrigger(theta_tol, disp_tol)`, `EnergyMismatchTrigger`, `ResidualTrigger`, `ValidityTrigger`, `CompositeTrigger(triggers=[...])` | `RotationTrigger` at 0.5 deg element rotation since the last reference (4 deg before; see below) |
+| `UpdatePolicy` | `path` (`UpdatePath.DEVICE` / `HOST`), `freeze_in_contact`, `freeze_after_release`, `freeze_from_step`, `guard_indefinite` (`IndefiniteGuard.KEEP` / `CLAMP` / `REJECT`), `rest_rotation` (`RestRotationMode`), `notify`, `diagnostics`, `validation` | device path, no freezes, negative tangent eigenvalues written as they are, joint rest rotations kept by counter-rotation, default validation |
+| `ValidationOptions` (`UpdatePolicy.validation`) | `det_f_floor`, `orthonormality_tol`, `rank_tol`, `eigen_residual_tol`, `negative_stiffness_tol`, `interface_cond_max`, `transfer_energy_budget`, `backoff_steps`, `max_consecutive_rejections` | reject non-finite candidates, `det F <= 0`, non-positive mass, rank-deficient or non-M-orthonormal bases, ill-conditioned interface transfers; no eigen-residual or energy budget; 10-step back-off, stop after 5 rejections in a row |
 | `NonlinearForceOptions` | `element_ids`, `weights`, `interval`, `fold_interval`, `manifold` | off unless passed: IMEX hyper-reduced nonlinear remainder between updates (free bodies only) |
+
+**Trigger tolerance.** The rotation angle is a proxy, and the tolerance it needs depends on geometry and
+slenderness (spurious stretch energy `~ (L/h)^2 theta^2`), mode content and time step. On the coarse beam of
+`examples/beam_swing.py` (189 nodes, 12 modes, E = 10 MPa, 0.6 s against backward-Euler FE) an external review
+measured 16.95 % L tip RMS error with the former 4 deg default, 0.22 % L at 0.5 deg and 0.03 % L at 0.2 deg; more
+VBD iterations, a smaller step or ARPACK did not repair 4 deg. The default is therefore 0.5 deg; pass
+`theta_tol=math.radians(4.0)` for the former behavior. A rotation criterion cannot see stretch without
+rotation; combine triggers where that matters:
+
+```python
+trigger = rerom.CompositeTrigger(
+    triggers=[
+        rerom.RotationTrigger(theta_tol=math.radians(0.5)),
+        rerom.EnergyMismatchTrigger(tol=0.05),
+        rerom.ValidityTrigger(det_f_floor=0.0),  # runs before, and is never suppressed by, the gating
+    ],
+    options=rerom.TriggerOptions(min_interval=1),
+)
+```
+
+## Update safety and diagnostics
+
+**Raw and operational spectra.** `controller.lam_raw` is the restricted tangent spectrum of the last update
+(negative values kept, `info["eigenvalues"]`); `controller.lam` is the operational spectrum the solver steps
+(`info["eigenvalues_operational"]`). Every consumer uses the operational one: the written modal stiffness and
+damping, `rom_strain_energy`, the IMEX linear term and remainder (`f_tot'(0) = Lambda_op`), `ResidualTrigger`.
+With `IndefiniteGuard.KEEP` they are equal; `CLAMP` makes the clamped spectrum the model (a regularization, logged
+in `controller.clamp_log`); `REJECT` refuses an update whose restricted tangent has a materially negative
+eigenvalue.
+
+**Transactional updates.** `relinearize` builds the whole candidate (reference, basis, spectra, pre-stress,
+inertia, endpoint/sample maps, transferred state, adapter state such as the interface frame map and endpoint
+offset) without touching the Model, the State, the controller or the adapter, checks it against
+`ValidationOptions`, then commits it or returns `{"accepted": False, "reason": ..., "stage": ...}` with a
+`RejectReason` code. A rejection changes nothing (tested bit for bit on both update paths, CPU and CUDA), is
+logged in `controller.rejections`, and makes the triggers back off for `backoff_steps` steps; after
+`max_consecutive_rejections` in a row updates stop until `controller.request_update()`. Accuracy alarms that a
+gate (min interval, budget, freeze, back-off) suppresses are counted in `controller.accuracy_unverified`
+(count, last step, reason, gate); validity alarms in `controller.validity_alarms`.
+
+**Transfer diagnostics.** Each update's `info` reports the `transfer_mode` (`TransferMode.FREE`,
+`PRESCRIBED_FRAME`, `INTERFACE_CONSTRAINED`), `KE_before`, `KE_after` and the signed `delta_KE` [J],
+`velocity_projection_residual_energy` (`1/2 e^T M e`), the absolute and relative momentum changes (`dP`, `dL`,
+`dP_rel`, `dL_rel`), the maximum nodal position change, the interface velocity mismatch, the minimum `det F` of the
+new reference and the raw / operational minimum eigenvalues. Only the free mode guarantees
+`delta_KE = -velocity_projection_residual_energy`; the interface-constrained correction is affine and can raise
+the kinetic energy. `KE_lost_projection` is kept as an alias of the residual and is an energy loss only in the
+free mode. The constrained correction minimizes the kinetic energy in the reduced metric `Phi^T M Phi`.
+`W_rom_quadratic` (alias `W_rom`) is the quadratic model energy at the update point and `W_rom_model` the
+corrected (IMEX) model energy.
+
+**Velocity enrichment.** `BasisOptions(velocity_enrichment=True)` (off by default) adds the M-orthogonal
+residual of the old elastic velocity to the candidate space, evicting its highest-frequency Rayleigh-Ritz
+direction, so the transfer keeps the current velocity within the fixed mode count.
+
+**Not implemented.** Rolling the solver state back and retrying a step with a smaller time step after a
+rejection (it needs a Newton-side checkpoint of the state, contacts and solver caches): a rejection keeps the
+previous basis, which does not make the already advanced state accurate. Static load directions for contact
+or other applied loads in the basis (only `f_int`, gravity / `external_force_fn`, velocity and acceleration
+candidates are used). A matched ROM/FE contact validation case.
 
 ## Known limitations
 
@@ -218,9 +281,13 @@ All option groups are keyword-only dataclasses in `rerom/options.py`; the docstr
   every one to a few steps for a few percent tip accuracy; more Ritz vectors, modal derivatives or fresh
   eigenmodes do not change this. Panels and compliant parts in quasi-static motion amortize much better.
 * **Indefinite rebuilt tangent.** Under strong compression or contact pressing (for example a cushion press) the
-  rebuilt `K_T` can have negative eigenvalues. `IndefiniteGuard.CLAMP` raises them to a positive floor and logs
-  it; refusing the update and keeping the previous basis is not implemented. Gate triggers with
+  rebuilt `K_T` can have negative eigenvalues. `IndefiniteGuard.CLAMP` raises them to a positive floor (the
+  clamped spectrum becomes the operational model) and `IndefiniteGuard.REJECT` refuses the update and keeps the
+  previous basis; neither resolves a physical instability, and there is no rollback/retry. Gate triggers with
   `UpdatePolicy(freeze_in_contact=True)` or settling checks, which also avoids update limit cycles in contact.
+* **The trigger is an accuracy proxy.** No rotation angle is safe for every geometry (see "Trigger tolerance");
+  the energy and validity checks are sampled; a reduced-force or sampled residual estimator that sees load
+  directions outside the basis is not implemented.
 * **The host eigensolve dominates an update.** With the device path the sparse factorization and eigensolve on
   the host are most of the update time (see `BENCHMARKS.md`); a GPU backend plugs into the seam above but none
   ships here.
