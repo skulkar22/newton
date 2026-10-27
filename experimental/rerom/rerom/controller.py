@@ -60,7 +60,6 @@ from .hyper_reduction import ReducedElementForce
 from .numerics import (
     MOrthonormalBlock,
     compare_eigen,
-    constrain_frame_velocity,
     fd_step,
     host_sparse,
     m_orthonormal_rigid,
@@ -77,6 +76,7 @@ from .numerics import (
     static_modal_derivatives,
     tangent_derivative,
     to_nodal,
+    transfer_modal_velocity,
 )
 from .options import (
     BasisOptions,
@@ -98,6 +98,9 @@ __all__ = [
     "ReROMController",
     "UpdateSync",
 ]
+
+INTERFACE_COND_MAX = 1.0e12
+"""Largest accepted condition number of ``F G^-1 F^T`` in the interface-constrained velocity transfer."""
 
 
 # ----------------------------------------------------------------------------------------------
@@ -497,10 +500,11 @@ class InterfaceBodyAdapter(BodyAdapter):
         mass_modes = M @ Phi_new
         mode_mass_matrix = Phi_new.T @ mass_modes
         mode_mass = np.diag(mode_mass_matrix).copy()
-        # state projection: frame twist kept, interface velocities preserved
-        qd_new = project_modal_velocity(u_el_old, Phi_new, M, mode_mass_matrix)
-        if F_new is not None:
-            qd_new = constrain_frame_velocity(qd_new, F_new, fdot)
+        # state projection: frame twist kept, interface velocities preserved (minimum kinetic energy in the
+        # reduced metric; the Euclidean formula for the M-orthonormal CB basis)
+        qd_new, transfer_info = transfer_modal_velocity(
+            u_el_old, Phi_new, M, mode_mass_matrix, F=F_new, fdot=fdot, cond_max=INTERFACE_COND_MAX
+        )
         mass_new, com_new, I_new = rigid_properties(M, x_new)
         omega_l = R.T @ ctx["omega"]
         t_vec = R.T @ ctx["v_c"] + np.cross(omega_l, com_new - ctrl.com)
@@ -545,6 +549,8 @@ class InterfaceBodyAdapter(BodyAdapter):
                 "held_names": binfo.get("held_names"),
                 "frame_map_residual": binfo.get("frame_map_residual"),
                 "tip_frame_velocity_change": None if fdot is None else float(np.max(np.abs(fdot_after - fdot))),
+                "interface_transfer_metric": transfer_info.get("metric"),
+                "interface_schur_condition": transfer_info.get("schur_condition"),
             },
         }
 

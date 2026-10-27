@@ -18,7 +18,7 @@ re-diagonalization :func:`rayleigh_ritz` (``Phi^T M Phi = I``, ``Phi^T K Phi`` d
                    ``_orient_modes`` sign rule)
 modal derivatives  :func:`tangent_derivative`, :func:`static_modal_derivatives`
 state projection   :func:`split_rigid_velocity`, :func:`project_modal_velocity`,
-                   :func:`constrain_frame_velocity`
+                   :func:`constrain_frame_velocity`, :func:`transfer_modal_velocity`
 diagnostics        :func:`compare_eigen`, :func:`imex_spectral_radius`
 """
 
@@ -62,6 +62,7 @@ __all__ = [
     "static_modal_derivatives",
     "tangent_derivative",
     "to_nodal",
+    "transfer_modal_velocity",
 ]
 
 
@@ -467,10 +468,79 @@ def project_modal_velocity(u_el: np.ndarray, Phi: np.ndarray, M, mode_mass_matri
     return np.linalg.solve(mode_mass_matrix, a)
 
 
-def constrain_frame_velocity(qd: np.ndarray, F: np.ndarray, fdot: np.ndarray) -> np.ndarray:
-    """Minimal-norm correction of ``qd`` so that the interface-frame velocity ``F qd`` equals ``fdot``."""
-    corr = F.T @ np.linalg.solve(F @ F.T, fdot - F @ qd)
+def constrain_frame_velocity(
+    qd: np.ndarray,
+    F: np.ndarray,
+    fdot: np.ndarray,
+    *,
+    G: np.ndarray | None = None,
+    cond_max: float | None = None,
+    info: dict | None = None,
+) -> np.ndarray:
+    """Minimum-kinetic-energy correction of ``qd`` so that the interface-frame velocity ``F qd`` equals ``fdot``.
+
+    Solves ``min 1/2 (a - qd)^T G (a - qd)`` subject to ``F a = fdot`` for the reduced mass metric ``G``
+    (``Phi^T M Phi``):  ``a = qd + G^-1 F^T (F G^-1 F^T)^-1 (fdot - F qd)``. ``G = None`` is the Euclidean
+    metric, exact for an M-orthonormal basis (``G = I``) and bit-identical to the original implementation.
+
+    Args:
+        qd: Unconstrained modal velocity (the M-orthogonal projection), (m,).
+        F: Interface map ``fdot = F qd``, (k, m), full row rank.
+        fdot: Interface velocity to preserve, (k,).
+        G: Reduced mass metric (m, m), symmetric positive definite (``None``: identity).
+        cond_max: Raise :class:`ValueError` when ``F G^-1 F^T`` is singular, indefinite or its condition number
+            exceeds ``cond_max`` (``None``: no check; a singular system still raises from the solve).
+        info: Receives ``"schur_condition"`` (condition number of ``F G^-1 F^T``) when given.
+    """
+    if G is None:
+        GiFt = F.T
+    else:
+        GiFt = np.linalg.solve(G, F.T)
+    S = F @ GiFt
+    if cond_max is not None or info is not None:
+        w = np.linalg.eigvalsh(0.5 * (S + S.T)) if S.size else np.ones(1)
+        cond = float(w[-1] / w[0]) if w[0] > 0.0 and np.all(np.isfinite(w)) else float("inf")
+        if info is not None:
+            info["schur_condition"] = cond
+        if cond_max is not None and not cond <= cond_max:
+            raise ValueError(
+                f"interface-constrained velocity transfer is singular or ill-conditioned: cond(F G^-1 F^T) = "
+                f"{cond:.3e} > {cond_max:.3e}"
+            )
+    corr = GiFt @ np.linalg.solve(S, fdot - F @ qd)
     return qd + corr
+
+
+def transfer_modal_velocity(
+    u_el: np.ndarray,
+    Phi: np.ndarray,
+    M,
+    mode_mass_matrix: np.ndarray,
+    *,
+    F: np.ndarray | None = None,
+    fdot: np.ndarray | None = None,
+    identity_tol: float = 1.0e-12,
+    cond_max: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Modal velocity of the new basis ``Phi`` for the old elastic nodal velocity ``u_el``.
+
+    The M-orthogonal projection onto ``span(Phi)`` (:func:`project_modal_velocity`), then, with an interface map
+    ``F``, the minimum-kinetic-energy correction to ``F qd = fdot`` in the reduced metric
+    ``G = Phi^T M Phi`` (:func:`constrain_frame_velocity`). ``G`` within ``identity_tol`` (max abs) of the
+    identity is treated as the identity, which keeps M-orthonormal bases on the Euclidean formula.
+
+    Returns ``(qd, info)``; ``info`` holds ``metric`` (``"identity"`` / ``"mass"``), ``schur_condition`` and
+    ``interface_velocity_mismatch`` (``max |F qd - fdot|``) when ``F`` is given.
+    """
+    qd = project_modal_velocity(u_el, Phi, M, mode_mass_matrix)
+    info: dict = {}
+    if F is not None:
+        G = np.asarray(mode_mass_matrix, dtype=np.float64)
+        identity = float(np.max(np.abs(G - np.eye(G.shape[0])))) <= identity_tol if G.size else True
+        info["metric"] = "identity" if identity else "mass"
+        qd = constrain_frame_velocity(qd, F, fdot, G=None if identity else G, cond_max=cond_max, info=info)
+        info["interface_velocity_mismatch"] = float(np.max(np.abs(F @ qd - fdot))) if fdot.size else 0.0
+    return qd, info
 
 
 # ----------------------------------------------------------------------------------------------
