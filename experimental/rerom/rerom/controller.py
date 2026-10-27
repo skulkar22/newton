@@ -94,6 +94,7 @@ from .triggers import RotationTrigger
 from .update_kernels import DeviceUpdater
 
 __all__ = [
+    "UPDATE_STAGES",
     "BodyAdapter",
     "FreeBodyAdapter",
     "InterfaceBodyAdapter",
