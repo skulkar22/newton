@@ -232,6 +232,14 @@ ctrl = rerom.ReROMController(
   inverse, because a pre-stressed `K_T` does not keep the rigid motions invariant (Warpack's own rigid-mode
   `constraints` assume they are).
 
+Provenance of the factorization: Warpack's own cuDSS binding (`warp-cudss`) was not installed in the measuring
+environment, so the shift-invert factorization and the Sturm/inertia count come from this package's `CudssFactor`
+adapter on cuDSS 0.8.0 through nvmath-python, which follows Warpack's inverse protocol (the Krylov-Schur and LOBPCG
+solvers are Warpack's). Warpack's own test suite in that environment: 86 passed, 2 skipped, and its 37
+cuDSS-dependent tests failed at import with `ModuleNotFoundError: No module named 'warp_cudss'`. When cuDSS reports
+perturbed pivots in the Sturm factorization the count is not certified: the backend returns no inertia count and the
+Sturm check is skipped with a warning. Warpack is by Alec Jacobson.
+
 Without these options nothing changes (the defaults are bit-identical). Measured accuracy and cost: `BENCHMARKS.md`
 section 3.
 
@@ -275,7 +283,11 @@ trigger = rerom.CompositeTrigger(
 damping, `rom_strain_energy`, the IMEX linear term and remainder (`f_tot'(0) = Lambda_op`), `ResidualTrigger`.
 With `IndefiniteGuard.KEEP` they are equal; `CLAMP` makes the clamped spectrum the model (a regularization, logged
 in `controller.clamp_log`); `REJECT` refuses an update whose restricted tangent has a materially negative
-eigenvalue.
+eigenvalue. Tangent folds (`NonlinearForceOptions.fold_interval`) apply the same guard: `eig T` is the raw spectrum;
+with `CLAMP` the guarded spectrum is written and the IMEX split is shifted in the clamped directions so that the
+force and the model energy at the fold point are unchanged and the remainder does not restore the negative
+stiffness (`clamp_log` entries with `"source": "fold"`); with `REJECT` the fold is skipped and recorded in
+`controller.folds` (`"skipped": "negative_stiffness"`).
 
 **Transactional updates.** `relinearize` builds the whole candidate (reference, basis, spectra, pre-stress,
 inertia, endpoint/sample maps, transferred state, adapter state such as the interface frame map and endpoint

@@ -228,6 +228,14 @@ nvmath-python 1.0.0 (`nvidia-cudss-cu13` 0.8.0.10), Warp 1.18.0, float64, physic
 average 2-19 during the runs (partly the cuDSS OpenMP reordering itself): upper bounds. Full tables, commands, raw
 JSON and logs: the experiment directory `exp-re-rom/gpu_eigen_proto/` (`RESULTS.md`) next to this worktree.
 
+Provenance of the factorization: Warpack's own cuDSS binding (`warp-cudss`) was not installed in the measuring
+environment, so the shift-invert factorization and the Sturm/inertia count come from this package's `CudssFactor`
+adapter on cuDSS 0.8.0 through nvmath-python, which follows Warpack's inverse protocol (the Krylov-Schur and LOBPCG
+solvers are Warpack's). Warpack's own test suite in that environment: 86 passed, 2 skipped, and its 37
+cuDSS-dependent tests failed at import with `ModuleNotFoundError: No module named 'warp_cudss'`. When cuDSS reports
+perturbed pivots in the Sturm factorization the count is not certified: the backend returns no inertia count and the
+Sturm check is skipped with a warning. Warpack is by Alec Jacobson.
+
 ### Accuracy
 
 Per pencil (beam 6k, panel 22.5k, solid block 28.8k, panel 88k; clamped and free; m = 12 and 30) against the CPU
