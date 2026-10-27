@@ -21,7 +21,8 @@ Craig-Bampton   :func:`cb_basis`, :class:`CBSegment`, :class:`CBChain`, :func:`b
 References      :class:`FullFEReference`, :class:`PrescribedMotionReference`, :class:`BaseMotion`
 
 Submodules :mod:`rerom.numerics`, :mod:`rerom.model_io`, :mod:`rerom.hyper_reduction`, :mod:`rerom.strain`,
-:mod:`rerom.update_kernels` (device-side update), :mod:`rerom.ccx` and :mod:`rerom.panel` (CalculiX; need the ``ccx`` binary) are imported on demand.
+:mod:`rerom.update_kernels` (device-side update), :mod:`rerom.ccx` and :mod:`rerom.panel` (CalculiX; need the ``ccx`` binary),
+:mod:`rerom.eigen_warpack` (optional Warpack + cuDSS eigensolver backends) are imported on demand.
 """
 
 from .assembly import NumpyTetAssembler, TangentAssembler, TetMesh, default_assembler, make_beam_mesh, make_flexure_mesh

@@ -42,6 +42,7 @@ result tracks large deformation far better than one fixed basis, at the cost of 
 | `rerom/triggers.py` | `RotationTrigger`, `EnergyMismatchTrigger`, `ResidualTrigger`, `ValidityTrigger`, `CompositeTrigger` on a shared gating base `Trigger` |
 | `rerom/numerics.py` | the shared numerics (rigid vectors, M-orthonormal blocks, Ritz/Krylov enrichment, Rayleigh-Ritz, modal derivatives, state projection, quaternions) |
 | `rerom/eigen.py` | the eigensolver seam: `resolve_backend`, `RestrictedArpackBackend`, `RestrictedSubspaceBackend`, `ShiftedRestrictedSolver` |
+| `rerom/eigen_warpack.py` | optional Warpack + cuDSS backends (`WarpackKrylovBackend`, `WarpackLOBPCGBackend`) and the GPU restricted-solver factory (`WarpackContext`) |
 | `rerom/model_io.py` | every `Model`/`State`/`Control` array read and write of the host path (batched), joint rest-rotation propagation |
 | `rerom/update_kernels.py` | device-side update (`DeviceUpdater`): recovery, packed gather/scatter, inertia integrals, sample/endpoint rewrites, state projection, per-step trigger and pre-stress kernels |
 | `rerom/assembly.py` | `TangentAssembler` protocol, `NumpyTetAssembler`, meshes, `Material`, `default_assembler` |
@@ -200,6 +201,39 @@ The named built-ins `"arpack"` and `"subspace"` resolve to the *restricted* back
 (`RestrictedArpackBackend`, `RestrictedSubspaceBackend`), which use the exact inverse on the rigid-motion
 complement; Newton's generic backends project the rigid motions out after a plain shift-invert solve, which is not
 the inverse of the restricted pencil for a pre-stressed `K_T`. The restricted backends reproduce the recorded M1/WP3a runs bit for bit.
+
+### Warpack backends (optional, experimental): `rerom/eigen_warpack.py`
+
+[Warpack](https://github.com/alecjacobson/warpack) is Alec Jacobson's device-resident sparse eigensolver library for
+Warp (MIT licence). `rerom/eigen_warpack.py` runs it on the update's pencil, with cuDSS 0.8 (through
+`nvmath-python`) for the sparse factorization; both are optional and imported lazily (a clear `ImportError` otherwise):
+
+```python
+from rerom import eigen_warpack as ew
+
+ctx = ew.WarpackContext(device="cuda:0", assembler=warp_assembler, free_dofs=free_dofs)  # one per body
+ctrl = rerom.ReROMController(
+    ...,
+    basis=rerom.BasisOptions(n_ritz=2, restricted_solver_factory=ctx),
+    eigensolver=ew.WarpackKrylovBackend(ctx),  # or ew.WarpackLOBPCGBackend(ctx) (warm-started)
+)
+```
+
+* `WarpackKrylovBackend`: `warpack.GeneralizedKrylovSchur`, shift-invert, M inner product, cold start; Sturm count
+  from the cuDSS `L D L^T` inertia (Haynsworth-corrected for the rigid restriction); the shift is lowered when the
+  tangent has eigenvalues below it, so negative eigenvalues are returned.
+* `WarpackLOBPCGBackend`: `warpack.BlockLOBPCG` warm-started from the previous basis, the shift-invert inverse as
+  preconditioner.
+* `BasisOptions.restricted_solver_factory=ctx`: the update's static Ritz and modal-derivative solves use the same
+  GPU factorization (one numeric factorization per update; the symbolic analysis and all Warpack workspaces are
+  kept across updates). With the device update path and a `WarpTetAssembler` the tangent goes from the assembler's
+  device BSR values to the solver without a host copy.
+* The pencil is posed with the projected stiffness `P^T K_T P` (`P = I - Y (M Y)^T`) and the exact restricted
+  inverse, because a pre-stressed `K_T` does not keep the rigid motions invariant (Warpack's own rigid-mode
+  `constraints` assume they are).
+
+Without these options nothing changes (the defaults are bit-identical). Measured accuracy and cost: `BENCHMARKS.md`
+section 3.
 
 ## Options summary
 
