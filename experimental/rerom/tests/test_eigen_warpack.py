@@ -3,7 +3,10 @@
 
 """Tests of rerom.eigen_warpack (Warpack eigensolver backends, cuDSS factorization, restricted-solver factory).
 
-Skipped when Warpack, nvmath-python (cuDSS) or a CUDA device is missing; the import-error test always runs.
+The CUDA tests run once per available factorization: ``"warpack"`` (Warpack's ``CuDSSInverse`` on its
+``warp-cudss`` binding) and ``"nvmath"`` (the ``CudssFactor`` adapter). Skipped when Warpack, the factorization's
+binding or a CUDA device is missing; the import-error and option tests always run. In one process the first
+loaded ``libcudss.so.0`` serves both factorizations.
 """
 
 from __future__ import annotations
@@ -32,9 +35,22 @@ from rerom.numerics import m_orthonormal_rigid, nodal_rigid_vectors, rigid_prope
 import newton
 from newton._src.sim import modal_sparse
 
-HAVE_WARPACK = importlib.util.find_spec("warpack") is not None and importlib.util.find_spec("nvmath") is not None
+HAVE_NVMATH = importlib.util.find_spec("nvmath") is not None
+HAVE_NATIVE = importlib.util.find_spec("warp_cudss") is not None
+HAVE_WARPACK = importlib.util.find_spec("warpack") is not None and (HAVE_NVMATH or HAVE_NATIVE)
 GPU = "cuda:0"
-SKIP = unittest.skipUnless(HAVE_CUDA and HAVE_WARPACK, "needs CUDA, warpack and nvmath-python (cuDSS)")
+SKIP = unittest.skipUnless(HAVE_CUDA and HAVE_WARPACK, "needs CUDA, warpack and warp-cudss or nvmath-python (cuDSS)")
+FACTORIZATIONS = [k for k, ok in (("warpack", HAVE_NATIVE), ("nvmath", HAVE_NVMATH)) if ok]
+
+
+class _PerFactorization(unittest.TestCase):
+    """Runs each ``test_*`` body once per available factorization (``self.fact``) as subtests."""
+
+    def run_all(self, body):
+        for kind in FACTORIZATIONS:
+            with self.subTest(factorization=kind):
+                self.fact = kind
+                body()
 
 
 class TestSturmPerturbedPivots(unittest.TestCase):
@@ -109,15 +125,37 @@ class TestImportError(unittest.TestCase):
             with self.assertRaisesRegex(ImportError, "Warpack"):
                 ew._require()
 
+    def test_missing_binding_messages(self):
+        with mock.patch.dict(sys.modules, {"warp_cudss": None}):
+            if importlib.util.find_spec("warpack") is not None:
+                with self.assertRaisesRegex(ImportError, "warp-cudss"):
+                    ew._require_native()
+        with mock.patch.dict(sys.modules, {"nvmath": None, "nvmath.bindings": None}):
+            with self.assertRaisesRegex(ImportError, "nvmath-python"):
+                ew._require_nvmath()
+
+    def test_factorization_option(self):
+        self.assertEqual(ew.resolve_factorization("nvmath"), "nvmath")
+        self.assertEqual(ew.resolve_factorization("warpack"), "warpack")
+        self.assertEqual(ew.resolve_factorization("auto"), "warpack" if HAVE_NATIVE else "nvmath")
+        with self.assertRaises(ValueError):
+            ew.resolve_factorization("cupy")
+
 
 @SKIP
-class TestCudssFactor(unittest.TestCase):
+class TestCudssFactor(_PerFactorization):
     def test_solve_inertia_and_refactor_reuse(self):
+        self.run_all(self._solve_inertia_and_refactor_reuse)
+
+    def _solve_inertia_and_refactor_reuse(self):
         _, _, K, M, Y, _ = _pencil("clamped")
-        ctx = ew.WarpackContext(device=GPU)
+        ctx = ew.WarpackContext(device=GPU, factorization=self.fact)
         s = ctx(K, M, Y)
         p = s.pencil
         f = p.factors["primary"]
+        self.assertEqual(f.kind, self.fact)
+        if self.fact == "warpack":
+            self.assertEqual(f.inverse.refinement_steps, 0)  # see eigen_warpack's notes on the rigid restriction
         self.assertTrue(f.analyzed)
         analysis_time = f.timings["analysis"]
         # solve: cuDSS L D L^T of K - sigma M against SciPy
@@ -135,6 +173,9 @@ class TestCudssFactor(unittest.TestCase):
         self.assertEqual(p.factors["aux"].negative_pivot_count, 3)
         self.assertEqual(modal_sparse.ShiftedFactorization(K.tocsc(), M, tau).negative_pivot_count, 3)
         self.assertEqual(p.factors["aux"].perturbed_pivots, 0)
+        # refactor of the same factor at another shift (between eigenvalues 5 and 6): count follows
+        p.factor("aux", 0.5 * (vals[4] + vals[5]))
+        self.assertEqual(p.factors["aux"].negative_pivot_count, 5)
         # refactor with new values: numeric phase only (analysis kept), solves follow the new matrix
         K2 = sp.csr_matrix(K * 1.5)
         count0 = f.factor_count
@@ -148,10 +189,14 @@ class TestCudssFactor(unittest.TestCase):
         self.assertLess(np.max(np.linalg.norm(r, axis=0) / np.linalg.norm(b, axis=1)), 1e-10)
 
     def test_restricted_solver_matches_host(self):
+        self.run_all(self._restricted_solver_matches_host)
+
+    def _restricted_solver_matches_host(self):
         for kind in ("clamped", "free"):
             with self.subTest(kind=kind):
                 _, _, K, M, Y, _ = _pencil(kind)
-                g = ew.WarpackContext(device=GPU)(K, M, Y)
+                g = ew.WarpackContext(device=GPU, factorization=self.fact)(K, M, Y)
+                self.assertEqual(g.pencil.factorization, self.fact)
                 h = ShiftedRestrictedSolver(K, M, Y, symmetric=True)
                 self.assertAlmostEqual(g.sigma / h.sigma, 1.0, places=12)
                 b = np.random.default_rng(1).standard_normal((K.shape[0], 2))
@@ -162,11 +207,14 @@ class TestCudssFactor(unittest.TestCase):
 
 
 @SKIP
-class TestWarpackEigen(unittest.TestCase):
+class TestWarpackEigen(_PerFactorization):
     def _check(self, backend_cls, kind, count=10, **kw):
+        self.run_all(lambda: self._check_one(backend_cls, kind, count, **kw))
+
+    def _check_one(self, backend_cls, kind, count=10, **kw):
         _, _, K, M, Y, _ = _pencil(kind)
         ref = RestrictedArpackBackend().solve(K.tocsc(), M, count + 4, deflation=Y)
-        ctx = ew.WarpackContext(device=GPU)
+        ctx = ew.WarpackContext(device=GPU, factorization=self.fact)
         b = backend_cls(ctx, **kw)
         if backend_cls is ew.WarpackLOBPCGBackend:
             b.previous_vectors = np.asarray(ref.vectors)[:, :count] + 1e-3 * np.random.default_rng(2).standard_normal(
@@ -179,6 +227,7 @@ class TestWarpackEigen(unittest.TestCase):
             res, size=K.shape[0], count=count, deflated=d, supports_inertia_count=True
         )
         self.assertIsNotNone(res.inertia_count)
+        self.assertEqual(b.last_info["factorization"], self.fact)
         rv = np.asarray(ref.values)
         np.testing.assert_allclose(vals[:count], rv[:count], rtol=1e-7)
         self.assertLess(np.max(np.abs(V.T @ (M @ V) - np.eye(V.shape[1]))), 1e-10)
@@ -194,7 +243,6 @@ class TestWarpackEigen(unittest.TestCase):
         self.assertLess(np.max(np.linalg.norm(R, axis=0) / np.linalg.norm(K @ V, axis=0)), 1e-6)
         below = int(res.inertia_count) - d
         self.assertEqual(below, int(np.count_nonzero(rv < res.inertia_shift)))
-        return b
 
     def test_krylov_clamped(self):
         self._check(ew.WarpackKrylovBackend, "clamped")
@@ -210,13 +258,16 @@ class TestWarpackEigen(unittest.TestCase):
 
     def test_indefinite_reports_negative_eigenvalues(self):
         """K - alpha M with alpha between eigenvalues 2 and 3: two negative restricted eigenvalues are returned."""
+        self.run_all(self._indefinite_reports_negative_eigenvalues)
+
+    def _indefinite_reports_negative_eigenvalues(self):
         _, _, K, M, _, _ = _pencil("clamped")
         vals0, _ = _dense_restricted(K, M, None, 8)
         alpha = 0.5 * (vals0[1] + vals0[2])
         Ki = sp.csr_matrix(K - alpha * M)
         ref_vals, ref_V = _dense_restricted(Ki, M, None, 8)
         self.assertEqual(int(np.count_nonzero(ref_vals < 0.0)), 2)
-        b = ew.WarpackKrylovBackend(ew.WarpackContext(device=GPU))
+        b = ew.WarpackKrylovBackend(ew.WarpackContext(device=GPU, factorization=self.fact))
         res = b.solve(Ki, M, 6)
         vals, V = modal_sparse.validate_eigen_result(
             res, size=Ki.shape[0], count=6, deflated=0, supports_inertia_count=True
@@ -228,8 +279,11 @@ class TestWarpackEigen(unittest.TestCase):
 
 
 @SKIP
-class TestControllerIntegration(unittest.TestCase):
+class TestControllerIntegration(_PerFactorization):
     def test_device_handoff_matches_host_bitwise(self):
+        self.run_all(self._device_handoff_matches_host_bitwise)
+
+    def _device_handoff_matches_host_bitwise(self):
         """WarpTetAssembler BSR values -> symmetrized free-node BSR: identical to the host 0.5 (K + K^T)[free][:, free]."""
         asm_np, x, _, _, _, free = _pencil("clamped")
         mesh = asm_np.mesh
@@ -241,7 +295,7 @@ class TestControllerIntegration(unittest.TestCase):
         K = 0.5 * (K + K.T)
         Kf = sp.csr_matrix(K[free][:, free])
         Mf = sp.csr_matrix(asm.mass_matrix)[free][:, free]
-        ctx = ew.WarpackContext(device=GPU, assembler=asm, free_dofs=free)
+        ctx = ew.WarpackContext(device=GPU, assembler=asm, free_dofs=free, factorization=self.fact)
         ctx(Kf, Mf, None, device_tangent=asm.tangent_values_device())
         dev_blocks = ctx.pencil.Kv.numpy()
         host_blocks = ctx.pencil.s.host_blocks(Kf)
@@ -249,6 +303,9 @@ class TestControllerIntegration(unittest.TestCase):
 
     def test_controller_update_matches_arpack(self):
         """One update of a clamped cantilever (device path, Warp assembler on CUDA): Warpack vs the default ARPACK."""
+        self.run_all(self._controller_update_matches_arpack)
+
+    def _controller_update_matches_arpack(self):
         results = {}
         for name in ("arpack", "warpack-ks", "warpack-lobpcg"):
             asm_np = beam_assembler(young=1.0e8)
@@ -264,7 +321,9 @@ class TestControllerIntegration(unittest.TestCase):
                 fx = np.zeros(n, bool)
                 for a in fixed:
                     fx[3 * a : 3 * a + 3] = True
-                factory = ew.WarpackContext(device=GPU, assembler=asm, free_dofs=np.nonzero(~fx)[0])
+                factory = ew.WarpackContext(
+                    device=GPU, assembler=asm, free_dofs=np.nonzero(~fx)[0], factorization=self.fact
+                )
                 eig = ew.WarpackKrylovBackend(factory) if name == "warpack-ks" else ew.WarpackLOBPCGBackend(factory)
             basis = rerom.BasisOptions(n_ritz=2, restricted_solver_factory=factory)
             ctrl = free_controller(

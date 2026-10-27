@@ -17,12 +17,27 @@ motions ``Y``:
 Both satisfy :class:`newton.ModalEigensolverBackend` and accept the update's shared factorization
 (:class:`WarpackRestrictedSolver`) through ``solve(..., factorization=...)``.
 
-Sparse factorization. Warpack's own ``CuDSSInverse`` needs the ``warp-cudss`` binding, which is not
-installed here. :class:`CudssFactor` provides the same Warpack inverse protocol (``n``, ``device``,
-``width``, ``apply(rows, out)``) on cuDSS 0.8 through ``nvmath-python``'s low-level bindings. It works
-directly on Warp device arrays, with the symbolic analysis once per pattern, numeric refactorization per
-update, arbitrary RHS blocks and the ``L D L^T`` inertia. It is always ``MatrixType.SYMMETRIC``: the cuDSS
-SPD type can hang on an indefinite ``K - sigma M``.
+Sparse factorization (``WarpackContext(factorization=...)``), always the symmetric-indefinite ``L D L^T``
+(cuDSS ``SYMMETRIC``; the SPD type can hang on an indefinite ``K - sigma M``):
+
+- ``"warpack"`` (:class:`NativeCudssFactor`, the default when the binding is importable): Warpack's own
+  ``CuDSSInverse`` on its pinned ``warp-cudss`` binding (``pip install 'warpack[cudss]'``, cuDSS 0.8.0.10
+  ``cu12``). Setup (reordering, symbolic and first numeric factorization) once per pattern; each update
+  refreshes the values and runs the binding's numeric refactorization (``CudssSolver.refactor``). The Sturm
+  count reads ``CuDSSInverse.inertia()``. No residual-correction step by default (``refinement_steps=0``, as
+  Warpack's own completeness certificate uses): Warpack's default single step for an indefinite factor breaks
+  the exact cancellation of the rigid restriction at the near-singular free-body Ritz shift (rigid overlap of a
+  restricted solve 2.5e-11 -> 2.6e-9 relative, Krylov-Schur stalled at 9/12 pairs on the free test beam). ``CuDSSInverse`` fixes the RHS width at setup (width 1 here, what
+  the shift-invert Krylov-Schur applies), so blocks of other widths (rigid restriction, LOBPCG
+  preconditioner, Ritz and modal-derivative solves) are solved row by row on the same factorization, as
+  Warpack's own shift operators do; no second factorization is made.
+- ``"nvmath"`` (:class:`CudssFactor`): this package's adapter of the same Warpack inverse protocol (``n``,
+  ``device``, ``width``, ``apply(rows, out)``) on cuDSS 0.8 through ``nvmath-python``'s low-level bindings
+  (``nvidia-cudss-cu13``), with one block solve for any RHS width. It was the only path before the binding
+  was installable and remains the alternative (and the fallback of ``"auto"``).
+
+Both binaries carry the SONAME ``libcudss.so.0``: in one process, whichever is loaded first serves both
+paths.
 
 Rigid deflation. Warpack's ``MassOrthogonalComplementInverse`` and LOBPCG ``constraints`` assume the
 excluded space is invariant under ``K``. A pre-stressed ``K_T`` does not annihilate the rigid rotations, so
@@ -41,7 +56,8 @@ Sturm count. From the cuDSS ``L D L^T`` inertia at a shift ``tau`` in a gap abov
 Haynsworth correction ``neg(A) + neg(-B^T A^-1 B) - d`` for the restriction, reported like
 :class:`rerom.eigen.RestrictedArpackBackend` (``inertia_count = below + d``).
 
-Requires ``warpack`` and ``nvmath-python`` with cuDSS (``nvidia-cudss-cu13``); both are imported lazily.
+Requires ``warpack`` and either its ``warp-cudss`` binding or ``nvmath-python`` with cuDSS; all are imported
+lazily.
 """
 
 from __future__ import annotations
@@ -58,7 +74,9 @@ import newton
 from .eigen import ShiftedRestrictedSolver
 
 __all__ = [
+    "FACTORIZATIONS",
     "CudssFactor",
+    "NativeCudssFactor",
     "WarpackContext",
     "WarpackKrylovBackend",
     "WarpackLOBPCGBackend",
@@ -67,24 +85,64 @@ __all__ = [
 
 _TILE = 256
 
+FACTORIZATIONS = ("auto", "warpack", "nvmath")
+"""Values of ``WarpackContext(factorization=...)``: ``"auto"`` = ``"warpack"`` when its ``warp-cudss`` binding
+is importable, else ``"nvmath"``."""
+
 
 def _require():
-    """Import Warpack and the cuDSS bindings (raise an ImportError with install hints)."""
+    """Import Warpack (raise an ImportError with install hints)."""
     try:
         import warpack  # noqa: PLC0415
     except ImportError as exc:
         raise ImportError(
             "rerom.eigen_warpack needs Warpack (Alec Jacobson, MIT licence, https://github.com/alecjacobson/warpack); "
-            "install it from a checkout with `pip install <warpack checkout>`"
+            "install it from a checkout with `pip install '<warpack checkout>[cudss]'`"
         ) from exc
+    return warpack
+
+
+def _require_nvmath():
+    """Import the nvmath-python cuDSS bindings of the :class:`CudssFactor` adapter."""
     try:
         from nvmath.bindings import cudss  # noqa: PLC0415
     except ImportError as exc:
         raise ImportError(
-            "rerom.eigen_warpack needs cuDSS through nvmath-python: `pip install nvmath-python[cu13]` "
+            "factorization='nvmath' needs cuDSS through nvmath-python: `pip install nvmath-python[cu13]` "
             "(brings nvidia-cudss-cu13 0.8)"
         ) from exc
-    return warpack, cudss
+    return cudss
+
+
+def _require_native():
+    """Import Warpack and its ``warp-cudss`` binding (the native :class:`NativeCudssFactor`)."""
+    warpack = _require()
+    try:
+        import warp_cudss  # noqa: F401, PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "factorization='warpack' needs Warpack's cuDSS binding: `pip install '<warpack checkout>[cudss]'` "
+            "(warp-cudss at Warpack's pinned revision, nvidia-cudss-cu12 0.8.0.10)"
+        ) from exc
+    return warpack
+
+
+def _module_available(name: str) -> bool:
+    import importlib.util  # noqa: PLC0415
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def resolve_factorization(kind: str = "auto") -> str:
+    """``"warpack"`` or ``"nvmath"`` for a :data:`FACTORIZATIONS` value (``"auto"`` prefers the native binding)."""
+    if kind not in FACTORIZATIONS:
+        raise ValueError(f"factorization must be one of {FACTORIZATIONS}, got {kind!r}")
+    if kind != "auto":
+        return kind
+    return "warpack" if _module_available("warp_cudss") else "nvmath"
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -116,6 +174,17 @@ def _shifted_values(
     r = rc // 3
     c = rc - 3 * r
     out[e] = k[blk][r, c] - sigma * m[blk][r, c]
+
+
+@wp.kernel
+def _shifted_blocks(
+    k: wp.array[wp.mat33d],
+    m: wp.array[wp.mat33d],
+    sigma: wp.float64,
+    out: wp.array[wp.mat33d],
+):
+    i = wp.tid()
+    out[i] = k[i] - sigma * m[i]
 
 
 @wp.kernel
@@ -214,7 +283,7 @@ class _CudssHandles:
     def get(cls, device) -> int:
         key = str(device)
         if key not in cls.handles:
-            _, cudss = _require()
+            cudss = _require_nvmath()
             with wp.ScopedDevice(device):
                 h = cudss.create()
                 lib = _threading_lib()
@@ -238,8 +307,10 @@ class CudssFactor:
     requires_static_outer_capture = True
     width = 1
 
+    kind = "nvmath"
+
     def __init__(self, indptr: wp.array, indices: wp.array, values: wp.array, n: int, device):
-        _, cudss = _require()
+        cudss = _require_nvmath()
         self._cudss = cudss
         self.n = int(n)
         self.device = wp.get_device(device)
@@ -354,6 +425,102 @@ class CudssFactor:
             pass
 
 
+class NativeCudssFactor:
+    """Warpack's own ``CuDSSInverse`` (``warp-cudss`` binding) of the free-node 3x3 BSR ``K - sigma M``.
+
+    Same interface as :class:`CudssFactor`. :meth:`analyze` constructs the ``CuDSSInverse`` (width 1,
+    ``mtype="symmetric"``: cuDSS reordering, symbolic and a first numeric factorization, once per pattern);
+    :meth:`factorize` runs the binding's numeric refactorization of the current ``matrix`` values
+    (``CuDSSInverse.solver.refactor``, same pattern) and reads ``CuDSSInverse.inertia()`` (INFO, pivot counter,
+    inertia). :meth:`apply` solves rows ``(w, n)``: width 1 directly, other widths row by row on the same
+    factorization (``CuDSSInverse`` fixes the RHS width at setup).
+
+    Args:
+        matrix: ``warp.sparse`` BSR (``mat33d``) whose values the caller writes before each factorization;
+            its storage must stay in place (the binding keeps a scalar CSR expansion of it).
+        refinement_steps: ``CuDSSInverse`` residual-correction steps per solve (default 0; ``None`` =
+            Warpack's default, one step for a symmetric-indefinite factor).
+    """
+
+    requires_static_outer_capture = True
+    width = 1
+    kind = "warpack"
+
+    def __init__(self, matrix, n: int, device, refinement_steps: int | None = 0):
+        self._warpack = _require_native()
+        self.matrix = matrix
+        self.n = int(n)
+        self.device = wp.get_device(device)
+        self.refinement_steps = refinement_steps
+        self.inverse = None
+        self.analyzed = False
+        self.factor_count = 0
+        self.timings: dict[str, float] = {}
+        self.info = 0
+        self.inertia: tuple[int, int] | None = None
+        self.inertia_status = ""
+        self.perturbed_pivots = 0
+        self.negative_pivot_count = -1
+        self.sigma = float("nan")
+
+    def analyze(self):
+        """Construct the ``CuDSSInverse`` (reordering, symbolic and first numeric factorization; synchronizes)."""
+        wp.synchronize_device(self.device)
+        t0 = time.perf_counter()
+        self.inverse = self._warpack.CuDSSInverse(
+            self.matrix, 1, mtype="symmetric", refinement_steps=self.refinement_steps
+        )
+        wp.synchronize_device(self.device)
+        self.timings["analysis"] = time.perf_counter() - t0
+        self.analyzed = True
+
+    def factorize(self, sigma: float = float("nan")):
+        """Numeric refactorization of the current ``matrix`` values; reads the inertia snapshot (synchronizes)."""
+        if not self.analyzed:
+            self.analyze()
+        t0 = time.perf_counter()
+        self.inverse.solver.refactor(self.matrix)
+        wp.synchronize_device(self.device)
+        self.timings["factorization"] = time.perf_counter() - t0
+        self.factor_count += 1
+        self.sigma = float(sigma)
+        r = self.inverse.inertia()
+        self.inertia_status = r.status
+        self.info = -1 if r.info is None else int(r.info)
+        if self.info != 0:
+            raise ValueError(
+                f"cuDSS factorization of K - sigma M (sigma = {sigma:.6g}) reported info = {self.info} ({r.reason})"
+            )
+        if r.positive is None or r.negative is None or r.pivots is None:
+            raise ValueError(f"cuDSS inertia unavailable for K - sigma M: {r.status} ({r.reason})")
+        self.perturbed_pivots = int(r.pivots)
+        pos, neg = int(r.positive), int(r.negative)
+        self.inertia = (pos, neg)
+        self.negative_pivot_count = neg + (self.n - pos - neg)  # zero pivots count as non-positive
+
+    def apply(self, x: wp.array, y: wp.array):
+        """``y = A^-1 x`` for contiguous FP64 rows ``(w, n)`` (distinct arrays; row by row when ``w > 1``)."""
+        inv = self.inverse
+        w = int(x.shape[0])
+        if w == 1:
+            inv.apply(x, y)
+            return
+        for i in range(w):
+            inv.apply(x[i : i + 1], y[i : i + 1])
+
+    def free(self):
+        inv = getattr(self, "inverse", None)
+        if inv is not None:
+            self.inverse = None
+            inv.close()
+
+    def __del__(self):
+        try:
+            self.free()
+        except Exception:
+            pass
+
+
 # ----------------------------------------------------------------------------------------------------------
 # pencil structure (host index maps, built once per pattern)
 # ----------------------------------------------------------------------------------------------------------
@@ -429,13 +596,19 @@ def _host_block_pattern(A) -> tuple[np.ndarray, np.ndarray, int]:
 # pencil on the device
 # ----------------------------------------------------------------------------------------------------------
 class _Pencil:
-    """Device state of one restricted pencil: K, M (free-node BSR), shifted CSR values, two cuDSS factors,
-    rigid rows Y, B = M Y, and the restriction data of the primary factor."""
+    """Device state of one restricted pencil: K, M (free-node BSR), the shifted matrices ``K - sigma M`` of two
+    cuDSS factors ("primary", "aux"; native: free-node BSR, adapter: scalar CSR values), rigid rows Y, B = M Y,
+    and the restriction data of each factor."""
 
-    def __init__(self, structure: _BlockStructure, device):
+    def __init__(
+        self, structure: _BlockStructure, device, factorization: str = "nvmath", refinement_steps: int | None = 0
+    ):
         import warp.sparse as wps  # noqa: PLC0415
 
-        warpack, _ = _require()
+        warpack = _require()
+        if factorization not in ("warpack", "nvmath"):
+            raise ValueError(f"unresolved factorization {factorization!r}")
+        self.factorization = factorization
         self.s = structure
         self.device = wp.get_device(device)
         self.n = structure.n
@@ -463,15 +636,21 @@ class _Pencil:
         self.block_rows = rows_wp
         self.src_a = wp.array(structure.src_a, dtype=wp.int32, device=dev)
         self.src_b = wp.array(structure.src_b, dtype=wp.int32, device=dev)
-        self.flat = wp.array(structure.flat, dtype=wp.int32, device=dev)
-        self.indptr = wp.array(structure.indptr, dtype=wp.int32, device=dev)
-        self.indices = wp.array(structure.indices, dtype=wp.int32, device=dev)
-        self.values = {
-            name: wp.zeros(structure.indices.size, dtype=wp.float64, device=dev) for name in ("primary", "aux")
-        }
-        self.factors = {
-            name: CudssFactor(self.indptr, self.indices, self.values[name], self.n, dev) for name in ("primary", "aux")
-        }
+        names = ("primary", "aux")
+        if factorization == "warpack":
+            self.shifted = {name: bsr() for name in names}
+            self.values = {name: self.shifted[name].values[: structure.nnzb] for name in names}
+            self.factors = {
+                name: NativeCudssFactor(self.shifted[name], self.n, dev, refinement_steps) for name in names
+            }
+        else:
+            self.flat = wp.array(structure.flat, dtype=wp.int32, device=dev)
+            self.indptr = wp.array(structure.indptr, dtype=wp.int32, device=dev)
+            self.indices = wp.array(structure.indices, dtype=wp.int32, device=dev)
+            self.values = {name: wp.zeros(structure.indices.size, dtype=wp.float64, device=dev) for name in names}
+            self.factors = {
+                name: CudssFactor(self.indptr, self.indices, self.values[name], self.n, dev) for name in names
+            }
         self.mass_host = None
         self.m_norm = None
         self.k_norm_value = float("nan")
@@ -536,15 +715,24 @@ class _Pencil:
         return self._scratch[key]
 
     # -- factorizations ----------------------------------------------------------------------------
-    def factor(self, name: str, sigma: float) -> CudssFactor:
+    def write_shifted(self, name: str, sigma: float):
+        """Values of ``K - sigma M`` into the matrix of factor ``name``."""
+        if self.factorization == "warpack":
+            wp.launch(
+                _shifted_blocks, self.s.nnzb, [self.Kv, self.Mv, float(sigma), self.values[name]], device=self.device
+            )
+        else:
+            wp.launch(
+                _shifted_values,
+                self.values[name].shape[0],
+                [self.Kv, self.Mv, self.flat, float(sigma), self.values[name]],
+                device=self.device,
+            )
+
+    def factor(self, name: str, sigma: float) -> CudssFactor | NativeCudssFactor:
         """Numeric factorization of ``K - sigma M`` into factor ``name`` (+ restriction data)."""
         f = self.factors[name]
-        wp.launch(
-            _shifted_values,
-            self.values[name].shape[0],
-            [self.Kv, self.Mv, self.flat, float(sigma), self.values[name]],
-            device=self.device,
-        )
+        self.write_shifted(name, sigma)
         f.factorize(sigma)
         info: dict[str, Any] = {"negA": f.negative_pivot_count}
         if self.d:
@@ -721,10 +909,32 @@ class WarpackContext:
         assembler: Optional :class:`rerom.assembly_warp.WarpTetAssembler`; enables the device hand-off of its BSR
             tangent (``device_tangent``) without host copies.
         free_dofs: Free DOFs of the controller (whole nodes), required with ``assembler``.
+        factorization: Sparse factorization (:data:`FACTORIZATIONS`): ``"warpack"`` = Warpack's ``CuDSSInverse``
+            on its ``warp-cudss`` binding (:class:`NativeCudssFactor`), ``"nvmath"`` = the :class:`CudssFactor`
+            adapter, ``"auto"`` (default) = ``"warpack"`` when the binding is importable, else ``"nvmath"``.
+        refinement_steps: Native path only: ``CuDSSInverse`` residual-correction steps per solve. Default 0;
+            ``None`` = Warpack's default (one for the symmetric-indefinite factor), which breaks the rigid
+            restriction's cancellation at the near-singular free-body shift (see the module notes).
     """
 
-    def __init__(self, *, device="cuda:0", assembler=None, free_dofs: np.ndarray | None = None):
-        _require()
+    def __init__(
+        self,
+        *,
+        device="cuda:0",
+        assembler=None,
+        free_dofs: np.ndarray | None = None,
+        factorization: str = "auto",
+        refinement_steps: int | None = 0,
+    ):
+        self.factorization = resolve_factorization(factorization)
+        if self.factorization == "warpack":
+            _require_native()
+        else:
+            _require()
+            _require_nvmath()
+        if self.factorization == "nvmath" and refinement_steps != 0:
+            raise ValueError("refinement_steps applies to factorization='warpack' only")
+        self.refinement_steps = refinement_steps
         self.device = wp.get_device(device)
         if not self.device.is_cuda:
             raise ValueError("WarpackContext needs a CUDA device")
@@ -759,7 +969,7 @@ class WarpackContext:
             off, col, nn = _host_block_pattern(Kf)
             structure = _BlockStructure(off, col, nn, np.arange(nn))
         t1 = time.perf_counter()
-        self.pencil = _Pencil(structure, self.device)
+        self.pencil = _Pencil(structure, self.device, self.factorization, self.refinement_steps)
         wp.synchronize_device(self.device)
         self.setup_s = {"pattern_maps": t1 - t0, "device_alloc": time.perf_counter() - t1}
 
@@ -791,12 +1001,7 @@ class WarpackContext:
         tf = time.perf_counter()
         first = not p.factors["primary"].analyzed
         if first:
-            wp.launch(
-                _shifted_values,
-                p.values["primary"].shape[0],
-                [p.Kv, p.Mv, p.flat, float(sigma), p.values["primary"]],
-                device=self.device,
-            )
+            p.write_shifted("primary", sigma)
             p.factors["primary"].analyze()
             tim["analysis"] = p.factors["primary"].timings["analysis"]
         p.factor("primary", sigma)
@@ -993,7 +1198,7 @@ class WarpackKrylovBackend(_WarpackBackendBase):
         self.max_restarts = int(max_restarts)
 
     def solver_for(self, p: _Pencil, k: int, inverse_name: str):
-        warpack, _ = _require()
+        warpack = _require()
         ncv = self.ncv if self.ncv is not None else max(2 * k, k + 8)
         ncv = min(ncv, p.n - p.d)
         key = (id(p), k, ncv, inverse_name)
@@ -1039,7 +1244,12 @@ class WarpackKrylovBackend(_WarpackBackendBase):
         p = shared.pencil
         count = min(int(count), p.n - p.d)
         k = min(count + self.guard, p.n - p.d - 1)
-        info: dict[str, Any] = {"path": self.name, "sigma": shared.sigma, "t_factor": 0.0}
+        info: dict[str, Any] = {
+            "path": self.name,
+            "factorization": p.factorization,
+            "sigma": shared.sigma,
+            "t_factor": 0.0,
+        }
         # Sturm check at the operator shift: lower it while restricted eigenvalues lie below
         below = p.restriction["primary"]["below"]
         inverse_name, sigma_op = "primary", shared.sigma
@@ -1127,7 +1337,7 @@ class WarpackLOBPCGBackend(_WarpackBackendBase):
         self._start: dict[tuple, wp.array] = {}
 
     def solver_for(self, p: _Pencil, k: int, n_start: int):
-        warpack, _ = _require()
+        warpack = _require()
         width = self.width if self.width is not None else k + 4
         width = max(width, k)
         key = (id(p), k, width, n_start, p.d)
@@ -1168,6 +1378,7 @@ class WarpackLOBPCGBackend(_WarpackBackendBase):
         k = min(count + self.guard, p.n - p.d - 1)
         info: dict[str, Any] = {
             "path": self.name,
+            "factorization": p.factorization,
             "sigma": shared.sigma,
             "t_factor": 0.0,
             "below_sigma": p.restriction["primary"]["below"],
