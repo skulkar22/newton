@@ -8,7 +8,7 @@ predicted end-of-step state:
 
     ``r(p) = p - h g(q(p), qd(p)) = 0``
 
-    ``qd(p) = qd + A p``
+    ``qd(p) = qd + A (p - h b)``
 
     ``q(p) = q + h qd(p)``
 
@@ -16,9 +16,12 @@ Here ``h`` is the timestep, ``g`` is the drive force law with clamping,
 and ``A`` is the coupled inverse-mass response supplied by
 :class:`JointSpaceResponse`. Options: :class:`ImplicitOptions`.
 
+``b`` is the optional bias force passed to
+:meth:`Actuator.step <newton.actuators.Actuator.step>`, in the sign convention
+of the manipulator equation ``tau = M qdd + b``: the Coriolis and gravity
+forces ``C qd + g`` from :func:`~newton.eval_inverse_dynamics_passive`. The
+step itself applies ``-b``. Without it, ``b`` is zero and
 ``qd(p)`` advances the step-start velocity by this actuator's own impulse alone.
-Gravity, any other applied force, other actuators on the same articulation, and
-joint drive applied without the actuator do not enter the prediction.
 """
 
 from __future__ import annotations
@@ -74,6 +77,11 @@ class ImplicitOptions:
     warm_start: WarmStart = WarmStart.EXPLICIT
     """Initial impulse guess."""
 
+    ls_iterations: int = 8
+    """Maximum step lengths tried per Newton iteration, halving each time, until
+    the residual drops. Each try evaluates the residual once. ``0`` always takes
+    the full Newton step."""
+
 
 # ---------------------------------------------------------------------------
 # Clamp chain: fold every implicit-capable clamp into one @wp.func
@@ -123,18 +131,74 @@ def _gather_slot_response_kernel(
     slot_response[i] = inverse_blocks[slot_art[i], li, li]
 
 
+@wp.kernel(enable_backward=False)
+def _bias_velocity_kernel(
+    inverse_blocks: wp.array3d[float],
+    bias_force: wp.array[float],
+    dt: float,
+    slot_art: wp.array[wp.int32],
+    slot_local: wp.array[wp.int32],
+    art_base: wp.array[wp.int32],
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_qd_start: wp.array[int],
+    body_q: wp.array[wp.transform],
+    bias_velocity: wp.array[wp.float64],
+):
+    """Per-slot velocity change ``-h (A b)_i`` over the slot's whole articulation row.
+
+    Free and distance joints take ``joint_f`` as a world-frame wrench, but
+    ``A`` maps a wrench in the joint's parent frame, so their linear and
+    angular parts are rotated into it first.
+    """
+    i = wp.tid()
+    a = slot_art[i]
+    li = slot_local[i]
+    base = art_base[a]
+    acc = wp.float64(0.0)
+    for joint_id in range(articulation_start[a], articulation_end[a]):
+        qd_start = joint_qd_start[joint_id]
+        jtype = joint_type[joint_id]
+        if jtype == JointType.FREE or jtype == JointType.DISTANCE:
+            X_wpj = joint_X_p[joint_id]
+            parent = joint_parent[joint_id]
+            if parent >= 0:
+                X_wpj = body_q[parent] * X_wpj
+            q_p = wp.transform_get_rotation(X_wpj)
+            f_lin = wp.quat_rotate_inv(
+                q_p, wp.vec3(bias_force[qd_start], bias_force[qd_start + 1], bias_force[qd_start + 2])
+            )
+            f_ang = wp.quat_rotate_inv(
+                q_p, wp.vec3(bias_force[qd_start + 3], bias_force[qd_start + 4], bias_force[qd_start + 5])
+            )
+            lj = qd_start - base
+            for k in range(3):
+                acc += wp.float64(inverse_blocks[a, li, lj + k]) * wp.float64(f_lin[k])
+                acc += wp.float64(inverse_blocks[a, li, lj + 3 + k]) * wp.float64(f_ang[k])
+        else:
+            for j in range(qd_start, joint_qd_start[joint_id + 1]):
+                acc += wp.float64(inverse_blocks[a, li, j - base]) * wp.float64(bias_force[j])
+    bias_velocity[i] = -wp.float64(dt) * acc
+
+
 # ---------------------------------------------------------------------------
 # Coupled solve kernel
 # ---------------------------------------------------------------------------
 
 _coupled_kernel_cache: dict[tuple[Any, Any], wp.Kernel] = {}
 
+_BLOCK_SOLVE_MIN_ROWS = 6
+"""Smallest group size solved by one thread block; smaller groups are faster with one thread each."""
+
 _BLOCK_SOLVE_MAX_ROWS = 64
 """Largest padded group size solved by one thread block; larger groups use one thread each."""
 
 
-_LINE_SEARCH_STEPS = 8
-"""Step lengths tried (halving each time) before the solve stops with the current impulse."""
+_SUFFICIENT_DECREASE = 1.0e-4
+"""Armijo factor: a step of length ``alpha`` is accepted when ``|r|^2`` drops by at least this times ``alpha``."""
 
 
 def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Function, cache_key: tuple):
@@ -162,9 +226,12 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
         i: wp.int32,
         ng: wp.int32,
         si: wp.int32,
+        bias_velocity: wp.array[wp.float64],
     ) -> wp.float64:
-        """End-of-step velocity of row *i*: ``qd + (A p)_i``."""
+        """End-of-step velocity of row *i*: ``qd - h (A b)_i + (A p)_i``."""
         qd_i = wp.float64(velocities[vel_indices[si]])
+        if bias_velocity:
+            qd_i += bias_velocity[si]
         li = group_local[g, i]
         for jj in range(ng):
             qd_i += wp.float64(inverse_blocks[art, li, group_local[g, jj]]) * pbuf[g, jj]
@@ -191,7 +258,7 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
             ff = wp.float64(feedforward[target_vel_indices[si]])
         return clamp_chain(evaluate_force(q_i, qd_i, tq, tqd, ff, params, si), q_i, qd_i, clamp_params, si)
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def solve(
         group_size: wp.array[wp.int32],
         group_art: wp.array[wp.int32],
@@ -210,6 +277,7 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
         params: wp.array2d[float],
         h: float,
         max_iters: int,
+        ls_iterations: int,
         residual_tol: float,
         update_tol: float,
         fd_epsilon: float,
@@ -221,6 +289,7 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
         sbuf: wp.array2d[wp.float64],
         vbuf: wp.array2d[wp.float64],
         jbuf: wp.array3d[wp.float64],
+        bias_velocity: wp.array[wp.float64],
         computed_efforts: wp.array[float],
         applied_efforts: wp.array[float],
     ):
@@ -260,7 +329,9 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
             rn = wp.float64(0.0)
             for i in range(ng):
                 si = group_slot[g, i]
-                qd_i = predict_qd(velocities, vel_indices, inverse_blocks, group_local, pbuf, art, g, i, ng, si)
+                qd_i = predict_qd(
+                    velocities, vel_indices, inverse_blocks, group_local, pbuf, art, g, i, ng, si, bias_velocity
+                )
                 q_i = wp.float64(positions[pos_indices[si]]) + hd * qd_i
                 f_i = force_at(
                     q_i,
@@ -330,16 +401,19 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
                 rbuf[g, i] = s / jbuf[g, i, i]
             # Backtrack until the residual drops. A clamp makes the residual
             # piecewise smooth, and a full step can jump between opposite limits
-            # without ever converging; a shorter step lands in between.
+            # without ever converging; a shorter step lands in between. The first
+            # full step is always taken, so a step that converges is not shortened.
             alpha = wp.float64(1.0)
             accepted = int(0)
-            for _ls in range(_LINE_SEARCH_STEPS):
+            for _ls in range(wp.max(ls_iterations, 1)):
                 for i in range(ng):
                     vbuf[g, i] = pbuf[g, i] + alpha * rbuf[g, i]
                 rn_t = wp.float64(0.0)
                 for i in range(ng):
                     si = group_slot[g, i]
-                    qd_i = predict_qd(velocities, vel_indices, inverse_blocks, group_local, vbuf, art, g, i, ng, si)
+                    qd_i = predict_qd(
+                        velocities, vel_indices, inverse_blocks, group_local, vbuf, art, g, i, ng, si, bias_velocity
+                    )
                     q_i = wp.float64(positions[pos_indices[si]]) + hd * qd_i
                     f_i = force_at(
                         q_i,
@@ -355,7 +429,11 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
                     )
                     ri = vbuf[g, i] - hd * f_i
                     rn_t += ri * ri
-                if rn_t <= (wp.float64(1.0) - wp.float64(1.0e-4) * alpha) * rn:
+                if (
+                    it == 0
+                    or ls_iterations == 0
+                    or rn_t <= (wp.float64(1.0) - wp.float64(_SUFFICIENT_DECREASE) * alpha) * rn
+                ):
                     accepted = 1
                     break
                 alpha = alpha * wp.float64(0.5)
@@ -364,16 +442,17 @@ def _build_coupled_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Fun
                 break
             dpn = wp.float64(0.0)
             for i in range(ng):
-                dv = vbuf[g, i] - pbuf[g, i]
                 pbuf[g, i] = vbuf[g, i]
-                dpn += dv * dv
+                dpn += rbuf[g, i] * rbuf[g, i]
             if dpn < upd_tol * upd_tol:
                 break
 
         # Re-clamp at the final predicted state and write effort.
         for i in range(ng):
             si = group_slot[g, i]
-            qd_i = predict_qd(velocities, vel_indices, inverse_blocks, group_local, pbuf, art, g, i, ng, si)
+            qd_i = predict_qd(
+                velocities, vel_indices, inverse_blocks, group_local, pbuf, art, g, i, ng, si, bias_velocity
+            )
             q_i = wp.float64(positions[pos_indices[si]]) + hd * qd_i
             tq = wp.float64(target_pos[target_pos_indices[si]])
             tqd = wp.float64(target_vel[target_vel_indices[si]])
@@ -410,7 +489,9 @@ def _build_block_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Funct
 
     One thread block per group and one thread per row. The Newton system
     ``J = I - h diag(s) A`` is solved by Gauss elimination with floored pivots,
-    as in the per-thread kernel, one row per lane.
+    as in the per-thread kernel, one row per lane. Unlike the per-thread
+    kernel, ``A p`` and the elimination run in float32; the residual and the
+    force law stay in float64.
     """
     key = (*cache_key, "block", tile)
     cached = _coupled_kernel_cache.get(key)
@@ -498,7 +579,7 @@ def _build_block_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Funct
     @wp.kernel(
         enable_backward=False,
         module="unique",
-        module_options={"block_dim": tile, "max_unroll": tile_aug},
+        module_options={"block_dim": tile, "max_unroll": tile_aug, "enable_mathdx_gemm": False},
     )
     def solve(
         group_size: wp.array[wp.int32],
@@ -516,12 +597,14 @@ def _build_block_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Funct
         params: wp.array2d[float],
         h: float,
         max_iters: int,
+        ls_iterations: int,
         residual_tol: float,
         update_tol: float,
         fd_epsilon: float,
         derivative_floor: float,
         warm_zero: int,
         clamp_params: wp.array2d[float],
+        bias_velocity: wp.array[wp.float64],
         computed_efforts: wp.array[float],
         applied_efforts: wp.array[float],
     ):
@@ -553,6 +636,9 @@ def _build_block_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Funct
                 ff = wp.float64(feedforward[target_vel_indices[si]])
             if warm_zero == 0:
                 p = hd * force_at(q0, qd0, tq, tqd, ff, params, clamp_params, si)
+            # Predictions start from qd - h (A b)_i; the warm start uses the step-start velocity.
+            if bias_velocity:
+                qd0 += bias_velocity[si]
 
         for it in range(max_iters):
             u = apply_response(A, p)
@@ -579,7 +665,7 @@ def _build_block_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Funct
             alpha = wp.float64(1.0)
             accepted = int(0)
             p_t = p
-            for _ls in range(_LINE_SEARCH_STEPS):
+            for _ls in range(wp.max(ls_iterations, 1)):
                 p_t = p + alpha * step
                 u_t = apply_response(A, p_t)
                 r_t = wp.float64(0.0)
@@ -587,15 +673,18 @@ def _build_block_solve_kernel(evaluate_force: wp.Function, clamp_chain: wp.Funct
                     qd_t = qd0 + u_t
                     r_t = p_t - hd * force_at(q0 + hd * qd_t, qd_t, tq, tqd, ff, params, clamp_params, si)
                 rn_t = wp.tile_extract(wp.tile_sum(wp.tile(r_t * r_t)), 0)
-                if rn_t <= (wp.float64(1.0) - wp.float64(1.0e-4) * alpha) * rn:
+                if (
+                    it == 0
+                    or ls_iterations == 0
+                    or rn_t <= (wp.float64(1.0) - wp.float64(_SUFFICIENT_DECREASE) * alpha) * rn
+                ):
                     accepted = 1
                     break
                 alpha = alpha * wp.float64(0.5)
             if accepted == 0:
                 break
-            dp = p_t - p
             p = p_t
-            dpn = wp.tile_extract(wp.tile_sum(wp.tile(dp * dp)), 0)
+            dpn = wp.tile_extract(wp.tile_sum(wp.tile(step * step)), 0)
             if dpn < upd_tol * upd_tol:
                 break
 
@@ -646,6 +735,8 @@ class _EffortModeImplicit:
         if self._options.fd_epsilon <= 0.0:
             # The Jacobian divides by this, so zero yields NaN.
             raise ValueError(f"fd_epsilon must be positive, got {self._options.fd_epsilon}")
+        if self._options.ls_iterations < 0:
+            raise ValueError(f"ls_iterations must be non-negative, got {self._options.ls_iterations}")
         self._num_actuators = num_actuators
         self._device = device
         if not isinstance(response, JointSpaceResponse):
@@ -812,12 +903,15 @@ class _EffortModeImplicit:
         self._slot_local = wp.array(slot_local, dtype=wp.int32, device=device)
         self._slot_response = wp.zeros(self._num_actuators, dtype=float, device=device)
         self._num_groups = num_groups
+        self._art_base = wp.array(np.asarray(art_base, dtype=np.int32), dtype=wp.int32, device=device)
+        self._bias_velocity = wp.zeros(self._num_actuators, dtype=wp.float64, device=device)
+        self._joint_dof_count = int(model.joint_dof_count)
 
-        # One thread block per group on CUDA when the group fits a tile, one
-        # thread per group otherwise.
+        # One thread block per group on CUDA when the group is large enough and
+        # fits a tile, one thread per group otherwise.
         self._block_kernel = None
         tile = max(32, ((max_ng + 15) // 16) * 16)
-        if wp.get_device(device).is_cuda and tile <= _BLOCK_SOLVE_MAX_ROWS:
+        if wp.get_device(device).is_cuda and _BLOCK_SOLVE_MIN_ROWS <= max_ng and tile <= _BLOCK_SOLVE_MAX_ROWS:
             self._block_tile = tile
             self._group_response = wp.zeros((num_groups, tile, tile), dtype=float, device=device)
             self._block_kernel = _build_block_solve_kernel(
@@ -850,6 +944,7 @@ class _EffortModeImplicit:
         drive_state: Any,
         dt: float | None,
         custom_inputs: dict[str, Any] | None = None,
+        bias_force: wp.array[float] | None = None,
     ) -> wp.array[float]:
         """Solve implicit effort and return the applied-effort buffer.
 
@@ -861,6 +956,11 @@ class _EffortModeImplicit:
         :attr:`~newton.actuators.DriveBase.custom_inputs`, and is forwarded to
         :meth:`~newton.actuators.DriveBase.prepare_implicit` so the
         linearization sees the same extra arrays the explicit path does.
+
+        *bias_force* is a per-DOF force indexed like ``joint_qd`` [N or N·m],
+        in the convention ``tau = M qdd + bias_force``. When given, the
+        predicted end-of-step velocity is ``qd + A (p - h bias_force)`` instead
+        of ``qd + A p``.
         """
         if dt is None:
             raise ValueError("Implicit actuation requires dt")
@@ -894,6 +994,40 @@ class _EffortModeImplicit:
                 **prepare_kwargs,
             )
         inverse_blocks = self._response.inverse_blocks
+        bias_velocity = None
+        if bias_force is not None:
+            if not isinstance(bias_force, wp.array):
+                raise TypeError(f"bias_force must be a wp.array, got {type(bias_force).__name__}")
+            if bias_force.ndim != 1 or bias_force.dtype != wp.float32 or bias_force.shape[0] != self._joint_dof_count:
+                raise ValueError(
+                    f"bias_force must be a 1-D float32 array with joint_dof_count = {self._joint_dof_count} entries; "
+                    f"got shape {bias_force.shape} and dtype {wp.types.type_repr(bias_force.dtype)}"
+                )
+            if bias_force.device != self._device:
+                raise ValueError(f"bias_force is on {bias_force.device}, but the actuator runs on {self._device}")
+            model = self._response.model
+            bias_velocity = self._bias_velocity
+            wp.launch(
+                _bias_velocity_kernel,
+                dim=self._num_actuators,
+                inputs=[
+                    inverse_blocks,
+                    bias_force,
+                    dt,
+                    self._slot_art,
+                    self._slot_local,
+                    self._art_base,
+                    model.articulation_start,
+                    model.articulation_end,
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_X_p,
+                    model.joint_qd_start,
+                    sim_state.body_q,
+                ],
+                outputs=[bias_velocity],
+                device=self._device,
+            )
 
         opts = self._options
         if self._block_kernel is not None:
@@ -924,12 +1058,14 @@ class _EffortModeImplicit:
                     self._params,
                     float(dt),
                     int(opts.max_iters),
+                    int(opts.ls_iterations),
                     float(opts.residual_tol),
                     float(opts.update_tol),
                     float(opts.fd_epsilon),
                     float(opts.derivative_floor),
                     1 if opts.warm_start is ImplicitOptions.WarmStart.ZERO else 0,
                     self._clamp_params,
+                    bias_velocity,
                 ],
                 outputs=[computed_forces, applied_forces],
                 block_dim=tile,
@@ -957,6 +1093,7 @@ class _EffortModeImplicit:
                 self._params,
                 float(dt),
                 int(opts.max_iters),
+                int(opts.ls_iterations),
                 float(opts.residual_tol),
                 float(opts.update_tol),
                 float(opts.fd_epsilon),
@@ -968,6 +1105,7 @@ class _EffortModeImplicit:
                 self._sbuf,
                 self._vbuf,
                 self._jbuf,
+                bias_velocity,
             ],
             outputs=[computed_forces, applied_forces],
             device=self._device,

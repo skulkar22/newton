@@ -7,6 +7,8 @@ import warnings
 
 import warp as wp
 
+from ..exceptions import NewtonWarning
+from .articulation import eval_angular_coordinates
 from .enums import JointType
 from .model import Model
 from .state import State
@@ -146,6 +148,16 @@ def eval_mimic(
     copied and updated; unselected coordinates in ``state_out`` retain their
     existing values. With neither selector, all joints are processed.
 
+    Solvers with mimic support enforce the relationship during ``step()``;
+    this helper is not a required post-step call. Whether ``step()`` refreshes
+    joint coordinates in ``state_out`` is solver-defined. If a solver advances
+    body coordinates without refreshing joint coordinates, use
+    :func:`~newton.eval_ik` to derive current joint values from the output body
+    state; calling this function on stale joint arrays would use stale
+    reference values. Call this helper before
+    :func:`~newton.eval_fk` when initializing body poses from joint values
+    that need mimic projection.
+
     Args:
         model: Model containing the joint mimic metadata.
         state_in: State providing the input joint coordinates.
@@ -236,6 +248,104 @@ def eval_mimic(
     )
 
 
+@wp.func
+def eval_joint_mimic_coordinate(
+    joint: int,
+    component: int,
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_axis: wp.array[wp.vec3],
+):
+    """Return one joint coordinate and its parent/child maximal-coordinate gradients."""
+    type = joint_type[joint]
+    parent = joint_parent[joint]
+    child = joint_child[joint]
+
+    X_wp = joint_X_p[joint]
+    pose_p = X_wp
+    if parent >= 0:
+        pose_p = body_q[parent]
+        X_wp = pose_p * X_wp
+    pose_c = body_q[child]
+    X_wc = pose_c * joint_X_c[joint]
+
+    q_p = wp.transform_get_rotation(X_wp)
+    q_c = wp.transform_get_rotation(X_wc)
+    rel_q = wp.quat_inverse(q_p) * q_c
+    x_err = wp.transform_get_translation(X_wc) - wp.transform_get_translation(X_wp)
+    x_err_p = wp.quat_rotate_inv(q_p, x_err)
+
+    qd_start = joint_qd_start[joint]
+    lin_axis_count = joint_dof_dim[joint, 0]
+    ang_axis_count = joint_dof_dim[joint, 1]
+
+    coordinate = float(0.0)
+    linear_axis = wp.vec3(0.0)
+    angular_covector = wp.vec3(0.0)
+
+    if type == JointType.PRISMATIC:
+        axis = joint_axis[qd_start]
+        coordinate = wp.dot(x_err_p, axis)
+        linear_axis = wp.quat_rotate(q_p, axis)
+    elif type == JointType.REVOLUTE:
+        axis = joint_axis[qd_start]
+        coordinate = wp.quat_twist_angle_signed(axis, rel_q)
+        angular_covector = wp.quat_rotate(q_p, axis)
+    elif type == JointType.D6:
+        if component < lin_axis_count:
+            axis = joint_axis[qd_start + component]
+            coordinate = wp.dot(x_err_p, axis)
+            linear_axis = wp.quat_rotate(q_p, axis)
+        else:
+            angular_component = component - lin_axis_count
+            angular_start = qd_start + lin_axis_count
+            if ang_axis_count == 1:
+                axis = joint_axis[angular_start]
+                coordinate = wp.quat_twist_angle_signed(axis, rel_q)
+                angular_covector = wp.quat_rotate(q_p, axis)
+            else:
+                coordinates, covectors = eval_angular_coordinates(joint_axis, angular_start, ang_axis_count, q_p, q_c)
+                coordinate = coordinates[angular_component]
+                angular_covector = covectors[angular_component]
+
+    r_p = wp.vec3(0.0)
+    if parent >= 0:
+        r_p = wp.transform_get_translation(X_wp) - wp.transform_point(pose_p, body_com[parent])
+    r_c = wp.transform_get_translation(X_wc) - wp.transform_point(pose_c, body_com[child])
+
+    gradient_parent = wp.spatial_vector(-linear_axis, -wp.cross(r_p, linear_axis) - angular_covector)
+    gradient_child = wp.spatial_vector(linear_axis, wp.cross(r_c, linear_axis) + angular_covector)
+    return coordinate, gradient_parent, gradient_child
+
+
+@wp.func
+def eval_joint_mimic_velocity(
+    parent: int,
+    child: int,
+    parent_gradient: wp.spatial_vector,
+    child_gradient: wp.spatial_vector,
+    body_qd: wp.array[wp.spatial_vector],
+) -> float:
+    """Return one joint-coordinate velocity from maximal body velocities."""
+    velocity = float(0.0)
+    if parent >= 0:
+        parent_twist = body_qd[parent]
+        velocity += wp.dot(wp.spatial_top(parent_gradient), wp.spatial_top(parent_twist))
+        velocity += wp.dot(wp.spatial_bottom(parent_gradient), wp.spatial_bottom(parent_twist))
+    if child >= 0:
+        child_twist = body_qd[child]
+        velocity += wp.dot(wp.spatial_top(child_gradient), wp.spatial_top(child_twist))
+        velocity += wp.dot(wp.spatial_bottom(child_gradient), wp.spatial_bottom(child_twist))
+    return velocity
+
+
 def has_supported_joint_mimics(model: Model, solver_name: str) -> bool:
     """Return whether a model has supported mimics and warn about unsupported ones."""
     joint_mimic_joint = model.joint_mimic_joint.numpy()
@@ -259,6 +369,7 @@ def has_supported_joint_mimics(model: Model, solver_name: str) -> bool:
         warnings.warn(
             f"{solver_name} ignores joint-owned mimic relationships unless both joints are PRISMATIC, "
             f"REVOLUTE, or D6; unsupported follower joint indices: {unsupported_sample}{omitted_suffix}.",
+            NewtonWarning,
             stacklevel=3,
         )
     return has_supported

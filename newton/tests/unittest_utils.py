@@ -9,6 +9,7 @@ import importlib.util
 import io
 import linecache
 import os
+import platform
 import re
 import shlex
 import sys
@@ -24,6 +25,14 @@ import warp as wp
 
 pxr = importlib.util.find_spec("pxr")
 USD_AVAILABLE = pxr is not None
+
+MODULE_LOAD_OUTPUT_RE = r"^Module .* load on device '[^']*' took [\d.]+ ms\s*\((?:compiled|cached)\)\n?"
+
+# The batched transform helpers in newton._src.core.host_transform mirror the operation
+# order of Warp's native builtins, so they match bit for bit where neither side fuses
+# multiply-adds. That is verified on Linux x86-64; elsewhere, tests compare within
+# float32 round-off.
+HOST_TRANSFORMS_BIT_EXACT = platform.system() == "Linux" and platform.machine() == "x86_64"
 
 # default test mode (see get_test_devices())
 #   "basic" - only run on CPU and first GPU device
@@ -314,9 +323,8 @@ class CheckOutput:
     def __enter__(self):
         # wp.force_load()
 
-        # Drain any device printf still buffered on the GPU before redirecting stdout. CUDA
-        # copies its printf buffer to the host only at a synchronization, so output from an
-        # earlier (check_output=False) test would otherwise land in this test's capture.
+        # Flush device printf output still pending from earlier tests so the
+        # capture holds only this test's output.
         wp.synchronize()
         self.capture = StdOutCapture()
         self.capture.begin()

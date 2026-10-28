@@ -35,12 +35,7 @@ def _com_drift(device, dt, seconds):
     )
     b.add_articulation([root, hinge])
     b.color()
-    previous = newton.use_coord_layout_targets
-    newton.use_coord_layout_targets = True
-    try:
-        model = b.finalize(device=device)
-    finally:
-        newton.use_coord_layout_targets = previous
+    model = b.finalize(device=device)
     solver = newton.solvers.SolverVBD(
         model,
         iterations=12,
@@ -138,12 +133,7 @@ def _elastic_com_drift(device, dt, seconds):
     )
     b.add_articulation([root, hinge])
     b.color()
-    previous = newton.use_coord_layout_targets
-    newton.use_coord_layout_targets = True
-    try:
-        model = b.finalize(device=device)
-    finally:
-        newton.use_coord_layout_targets = previous
+    model = b.finalize(device=device)
     solver = newton.solvers.SolverVBD(
         model,
         iterations=12,

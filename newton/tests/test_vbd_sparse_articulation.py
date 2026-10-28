@@ -5,7 +5,6 @@ import math
 import unittest
 import warnings
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -456,32 +455,31 @@ def _solve_coupled_revolute_armature() -> tuple[float, float, float]:
     target_angle = 1.0e-3
     dt = 1.0e-2
 
-    with mock.patch("newton.use_coord_layout_targets", True):
-        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
-        parent = builder.add_link(
-            xform=wp.transform(),
-            mass=1.0,
-            inertia=wp.mat33(np.diag([0.25, parent_inertia, 0.35]).astype(np.float32)),
-        )
-        child = builder.add_link(
-            xform=wp.transform(),
-            mass=1.0,
-            inertia=wp.mat33(np.diag([0.4, child_inertia, 0.5]).astype(np.float32)),
-        )
-        root_joint = builder.add_joint_free(child=parent)
-        revolute_joint = builder.add_joint_revolute(
-            parent=parent,
-            child=child,
-            axis=newton.Axis.Y,
-            target_ke=drive_ke,
-            target_kd=0.0,
-            limit_ke=0.0,
-            limit_kd=0.0,
-            armature=armature,
-        )
-        builder.add_articulation([root_joint, revolute_joint])
-        builder.color()
-        model = builder.finalize(device="cpu")
+    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+    parent = builder.add_link(
+        xform=wp.transform(),
+        mass=1.0,
+        inertia=wp.mat33(np.diag([0.25, parent_inertia, 0.35]).astype(np.float32)),
+    )
+    child = builder.add_link(
+        xform=wp.transform(),
+        mass=1.0,
+        inertia=wp.mat33(np.diag([0.4, child_inertia, 0.5]).astype(np.float32)),
+    )
+    root_joint = builder.add_joint_free(child=parent)
+    revolute_joint = builder.add_joint_revolute(
+        parent=parent,
+        child=child,
+        axis=newton.Axis.Y,
+        target_ke=drive_ke,
+        target_kd=0.0,
+        limit_ke=0.0,
+        limit_kd=0.0,
+        armature=armature,
+    )
+    builder.add_articulation([root_joint, revolute_joint])
+    builder.color()
+    model = builder.finalize(device="cpu")
 
     state_in = model.state()
     state_out = model.state()

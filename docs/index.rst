@@ -18,6 +18,7 @@ Newton Physics
    guide/installation
    guide/compatibility
    guide/visualization
+   guide/diagnostics
    guide/tutorials
    Development <guide/development>
    Source Code Guidelines <guide/source_code_guidelines>
@@ -32,6 +33,8 @@ Newton Physics
    Articulations <concepts/articulations>
    Reduced Elastic Links <concepts/reduced_elastic>
    Deformable Objects <concepts/deformable_objects>
+   Selection API <concepts/selection>
+   Deformable Selection <concepts/deformable_selection>
    Mass and Inertia <concepts/mass_inertia>
    Sites <concepts/sites>
    Sensors <concepts/sensors>
@@ -75,3 +78,4 @@ Newton Physics
    :caption: Project Links
 
     GitHub <https://github.com/newton-physics/newton>
+    Publications <https://github.com/newton-physics/newton/blob/main/PUBLICATIONS.md>
