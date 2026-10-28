@@ -1444,8 +1444,7 @@ class ModelBuilder:
 
         Built-in string names are also supported (values are offset by entity count):
             - ``"body"``, ``"shape"``, ``"joint"``, ``"joint_dof"``, ``"joint_coord"``, ``"articulation"``,
-              ``"constraint_mimic"``, ``"particle"``, ``"edge"``, ``"triangle"``, ``"tetrahedron"``, ``"spring"``,
-              ``"tendon"``, ``"tendon_guide"``, ``"tendon_segment"``
+              ``"constraint_mimic"``, ``"particle"``, ``"edge"``, ``"triangle"``, ``"tetrahedron"``, ``"spring"``
 
         For experimental deformable object types, use ``Model.AttributeFrequency.CURVE``,
         ``SURFACE``, or ``VOLUME``. The strings ``"curve"``, ``"surface"``, and ``"volume"``
@@ -1521,7 +1520,7 @@ class ModelBuilder:
           entities. Keys are ``"body"``, ``"shape"``, ``"joint"``, ``"joint_dof"``,
           ``"joint_coord"``, ``"joint_constraint"``, ``"articulation"``, ``"particle"``,
           ``"edge"``, ``"triangle"``, ``"tetrahedron"``, ``"spring"``,
-          ``"tendon"``, ``"tendon_guide"``, ``"tendon_segment"``,
+          ``"tendon"``, ``"tendon_link"``, ``"tendon_segment"``,
           ``"constraint_mimic"``, and ``"attachment_particle_body"``.
         - ``"custom_frequency_offsets"`` (``dict[str, int]``): Destination row counts
           before this copy's custom attributes are merged, keyed by full frequency name
@@ -2582,21 +2581,6 @@ class ModelBuilder:
     def _equality_constraint_count(self) -> int:
         """Number of equality constraints added to this builder (from the ``mujoco:equality_constraint`` counter)."""
         return self._custom_frequency_counts.get("mujoco:equality_constraint", 0)
-
-    @property
-    def tendon_count(self) -> int:
-        """Number of authored tendon routes."""
-        return len(self.tendon_start)
-
-    @property
-    def tendon_guide_count(self) -> int:
-        """Number of guides across all tendon routes."""
-        return len(self.tendon_guide_body)
-
-    @property
-    def tendon_segment_count(self) -> int:
-        """Number of incoming straight spans across all tendon routes."""
-        return len(self.tendon_segment_rest_length)
 
     @property
     def shape_collision_filter_pairs(self) -> list[tuple[int, int]]:
@@ -4023,29 +4007,6 @@ class ModelBuilder:
                 transformed = transform_multiply_rows(moved_xforms[:, None], source[None])
                 targets = shape_transform_start + moved_copies[:, None] * counts["shape"] + static_shapes[None]
                 store_transform_rows(self.shape_transform, targets.ravel(), transformed.reshape(-1, 7))
-
-        # World guides carry their own frame; body-local guides follow the placed body.
-        world_guides = np.flatnonzero(np.asarray(builder.tendon_guide_body, dtype=np.int64) == -1)
-        for name in ("tendon_guide_offset", "tendon_guide_axis"):
-            attribute_specs.pop(name)
-            start = int(bases["tendon_guide"])
-            values = getattr(self, name)
-            values.extend(source_list(name) * copy_count)
-            is_offset = name == "tendon_guide_offset"
-            if world_guides.size == 0 or (not is_offset and translations_only):
-                continue
-            source_vectors = np.asarray(getattr(builder, name), dtype=np.float32)[world_guides]
-            for world_index, xform in enumerate(xforms):
-                if xform is None:
-                    continue
-                transformed = source_vectors.copy()
-                if not translations_only:
-                    rotate_vectors(xform.q, transformed)
-                if is_offset:
-                    transformed += np.asarray(xform.p, dtype=np.float32)
-                targets = start + world_index * counts["tendon_guide"] + world_guides
-                for target, vector in zip(targets, transformed.tolist(), strict=True):
-                    values[target] = tuple(vector)
 
         for body_start, shape_start in zip(body_starts, shape_starts, strict=True):
             for body, shapes in builder.body_shapes.items():
@@ -8918,22 +8879,6 @@ class ModelBuilder:
 
         # Reset the constraint count based on the retained joints
         self.joint_constraint_count = len(self.joint_cts)
-
-        # Keep tendon contact geometry in the same world frame when its body is merged.
-        for guide_idx, old_body in enumerate(self.tendon_guide_body):
-            if old_body in body_remap:
-                self.tendon_guide_body[guide_idx] = body_remap[old_body]
-                continue
-
-            merged_parent = body_merged_parent[old_body]
-            merge_xform = body_merged_transform[old_body]
-            self.tendon_guide_body[guide_idx] = body_remap[merged_parent]
-            self.tendon_guide_offset[guide_idx] = wp.transform_point(
-                merge_xform, axis_to_vec3(self.tendon_guide_offset[guide_idx])
-            )
-            self.tendon_guide_axis[guide_idx] = wp.transform_vector(
-                merge_xform, axis_to_vec3(self.tendon_guide_axis[guide_idx])
-            )
 
         # Remap equality constraint body/joint indices and transform anchors for merged bodies.
         # Import locally to avoid a cycle while the public simulation package initializes.
@@ -16698,49 +16643,6 @@ class ModelBuilder:
             m.spring_stiffness = _to_wp_array(self.spring_stiffness, wp.float32, requires_grad=requires_grad)
             m.spring_damping = _to_wp_array(self.spring_damping, wp.float32, requires_grad=requires_grad)
             m.spring_control = _to_wp_array(self.spring_control, wp.float32, requires_grad=requires_grad)
-
-            # ---------------------
-            # tendons
-
-            tendon_count = len(self.tendon_start)
-            m.tendon_label = list(self.tendon_label)
-            m.tendon_world = wp.array(self.tendon_world, dtype=int)
-            guide_count = len(self.tendon_guide_body)
-            seg_count = len(self.tendon_segment_rest_length)
-
-            if tendon_count > 0:
-                tendon_end = [*self.tendon_start[1:], guide_count]
-                for tendon_idx, (start, end) in enumerate(zip(self.tendon_start, tendon_end, strict=True)):
-                    if end - start < 2:
-                        raise ValueError(f"Tendon {tendon_idx} must contain at least two guides")
-                    if (self.tendon_guide_flags[end - 1] & int(TendonGuideFlags.DYNAMIC)) != 0:
-                        raise ValueError("A dynamic ROLLER tendon guide must have guides on both sides")
-
-                tendon_start = [*self.tendon_start, guide_count]
-                m.tendon_start = wp.array(tendon_start, dtype=wp.int32)
-                m.tendon_guide_body = wp.array(self.tendon_guide_body, dtype=wp.int32)
-                m.tendon_guide_type = wp.array(self.tendon_guide_type, dtype=wp.int32)
-                m.tendon_guide_radius = wp.array(
-                    self.tendon_guide_radius, dtype=wp.float32, requires_grad=requires_grad
-                )
-                m.tendon_guide_orientation = wp.array(self.tendon_guide_orientation, dtype=wp.int32)
-                m.tendon_guide_mu = wp.array(self.tendon_guide_mu, dtype=wp.float32, requires_grad=requires_grad)
-                m.tendon_guide_flags = wp.array(self.tendon_guide_flags, dtype=wp.int32)
-                m.tendon_guide_offset = wp.array(self.tendon_guide_offset, dtype=wp.vec3)
-                m.tendon_guide_axis = wp.array(self.tendon_guide_axis, dtype=wp.vec3)
-                m.tendon_segment_compliance = wp.array(
-                    self.tendon_segment_compliance, dtype=wp.float32, requires_grad=requires_grad
-                )
-                m.tendon_segment_damping = wp.array(
-                    self.tendon_segment_damping, dtype=wp.float32, requires_grad=requires_grad
-                )
-                m.tendon_segment_rest_length = wp.array(
-                    self.tendon_segment_rest_length, dtype=wp.float32, requires_grad=requires_grad
-                )
-
-            m.tendon_count = tendon_count
-            m.tendon_guide_count = guide_count
-            m.tendon_segment_count = seg_count
 
             # ---------------------
             # particle-body attachments

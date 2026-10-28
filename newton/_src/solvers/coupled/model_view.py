@@ -104,7 +104,7 @@ class ModelView:
         if name == "shape_contact_pair_count":
             raise AttributeError("shape_contact_pair_count is read-only; replace shape_contact_pairs instead")
         parent = object.__getattribute__(self, "_parent")
-        if parent.tendon_count and name in {"body_count", "tendon_count", "tendon_guide_count", "tendon_segment_count"}:
+        if parent.tendon_count and name in {"body_count", "tendon_count", "tendon_link_count", "tendon_segment_count"}:
             if value != getattr(parent, name):
                 raise ValueError("Partial model views containing tendons are unsupported; use a complete tendon model")
         spec = parent._attribute_spec(name)

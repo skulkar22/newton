@@ -8222,8 +8222,9 @@ def compute_body_particle_contact_forces(
     contact_force[tid] = wp.spatial_vector(f_body, wp.cross(cp_world - com_world, f_body))
 
 
-# MERGE-TODO(#4337): main replaced this kernel with create_solve_rigid_body(has_tendons) (module="unique",
-# tendon-free specialization); dev kernel kept verbatim for the follow-up #4337 port.
+# MERGE-TODO(#4337): main replaced this kernel with a solve_rigid_body factory specialized on
+# tendon presence (module="unique", tendon-free specialization); dev kernel kept verbatim for
+# the follow-up #4337 port.
 @wp.kernel
 def solve_rigid_body(
     step_size: RigidStepSize,

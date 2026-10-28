@@ -1438,7 +1438,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         options = {"deterministic": effective_deterministic, "deterministic_max_records": 0}
         if integrates_rigid_bodies:
             rigid_modules = (
-                # MERGE-TODO(#4337): main lists self._solve_rigid_body_kernel.module (create_solve_rigid_body) here.
+                # MERGE-TODO(#4337): main lists self._solve_rigid_body_kernel.module (its solve_rigid_body factory) here.
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
                 reduced_elastic_kernels,
@@ -6508,7 +6508,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self._launch_assemble_elastic_bodies(color_group, state_in, state_out, control, contacts, dt)
 
             wp.launch(
-                # MERGE-TODO(#4337): main launches create_solve_rigid_body() with per-color block_dim.
+                # MERGE-TODO(#4337): main launches its factory-built solve_rigid_body kernel with per-color block_dim.
                 kernel=solve_rigid_body,
                 inputs=[
                     self._step_size,
