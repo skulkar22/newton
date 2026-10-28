@@ -11487,29 +11487,23 @@ class ModelBuilder:
         along the cable. The sampled polyline and frames are then assembled into capsule bodies
         connected by cable joints via :meth:`add_rod`.
 
-        The configuration conveyed by :attr:`Model.body_q` is the cable's rest shape: solvers
-        that measure cable stretch/bend relative to the rest configuration (e.g.
-        :class:`newton.solvers.SolverVBD`) keep it at equilibrium. By default the bodies are
-        built along the spline, so pre-shaped cables (coils, knots) hold their shape. With
-        ``straight_rest_shape=True`` the bodies are instead built at the cable's *natural*
-        (minimal bending, untwisted) configuration — a straight chain for open cables, a
-        circle of the same circumference for closed ones — and the spline only describes the
-        intended initial pose, which the caller writes into the simulation state:
+        The bodies are always placed on the posed spline (:attr:`Model.body_q` and the initial
+        state). The rod's structural rest shape is stored separately in the rod joints' rest
+        targets (:attr:`Model.joint_target_q`), which solvers that measure cable stretch/bend
+        relative to the rest configuration (e.g. :class:`newton.solvers.SolverVBD`) use as
+        the equilibrium. By default the rest shape is the spline itself, so pre-shaped cables
+        (coils, knots) hold their shape. With ``straight_rest_shape=True`` the rest shape is
+        the cable's *natural* (minimal bending, untwisted) configuration -- a straight chain
+        for open cables, a circle of the same circumference for closed ones -- while the
+        bodies still start on the spline, so the cable starts pre-strained and relaxes toward
+        the straight rest shape:
 
         .. code-block:: python
 
             bodies, _ = builder.add_cable_spline(points, segment_length=0.04, straight_rest_shape=True)
             model = builder.finalize()
             solver = newton.solvers.SolverVBD(model)
-            state_0, state_1 = model.state(), model.state()
-
-            shape = newton.utils.cable_spline_shape(points, segment_length=0.04)
-            xforms = shape.body_transforms()
-            body_q = state_0.body_q.numpy()
-            body_q[bodies] = [[*t.p, *t.q] for t in xforms]
-            state_0.body_q.assign(body_q)
-            state_1.body_q.assign(body_q)
-            solver.body_q_prev.assign(state_0.body_q)  # avoid a spurious first-step velocity
+            state_0, state_1 = model.state(), model.state()  # bodies already posed on the spline
 
         This is the routing workflow (cables tensioned around pulleys); see
         ``newton/examples/cable/example_cable_cross_slide_table.py`` for a complete scene.
@@ -11545,17 +11539,17 @@ class ModelBuilder:
             twist_total: Total intrinsic twist [rad] distributed uniformly along the cable. For
                 closed cables this must be a multiple of ``2*pi`` (whole turns of stored twist).
                 With ``straight_rest_shape=True`` the rest configuration is untwisted, so the
-                twist appears only in the posed geometry written into the state and becomes
-                live strain.
+                twist appears only in the initial posed geometry and becomes live strain.
             normal_hint: Optional direction seeding the first cross-section normal (its
                 component orthogonal to the first segment is used). If ``None`` or nearly
                 parallel to the first segment, a world axis is chosen automatically.
             alpha: Catmull-Rom parameterization exponent: 0.0 uniform, 0.5 centripetal
                 (default), 1.0 chordal. Centripetal avoids cusps and local self-intersections
                 within spans.
-            straight_rest_shape: If True, builds the bodies at the natural rest configuration
-                (straight chain, or a circle for closed cables) instead of along the spline;
-                see above and :func:`newton.utils.cable_spline_shape`.
+            straight_rest_shape: If True, uses the natural configuration (straight chain, or a
+                circle for closed cables) as the structural rest shape instead of the spline.
+                The bodies are still placed on the spline; see above and
+                :func:`newton.utils.cable_spline_shape`.
             label: Optional label prefix for bodies, shapes, and joints.
             wrap_in_articulation: If True, wraps the created joints into a single articulation;
                 see :meth:`add_rod`.

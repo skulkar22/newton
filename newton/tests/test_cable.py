@@ -7778,9 +7778,9 @@ def _cable_body_transforms_impl(test: unittest.TestCase, device):
 def _add_cable_spline_straight_rest_relaxes_impl(test: unittest.TestCase, device):
     """Verify a cable built with straight_rest_shape=True but posed curved relaxes toward straight.
 
-    Builds the rod at the straight rest configuration, writes the curved spline pose into the
-    simulation state (the routing workflow), and verifies the end-to-end distance grows toward
-    the full cable length under zero gravity.
+    The bodies start on the curved spline while the rod joints' rest targets
+    (``Model.joint_target_q``) describe the straight, untwisted rest configuration. Verifies the
+    end-to-end distance grows toward the full cable length under zero gravity.
     """
     control_points = [wp.vec3(float(x), float(0.4 * np.sin(2.5 * x)), 0.5) for x in np.linspace(0.0, 1.2, 10)]
     num_segments = 24
@@ -7790,7 +7790,7 @@ def _add_cable_spline_straight_rest_relaxes_impl(test: unittest.TestCase, device
     builder.default_shape_cfg.kd = 0.0
     builder.default_shape_cfg.mu = 1.0
 
-    bodies, _joints = builder.add_cable_spline(
+    bodies, joints = builder.add_cable_spline(
         control_points,
         num_segments=num_segments,
         radius=0.01,
@@ -7805,26 +7805,27 @@ def _add_cable_spline_straight_rest_relaxes_impl(test: unittest.TestCase, device
     model = builder.finalize(device=device)
     model.set_gravity((0.0, 0.0, 0.0))
 
-    # The model conveys the straight rest configuration.
-    rest_q = model.body_q.numpy()
-    rest_positions = rest_q[bodies, :3]
-    rest_dirs = np.diff(rest_positions, axis=0)
-    rest_dirs /= np.linalg.norm(rest_dirs, axis=1)[:, None]
-    test.assertGreater(float((rest_dirs @ rest_dirs[0]).min()), 1.0 - 1.0e-6, "model rest pose is not straight")
+    # The model's rest targets convey the straight, untwisted rest configuration: every rod
+    # joint's angular rest target is the identity rotation.
+    target_q = model.joint_target_q.numpy()
+    target_q_start = model.joint_target_q_start.numpy()
+    for j in joints:
+        rest_rot = target_q[target_q_start[j] + 3 : target_q_start[j] + 7]
+        test.assertGreater(abs(float(rest_rot[3])), 1.0 - 1.0e-6, f"joint {j} rest pose is not straight")
+
+    # The bodies start on the curved spline.
+    shape = newton.utils.cable_spline_shape(control_points, num_segments=num_segments)
+    xforms = shape.body_transforms(body_frame_origin="com")
+    np.testing.assert_allclose(
+        model.body_q.numpy()[bodies, :3],
+        np.array([[*wp.transform_get_translation(t)] for t in xforms]),
+        atol=1.0e-5,
+    )
 
     solver = newton.solvers.SolverVBD(model, iterations=4, rigid_compliant_alm=True)
     state0 = model.state()
     state1 = model.state()
     control = model.control()
-
-    # Pose the cable along the curved spline through the state (routing workflow).
-    shape = newton.utils.cable_spline_shape(control_points, num_segments=num_segments)
-    xforms = shape.body_transforms(body_frame_origin="com")
-    body_q = state0.body_q.numpy()
-    body_q[bodies] = [[*wp.transform_get_translation(t), *wp.transform_get_rotation(t)] for t in xforms]
-    state0.body_q.assign(body_q)
-    state1.body_q.assign(body_q)
-    solver.body_q_prev.assign(state0.body_q)
 
     total_length = np.linalg.norm(np.diff(_points_to_np(shape.rest_points), axis=0), axis=1).sum()
 
