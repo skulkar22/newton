@@ -1855,5 +1855,95 @@ add_function_test(
 )
 
 
+def _run_multi_axis_d6_chain(device, mode: str, angular_count: int) -> np.ndarray:
+    """Drive a hanging chain of 2- or 3-axis D6 joints for 1 s; return the final body poses."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    JointDofConfig = newton.ModelBuilder.JointDofConfig
+    axes = (newton.Axis.X, newton.Axis.Y, newton.Axis.Z)[:angular_count]
+    targets = (0.5, -0.3, 0.6)
+    # The second axis's drive target lies outside its limit, so a limit row engages.
+    limits = ((-1.0, 1.0), (-0.25, 0.25), (-0.5, 0.5))
+    inertia = wp.mat33(np.eye(3, dtype=np.float32)) * 0.01
+    link_length = 0.3
+    bodies = []
+    joints = []
+    for i in range(3):
+        body = builder.add_link(
+            xform=wp.transform(p=wp.vec3(link_length * (i + 0.5), 0.0, 1.0), q=wp.quat_identity()),
+            mass=1.0,
+            inertia=inertia,
+        )
+        angular_axes = [
+            JointDofConfig(
+                axis=axis,
+                target_pos=targets[k],
+                target_ke=200.0,
+                target_kd=5.0,
+                limit_lower=limits[k][0],
+                limit_upper=limits[k][1],
+                limit_ke=1.0e4,
+                limit_kd=10.0,
+            )
+            for k, axis in enumerate(axes)
+        ]
+        joints.append(
+            builder.add_joint_d6(
+                parent=bodies[-1] if bodies else -1,
+                child=body,
+                parent_xform=wp.transform(
+                    p=wp.vec3(0.5 * link_length, 0.0, 0.0) if bodies else wp.vec3(0.0, 0.0, 1.0),
+                    q=wp.quat_identity(),
+                ),
+                child_xform=wp.transform(p=wp.vec3(-0.5 * link_length, 0.0, 0.0), q=wp.quat_identity()),
+                linear_axes=[],
+                angular_axes=angular_axes,
+            )
+        )
+        bodies.append(body)
+    builder.add_articulation(joints)
+    builder.color()
+    model = builder.finalize(device=device)
+    state_in = model.state()
+    state_out = model.state()
+    control = model.control()
+    solver = newton.solvers.SolverVBD(model, iterations=20, rigid_articulation_solve=mode)
+    for _ in range(240):
+        solver.step(state_in, state_out, control, None, 1.0 / 240.0)
+        state_in, state_out = state_out, state_in
+    return state_in.body_q.numpy()
+
+
+def _pose_differences(q_a: np.ndarray, q_b: np.ndarray) -> tuple[float, float]:
+    """Return the largest position [m] and rotation [rad] difference over bodies."""
+    q_a = q_a.astype(np.float64)
+    q_b = q_b.astype(np.float64)
+    position = float(np.max(np.linalg.norm(q_a[:, :3] - q_b[:, :3], axis=1)))
+    q_a[:, 3:] /= np.linalg.norm(q_a[:, 3:], axis=1, keepdims=True)
+    q_b[:, 3:] /= np.linalg.norm(q_b[:, 3:], axis=1, keepdims=True)
+    dots = np.abs(np.sum(q_a[:, 3:] * q_b[:, 3:], axis=1))
+    rotation = float(np.max(2.0 * np.arccos(np.clip(dots, 0.0, 1.0))))
+    return position, rotation
+
+
+def test_sparse_multi_axis_d6_matches_local(test, device):
+    """Local and block-sparse solves agree on driven, limited 2- and 3-axis D6 chains."""
+    for angular_count in (2, 3):
+        local_q = _run_multi_axis_d6_chain(device, "local", angular_count)
+        sparse_q = _run_multi_axis_d6_chain(device, "block_sparse_joints", angular_count)
+        test.assertTrue(np.isfinite(local_q).all() and np.isfinite(sparse_q).all())
+        position, rotation = _pose_differences(local_q, sparse_q)
+        with test.subTest(angular_count=angular_count):
+            test.assertLess(rotation, 1.0e-3, f"rotation difference {rotation:.3e} rad")
+            test.assertLess(position, 1.0e-3, f"position difference {position:.3e} m")
+
+
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_multi_axis_d6_matches_local",
+    test_sparse_multi_axis_d6_matches_local,
+    devices=devices,
+)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

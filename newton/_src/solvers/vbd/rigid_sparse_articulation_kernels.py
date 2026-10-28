@@ -29,7 +29,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _rod_bend_twist_jacobian_z_from_measure,
     _structural_row_has_stiffness,
     _world_selected,
-    compute_kappa_and_jacobian,
+    compute_joint_kappa_and_jacobian,
     compute_kappa_dot,
     evaluate_rod_joint_force_hessian,
     quat_from_rotation_vector,
@@ -366,8 +366,14 @@ def _angular_constraint_force_hessian(
     alpha: float,
     damping: float,
     dt: float,
+    joint_axis: wp.array[wp.vec3],
+    ang_start: int,
+    ang_count: int,
 ):
-    kappa, J_world = compute_kappa_and_jacobian(parent_anchor_q, child_anchor_q, parent_rest_q, child_rest_q)
+    # Multi-axis D6 joints measure kappa in eval_fk coordinates, like the local solve and the dual update.
+    kappa, J_world = compute_joint_kappa_and_jacobian(
+        joint_axis, ang_start, ang_count, parent_anchor_q, child_anchor_q, parent_rest_q, child_rest_q
+    )
     kappa_stab = kappa - alpha * C0_ang
     f_local = stiffness * (P * kappa_stab) + sigma0 + P * lambda_ang
 
@@ -682,6 +688,9 @@ def _assemble_angular_joint_scalar(
     C0_ang: wp.vec3,
     alpha: float,
     cross_slot: int,
+    joint_axis: wp.array[wp.vec3],
+    ang_start: int,
+    ang_count: int,
 ):
     torque_parent, H_aa, kappa, J_world = _angular_constraint_force_hessian(
         parent_anchor_q,
@@ -699,6 +708,9 @@ def _assemble_angular_joint_scalar(
         alpha,
         damping,
         dt,
+        joint_axis,
+        ang_start,
+        ang_count,
     )
     _assemble_angular_direct_pair_scalar(
         values_scalar,
@@ -1807,6 +1819,9 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                 ang_C0,
                 ang_alpha,
                 cross_slot,
+                joint_axis,
+                qd_start + lin_count,
+                ang_count,
             )
 
         if jt == JointType.REVOLUTE or jt == JointType.PRISMATIC or jt == JointType.D6:
