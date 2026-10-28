@@ -135,9 +135,6 @@ from .rigid_vbd_kernels import (
     RigidForceElementAdjacencyInfo,
     RigidStepSize,
     _count_body_particle_attachments_per_body,
-    # MERGE-TODO(#4337): main removed _count_num_adjacent_joints/_fill_adjacent_joints (numpy CSR adjacency).
-    _count_num_adjacent_joints,
-    _fill_adjacent_joints,
     _fill_body_particle_attachments_per_body,
     accumulate_body_body_contacts_per_body,
     accumulate_body_particle_attachments_per_body,
@@ -202,6 +199,26 @@ logger = logging.getLogger(__name__)
 __all__ = ["SolverVBD"]
 
 _PARTICLE_CONTACT_GATHER_BLOCK_DIM = 128
+
+
+def _select_rigid_block_dim(launch_dim: int, device: wp.Device) -> int:
+    """Expose more blocks on small rigid launches, allowing sub-warp blocks.
+
+    Target as many blocks as SMs, with a four-thread minimum and a 256-thread
+    maximum. This empirical tradeoff does not guarantee occupancy.
+    """
+    if not device.is_cuda:
+        return 256
+
+    target_blocks = device.sm_count
+    block_dim = 4
+    while block_dim < 256:
+        candidate = 2 * block_dim
+        if (launch_dim + candidate - 1) // candidate < target_blocks:
+            break
+        block_dim = candidate
+    return block_dim
+
 
 _WARP_CPU_TILE_SHARED_MEMORY_BYTES = 256 * 1024
 """Size of Warp's fixed per-block CPU arena for shared-storage tiles."""
@@ -1447,7 +1464,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         options = {"deterministic": effective_deterministic, "deterministic_max_records": 0}
         if integrates_rigid_bodies:
             rigid_modules = (
-                # MERGE-TODO(#4337): main lists self._solve_rigid_body_kernel.module (its solve_rigid_body factory) here.
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
                 reduced_elastic_kernels,
@@ -2517,8 +2533,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.body_inertia_q = wp.zeros_like(model.body_q, device=self.device)  # inertial target poses
 
             # Adjacency and dimensions
-            # MERGE-TODO(#4337): main builds adjacency from _init_joint_constraint_layout() dims on device (no .to()).
-            self.rigid_adjacency = self._compute_rigid_force_element_adjacency(model).to(self.device)
+            joint_constraint_dim = self._init_joint_constraint_layout()
+            self.rigid_adjacency = self._compute_rigid_force_element_adjacency(model, joint_constraint_dim)
             (
                 self.body_particle_attachment_offsets,
                 self.body_particle_attachment_indices,
@@ -2529,20 +2545,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.tendon_adjacency.modes = self.tendon_material_modes
             self.tendon_adjacency.attachment_l = self.tendon_seg_attachment_l
             self.tendon_adjacency.attachment_r = self.tendon_seg_attachment_r
-            # Force accumulation arrays
-            # MERGE-TODO(#4337): main packs body forces/torques/Hessians into one _body_contact_scratch.
-            self.body_torques = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
-            self.body_forces = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
+            # Pack two vec3 and three mat33 fields for one clear.
+            body_count = model.body_count
+            self._body_contact_scratch = wp.zeros((11, body_count, 3), dtype=float, device=self.device)
+            self.body_forces = self._body_contact_scratch[0].view(wp.vec3)
+            self.body_torques = self._body_contact_scratch[1].view(wp.vec3)
+            # Hessian slices store consecutive per-body matrices, not scratch[row, body] matrix rows.
+            self.body_hessian_ll = self._body_contact_scratch[2:5].reshape((body_count, 3, 3)).view(wp.mat33)
+            self.body_hessian_al = self._body_contact_scratch[5:8].reshape((body_count, 3, 3)).view(wp.mat33)
+            self.body_hessian_aa = self._body_contact_scratch[8:11].reshape((body_count, 3, 3)).view(wp.mat33)
 
             # Persistent scratch for joint_f accumulation
             self._body_f_for_integration = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.device)
             # Body wrenches the current step's rigid predictor applied (``state.body_f`` or the scratch above).
             self._body_f_integrated = self._body_f_for_integration
-
-            # Hessian blocks (6x6 block structure: angular-angular, angular-linear, linear-linear)
-            self.body_hessian_aa = wp.zeros(model.body_count, dtype=wp.mat33, device=self.device)
-            self.body_hessian_al = wp.zeros(model.body_count, dtype=wp.mat33, device=self.device)
-            self.body_hessian_ll = wp.zeros(model.body_count, dtype=wp.mat33, device=self.device)
 
             # Per-body contact lists (CSR-like: per-body counts + flat index array).
             # Tight: pre_alloc = 0 when the contact source is absent (no shapes / no particles).
@@ -2579,9 +2595,19 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
             self._validate_joint_friction()
 
-            # Joint constraint layout, legacy penalty state, and material data.
-            # MERGE-TODO(#4337): main selects _rigid_body/_joint/_color block dims (_select_rigid_block_dim) here.
-            self._init_joint_constraint_layout()
+            # Launch dimensions are fixed for the solver's lifetime.
+            self._rigid_body_block_dim = _select_rigid_block_dim(model.body_count, self.device)
+            self._rigid_joint_block_dim = _select_rigid_block_dim(model.joint_count, self.device)
+            self._rigid_color_block_dims = tuple(
+                (
+                    _select_rigid_block_dim(group.size, self.device),
+                    _select_rigid_block_dim(group.size * _NUM_CONTACT_THREADS_PER_BODY, self.device),
+                    _select_rigid_block_dim(group.size * self._body_particle_contact_threads, self.device),
+                )
+                for group in model.body_color_groups
+            )
+
+            # Joint penalty state and material data (the constraint layout is built with the adjacency).
             (
                 self.joint_penalty_k,
                 self.joint_penalty_k_min,
@@ -3282,7 +3308,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         result = cpu.numpy() if hasattr(cpu, "numpy") else np.asarray(cpu)
         return result if dtype is None else result.astype(dtype, copy=False)
 
-    def _init_joint_constraint_layout(self) -> None:
+    def _init_joint_constraint_layout(self) -> np.ndarray:
         """Initialize VBD-owned joint constraint indexing.
 
         VBD indexes scalar constraint components for structural joint penalties,
@@ -3300,6 +3326,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         Drive and limit for each free DOF share one AVBD slot (mutually exclusive at runtime).
 
         Any other joint type will raise NotImplementedError.
+
+        Returns:
+            Host constraint dimensions for adjacency construction without a device round trip.
         """
         n_j = self.model.joint_count
         with wp.ScopedDevice("cpu"):
@@ -3346,6 +3375,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.joint_constraint_count = int(c)
             self.joint_constraint_dim = wp.array(dim_np, dtype=wp.int32, device=self.device)
             self.joint_constraint_start = wp.array(start_np, dtype=wp.int32, device=self.device)
+        return dim_np
 
     def _init_joint_penalty_k(self):
         """Build initial joint penalty state on CPU and upload to solver device.
@@ -3727,61 +3757,28 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError("model.soft_mesh_adjacency is missing; finalize the model with ModelBuilder.")
         return self.model.soft_mesh_adjacency.init_vertex_adjacency(self.model.particle_count)
 
-    # MERGE-TODO(#4337): main replaces this with a numpy CSR build excluding FREE joints.
-    def _compute_rigid_force_element_adjacency(self, model):
-        """
-        Build CSR adjacency between rigid bodies and joints.
+    def _compute_rigid_force_element_adjacency(self, model, joint_constraint_dim: np.ndarray):
+        """Build body-to-constraint CSR adjacency in ascending joint order.
 
-        Returns an instance of RigidForceElementAdjacencyInfo with:
-          - body_adj_joints: flattened joint ids
-          - body_adj_joints_offsets: CSR offsets of size body_count + 1
-
-        Notes:
-            - Runs on CPU to avoid GPU atomics; kernels iterate serially over joints (dim=1).
-            - When there are no joints, offsets are an all-zero array of length body_count + 1.
+        Joints with no constraint rows (FREE, ELASTIC) contribute no joint force or Hessian, so they are
+        left out; disabled constraints are kept because ``joint_enabled`` can change between steps.
         """
         adjacency = RigidForceElementAdjacencyInfo()
-
-        with wp.ScopedDevice("cpu"):
-            # Build body-joint adjacency data (rigid-only)
-            if model.joint_count > 0:
-                joint_parent_cpu = model.joint_parent.to("cpu")
-                joint_child_cpu = model.joint_child.to("cpu")
-
-                num_body_adjacent_joints = wp.zeros(shape=(model.body_count,), dtype=wp.int32)
-                wp.launch(
-                    kernel=_count_num_adjacent_joints,
-                    inputs=[joint_parent_cpu, joint_child_cpu, num_body_adjacent_joints],
-                    dim=1,
-                    device="cpu",
-                )
-
-                num_body_adjacent_joints = num_body_adjacent_joints.numpy()
-                body_adjacent_joints_offsets = np.empty(shape=(model.body_count + 1,), dtype=wp.int32)
-                body_adjacent_joints_offsets[1:] = np.cumsum(num_body_adjacent_joints)[:]
-                body_adjacent_joints_offsets[0] = 0
-                adjacency.body_adj_joints_offsets = wp.array(body_adjacent_joints_offsets, dtype=wp.int32)
-
-                body_adjacent_joints_fill_count = wp.zeros(shape=(model.body_count,), dtype=wp.int32)
-                adjacency.body_adj_joints = wp.empty(shape=(num_body_adjacent_joints.sum(),), dtype=wp.int32)
-
-                wp.launch(
-                    kernel=_fill_adjacent_joints,
-                    inputs=[
-                        joint_parent_cpu,
-                        joint_child_cpu,
-                        adjacency.body_adj_joints_offsets,
-                        body_adjacent_joints_fill_count,
-                        adjacency.body_adj_joints,
-                    ],
-                    dim=1,
-                    device="cpu",
-                )
-            else:
-                # No joints: create offset array of zeros (size body_count + 1) so indexing works
-                adjacency.body_adj_joints_offsets = wp.zeros(shape=(model.body_count + 1,), dtype=wp.int32)
-                adjacency.body_adj_joints = wp.empty(shape=(0,), dtype=wp.int32)
-
+        if self.joint_constraint_count == 0:
+            adjacency.body_adj_joints = wp.empty(0, dtype=wp.int32, device=self.device)
+            adjacency.body_adj_joints_offsets = wp.zeros(model.body_count + 1, dtype=wp.int32, device=self.device)
+            return adjacency
+        constrained_joints = np.flatnonzero(joint_constraint_dim).astype(np.int32)
+        body_ids = np.column_stack((model.joint_parent.numpy(), model.joint_child.numpy()))[constrained_joints].ravel()
+        joint_ids = np.repeat(constrained_joints, 2)
+        valid = body_ids >= 0  # Exclude world endpoints.
+        body_ids, joint_ids = body_ids[valid], joint_ids[valid]
+        # A stable sort preserves ascending joint order within each body.
+        order = np.argsort(body_ids, kind="stable")
+        offsets = np.zeros(model.body_count + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(np.bincount(body_ids, minlength=model.body_count))
+        adjacency.body_adj_joints = wp.array(joint_ids[order], dtype=wp.int32, device=self.device)
+        adjacency.body_adj_joints_offsets = wp.array(offsets, dtype=wp.int32, device=self.device)
         return adjacency
 
     def _compute_body_particle_attachment_adjacency(self, model: Model) -> tuple[wp.array, wp.array]:
@@ -5572,6 +5569,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self.body_inertia_q,
                     ],
                     dim=model.body_count,
+                    block_dim=self._rigid_body_block_dim,
                     device=self.device,
                 )
 
@@ -5579,8 +5577,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             # solve iterations run on the predicted poses.
             self._rigid_penetration_free_truncation(state_in, contacts)
 
-            # MERGE-TODO(#4337): main gates per-step joint launches on self.joint_constraint_count and passes block_dim.
-            if model.joint_count > 0:
+            if self.joint_constraint_count > 0:
                 # Per-step joint setup: penalty-k decay, C0 snapshot, lambda retention,
                 # and automatic per-row rho refresh for compliant ALM.
                 joint_lambda_retention = _rigid_lambda_retention(
@@ -5648,6 +5645,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self.joint_drive_lambda,
                         self.joint_limit_lambda,
                     ],
+                    block_dim=self._rigid_joint_block_dim,
                     device=self.device,
                 )
                 if self.rigid_limit_rho_floor:
@@ -5718,6 +5716,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self.joint_C_fric,
                     ],
                     dim=model.joint_count,
+                    block_dim=self._rigid_joint_block_dim,
                     device=self.device,
                 )
 
@@ -6359,6 +6358,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         dt: float,
         body_group: wp.array[wp.int32],
         state_out: State | None = None,
+        body_contact_block_dim: int = 256,
+        particle_contact_block_dim: int = 256,
     ):
         """Accumulate contact and body-particle attachment terms for a body group.
 
@@ -6452,10 +6453,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.body_hessian_al,
                     self.body_hessian_aa,
                 ],
+                block_dim=particle_contact_block_dim,
                 device=self.device,
             )
 
-        if contacts is not None:
+        if contacts is not None and model.shape_count > 0:
             wp.launch(
                 kernel=accumulate_body_body_contacts_per_body,
                 dim=dim,
@@ -6513,6 +6515,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.body_hessian_al,
                     self.body_hessian_aa,
                 ],
+                block_dim=body_contact_block_dim,
                 device=self.device,
             )
 
@@ -6536,18 +6539,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
 
         if body_color_groups is None:
-            # MERGE-TODO(#4337): main clears self._body_contact_scratch once here.
-            self.body_torques.zero_()
-            self.body_forces.zero_()
-            self.body_hessian_aa.zero_()
-            self.body_hessian_al.zero_()
-            self.body_hessian_ll.zero_()
+            self._body_contact_scratch.zero_()
             self._add_external_wrench_to_solve()
             if self._mimic_solver is not None:
                 self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
             if model.elastic_body_count > 0:
                 self._accumulate_elastic_frame_coupling(state_in, state_out, dt)
             body_color_groups = model.body_color_groups
+        # Precomputed per-color launch widths cover the model's color groups; the subset
+        # left over by the sparse articulation solve keeps the default launch configuration.
+        color_block_dims = self._rigid_color_block_dims if body_color_groups is model.body_color_groups else None
         _contact_max, _contact_count, elastic_body_relaxation = self._elastic_solve_inputs(contacts)
         # A subset follows sparse assembly: preserve its Hessians and the
         # already accumulated reactions on bodies handled by the local solve.
@@ -6565,13 +6566,23 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if not self._tendon_alm_rows:
                 self._update_tendon_routing(state_in, dt, report_unsupported_wrap and color == 0)
 
-            self._accumulate_rigid_contact_forces(state_in, contacts, dt, color_group, state_out)
+            solve_block_dim, body_contact_block_dim, particle_contact_block_dim = (
+                color_block_dims[color] if color_block_dims is not None else (256, 256, 256)
+            )
+            self._accumulate_rigid_contact_forces(
+                state_in,
+                contacts,
+                dt,
+                color_group,
+                state_out,
+                body_contact_block_dim=body_contact_block_dim,
+                particle_contact_block_dim=particle_contact_block_dim,
+            )
 
             if model.elastic_body_count > 0:
                 self._launch_assemble_elastic_bodies(color_group, state_in, state_out, control, contacts, dt)
 
             wp.launch(
-                # MERGE-TODO(#4337): main launches its factory-built solve_rigid_body kernel with per-color block_dim.
                 kernel=solve_rigid_body,
                 inputs=[
                     self._step_size,
@@ -6677,6 +6688,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     state_in.body_q,
                 ],
                 dim=color_group.size,
+                block_dim=solve_block_dim,
                 device=self.device,
             )
             if model.elastic_body_count > 0:
@@ -6726,7 +6738,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     ):
         """Update contact and joint dual state after one rigid solve iteration."""
         model = self.model
-        if self._integrates_rigid_bodies and contacts is not None and contacts.rigid_contact_max > 0:
+        if (
+            self._integrates_rigid_bodies
+            and contacts is not None
+            and contacts.rigid_contact_max > 0
+            and model.shape_count > 0
+        ):
             wp.launch(
                 kernel=update_duals_body_body_contacts,
                 dim=contacts.rigid_contact_max,
@@ -6806,7 +6823,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if not self._integrates_rigid_bodies:
             return
 
-        if model.joint_count > 0 and (self.rigid_compliant_alm or self.rigid_joint_adaptive_stiffness is not False):
+        if self.joint_constraint_count > 0 and (
+            self.rigid_compliant_alm or self.rigid_joint_adaptive_stiffness is not False
+        ):
             wp.launch(
                 kernel=update_duals_joint,
                 dim=model.joint_count,
@@ -6866,6 +6885,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.joint_drive_lambda,
                     self.joint_limit_lambda,
                 ],
+                block_dim=self._rigid_joint_block_dim,
                 device=self.device,
             )
 
@@ -8510,6 +8530,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             ],
             outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
             dim=model.body_count,
+            block_dim=self._rigid_body_block_dim,
             device=self.device,
         )
 
@@ -8541,6 +8562,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.joint_dkappa_prev,
                 ],
                 dim=model.joint_count,
+                block_dim=self._rigid_joint_block_dim,
                 device=self.device,
             )
 

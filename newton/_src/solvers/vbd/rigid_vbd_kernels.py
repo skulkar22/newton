@@ -2532,14 +2532,17 @@ def evaluate_rod_stretch_shear_force_hessian(
 # ---------------------------------
 
 
-# MERGE-TODO(#4337): main drops .to() and excludes FREE joints from this adjacency (numpy build); dev kept.
 @wp.struct
 class RigidForceElementAdjacencyInfo:
     r"""
-    Stores adjacency information for rigid bodies and their connected joints using CSR (Compressed Sparse Row) format.
+    Stores adjacency information for rigid bodies and constrained joints using CSR (Compressed Sparse Row) format.
+
+    Joints without VBD constraint rows (FREE) are excluded; disabled constraints are retained because they
+    can be enabled between steps. ELASTIC joints are retained: they have constraint rows and the reduced
+    elastic endpoint loops walk this adjacency.
 
     - body_adj_joints: Flattened array of joint IDs. Size is sum over all bodies of N_i, where N_i is the
-      number of joints connected to body i.
+      number of constrained joints connected to body i.
 
     - body_adj_joints_offsets: Offset array indicating where each body's joint list starts.
       Size is |B|+1 (number of bodies + 1).
@@ -2549,16 +2552,6 @@ class RigidForceElementAdjacencyInfo:
     # Rigid body joint adjacency
     body_adj_joints: wp.array[wp.int32]
     body_adj_joints_offsets: wp.array[wp.int32]
-
-    def to(self, device):
-        if device == self.body_adj_joints.device:
-            return self
-        else:
-            adjacency_gpu = RigidForceElementAdjacencyInfo()
-            adjacency_gpu.body_adj_joints = self.body_adj_joints.to(device)
-            adjacency_gpu.body_adj_joints_offsets = self.body_adj_joints_offsets.to(device)
-
-            return adjacency_gpu
 
 
 @wp.func
@@ -5112,53 +5105,6 @@ def reset_rigid_state(
                 joint_friction.rho[dof] = 0.0
 
 
-# MERGE-TODO(#4337): main removed these adjacency kernels in favor of a numpy CSR build; dev kept.
-@wp.kernel
-def _count_num_adjacent_joints(
-    joint_parent: wp.array[wp.int32],
-    joint_child: wp.array[wp.int32],
-    num_body_adjacent_joints: wp.array[wp.int32],
-):
-    joint_count = joint_parent.shape[0]
-    for joint_id in range(joint_count):
-        parent_id = joint_parent[joint_id]
-        child_id = joint_child[joint_id]
-
-        # Skip world joints (parent/child == -1)
-        if parent_id >= 0:
-            num_body_adjacent_joints[parent_id] = num_body_adjacent_joints[parent_id] + 1
-        if child_id >= 0:
-            num_body_adjacent_joints[child_id] = num_body_adjacent_joints[child_id] + 1
-
-
-@wp.kernel
-def _fill_adjacent_joints(
-    joint_parent: wp.array[wp.int32],
-    joint_child: wp.array[wp.int32],
-    body_adjacent_joints_offsets: wp.array[wp.int32],
-    body_adjacent_joints_fill_count: wp.array[wp.int32],
-    body_adjacent_joints: wp.array[wp.int32],
-):
-    joint_count = joint_parent.shape[0]
-    for joint_id in range(joint_count):
-        parent_id = joint_parent[joint_id]
-        child_id = joint_child[joint_id]
-
-        # Add joint to parent body's adjacency list
-        if parent_id >= 0:
-            fill_count_parent = body_adjacent_joints_fill_count[parent_id]
-            buffer_offset_parent = body_adjacent_joints_offsets[parent_id]
-            body_adjacent_joints[buffer_offset_parent + fill_count_parent] = joint_id
-            body_adjacent_joints_fill_count[parent_id] = fill_count_parent + 1
-
-        # Add joint to child body's adjacency list
-        if child_id >= 0:
-            fill_count_child = body_adjacent_joints_fill_count[child_id]
-            buffer_offset_child = body_adjacent_joints_offsets[child_id]
-            body_adjacent_joints[buffer_offset_child + fill_count_child] = joint_id
-            body_adjacent_joints_fill_count[child_id] = fill_count_child + 1
-
-
 @wp.kernel
 def refresh_body_structural_k(
     joint_type: wp.array[int],
@@ -7163,6 +7109,8 @@ def create_accumulate_body_body_contacts_per_body():
         use_contact_list = num_contacts <= body_contact_buffer_pre_alloc
         if not use_contact_list:
             num_contacts = contact_count
+        if thread_id_within_body >= num_contacts:
+            return
 
         force_acc = wp.vec3(0.0)
         torque_acc = wp.vec3(0.0)
@@ -7983,7 +7931,8 @@ def accumulate_body_particle_contacts_per_body(
         # The bounded list is only a fast path. Preserve every stored candidate
         # so particle forces never lose their corresponding body reactions.
         num_contacts = max_contacts
-    # MERGE-TODO(#4337): main returns early here when thread_id_within_body >= num_contacts.
+    if thread_id_within_body >= num_contacts:
+        return
 
     X_wb = body_q[body_id]
     X_wb_prev = body_q_prev[body_id]
@@ -8223,9 +8172,6 @@ def compute_body_particle_contact_forces(
     contact_force[tid] = wp.spatial_vector(f_body, wp.cross(cp_world - com_world, f_body))
 
 
-# MERGE-TODO(#4337): main replaced this kernel with a solve_rigid_body factory specialized on
-# tendon presence (module="unique", tendon-free specialization); dev kernel kept verbatim for
-# the follow-up #4337 port.
 @wp.kernel
 def solve_rigid_body(
     step_size: RigidStepSize,
