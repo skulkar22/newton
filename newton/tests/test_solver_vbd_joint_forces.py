@@ -375,7 +375,7 @@ def test_vbd_joint_force_capture(test, device, *, solve="local"):
 
 
 def test_vbd_joint_effort_multiaxis(test, device, *, solve="local"):
-    """Project D6 actuation onto its moving motion axes, not coordinate gradients."""
+    """Report a 3-axis D6 joint_f as its own generalized effort, without leaking into other coordinates."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), lock_inertia=True)
     config = newton.ModelBuilder.JointDofConfig
@@ -401,13 +401,18 @@ def test_vbd_joint_effort_multiaxis(test, device, *, solve="local"):
         joint_effort=effort,
         joint_qd_prev=previous_qd,
     )
-    q0, q1, _q2 = next_state.joint_q.numpy()
-    expected = [
-        2.0,
-        3.0 * np.cos(q0) + 5.0 * np.sin(q0),
-        2.0 * np.sin(q1) - 3.0 * np.sin(q0) * np.cos(q1) + 5.0 * np.cos(q0) * np.cos(q1),
-    ]
-    np.testing.assert_allclose(effort.numpy(), expected, atol=2.0e-5)
+    # Effort is reported by virtual work, Q_i = s_i . tau, where s_i are the moving
+    # motion axes (omega = sum_i s_i * qd_i, transform_3d_rotational_axes). Since
+    # #4696, apply_joint_forces applies a multi-axis D6 joint_f along the
+    # coordinate covectors, tau = sum_k f_k * c_k, with c_k . omega = qd_k
+    # (eval_angular_coordinates). The covectors are the dual basis of the motion
+    # axes, c_k . s_i = delta_ki, so Q_i = sum_k f_k * (c_k . s_i) = f_i: the
+    # reported effort equals joint_f at any pose. The previous expectation,
+    # [f0, f1*cos(q0) + f2*sin(q0), ...], projected a torque applied along the
+    # fixed parent-frame axes (tau = sum_k f_k * a_k) and is no longer the applied
+    # torque. A small residual (~6e-6) remains: eval_joint_forces applies joint_f
+    # at body_q_prev and projects at the step-end pose, plus float32 round-off.
+    np.testing.assert_allclose(effort.numpy(), [2.0, 3.0, 5.0], atol=2.0e-5)
 
 
 def test_vbd_joint_effort_rotating_parent(test, device, *, solve="local"):
