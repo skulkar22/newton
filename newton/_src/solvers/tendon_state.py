@@ -260,7 +260,7 @@ class TendonStateMixin:
         self._tendon_material_state.enabled = False
         self._tendon_material_kernel = solve_tendon_material
         self._tendon_material_lanes = 1
-        self._tendon_material_block_dim = 256
+        self._tendon_material_block_dim = 32
         self._has_dynamic_tendon_links = False
         # Solver-level cable cone parameters (a solver may override before calling this).
         if not hasattr(self, "tendon_max_sweeps"):
