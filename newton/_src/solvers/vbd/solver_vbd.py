@@ -8718,7 +8718,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if self._has_joint_mimics:
             raise ValueError("rigid_time_integration='bdf2' does not support joint mimics")
         if int(self.model.elastic_body_count) > 0:
-            raise ValueError("rigid_time_integration='bdf2' does not support reduced elastic bodies")
+            # The reduced elastic frame and modal assembly (local block solve and both sparse elastic
+            # backends) is backward Euler only: it recovers the frame acceleration as d / dt^2 from the
+            # BDF1 inertial target, weights modal inertia and damping with dt (target q_n + dt qd_n,
+            # rates (q - q_n) / dt), and updates the modal velocity as (q - q_n) / dt. None of it takes
+            # the per-body BDF2 step h = 2/3 dt, the BDF2 target or the rate reference.
+            raise ValueError(
+                "rigid_time_integration='bdf2' does not support reduced elastic bodies: their frame and modal "
+                "assembly uses backward Euler (BDF1) weights and has no BDF2 inertial target, rate reference or "
+                "modal history. Use rigid_time_integration='bdf1' for models with reduced elastic bodies."
+            )
         if self.model.particle_count > 0:
             raise ValueError("rigid_time_integration='bdf2' does not support particles")
         if self.model.tendon_count > 0:

@@ -410,7 +410,7 @@ selects the second-order BDF2 integrator, which damps motion much less than BDF1
 large time steps. A world takes BDF1 steps until it has a step history, that is after
 construction and after :meth:`~newton.solvers.SolverVBD.reset`, and, with the default
 ``rigid_bdf2_theta_policy="event"``, around contact, joint-limit, force, velocity and pose-write
-events. BDF2 does not support joint mimics, particles or tendons. With either integrator,
+events. BDF2 does not support joint mimics, particles, tendons or reduced elastic bodies. With either integrator,
 ``rigid_axis_support_armature`` and ``rigid_limit_rho_floor`` keep joint limits from
 overshooting when a light link is driven through a large armature at large time steps,
 and ``rigid_external_force_mode="solve"`` applies ``State.body_f`` and the mapped
