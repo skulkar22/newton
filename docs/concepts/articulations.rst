@@ -1442,11 +1442,12 @@ same factorization. Their owner joint
 (:attr:`~newton.JointType.ELASTIC`, created by
 :meth:`~newton.ModelBuilder.add_link_elastic`) carries no constraint, so it may
 stay outside the articulation; the link belongs to the articulation through its
-physical joints, or through the one-joint articulation that
-:meth:`~newton.ModelBuilder.add_body_elastic` creates. The solver eliminates
-each elastic link's modal coordinates onto its frame block and onto the frames
-of the bodies it is jointed to, so a loop through an elastic coupler is solved
-as one system:
+physical joints. With the default
+``rigid_articulation_elastic_solve="coupled"`` each body of an articulation
+that contains an elastic link is one block row of size ``6 + m``: the six
+frame components followed by the link's ``m`` modal coordinates (``m = 0`` for
+a rigid link). A loop through an elastic coupler is therefore solved as one
+system:
 
 .. code-block:: python
 
@@ -1459,16 +1460,108 @@ as one system:
    j_loop = builder.add_joint_revolute(parent=-1, child=rocker, ...)
    builder.add_articulation([j_drive, j_a, j_b, j_loop], allow_closed_loops=True)
 
-An elastic link whose joints all connect it to rigid links (such as the
-coupler above) is eliminated exactly, so the loop converges in as many
-iterations as a rigid one. A joint between two elastic links couples their
-modes directly; the sparse solve replaces that coupling by a conservative
-per-link term, which keeps the iteration stable and the converged solution
-unchanged but slows convergence. For two hinged elastic beams the trajectory
-is about 1e-2 from the converged solution at 24 iterations, 1e-3 at 96, and
-1e-5 at 384, where the local solve reaches 5e-4 at 24 and 2e-5 at 96
-iterations. For chains of directly jointed elastic links, prefer the local
-solve or a rigid link between the elastic links.
+Each joint is evaluated once per iteration at its deformed attachments and
+projected onto the generalized coordinates of both bodies, including the full
+cross block between them, so a joint between two elastic links couples their
+modes exactly in the factorization. The projection is the exact
+:math:`\mathbf{J}^T \mathbf{K} \mathbf{J}` of the joint's endpoint Hessian,
+with the same Hessian approximations as for rigid links. The local block solve
+and the ``"schur"`` backend instead refer the joint terms to the attachment
+point; the two forms agree for every joint row whose moment is taken about the
+attachment. The parent side of a :attr:`~newton.JointType.ROD` joint, whose
+stretch and shear force acts with the child anchor's lever arm, is the
+exception: there the exact projection adds the terms of that offset to the
+elastic link's frame-mode and mode-mode blocks.
+
+Articulations without elastic links keep the 6 x 6 block solve unchanged. An
+articulation whose only body is an elastic link, such as the one-joint
+articulation that :meth:`~newton.ModelBuilder.add_body_elastic` creates, is not
+part of the sparse layout: it is solved by the local block solve, uses
+``elastic_body_relaxation`` instead of ``rigid_articulation_relaxation``, and
+may be attached to other locally solved bodies by joints outside the
+articulation ranges.
+
+With ``rigid_articulation_solve="block_sparse_levels"`` only the articulations
+without elastic links use the level ordering and the level-scheduled 6 x 6
+solve. Articulations with elastic links keep the size-weighted elimination
+order and the coupled variable-size block solve described here, so they are
+solved exactly as under ``"block_sparse_joints"``.
+
+Cost and memory of the coupled solve:
+
+- Each mixed articulation is factored with a direct block Cholesky
+  factorization in a fill-reducing order. The order weights each block row by
+  its size, so the trailing-update cost, roughly :math:`O(n_i^3)` per
+  eliminated row of size :math:`n_i`, is kept small. The only fill is what
+  that order produces; unlike the ``"schur"`` backend below, none is forced
+  around elastic links.
+- Blocks are stored with their own sizes; no link is padded to the largest
+  modal count. On CUDA each mixed articulation is factored by one 256-thread
+  block. Rows of size six are factored in registers; wider rows are factored
+  in 32-column panels with 32 x 32 shared-memory tiles. The shared memory per
+  thread block is fixed (59,280 bytes with Warp 1.18, independent of the mode
+  count) and is checked against the device limit when the solver is
+  constructed, so the mode count of a link is limited by device memory rather
+  than shared memory. A CUDA device with less shared memory per block uses the
+  serial kernel instead, with one warning. The CPU uses one serial thread per
+  mixed articulation.
+- The CUDA kernel uses many registers per thread, so one thread block runs per
+  multiprocessor. It is designed for a few large articulations. When a model
+  has more mixed articulations than the device has multiprocessors and every
+  wide row, with the rows below it, fits about 11 KiB of shared memory (for
+  example rows of up to about 40 modes next to a few rigid neighbors), each
+  articulation is instead factored by one 32-thread warp, which keeps all of
+  them in flight. Both kernels give the serial kernel's result up to float32
+  rounding. Many small mixed articulations still cost more per iteration than
+  the local solve.
+- Per iteration, the elastic blocks and the rigid body diagonals overwrite
+  their rows, and the projected joint terms are gathered for each matrix
+  entry in joint order without atomics, so the system is not cleared between
+  iterations. The factorization and solve use no floating-point atomics
+  either. The per-body elastic blocks are still accumulated with atomics, so
+  bitwise reproducibility follows the solver's ``deterministic`` option.
+- Everything is allocated when the solver is constructed, so steps can be
+  captured in a CUDA graph.
+- A coupled iteration costs more than a local one when the chain has several
+  wide elastic rows: about 1.1 to 1.3 times the local solve for chains of
+  three or four elastic links with 105 to 151 modes each. The coupled solve
+  reaches a given accuracy in fewer iterations, so its time to a target
+  accuracy is lower in the measured cases. See :ref:`Reduced Elastic Links`
+  for the measurements.
+
+If a factorization fails, because a pivot is not positive and finite or the
+solve produces a non-finite update, that articulation takes a diagonal
+(Jacobi) step instead. That step is finite in the iteration that takes it, but
+it is not damped: if the system stays indefinite, the motion can grow over
+the following steps until it is no longer finite.
+:meth:`~newton.solvers.SolverVBD.rigid_articulation_elastic_solve_status`
+returns the status of each articulation in the last iteration (``0`` success,
+``1`` non-positive pivot, ``2`` non-finite update, ``-1`` not solved by this
+backend), and
+:meth:`~newton.solvers.SolverVBD.rigid_articulation_elastic_solve_failure_count`
+returns the number of failed solves so far. The solver warns once, at the first
+failure, from the next :meth:`~newton.solvers.SolverVBD.step` or
+:meth:`~newton.solvers.SolverBase.notify_model_changed` call outside CUDA graph
+capture; later failures are only counted.
+``rigid_articulation_diagonal_regularization`` is added to the six frame
+diagonal entries of every body of these articulations, elastic links
+included, and can restore definiteness for nearly singular frames. A failure
+usually indicates an inconsistent modal mass, stiffness, or damping; if it
+persists, fix the model or raise
+``rigid_articulation_diagonal_regularization`` rather than relying on the
+diagonal step.
+
+``rigid_articulation_elastic_solve="schur"`` selects the previous backend,
+kept for comparison only: it eliminates each elastic link's modal
+coordinates onto its frame block and onto the frames of its joint neighbors,
+so every row stays 6 x 6. It is exact for an elastic link jointed only to
+rigid links, but replaces the mode-mode coupling of a joint between two
+elastic links by a conservative per-link term, which keeps the converged
+solution but slows convergence: for two hinged elastic beams the trajectory
+is about 1e-2 from the converged solution at 24 iterations and 8.5e-4 at 96,
+against less than 1e-5 for the coupled solve at either count (see
+:ref:`Reduced Elastic Links`). Both backends are experimental, and
+``"schur"`` may be removed without a deprecation period.
 
 Every joint attached to an elastic link needs an elastic endpoint sample, the
 mode values at its attachment, so that the solve can couple the joint to the
@@ -1479,9 +1572,7 @@ or friction on joints attached to an elastic link, are not supported in this
 mode and are rejected, also when they are set later and reported with
 :meth:`~newton.solvers.SolverBase.notify_model_changed`.
 
-The modal factorization of each elastic link costs about as much as in the
-local solve; see :ref:`Reduced Elastic Links` for measured costs and mode-count
-limits.
+See :ref:`Reduced Elastic Links` for measured accuracy and costs.
 
 .. warning::
 

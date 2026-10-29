@@ -53,6 +53,9 @@ from . import (
     reduced_elastic_kernels,
     reduced_elastic_sparse_kernels,
     rigid_sparse_articulation_kernels,
+    rigid_sparse_articulation_variable_assembly,
+    rigid_sparse_articulation_variable_kernels,
+    rigid_sparse_articulation_variable_metrics,
     rigid_vbd_kernels,
     vbd_coupling_kernels,
 )
@@ -106,9 +109,10 @@ from .reduced_elastic_sparse_kernels import (
     scatter_elastic_sparse_schur,
     update_elastic_sparse_modes,
 )
-from .rigid_sparse_articulation import build_rigid_articulation_sparse_layout
+from .rigid_sparse_articulation import ELASTIC_SOLVE_MODES, build_rigid_articulation_sparse_layout
 from .rigid_sparse_articulation_kernels import (
     SPARSE_ARTICULATION_CTA_THREADS,
+    JointEndpointTerms,
     SparseElasticJointData,
     apply_articulation_sparse_delta_scalar,
     assemble_articulation_body_diagonal_scalar,
@@ -739,6 +743,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
+        rigid_articulation_elastic_solve: str = "coupled",
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
@@ -1037,13 +1042,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 rows; angular drives and limits retain continuous turn counts. Mimic joints keep
                 one reaction-force projection per iteration using the assembled body-diagonal
                 blocks, rather than being added to the sparse factorization.
-                Reduced elastic bodies in an articulation are solved inside its factorization: each
-                body's modal coordinates are eliminated exactly onto its frame block and the frames
-                of its joint neighbors, and its joints use the deformed attachments. Two elastic
-                bodies joined directly converge more slowly because their mode-mode coupling is
-                replaced by a conservative per-body term. Joint mimics, and armature, passive damping,
-                or friction on joints attached to elastic articulation bodies, are rejected in this
-                mode. Elastic bodies outside every articulation keep the local block solve.
+                Reduced elastic bodies in an articulation are solved inside its factorization, with
+                their joints at the deformed attachments; ``rigid_articulation_elastic_solve`` selects
+                how. Joint mimics, and armature, passive damping, or friction on joints attached to
+                elastic articulation bodies, are rejected in both sparse modes. Elastic bodies outside
+                every articulation keep the local block solve.
                 Both modes are intended for moderate-size articulations;
                 ``"block_sparse_joints"`` processes pivots sequentially. ``"block_sparse_levels"``
                 uses independent pivot levels and register-local block math on CUDA, reducing
@@ -1056,7 +1059,48 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 contact manifolds between collision updates. It also scales the frame and modal
                 updates of reduced elastic bodies solved inside these articulations.
             rigid_articulation_diagonal_regularization: Non-negative value added to each
-                translational and angular diagonal Hessian entry before sparse factorization.
+                translational and angular diagonal Hessian entry before sparse factorization. With
+                ``rigid_articulation_elastic_solve="coupled"`` it is also added to the six frame
+                diagonal entries of every body of an articulation that contains a reduced elastic
+                body, including the elastic bodies' frames.
+            rigid_articulation_elastic_solve: How ``"block_sparse_joints"`` and ``"block_sparse_levels"``
+                solve articulations that contain reduced elastic bodies; ignored by the ``"local"``
+                articulation solve.
+
+                - ``"coupled"`` (default): one factorization per articulation with a ``(6 + m)`` block
+                  per elastic body (``m`` modes), including the exact mode-mode coupling of directly
+                  jointed elastic bodies. Blocks keep their own sizes (no padding to the largest mode
+                  count); the elimination order is weighted by block size. Each joint is evaluated
+                  once per iteration and projected exactly (``J^T K J``) onto both bodies; this equals
+                  the attachment-referred form of the local block solve except on the parent side of
+                  a :attr:`~newton.JointType.ROD` joint, whose force acts with the child anchor's lever
+                  arm. Articulations without elastic bodies keep the 6 x 6 solve unchanged. An
+                  articulation whose only body is a reduced elastic body (for example from
+                  :meth:`~newton.ModelBuilder.add_body_elastic`) is solved by the local block solve
+                  instead and uses ``elastic_body_relaxation``. A factorization that fails (a pivot
+                  that is not positive and finite, or a non-finite update) is replaced by a diagonal
+                  (Jacobi) step for that articulation, recorded in
+                  :meth:`rigid_articulation_elastic_solve_status` and counted by
+                  :meth:`rigid_articulation_elastic_solve_failure_count`; the solver warns once, at the
+                  first failure. On
+                  CUDA each articulation is factored by one 256-thread block using 32 x 32
+                  shared-memory tiles for blocks wider than six (a device whose shared memory per block
+                  cannot fit it uses one thread per articulation, with one warning), or, when there are
+                  more mixed articulations than the device has multiprocessors and every wide row fits a
+                  warp's shared memory, by one 32-thread warp; on the CPU by one thread. Under
+                  ``"block_sparse_levels"`` the level-scheduled 6 x 6 kernel solves only the articulations
+                  without elastic bodies; these mixed articulations keep the size-weighted elimination order
+                  and the variable-size block solve above, exactly as under ``"block_sparse_joints"``.
+                - ``"schur"``: comparison backend. Each elastic body's modal coordinates are eliminated
+                  exactly onto its frame block and the frames of its joint neighbors, so every
+                  articulation is solved with 6 x 6 blocks. Two elastic bodies joined directly
+                  converge more slowly because their mode-mode coupling is replaced by a conservative
+                  per-body term.
+
+                .. experimental::
+                    ``rigid_articulation_elastic_solve`` and both of its values are experimental and
+                    may change or be removed without a deprecation period; ``"schur"`` is kept for
+                    comparison only.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
                 and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
                 dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
@@ -1064,10 +1108,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             elastic_body_relaxation: Under-relaxation factor for reduced elastic body block updates. This scales the
                 coupled frame-and-mode update after inertia, joint, and contact terms are assembled. Must be finite and
                 in the range ``[0, 1]``. Elastic bodies solved inside a block-sparse articulation
-                (``"block_sparse_joints"`` or ``"block_sparse_levels"``) use ``rigid_articulation_relaxation`` instead.
-            elastic_solver_metrics: Whether to compute reduced elastic block residual and update metrics. Disabled by
-                default to avoid extra dense matrix-vector products in every block solve. Elastic bodies solved inside
-                a block-sparse articulation report zero metrics.
+                (``"block_sparse_joints"`` or ``"block_sparse_levels"``) use ``rigid_articulation_relaxation`` instead,
+                except bodies that form an articulation alone under ``rigid_articulation_elastic_solve="coupled"``,
+                which are solved by the local block solve.
+            elastic_solver_metrics: Whether to compute reduced elastic block residual and update metrics (see
+                :meth:`elastic_mode_solve_metrics`). Disabled by default to avoid extra dense matrix-vector products
+                in every block solve. Elastic bodies solved inside a block-sparse articulation report metrics only
+                with ``rigid_articulation_elastic_solve="coupled"``, and NaN otherwise.
             elastic_block_solver: Solve method for the coupled frame-and-mode block of each reduced elastic body.
                 ``"tiled"`` factorizes each block in shared memory and raises :class:`ValueError` at construction
                 when a block does not fit the device's per-block shared memory (about 151 modes on a device with
@@ -1472,6 +1519,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
+                rigid_sparse_articulation_variable_kernels,
+                rigid_sparse_articulation_variable_assembly,
                 reduced_elastic_kernels,
                 reduced_elastic_sparse_kernels,
                 accumulate_body_body_contacts_per_body.module,
@@ -1516,9 +1565,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "rigid_articulation_diagonal_regularization must be non-negative, "
                 f"got {rigid_articulation_diagonal_regularization}"
             )
+        if rigid_articulation_elastic_solve not in ELASTIC_SOLVE_MODES:
+            raise ValueError(
+                f"rigid_articulation_elastic_solve must be one of {ELASTIC_SOLVE_MODES}, "
+                f"got {rigid_articulation_elastic_solve!r}"
+            )
         self.rigid_articulation_solve = rigid_articulation_solve
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
+        self.rigid_articulation_elastic_solve = rigid_articulation_elastic_solve
 
         if model.tendon_count and integrate_with_external_rigid_solver:
             raise ValueError("Tendons require VBD to integrate their rigid bodies.")
@@ -1659,39 +1714,44 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_sparse_rhs_scalar = None
         self.rigid_articulation_sparse_delta_scalar = None
         self.rigid_articulation_sparse_joint_dof_dim = model.joint_dof_dim
+        self._rigid_articulation_sparse_zero_views: tuple[wp.array, ...] = ()
         if self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels"):
             self.rigid_articulation_sparse_layout = build_rigid_articulation_sparse_layout(
-                model, self.device, use_levels=self.rigid_articulation_solve == "block_sparse_levels"
+                model,
+                self.device,
+                elastic_solve=self.rigid_articulation_elastic_solve,
+                use_levels=self.rigid_articulation_solve == "block_sparse_levels",
             )
-            if self.rigid_articulation_sparse_layout is not None:
+            layout = self.rigid_articulation_sparse_layout
+            if layout is not None:
                 self._rigid_articulation_armature_target = wp.zeros_like(model.joint_qd)
-                # Blocks past ``block_count`` capture per-joint cross blocks for elastic Schur updates.
-                sparse_value_block_count = (
-                    self.rigid_articulation_sparse_layout.block_count
-                    + self.rigid_articulation_sparse_layout.cross_block_count
-                )
-                self._rigid_articulation_sparse_values_scalar = wp.zeros(
-                    sparse_value_block_count * 36, dtype=float, device=self.device
-                )
-                self._rigid_articulation_sparse_rhs_scalar = wp.zeros(
-                    self.rigid_articulation_sparse_layout.articulation_body_count * 6,
-                    dtype=float,
-                    device=self.device,
-                )
-                self._rigid_articulation_sparse_delta_scalar = wp.zeros(
-                    self.rigid_articulation_sparse_layout.articulation_body_count * 6,
-                    dtype=float,
-                    device=self.device,
-                )
-                self.rigid_articulation_sparse_values = self._rigid_articulation_sparse_values_scalar.reshape(
-                    (sparse_value_block_count, 6, 6)
-                ).view(mat66f)
-                self.rigid_articulation_sparse_rhs = self._rigid_articulation_sparse_rhs_scalar.reshape(
-                    (self.rigid_articulation_sparse_layout.articulation_body_count, 6)
-                ).view(vec6f)
-                self.rigid_articulation_sparse_delta = self._rigid_articulation_sparse_delta_scalar.reshape(
-                    (self.rigid_articulation_sparse_layout.articulation_body_count, 6)
-                ).view(vec6f)
+                if layout.elastic_solve == "coupled":
+                    # One flat storage: the rigid prefix keeps the 6 x 6 ``36 * slot`` and ``6 * row``
+                    # indexing, the mixed articulations follow at the layout's variable offsets. The
+                    # mat66f/vec6f views cover the rigid prefix only.
+                    view_block_count = layout.rigid_block_count
+                    view_row_count = layout.rigid_body_row_count
+                    value_count = layout.articulation_value_count
+                    scalar_count = layout.articulation_scalar_count
+                else:
+                    # Blocks past ``block_count`` capture per-joint cross blocks for elastic Schur updates.
+                    view_block_count = layout.block_count + layout.cross_block_count
+                    view_row_count = layout.articulation_body_count
+                    value_count = 36 * view_block_count
+                    scalar_count = 6 * view_row_count
+                self._rigid_articulation_sparse_values_scalar = wp.zeros(value_count, dtype=float, device=self.device)
+                self._rigid_articulation_sparse_rhs_scalar = wp.zeros(scalar_count, dtype=float, device=self.device)
+                self._rigid_articulation_sparse_delta_scalar = wp.zeros(scalar_count, dtype=float, device=self.device)
+                values_view = self._rigid_articulation_sparse_values_scalar[: 36 * view_block_count]
+                rhs_view = self._rigid_articulation_sparse_rhs_scalar[: 6 * view_row_count]
+                delta_view = self._rigid_articulation_sparse_delta_scalar[: 6 * view_row_count]
+                self.rigid_articulation_sparse_values = values_view.reshape((view_block_count, 6, 6)).view(mat66f)
+                self.rigid_articulation_sparse_rhs = rhs_view.reshape((view_row_count, 6)).view(vec6f)
+                self.rigid_articulation_sparse_delta = delta_view.reshape((view_row_count, 6)).view(vec6f)
+                # Zeroed every iteration. The coupled assembly overwrites every stored entry of the
+                # mixed values and right-hand side, and the coupled solve writes every mixed update
+                # component.
+                self._rigid_articulation_sparse_zero_views = (values_view, rhs_view, delta_view)
                 if self.device.is_cuda:
                     self.rigid_articulation_sparse_values_scalar = self._rigid_articulation_sparse_values_scalar
                     self.rigid_articulation_sparse_rhs_scalar = self._rigid_articulation_sparse_rhs_scalar
@@ -1771,11 +1831,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._init_elastic_assembly_scratch(model)
         self._init_sparse_elastic_bodies(model)
         metric_count = model.elastic_body_count if self.elastic_solver_metrics else 0
-        self.elastic_body_block_initial_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
-        self.elastic_body_block_solve_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
-        self.elastic_body_block_applied_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
-        self.elastic_body_block_update_norm = wp.zeros(metric_count, dtype=float, device=self.device)
-        self.elastic_body_block_update_max = wp.zeros(metric_count, dtype=float, device=self.device)
+        # NaN until a solve evaluates a body (see elastic_mode_solve_metrics()).
+        nan = float("nan")
+        self.elastic_body_block_initial_residual_norm = wp.full(metric_count, nan, dtype=float, device=self.device)
+        self.elastic_body_block_solve_residual_norm = wp.full(metric_count, nan, dtype=float, device=self.device)
+        self.elastic_body_block_applied_residual_norm = wp.full(metric_count, nan, dtype=float, device=self.device)
+        self.elastic_body_block_update_norm = wp.full(metric_count, nan, dtype=float, device=self.device)
+        self.elastic_body_block_update_max = wp.full(metric_count, nan, dtype=float, device=self.device)
 
         # Controls whether the next step() refreshes contact state derived from
         # the Contacts buffer or reuses the current rigid/body-particle contact state.
@@ -1891,19 +1953,29 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._sparse_elastic_body_count = count
         max_modes = int(model.elastic_max_mode_count)
         group_count = 0 if layout is None else layout.elastic_group_count
-        self._sparse_elastic_definite = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
-        self._sparse_elastic_z = wp.zeros(max(count * max_modes, 1), dtype=float, device=self.device)
-        self._sparse_elastic_b = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
-        self._sparse_elastic_w = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
+        # Schur-backend storage: the coupled layout lists no Schur elastic bodies (count == 0), so
+        # none of it is allocated under ``rigid_articulation_elastic_solve="coupled"``.
+        self._sparse_elastic_definite = None
+        self._sparse_elastic_z = None
+        self._sparse_elastic_b = None
+        self._sparse_elastic_w = None
         self._sparse_elastic_joint_data = None
         self._sparse_elastic_modal_solve = None
-        # Failed modal factorizations, counted on the device and mirrored to host memory once per
-        # step without synchronizing; see _warn_sparse_elastic_indefinite().
-        self._sparse_elastic_indefinite_count = wp.zeros(1, dtype=wp.int32, device=self.device)
-        self._sparse_elastic_indefinite_count_host = wp.zeros(
-            1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
-        )
+        self._sparse_elastic_indefinite_count = None
+        self._sparse_elastic_indefinite_count_host = None
         self._sparse_elastic_indefinite_warned = False
+        if count > 0:
+            self._sparse_elastic_definite = wp.zeros(count, dtype=wp.int32, device=self.device)
+            self._sparse_elastic_z = wp.zeros(max(count * max_modes, 1), dtype=float, device=self.device)
+            self._sparse_elastic_b = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
+            self._sparse_elastic_w = wp.zeros(max(group_count * max_modes * 6, 1), dtype=float, device=self.device)
+            # Failed modal factorizations, counted on the device and mirrored to host memory once per
+            # step without synchronizing; see _warn_sparse_elastic_indefinite().
+            self._sparse_elastic_indefinite_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._sparse_elastic_indefinite_count_host = wp.zeros(
+                1, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+            )
+        self._init_coupled_articulation_solve(model, layout)
         if layout is None:
             return
         if count > 0 and max_modes > 0:
@@ -1925,6 +1997,113 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         data.joint_cross_slot = layout.joint_cross_slot
         self._sparse_elastic_joint_data = data
         self._validate_sparse_elastic_support()
+
+    def _init_coupled_articulation_solve(self, model: Model, layout) -> None:
+        """Allocate the coupled variable-block solve of the mixed articulations of ``layout``.
+
+        Everything a step needs is allocated here, so the step allocates nothing and can be
+        captured in a CUDA graph: the per-joint endpoint terms, the diagonal backup, the status per
+        mixed articulation, the device failure counter and its pinned host mirror, the elastic
+        endpoint data with ``enabled = 1`` (the 6 x 6 rigid-prefix kernels keep the solver's other
+        endpoint data, which is disabled under ``"coupled"``), and, with
+        ``elastic_solver_metrics``, copies of the assembled mixed values and right-hand side.
+        """
+        self._coupled_factor_status = None
+        self._coupled_failure_count = None
+        self._coupled_failure_count_host = None
+        self._coupled_failure_warned = False
+        self._coupled_cooperative = False
+        self._coupled_status_articulations = np.zeros(0, dtype=np.int64)
+        if layout is None or layout.mixed_articulation_count == 0:
+            return
+        device = self.device
+        # Compile the cooperative CUDA factor-and-solve and check its shared memory before any graph
+        # capture; a CUDA device that cannot fit it uses the serial kernel, as the CPU does.
+        self._coupled_cooperative = self._select_coupled_cooperative_solve(device)
+        max_modes = int(model.elastic_max_mode_count)
+        self._coupled_terms = wp.zeros(
+            layout.mixed_articulation_joints.shape[0], dtype=JointEndpointTerms, device=device
+        )
+        self._coupled_twists = wp.zeros(
+            rigid_sparse_articulation_variable_assembly.twist_scratch_size(layout), dtype=vec6f, device=device
+        )
+        # The diagonal backup and the metric copies below span the whole layout although only the
+        # mixed suffix ([6 * rigid_body_row_count, ...) and [36 * rigid_block_count, ...)) is used:
+        # the factor-and-solve and metrics kernels index them with the layout's global offsets, like
+        # values, rhs and delta. The unused prefix costs 6 floats per rigid row (and, with
+        # elastic_solver_metrics, 36 per rigid block plus 6 per rigid row).
+        self._coupled_diag_backup = wp.zeros(layout.articulation_scalar_count, dtype=float, device=device)
+        self._coupled_factor_status = wp.zeros(layout.mixed_articulation_count, dtype=wp.int32, device=device)
+        self._coupled_failure_count = wp.zeros(1, dtype=wp.int32, device=device)
+        self._coupled_failure_count_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=device.is_cuda)
+
+        data = SparseElasticJointData()
+        data.enabled = 1
+        data.body_elastic_index = model.body_elastic_index
+        data.elastic_joint = model.elastic_joint
+        data.elastic_mode_count = model.elastic_mode_count
+        data.joint_q_start = model.joint_q_start
+        data.parent_endpoint = model.joint_parent_elastic_endpoint
+        data.child_endpoint = model.joint_child_elastic_endpoint
+        data.endpoint_phi = model.elastic_endpoint_phi
+        data.endpoint_psi = model.elastic_endpoint_psi
+        data.max_mode_count = max_modes
+        data.joint_q = model.joint_q
+        data.joint_q_prev = model.joint_q
+        data.joint_cross_slot = layout.joint_cross_slot
+        self._coupled_elastic_joint_data = data
+        # Names of the ``joint_inputs`` list of _solve_rigid_body_iteration_block_sparse_joints: the arguments of
+        # assemble_articulation_joints_scalar up to and including ``elastic``.
+        labels = rigid_sparse_articulation_variable_assembly.kernel_argument_labels(assemble_articulation_joints_scalar)
+        self._sparse_joint_input_labels = labels[: labels.index("elastic") + 1]
+
+        body_offsets = layout.articulation_body_offsets.numpy()
+        rows = layout.mixed_elastic_body_rows.numpy()
+        articulations = np.searchsorted(body_offsets, rows, side="right") - 1
+        self._coupled_elastic_body_articulations = wp.array(
+            articulations.astype(np.int32), dtype=wp.int32, device=device
+        )
+        # Model articulation of each mixed layout articulation, for the status accessor.
+        joint_offsets = layout.articulation_joint_offsets.numpy()
+        joints = layout.articulation_joints.numpy()
+        joint_articulation = model.joint_articulation.numpy() if model.joint_articulation is not None else None
+        status_articulations = []
+        for a in range(layout.rigid_articulation_count, layout.articulation_count):
+            first = int(joints[joint_offsets[a]]) if joint_offsets[a + 1] > joint_offsets[a] else -1
+            status_articulations.append(
+                int(joint_articulation[first]) if joint_articulation is not None and first >= 0 else -1
+            )
+        self._coupled_status_articulations = np.asarray(status_articulations, dtype=np.int64)
+
+        self._coupled_metric_values = None
+        self._coupled_metric_rhs = None
+        if self.elastic_solver_metrics:
+            self._coupled_metric_values = wp.zeros(layout.articulation_value_count, dtype=float, device=device)
+            self._coupled_metric_rhs = wp.zeros(layout.articulation_scalar_count, dtype=float, device=device)
+
+    @staticmethod
+    def _select_coupled_cooperative_solve(device) -> bool:
+        """Return whether the coupled solve launches the cooperative CUDA kernel on ``device``.
+
+        The cooperative kernel is used on CUDA devices whose shared memory per block fits it. A
+        CUDA device that does not fit it uses the serial kernel (one thread per mixed
+        articulation) instead and warns once; the CPU always uses the serial kernel.
+        """
+        if not device.is_cuda:
+            return False
+        if rigid_sparse_articulation_variable_kernels.cooperative_kernel_fits(device):
+            return True
+        required = rigid_sparse_articulation_variable_kernels.cooperative_shared_memory_bytes(device)
+        warnings.warn(
+            f"SolverVBD's coupled articulation solve (rigid_articulation_elastic_solve='coupled') needs "
+            f"{required} bytes of shared memory per thread block for its cooperative CUDA kernel, but device "
+            f"'{device.alias}' provides {device.max_shared_memory_per_block}. The mixed rigid/elastic "
+            f"articulations are factored by the serial kernel (one thread per articulation) instead, which is "
+            f"slower for wide elastic rows.",
+            UserWarning,
+            stacklevel=4,
+        )
+        return False
 
     def _init_sparse_elastic_modal_solve(
         self, model: Model, layout, count: int, group_count: int, max_modes: int
@@ -2001,42 +2180,101 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             stacklevel=3,
         )
 
+    def _warn_coupled_articulation_failures(self) -> None:
+        """Warn once per solver if a coupled articulation solve failed.
+
+        The device failure counter is mirrored to pinned host memory at the end of each step
+        without synchronizing, so the first failure is reported by the next :meth:`step` or
+        :meth:`notify_model_changed` call made outside CUDA graph capture, as the Schur backend
+        does. Later failures are not warned about; they are counted by
+        :meth:`rigid_articulation_elastic_solve_failure_count` and recorded per articulation by
+        :meth:`rigid_articulation_elastic_solve_status`.
+        """
+        if self._coupled_failure_warned or self._coupled_failure_count_host is None or self.device.is_capturing:
+            return
+        if int(self._coupled_failure_count_host.numpy()[0]) == 0:
+            return
+        self._coupled_failure_warned = True
+        warnings.warn(
+            "SolverVBD's coupled articulation solve (rigid_articulation_elastic_solve='coupled') could not "
+            "factor or solve a mixed rigid/elastic articulation system: a pivot was not positive and finite, "
+            "or the update was not finite. The affected articulations took a diagonal (Jacobi) step instead, "
+            "which is not damped and can diverge if the failure persists. This warning is raised once per "
+            "solver; see rigid_articulation_elastic_solve_status() and "
+            "rigid_articulation_elastic_solve_failure_count(). The modal mass, stiffness, or damping is likely "
+            "inconsistent or indefinite; increasing rigid_articulation_diagonal_regularization can make the "
+            "frame blocks definite.",
+            UserWarning,
+            stacklevel=3,
+        )
+
     def _validate_sparse_elastic_support(self) -> None:
         """Reject joint features that the block-sparse solve cannot apply to reduced elastic bodies.
+
+        The checks cover the elastic bodies solved by the selected backend
+        (``rigid_articulation_elastic_solve``): every elastic articulation body under ``"schur"``,
+        and the elastic bodies of mixed articulations under ``"coupled"`` (standalone elastic
+        bodies are solved locally there and keep every joint feature).
 
         Raises:
             NotImplementedError: If joint mimics are combined with elastic articulation bodies.
             ValueError: If a joint attached to an elastic articulation body uses armature,
                 passive damping, or Coulomb friction, whose elastic-side terms the reduced
-                elastic block does not model.
+                elastic block does not model, or (``"coupled"``) if a joint attached to an elastic
+                articulation body lies outside that body's articulation range.
         """
         layout = self.rigid_articulation_sparse_layout
-        if layout is None or layout.elastic_body_count == 0:
+        if layout is None:
+            return
+        backend = layout.elastic_solve
+        if backend == "coupled":
+            elastic_body_array, joint_array = layout.mixed_elastic_bodies, layout.mixed_articulation_joints
+        else:
+            elastic_body_array, joint_array = layout.elastic_bodies, layout.articulation_joints
+        if elastic_body_array.shape[0] == 0:
             return
         model = self.model
         if self._has_joint_mimics:
             raise NotImplementedError(
-                "SolverVBD with rigid_articulation_solve='block_sparse_joints' does not support joint mimics "
-                "together with reduced elastic articulation bodies. Use rigid_articulation_solve='local'."
+                f"SolverVBD with rigid_articulation_solve={self.rigid_articulation_solve!r} and "
+                f"rigid_articulation_elastic_solve={backend!r} does not support joint mimics together with "
+                "reduced elastic articulation bodies. Use rigid_articulation_solve='local'."
             )
-        elastic_bodies = set(layout.elastic_bodies.numpy().tolist())
+        elastic_bodies = set(elastic_body_array.numpy().tolist())
         parent = model.joint_parent.numpy()
         child = model.joint_child.numpy()
         joint_type = model.joint_type.numpy()
         qd_start = model.joint_qd_start.numpy()
-        armature = model.joint_armature.numpy()
-        damping = model.joint_damping.numpy()
-        friction = model.joint_friction.numpy()
-        for joint in layout.articulation_joints.numpy():
+        coordinate_terms = (
+            ("joint_armature", model.joint_armature.numpy()),
+            ("joint_damping", model.joint_damping.numpy()),
+            ("joint_friction", model.joint_friction.numpy()),
+        )
+        listed = set(joint_array.numpy().tolist())
+        for joint in range(model.joint_count):
             if joint_type[joint] == int(JointType.ELASTIC):
                 continue
-            if int(parent[joint]) not in elastic_bodies and int(child[joint]) not in elastic_bodies:
+            body = next((int(b) for b in (parent[joint], child[joint]) if int(b) in elastic_bodies), None)
+            if body is None:
+                continue
+            if joint not in listed:
+                # The layout already rejects such joints; the coupled assembly adds joint terms only
+                # for the joints of each articulation, so never drop one silently.
+                if backend == "coupled":
+                    raise ValueError(
+                        f"Joint {joint} attaches reduced elastic body {body} but lies outside that body's "
+                        "articulation range; rigid_articulation_elastic_solve='coupled' applies only the joints "
+                        "of the articulation. Add the joint to the articulation or use "
+                        "rigid_articulation_solve='local'."
+                    )
                 continue
             dofs = slice(int(qd_start[joint]), int(qd_start[joint + 1]))
-            if np.any(armature[dofs] != 0.0) or np.any(damping[dofs] != 0.0) or np.any(friction[dofs] != 0.0):
+            names = [name for name, values in coordinate_terms if np.any(values[dofs] != 0.0)]
+            if names:
                 raise ValueError(
-                    f"Joint {int(joint)} attaches a reduced elastic body inside a block-sparse articulation and "
-                    "has nonzero joint_armature, joint_damping, or joint_friction. These coordinate terms are not "
+                    f"Joint {joint} attaches reduced elastic body {body} inside a block-sparse articulation and has "
+                    f"nonzero {', '.join(names)}. rigid_articulation_elastic_solve={backend!r} does not support "
+                    "joint_armature, joint_damping, or joint_friction on such joints: these coordinate terms are not "
                     "part of the reduced elastic block, so the block-sparse solve cannot apply them consistently. "
                     "Set them to zero on this joint or use rigid_articulation_solve='local'."
                 )
@@ -2755,6 +2993,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         self._apply_module_options()
         self._warn_sparse_elastic_indefinite()
+        self._warn_coupled_articulation_failures()
         # Mimic relationships are notified with CONSTRAINT_PROPERTIES.
         if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.CONSTRAINT_PROPERTIES):
             self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(
@@ -4012,13 +4251,26 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
     def elastic_mode_solve_metrics(self) -> dict[str, np.ndarray]:
         """Return the latest reduced elastic block solve metrics.
 
-        Metrics are written per elastic body during :meth:`step` and cover every row of the
-        coupled ``(6 + mode_count)`` block that the solve updates: the six floating-frame rows
-        when the frame is solved, plus the active modal rows. Padded modal rows are excluded.
-        ``initial_residual_norm`` measures the block gradient before the block update.
-        ``solve_residual_norm`` measures the linear residual after the unrelaxed dense block
-        solve, ``g + H delta``. ``applied_residual_norm`` uses the relaxed update that was
-        actually applied. ``update_norm`` and ``update_max`` measure the applied increment.
+        Metrics are written per elastic body (indexed like the model's elastic bodies) by the last
+        solve iteration of the latest :meth:`step` and cover every row of the body's
+        ``(6 + mode_count)`` block that the solve updates: the six floating-frame rows when the
+        frame is dynamic, plus the active modal rows. Padded modal rows are excluded.
+        ``initial_residual_norm`` measures the gradient ``g`` of those rows before the update.
+        ``solve_residual_norm`` measures the linear residual ``g + H delta`` of the unrelaxed
+        update. ``applied_residual_norm`` uses the relaxed update that was actually applied.
+        ``update_norm`` and ``update_max`` measure the applied increment.
+
+        Bodies solved by the local block solve evaluate ``H`` as their own block. Bodies of
+        mixed articulations solved with ``rigid_articulation_elastic_solve="coupled"`` evaluate
+        the rows of the whole articulation system that belong to the body, so ``H delta``
+        includes the joint coupling to the other bodies' updates and ``H`` includes the backend's
+        frame regularization; frame rows are in world axes, which leaves the norms unchanged.
+
+        A value of NaN means the body was not evaluated by a solve that computes metrics in the
+        latest step: bodies solved with ``rigid_articulation_elastic_solve="schur"``, bodies of a
+        coupled articulation whose factorization failed (see
+        :meth:`rigid_articulation_elastic_solve_status`), and every body before the first step or
+        when no solve iteration ran.
 
         Note:
             The frame and modal rows carry different units, so the norms mix ``[N]``, ``[N·m]``
@@ -4035,6 +4287,51 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             "update_norm": self.elastic_body_block_update_norm.numpy().copy(),
             "update_max": self.elastic_body_block_update_max.numpy().copy(),
         }
+
+    def rigid_articulation_elastic_solve_status(self) -> np.ndarray:
+        """Return the factorization status of each articulation in the latest coupled articulation solve.
+
+        Only articulations solved by ``rigid_articulation_elastic_solve="coupled"`` (those with a
+        reduced elastic body and at least two bodies) have a status; it is written by every solve
+        iteration, so it describes the last iteration that ran. A failed articulation took a
+        diagonal (Jacobi) step instead of the factorized update in that iteration.
+
+        .. experimental::
+            This accessor and its status codes may change or be removed without a deprecation
+            period, together with ``rigid_articulation_elastic_solve``.
+
+        Returns:
+            Status per model articulation, shape [articulation_count], ``int32``: ``-1`` for an
+            articulation the coupled backend does not solve, ``0`` when the factorization and solve
+            succeeded, ``1`` when a pivot was not positive and finite, and ``2`` when the solve
+            produced a non-finite update.
+        """
+        status = np.full(self.model.articulation_count, -1, dtype=np.int32)
+        if self._coupled_factor_status is not None:
+            values = self._coupled_factor_status.numpy()
+            valid = self._coupled_status_articulations >= 0
+            status[self._coupled_status_articulations[valid]] = values[valid]
+        return status
+
+    def rigid_articulation_elastic_solve_failure_count(self) -> int:
+        """Return the number of failed coupled articulation solves since the solver was constructed.
+
+        Every solve iteration of every articulation solved by
+        ``rigid_articulation_elastic_solve="coupled"`` whose factorization or solve failed (status
+        ``1`` or ``2`` of :meth:`rigid_articulation_elastic_solve_status`) counts once. The solver
+        warns only at the first failure, so use this count to monitor later ones. Synchronizes
+        with the device.
+
+        .. experimental::
+            This accessor may change or be removed without a deprecation period, together with
+            ``rigid_articulation_elastic_solve``.
+
+        Returns:
+            The cumulative failure count; 0 when the coupled backend solves no articulation.
+        """
+        if self._coupled_failure_count is None:
+            return 0
+        return int(self._coupled_failure_count.numpy()[0])
 
     @override
     def step(
@@ -4080,6 +4377,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.validate_observables(observables, contacts)
         self._apply_module_options()
         self._warn_sparse_elastic_indefinite()
+        self._warn_coupled_articulation_failures()
         if self.tendon_material_direct != self._tendon_material_state.enabled:
             raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
         if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
@@ -4198,11 +4496,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
 
         if self.elastic_solver_metrics:
-            self.elastic_body_block_initial_residual_norm.zero_()
-            self.elastic_body_block_solve_residual_norm.zero_()
-            self.elastic_body_block_applied_residual_norm.zero_()
-            self.elastic_body_block_update_norm.zero_()
-            self.elastic_body_block_update_max.zero_()
+            # NaN marks bodies that no metric-computing solve evaluates during this step.
+            nan = float("nan")
+            self.elastic_body_block_initial_residual_norm.fill_(nan)
+            self.elastic_body_block_solve_residual_norm.fill_(nan)
+            self.elastic_body_block_applied_residual_norm.fill_(nan)
+            self.elastic_body_block_update_norm.fill_(nan)
+            self.elastic_body_block_update_max.fill_(nan)
 
         wp.copy(state_out.joint_q, state_in.joint_q)
         wp.copy(state_out.joint_qd, state_in.joint_qd)
@@ -4270,6 +4570,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
         if self._sparse_elastic_modal_solve is not None and not self._sparse_elastic_indefinite_warned:
             wp.copy(self._sparse_elastic_indefinite_count_host, self._sparse_elastic_indefinite_count)
+        if self._coupled_failure_count is not None:
+            wp.copy(self._coupled_failure_count_host, self._coupled_failure_count)
 
         wp.launch(
             kernel=copy_body_frame_to_elastic_joint,
@@ -7112,9 +7414,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._accumulate_elastic_frame_coupling(state_in, state_out, dt)
         self._accumulate_rigid_contact_forces(state_in, contacts, dt, layout.articulation_bodies, state_out)
         if self.rigid_articulation_diagonal_regularization > 0.0:
+            # The coupled backend regularizes the frame rows of mixed articulations itself.
             wp.launch(
                 kernel=regularize_articulation_body_hessian,
-                dim=layout.articulation_body_count,
+                dim=layout.rigid_body_row_count,
                 inputs=[
                     layout.articulation_bodies,
                     self.rigid_articulation_diagonal_regularization,
@@ -7125,9 +7428,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         use_block32 = self.device.is_cuda
         has_sparse_elastic = self._sparse_elastic_body_count > 0
-        self._rigid_articulation_sparse_values_scalar.zero_()
-        self._rigid_articulation_sparse_rhs_scalar.zero_()
-        self._rigid_articulation_sparse_delta_scalar.zero_()
+        for array in self._rigid_articulation_sparse_zero_views:
+            array.zero_()
         elastic_joint_data = self._sparse_elastic_joint_data
         if has_sparse_elastic:
             # Kernels receive the struct by value: pair it with this step's modal coordinates.
@@ -7196,169 +7498,173 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             elastic_joint_data,
         ]
 
-        if use_block32 or has_sparse_elastic:
-            wp.launch(
-                kernel=assemble_articulation_body_diagonal_scalar,
-                dim=layout.articulation_body_count,
-                inputs=[
-                    self._step_size,
-                    dt,
-                    layout.articulation_bodies,
-                    layout.articulation_diag_slots,
-                    state_in.body_q,
-                    model.body_mass,
-                    self.body_inv_mass_effective,
-                    model.body_com,
-                    model.body_inertia,
-                    self.body_inertia_q,
-                    self.body_forces,
-                    self.body_torques,
-                    self.body_hessian_ll,
-                    self.body_hessian_al,
-                    self.body_hessian_aa,
-                    self._body_disp,
-                    self._body_disp_ang,
-                    self._use_body_displacement,
-                ],
-                outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
-                device=self.device,
-                block_dim=32,
-            )
-
-            wp.launch(
-                kernel=assemble_articulation_joints_scalar_bdf2
-                if self._bdf2_enabled
-                else assemble_articulation_joints_scalar,
-                dim=layout.articulation_joint_count,
-                inputs=joint_inputs,
-                outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
-                device=self.device,
-                block_dim=SPARSE_ARTICULATION_CTA_THREADS,
-            )
-            if has_sparse_elastic:
-                self._assemble_sparse_elastic_bodies(state_in, state_out, control, contacts, dt)
-
-        if not use_block32:
-            wp.launch(
-                kernel=solve_articulation_sparse_serial_scalar_bdf2
-                if self._bdf2_enabled
-                else solve_articulation_sparse_serial_scalar,
-                dim=layout.articulation_count,
-                inputs=[
-                    *joint_inputs,
-                    layout.articulation_body_offsets,
-                    layout.articulation_joint_offsets,
-                    layout.articulation_bodies,
-                    layout.articulation_diag_slots,
-                    model.body_mass,
-                    self.body_inv_mass_effective,
-                    model.body_inertia,
-                    self.body_forces,
-                    self.body_torques,
-                    self.body_hessian_ll,
-                    self.body_hessian_al,
-                    self.body_hessian_aa,
-                    self.rigid_articulation_relaxation,
-                    self._has_joint_mimics,
-                    not has_sparse_elastic,
-                    self._rigid_articulation_sparse_values_scalar,
-                    self._rigid_articulation_sparse_rhs_scalar,
-                    self.rigid_articulation_sparse_values,
-                    self.rigid_articulation_sparse_rhs,
-                    self.rigid_articulation_sparse_delta,
-                    self._body_disp,
-                    self._body_disp_ang,
-                    self._use_body_displacement,
-                ],
-                outputs=[state_in.body_q],
-                device=self.device,
-            )
-
-        if use_block32:
-            if self._has_joint_mimics:
+        # Rigid-only articulations: the 6 x 6 kernels on the layout's rigid prefix. Under "schur" the
+        # prefix is every articulation; under "coupled" the mixed articulations follow below (they are
+        # factored by the variable-size block solve, also under "block_sparse_levels").
+        if layout.rigid_articulation_count > 0:
+            if use_block32 or has_sparse_elastic:
                 wp.launch(
-                    save_articulation_body_hessians,
-                    dim=layout.articulation_body_count,
+                    kernel=assemble_articulation_body_diagonal_scalar,
+                    dim=layout.rigid_body_row_count,
                     inputs=[
+                        self._step_size,
+                        dt,
                         layout.articulation_bodies,
                         layout.articulation_diag_slots,
-                        self.rigid_articulation_sparse_values,
+                        state_in.body_q,
+                        model.body_mass,
+                        self.body_inv_mass_effective,
+                        model.body_com,
+                        model.body_inertia,
+                        self.body_inertia_q,
+                        self.body_forces,
+                        self.body_torques,
+                        self.body_hessian_ll,
+                        self.body_hessian_al,
+                        self.body_hessian_aa,
+                        self._body_disp,
+                        self._body_disp_ang,
+                        self._use_body_displacement,
                     ],
-                    outputs=[self.body_hessian_ll, self.body_hessian_al, self.body_hessian_aa],
+                    outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
                     device=self.device,
-                )
-            if layout.levels is not None:
-                wp.launch(
-                    kernel=solve_articulation_sparse_levels,
-                    dim=layout.articulation_count * SPARSE_ARTICULATION_CTA_THREADS,
-                    inputs=[
-                        layout.articulation_body_offsets,
-                        layout.articulation_block_row_offsets,
-                        layout.articulation_block_cols,
-                        layout.articulation_block_col_offsets,
-                        layout.articulation_block_col_rows,
-                        layout.articulation_block_col_slots,
-                        layout.articulation_diag_slots,
-                        layout.levels.articulation_level_offsets,
-                        layout.levels.level_body_offsets,
-                        layout.levels.level_column_offsets,
-                        layout.levels.level_column_slots,
-                        layout.levels.level_column_diag_slots,
-                        layout.levels.level_update_offsets,
-                        layout.levels.level_update_dst_slots,
-                        layout.levels.level_update_term_offsets,
-                        layout.levels.level_update_left_slots,
-                        layout.levels.level_update_right_slots,
-                        self._rigid_articulation_sparse_values_scalar,
-                        self._rigid_articulation_sparse_rhs_scalar,
-                    ],
-                    outputs=[self._rigid_articulation_sparse_delta_scalar],
-                    device=self.device,
-                    block_dim=SPARSE_ARTICULATION_CTA_THREADS,
-                )
-            else:
-                wp.launch(
-                    kernel=solve_articulation_sparse_block32_scalar,
-                    dim=layout.articulation_count * SPARSE_ARTICULATION_CTA_THREADS,
-                    inputs=[
-                        layout.articulation_body_offsets,
-                        layout.articulation_block_row_offsets,
-                        layout.articulation_block_cols,
-                        layout.articulation_block_col_offsets,
-                        layout.articulation_block_col_rows,
-                        layout.articulation_block_col_slots,
-                        layout.articulation_factor_update_offsets,
-                        layout.articulation_factor_update_dst_slots,
-                        layout.articulation_factor_update_left_slots,
-                        layout.articulation_factor_update_right_slots,
-                        layout.articulation_diag_slots,
-                        self._rigid_articulation_sparse_values_scalar,
-                        self._rigid_articulation_sparse_rhs_scalar,
-                    ],
-                    outputs=[self._rigid_articulation_sparse_delta_scalar],
-                    device=self.device,
-                    block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                    block_dim=32,
                 )
 
-            wp.launch(
-                kernel=apply_articulation_sparse_delta_scalar,
-                dim=layout.articulation_body_count,
-                inputs=[
-                    layout.articulation_bodies,
-                    state_in.body_q,
-                    self.body_inv_mass_effective,
-                    model.body_com,
-                    self.rigid_articulation_relaxation,
-                    self._rigid_articulation_sparse_delta_scalar,
-                    self.body_inertia_q,
-                    self._body_disp,
-                    self._body_disp_ang,
-                    self._use_body_displacement,
-                ],
-                outputs=[state_in.body_q],
-                device=self.device,
-                block_dim=32,
-            )
+                wp.launch(
+                    kernel=assemble_articulation_joints_scalar_bdf2
+                    if self._bdf2_enabled
+                    else assemble_articulation_joints_scalar,
+                    dim=layout.rigid_joint_count,
+                    inputs=joint_inputs,
+                    outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
+                    device=self.device,
+                    block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                )
+                if has_sparse_elastic:
+                    self._assemble_sparse_elastic_bodies(state_in, state_out, control, contacts, dt)
+
+            if not use_block32:
+                wp.launch(
+                    kernel=solve_articulation_sparse_serial_scalar_bdf2
+                    if self._bdf2_enabled
+                    else solve_articulation_sparse_serial_scalar,
+                    dim=layout.rigid_articulation_count,
+                    inputs=[
+                        *joint_inputs,
+                        layout.articulation_body_offsets,
+                        layout.articulation_joint_offsets,
+                        layout.articulation_bodies,
+                        layout.articulation_diag_slots,
+                        model.body_mass,
+                        self.body_inv_mass_effective,
+                        model.body_inertia,
+                        self.body_forces,
+                        self.body_torques,
+                        self.body_hessian_ll,
+                        self.body_hessian_al,
+                        self.body_hessian_aa,
+                        self.rigid_articulation_relaxation,
+                        self._has_joint_mimics,
+                        not has_sparse_elastic,
+                        self._rigid_articulation_sparse_values_scalar,
+                        self._rigid_articulation_sparse_rhs_scalar,
+                        self.rigid_articulation_sparse_values,
+                        self.rigid_articulation_sparse_rhs,
+                        self.rigid_articulation_sparse_delta,
+                        self._body_disp,
+                        self._body_disp_ang,
+                        self._use_body_displacement,
+                    ],
+                    outputs=[state_in.body_q],
+                    device=self.device,
+                )
+
+            if use_block32:
+                if self._has_joint_mimics:
+                    wp.launch(
+                        save_articulation_body_hessians,
+                        dim=layout.rigid_body_row_count,
+                        inputs=[
+                            layout.articulation_bodies,
+                            layout.articulation_diag_slots,
+                            self.rigid_articulation_sparse_values,
+                        ],
+                        outputs=[self.body_hessian_ll, self.body_hessian_al, self.body_hessian_aa],
+                        device=self.device,
+                    )
+                if layout.levels is not None:
+                    wp.launch(
+                        kernel=solve_articulation_sparse_levels,
+                        dim=layout.rigid_articulation_count * SPARSE_ARTICULATION_CTA_THREADS,
+                        inputs=[
+                            layout.articulation_body_offsets,
+                            layout.articulation_block_row_offsets,
+                            layout.articulation_block_cols,
+                            layout.articulation_block_col_offsets,
+                            layout.articulation_block_col_rows,
+                            layout.articulation_block_col_slots,
+                            layout.articulation_diag_slots,
+                            layout.levels.articulation_level_offsets,
+                            layout.levels.level_body_offsets,
+                            layout.levels.level_column_offsets,
+                            layout.levels.level_column_slots,
+                            layout.levels.level_column_diag_slots,
+                            layout.levels.level_update_offsets,
+                            layout.levels.level_update_dst_slots,
+                            layout.levels.level_update_term_offsets,
+                            layout.levels.level_update_left_slots,
+                            layout.levels.level_update_right_slots,
+                            self._rigid_articulation_sparse_values_scalar,
+                            self._rigid_articulation_sparse_rhs_scalar,
+                        ],
+                        outputs=[self._rigid_articulation_sparse_delta_scalar],
+                        device=self.device,
+                        block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                    )
+                else:
+                    wp.launch(
+                        kernel=solve_articulation_sparse_block32_scalar,
+                        dim=layout.rigid_articulation_count * SPARSE_ARTICULATION_CTA_THREADS,
+                        inputs=[
+                            layout.articulation_body_offsets,
+                            layout.articulation_block_row_offsets,
+                            layout.articulation_block_cols,
+                            layout.articulation_block_col_offsets,
+                            layout.articulation_block_col_rows,
+                            layout.articulation_block_col_slots,
+                            layout.articulation_factor_update_offsets,
+                            layout.articulation_factor_update_dst_slots,
+                            layout.articulation_factor_update_left_slots,
+                            layout.articulation_factor_update_right_slots,
+                            layout.articulation_diag_slots,
+                            self._rigid_articulation_sparse_values_scalar,
+                            self._rigid_articulation_sparse_rhs_scalar,
+                        ],
+                        outputs=[self._rigid_articulation_sparse_delta_scalar],
+                        device=self.device,
+                        block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                    )
+
+                wp.launch(
+                    kernel=apply_articulation_sparse_delta_scalar,
+                    dim=layout.rigid_body_row_count,
+                    inputs=[
+                        layout.articulation_bodies,
+                        state_in.body_q,
+                        self.body_inv_mass_effective,
+                        model.body_com,
+                        self.rigid_articulation_relaxation,
+                        self._rigid_articulation_sparse_delta_scalar,
+                        self.body_inertia_q,
+                        self._body_disp,
+                        self._body_disp_ang,
+                        self._use_body_displacement,
+                    ],
+                    outputs=[state_in.body_q],
+                    device=self.device,
+                    block_dim=32,
+                )
 
         if has_sparse_elastic:
             wp.launch(
@@ -7386,6 +7692,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+        if layout.mixed_articulation_count > 0:
+            self._solve_coupled_articulations(state_in, state_out, control, contacts, dt, joint_inputs)
+
         if layout.local_body_count > 0:
             self._solve_rigid_body_iteration_local(
                 state_in,
@@ -7405,11 +7714,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         control: Control,
         contacts: Contacts | None,
         dt: float,
+        *,
+        joint_terms: bool = True,
     ) -> None:
         """Assemble the dense frame/modal blocks of the reduced elastic bodies in ``body_ids``.
 
         The joint terms at elastic attachments are formed first, then one thread per block
-        column assembles the blocks, so no thread loops over mode pairs. The mode-pair sums at the
+        column assembles the blocks, so no thread loops over mode pairs. Without ``joint_terms``
+        the blocks hold only each body's own terms and contacts, for the coupled articulation
+        backend, which adds the joint terms itself. The mode-pair sums at the
         iterate come from :meth:`_accumulate_elastic_frame_coupling`, which runs at the start of
         every iteration before any elastic block of that iteration is solved; a body's modal
         coordinates change only in its own block update, which follows its assembly.
@@ -7424,7 +7737,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if body_count == 0:
             return
 
-        if self._elastic_has_endpoint_joints:
+        if self._elastic_has_endpoint_joints and joint_terms:
             wp.launch(
                 kernel=evaluate_elastic_endpoint_joints,
                 dim=body_count,
@@ -7495,6 +7808,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             inputs=[
                 dt,
                 True,
+                joint_terms,
                 body_ids,
                 model.elastic_joint,
                 model.elastic_mode_start,
@@ -7773,6 +8087,158 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self._sparse_elastic_w,
             ],
             outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
+            device=self.device,
+        )
+
+    def _solve_coupled_articulations(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts | None,
+        dt: float,
+        joint_inputs: list,
+    ) -> None:
+        """Solve the mixed rigid/elastic articulations with the coupled variable-block backend.
+
+        Runs after the rigid prefix of the same iteration, on the contact and frame-coupling terms
+        accumulated at its start: the body-axes blocks of the mixed elastic bodies without joint
+        terms (plus their contacts), the variable-size system assembly with every joint of the
+        mixed articulations evaluated once, the factor-and-solve (which adds the frame
+        regularization and records failures), the optional metrics, and the frame and modal update
+        with ``rigid_articulation_relaxation``. ``joint_inputs`` are the arguments of
+        :func:`assemble_articulation_joints_scalar` up to ``elastic``, in order.
+        """
+        model = self.model
+        layout = self.rigid_articulation_sparse_layout
+        values = self._rigid_articulation_sparse_values_scalar
+        rhs = self._rigid_articulation_sparse_rhs_scalar
+        delta = self._rigid_articulation_sparse_delta_scalar
+        self._launch_assemble_elastic_bodies(
+            layout.mixed_elastic_bodies, state_in, state_out, control, contacts, dt, joint_terms=False
+        )
+        # Kernels receive the struct by value: pair it with this step's modal coordinates.
+        elastic = self._coupled_elastic_joint_data
+        elastic.joint_q = state_out.joint_q
+        elastic.joint_q_prev = state_in.joint_q
+        named_inputs = dict(zip(self._sparse_joint_input_labels, joint_inputs, strict=True))
+        rigid_sparse_articulation_variable_assembly.assemble_articulation_variable_system(
+            layout,
+            model,
+            dt=dt,
+            body_q=state_in.body_q,
+            body_inv_mass=self.body_inv_mass_effective,
+            body_inertia_q=self.body_inertia_q,
+            body_forces=self.body_forces,
+            body_torques=self.body_torques,
+            body_hessian_ll=self.body_hessian_ll,
+            body_hessian_al=self.body_hessian_al,
+            body_hessian_aa=self.body_hessian_aa,
+            body_disp=self._body_disp,
+            body_disp_ang=self._body_disp_ang,
+            use_displacement=self._use_body_displacement,
+            elastic_body_block_grad=self.elastic_body_block_grad,
+            elastic_body_block_matrix=self.elastic_body_block_matrix,
+            elastic=elastic,
+            joint_inputs={
+                name: named_inputs[name] for name in rigid_sparse_articulation_variable_assembly.JOINT_TERM_INPUT_NAMES
+            },
+            terms=self._coupled_terms,
+            twists=self._coupled_twists,
+            values=values,
+            rhs=rhs,
+            device=self.device,
+        )
+        metrics = self._coupled_metric_values is not None
+        if metrics:
+            # The solve factors ``values`` in place; keep the assembled mixed system for the metrics.
+            value_start = 36 * layout.rigid_block_count
+            scalar_start = 6 * layout.rigid_body_row_count
+            wp.copy(
+                self._coupled_metric_values,
+                values,
+                dest_offset=value_start,
+                src_offset=value_start,
+                count=layout.articulation_value_count - value_start,
+            )
+            wp.copy(
+                self._coupled_metric_rhs,
+                rhs,
+                dest_offset=scalar_start,
+                src_offset=scalar_start,
+                count=layout.articulation_scalar_count - scalar_start,
+            )
+        rigid_sparse_articulation_variable_kernels.launch_solve_articulation_variable(
+            layout,
+            self.rigid_articulation_diagonal_regularization,
+            rhs,
+            values,
+            self._coupled_diag_backup,
+            self._coupled_factor_status,
+            self._coupled_failure_count,
+            delta,
+            device=self.device,
+            cooperative=self._coupled_cooperative,
+        )
+        if metrics:
+            wp.launch(
+                rigid_sparse_articulation_variable_metrics.evaluate_articulation_variable_elastic_metrics,
+                dim=layout.mixed_elastic_body_count,
+                inputs=[
+                    layout.rigid_articulation_count,
+                    self.rigid_articulation_diagonal_regularization,
+                    self.rigid_articulation_relaxation,
+                    layout.mixed_elastic_bodies,
+                    layout.mixed_elastic_body_rows,
+                    self._coupled_elastic_body_articulations,
+                    layout.articulation_body_offsets,
+                    layout.articulation_row_dims,
+                    layout.articulation_row_scalar_offsets,
+                    layout.articulation_block_value_offsets,
+                    layout.articulation_block_row_offsets,
+                    layout.articulation_block_cols,
+                    layout.articulation_block_col_offsets,
+                    layout.articulation_block_col_rows,
+                    layout.articulation_block_col_slots,
+                    model.body_elastic_index,
+                    self.body_inv_mass_effective,
+                    self._coupled_metric_values,
+                    self._coupled_metric_rhs,
+                    delta,
+                    self._coupled_factor_status,
+                ],
+                outputs=[
+                    self.elastic_body_block_initial_residual_norm,
+                    self.elastic_body_block_solve_residual_norm,
+                    self.elastic_body_block_applied_residual_norm,
+                    self.elastic_body_block_update_norm,
+                    self.elastic_body_block_update_max,
+                ],
+                device=self.device,
+            )
+        wp.launch(
+            rigid_sparse_articulation_variable_kernels.apply_articulation_variable_delta,
+            dim=layout.articulation_body_count - layout.rigid_body_row_count,
+            inputs=[
+                dt,
+                self.rigid_articulation_relaxation,
+                layout.rigid_body_row_count,
+                layout.articulation_bodies,
+                layout.articulation_row_dims,
+                layout.articulation_row_scalar_offsets,
+                delta,
+                state_in.body_q,
+                self.body_inv_mass_effective,
+                model.body_com,
+                self.body_inertia_q,
+                self._use_body_displacement,
+                model.body_elastic_index,
+                model.elastic_joint,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+            ],
+            outputs=[self._body_disp, self._body_disp_ang, state_in.body_q, state_out.joint_q, state_out.joint_qd],
             device=self.device,
         )
 

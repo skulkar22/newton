@@ -15,6 +15,7 @@ from newton._src.solvers.vbd.joint_coordinates import (
     evaluate_coordinate,
     evaluate_coordinate_prev,
 )
+from newton._src.solvers.vbd.reduced_elastic_kernels import _so3_left_jacobian
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     RigidStepSize,
     _drive_row_applies_force,
@@ -416,14 +417,7 @@ def _add_rhs_scalar_atomic(rhs_scalar: wp.array[float], index: int, value: vec6f
 
 
 @wp.func
-def _assemble_constraint_pair_scalar(
-    values_scalar: wp.array[float],
-    rhs_scalar: wp.array[float],
-    articulation_block_row_offsets: wp.array[wp.int32],
-    articulation_block_cols: wp.array[wp.int32],
-    body_start: int,
-    local_a: int,
-    local_b: int,
+def _constraint_pair_blocks(
     residual: wp.vec3,
     force_scale: float,
     hessian_scale: float,
@@ -433,11 +427,14 @@ def _assemble_constraint_pair_scalar(
     is_parent_a: bool,
     is_parent_b: bool,
     angular_only: bool,
-    cross_slot: int,
 ):
-    if force_scale == 0.0 and hessian_scale <= 0.0:
-        return
+    """Return the endpoint blocks of a three-row constraint between bodies ``a`` and ``b``.
 
+    The rows are ``J_a dx_a + J_b dx_b`` with the Jacobians of :func:`_joint_linear_jacobian_value`
+    (or :func:`_joint_angular_jacobian_value` when ``angular_only``) about each body's center of
+    mass. Returns ``(rhs_a, rhs_b, H_aa, H_ab, H_bb)`` with ``rhs = -force_scale J^T residual``
+    (the sparse right-hand side) and the Gauss-Newton blocks ``hessian_scale J^T J``.
+    """
     rhs_a = vec6f(0.0)
     rhs_b = vec6f(0.0)
     H_aa = mat66f(0.0)
@@ -468,6 +465,131 @@ def _assemble_constraint_pair_scalar(
                 H_bb[i, j] = H_bb[i, j] + hessian_scale * Jb * Jb_j
         rhs_a[i] = -force_scale * accum_a
         rhs_b[i] = -force_scale * accum_b
+
+    return rhs_a, rhs_b, H_aa, H_ab, H_bb
+
+
+@wp.func
+def _constraint_single_blocks(
+    residual: wp.vec3,
+    force_scale: float,
+    hessian_scale: float,
+    P: wp.mat33,
+    r: wp.vec3,
+    is_parent: bool,
+    angular_only: bool,
+):
+    """Return ``(rhs, H)`` of a three-row constraint acting on one body; see :func:`_constraint_pair_blocks`."""
+    rhs_body = vec6f(0.0)
+    H = mat66f(0.0)
+    for i in range(6):
+        accum = float(0.0)
+        for c in range(3):
+            if angular_only:
+                Ji = _joint_angular_jacobian_value(P, is_parent, c, i)
+            else:
+                Ji = _joint_linear_jacobian_value(P, r, is_parent, c, i)
+            accum = accum + Ji * residual[c]
+            for j in range(6):
+                if angular_only:
+                    Jj = _joint_angular_jacobian_value(P, is_parent, c, j)
+                else:
+                    Jj = _joint_linear_jacobian_value(P, r, is_parent, c, j)
+                H[i, j] = H[i, j] + hessian_scale * Ji * Jj
+        rhs_body[i] = -force_scale * accum
+    return rhs_body, H
+
+
+@wp.func
+def _angular_direct_pair_blocks(torque_parent: wp.vec3, H_aa: wp.mat33):
+    """Return ``(rhs_parent, rhs_child, H_self, H_cross)`` of an angular term with parent torque ``torque_parent``.
+
+    The child receives ``-torque_parent``; both self blocks are ``H_aa`` and the parent-child block
+    is ``-H_aa`` (angular rows and columns only).
+    """
+    rhs_parent = _vec6_from_parts(wp.vec3(0.0), torque_parent)
+    rhs_child = _vec6_from_parts(wp.vec3(0.0), -torque_parent)
+    H_block = _mat66_from_angular_block(H_aa)
+    H_cross = _mat66_from_angular_block(-H_aa)
+    return rhs_parent, rhs_child, H_block, H_cross
+
+
+@wp.func
+def _coordinate_row_blocks(
+    gradient_parent: wp.spatial_vector,
+    gradient_child: wp.spatial_vector,
+    force: float,
+    hessian: float,
+):
+    """Return ``(rhs_parent, rhs_child, H_pp, H_cc, H_pc)`` of a scalar joint-coordinate row.
+
+    ``gradient_*`` are the coordinate's derivatives with respect to the body twists (linear part
+    first); the row adds ``-force g`` to the right-hand side and ``hessian g g^T`` to the matrix.
+    """
+    gp = _vec6_from_parts(wp.spatial_top(gradient_parent), wp.spatial_bottom(gradient_parent))
+    gc = _vec6_from_parts(wp.spatial_top(gradient_child), wp.spatial_bottom(gradient_child))
+    return -force * gp, -force * gc, hessian * wp.outer(gp, gp), hessian * wp.outer(gc, gc), hessian * wp.outer(gp, gc)
+
+
+@wp.func
+def _linear_joint_residual(
+    parent_anchor: wp.vec3,
+    child_anchor: wp.vec3,
+    parent_anchor_prev: wp.vec3,
+    child_anchor_prev: wp.vec3,
+    stiffness: float,
+    damping: float,
+    dt: float,
+    P: wp.mat33,
+    lambda_lin: wp.vec3,
+    C0_lin: wp.vec3,
+    alpha: float,
+):
+    """Return the projected linear force residual and its Gauss-Newton scale of a joint anchor pair."""
+    C_vec = child_anchor - parent_anchor
+    C_stab = C_vec - alpha * C0_lin
+    force_residual = stiffness * (P * C_stab) + P * lambda_lin
+    hessian_scale = stiffness
+    if damping > 0.0:
+        residual_prev = child_anchor_prev - parent_anchor_prev
+        dC_dt = (C_vec - residual_prev) / dt
+        force_residual = force_residual + damping * (P * dC_dt)
+        hessian_scale = stiffness + damping / dt
+    return force_residual, hessian_scale
+
+
+@wp.func
+def _anchor_offset(body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3], body: int, anchor: wp.vec3) -> wp.vec3:
+    """Return the world vector from ``body``'s center of mass to the world point ``anchor``."""
+    return anchor - wp.transform_point(body_q[body], body_com[body])
+
+
+@wp.func
+def _assemble_constraint_pair_scalar(
+    values_scalar: wp.array[float],
+    rhs_scalar: wp.array[float],
+    articulation_block_row_offsets: wp.array[wp.int32],
+    articulation_block_cols: wp.array[wp.int32],
+    body_start: int,
+    local_a: int,
+    local_b: int,
+    residual: wp.vec3,
+    force_scale: float,
+    hessian_scale: float,
+    P: wp.mat33,
+    r_a: wp.vec3,
+    r_b: wp.vec3,
+    is_parent_a: bool,
+    is_parent_b: bool,
+    angular_only: bool,
+    cross_slot: int,
+):
+    if force_scale == 0.0 and hessian_scale <= 0.0:
+        return
+
+    rhs_a, rhs_b, H_aa, H_ab, H_bb = _constraint_pair_blocks(
+        residual, force_scale, hessian_scale, P, r_a, r_b, is_parent_a, is_parent_b, angular_only
+    )
 
     _add_rhs_scalar_atomic(rhs_scalar, body_start + local_a, rhs_a)
     _add_rhs_scalar_atomic(rhs_scalar, body_start + local_b, rhs_b)
@@ -510,23 +632,7 @@ def _assemble_constraint_single_scalar(
     if force_scale == 0.0 and hessian_scale <= 0.0:
         return
 
-    rhs_body = vec6f(0.0)
-    H = mat66f(0.0)
-    for i in range(6):
-        accum = float(0.0)
-        for c in range(3):
-            if angular_only:
-                Ji = _joint_angular_jacobian_value(P, is_parent, c, i)
-            else:
-                Ji = _joint_linear_jacobian_value(P, r, is_parent, c, i)
-            accum = accum + Ji * residual[c]
-            for j in range(6):
-                if angular_only:
-                    Jj = _joint_angular_jacobian_value(P, is_parent, c, j)
-                else:
-                    Jj = _joint_linear_jacobian_value(P, r, is_parent, c, j)
-                H[i, j] = H[i, j] + hessian_scale * Ji * Jj
-        rhs_body[i] = -force_scale * accum
+    rhs_body, H = _constraint_single_blocks(residual, force_scale, hessian_scale, P, r, is_parent, angular_only)
 
     _add_rhs_scalar_atomic(rhs_scalar, body_start + local_body, rhs_body)
     slot = _find_block_slot(articulation_block_row_offsets, articulation_block_cols, body_start, local_body, local_body)
@@ -547,9 +653,7 @@ def _assemble_angular_direct_pair_scalar(
     H_aa: wp.mat33,
     cross_slot: int,
 ):
-    rhs_parent = _vec6_from_parts(wp.vec3(0.0), torque_parent)
-    rhs_child = _vec6_from_parts(wp.vec3(0.0), -torque_parent)
-    H_block = _mat66_from_angular_block(H_aa)
+    rhs_parent, rhs_child, H_block, H_cross = _angular_direct_pair_blocks(torque_parent, H_aa)
 
     if parent_body >= 0 and parent_local >= 0:
         _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, rhs_parent)
@@ -563,7 +667,6 @@ def _assemble_angular_direct_pair_scalar(
         _add_mat66_scalar_atomic(values_scalar, slot_pp, H_block)
         _add_mat66_scalar_atomic(values_scalar, slot_cc, H_block)
 
-        H_cross = _mat66_from_angular_block(-H_aa)
         if parent_local >= child_local:
             slot_pc = _find_block_slot(
                 articulation_block_row_offsets, articulation_block_cols, body_start, parent_local, child_local
@@ -609,22 +712,23 @@ def _assemble_linear_joint_scalar(
     alpha: float,
     cross_slot: int,
 ):
-    C_vec = child_anchor - parent_anchor
-    C_stab = C_vec - alpha * C0_lin
-    force_residual = stiffness * (P * C_stab) + P * lambda_lin
-    hessian_scale = stiffness
-    if damping > 0.0:
-        residual_prev = child_anchor_prev - parent_anchor_prev
-        dC_dt = (C_vec - residual_prev) / dt
-        force_residual = force_residual + damping * (P * dC_dt)
-        hessian_scale = stiffness + damping / dt
-
-    child_pose = body_q[child_body]
-    r_child = child_anchor - wp.transform_point(child_pose, body_com[child_body])
+    force_residual, hessian_scale = _linear_joint_residual(
+        parent_anchor,
+        child_anchor,
+        parent_anchor_prev,
+        child_anchor_prev,
+        stiffness,
+        damping,
+        dt,
+        P,
+        lambda_lin,
+        C0_lin,
+        alpha,
+    )
+    r_child = _anchor_offset(body_q, body_com, child_body, child_anchor)
 
     if parent_body >= 0 and parent_local >= 0:
-        parent_pose = body_q[parent_body]
-        r_parent = parent_anchor - wp.transform_point(parent_pose, body_com[parent_body])
+        r_parent = _anchor_offset(body_q, body_com, parent_body, parent_anchor)
         _assemble_constraint_pair_scalar(
             values_scalar,
             rhs_scalar,
@@ -750,12 +854,10 @@ def _assemble_linear_axis_row_scalar(
 ):
     P = wp.outer(axis_world, axis_world)
     residual = axis_world
-    child_pose = body_q[child_body]
-    r_child = child_anchor - wp.transform_point(child_pose, body_com[child_body])
+    r_child = _anchor_offset(body_q, body_com, child_body, child_anchor)
 
     if parent_body >= 0 and parent_local >= 0:
-        parent_pose = body_q[parent_body]
-        r_parent = parent_anchor - wp.transform_point(parent_pose, body_com[parent_body])
+        r_parent = _anchor_offset(body_q, body_com, parent_body, parent_anchor)
         _assemble_constraint_pair_scalar(
             values_scalar,
             rhs_scalar,
@@ -841,27 +943,25 @@ def _assemble_coordinate_row_scalar(
     cross_slot: int,
 ):
     """Assemble a joint-coordinate row, including the parent-child coupling."""
-    gp = _vec6_from_parts(wp.spatial_top(gradient_parent), wp.spatial_bottom(gradient_parent))
-    gc = _vec6_from_parts(wp.spatial_top(gradient_child), wp.spatial_bottom(gradient_child))
+    rhs_parent, rhs_child, H_pp, H_cc, H_pc = _coordinate_row_blocks(gradient_parent, gradient_child, force, hessian)
     slot_cc = _find_block_slot(row_offsets, cols, body_start, child_local, child_local)
-    _add_mat66_scalar_atomic(values_scalar, slot_cc, hessian * wp.outer(gc, gc))
-    _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, -force * gc)
+    _add_mat66_scalar_atomic(values_scalar, slot_cc, H_cc)
+    _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child)
     if parent_local >= 0:
         slot_pp = _find_block_slot(row_offsets, cols, body_start, parent_local, parent_local)
-        _add_mat66_scalar_atomic(values_scalar, slot_pp, hessian * wp.outer(gp, gp))
-        _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, -force * gp)
+        _add_mat66_scalar_atomic(values_scalar, slot_pp, H_pp)
+        _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, rhs_parent)
         if parent_local >= child_local:
             slot_pc = _find_block_slot(row_offsets, cols, body_start, parent_local, child_local)
-            _add_mat66_scalar_atomic(values_scalar, slot_pc, hessian * wp.outer(gp, gc))
+            _add_mat66_scalar_atomic(values_scalar, slot_pc, H_pc)
         else:
             slot_cp = _find_block_slot(row_offsets, cols, body_start, child_local, parent_local)
-            _add_mat66_scalar_atomic(values_scalar, slot_cp, hessian * wp.outer(gc, gp))
-        _add_mat66_scalar_atomic(values_scalar, cross_slot, hessian * wp.outer(gp, gc))
+            _add_mat66_scalar_atomic(values_scalar, slot_cp, wp.transpose(H_pc))
+        _add_mat66_scalar_atomic(values_scalar, cross_slot, H_pc)
 
 
 @wp.func
 def _body_diagonal_contribution(
-    step_size: RigidStepSize,
     dt: float,
     local_body: int,
     articulation_bodies: wp.array[wp.int32],
@@ -881,7 +981,6 @@ def _body_diagonal_contribution(
     use_displacement: int,
 ):
     body = articulation_bodies[local_body]
-    dt = rigid_step_h(step_size, body, dt)
     q_current = body_q[body]
 
     diag = mat66f(0.0)
@@ -1426,8 +1525,7 @@ def assemble_articulation_body_diagonal_scalar(
 ):
     local_body = wp.tid()
     diag, rhs_value = _body_diagonal_contribution(
-        step_size,
-        dt,
+        rigid_step_h(step_size, articulation_bodies[local_body], dt),
         local_body,
         articulation_bodies,
         body_q,
@@ -1450,6 +1548,354 @@ def assemble_articulation_body_diagonal_scalar(
         _scalar_vec_set(rhs_scalar, local_body, i, rhs_value[i])
         for j in range(6):
             _scalar_block_set(values_scalar, diag_slot, i, j, diag[i, j])
+
+
+@wp.struct
+class _SparseJointGeometry:
+    """Endpoint frames and structural coefficients of one non-ROD joint, shared by the sparse joint walkers."""
+
+    child_anchor: wp.vec3
+    child_anchor_prev: wp.vec3
+    child_anchor_q: wp.quat
+    child_anchor_q_prev: wp.quat
+    child_rest_q: wp.quat
+    parent_anchor: wp.vec3
+    parent_anchor_prev: wp.vec3
+    parent_anchor_q: wp.quat
+    parent_anchor_q_prev: wp.quat
+    parent_rest_q: wp.quat
+    c_start: int
+    qd_start: int
+    lin_count: int
+    ang_count: int
+    P_lin: wp.mat33
+    P_ang: wp.mat33
+    lin_lambda: wp.vec3
+    lin_C0: wp.vec3
+    lin_alpha: float
+    ang_lambda: wp.vec3
+    ang_C0: wp.vec3
+    ang_alpha: float
+    k_linear: float
+    k_angular: float
+    kd_linear: float
+    kd_angular: float
+
+
+@wp.func
+def _sparse_joint_supported(jt: int) -> bool:
+    return (
+        jt == JointType.ROD
+        or jt == JointType.BALL
+        or jt == JointType.FIXED
+        or jt == JointType.REVOLUTE
+        or jt == JointType.PRISMATIC
+        or jt == JointType.D6
+    )
+
+
+@wp.func
+def _sparse_joint_geometry(
+    joint: int,
+    jt: int,
+    parent: int,
+    child: int,
+    X_p: wp.transform,
+    X_c: wp.transform,
+    X_p_prev: wp.transform,
+    X_c_prev: wp.transform,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[int],
+    joint_constraint_start: wp.array[int],
+    joint_penalty_k: wp.array[float],
+    joint_rho: wp.array[float],
+    joint_material_k: wp.array[float],
+    joint_penalty_kd: wp.array[float],
+    joint_dof_dim: wp.array2d[int],
+    joint_lambda_lin: wp.array[wp.vec3],
+    joint_lambda_ang: wp.array[wp.vec3],
+    joint_C0_lin: wp.array[wp.vec3],
+    joint_C0_ang: wp.array[wp.vec3],
+    joint_is_hard: wp.array[wp.int32],
+    avbd_alpha: float,
+    joint_compliant_alm: int,
+) -> _SparseJointGeometry:
+    """Evaluate the anchor frames, projectors and structural coefficients of a non-ROD joint."""
+    g = _SparseJointGeometry()
+    child_pose = body_q[child]
+    child_prev_pose = body_q_prev[child]
+    child_rest_pose = body_q_rest[child]
+    g.child_anchor = wp.transform_point(child_pose, wp.transform_get_translation(X_c))
+    g.child_anchor_prev = wp.transform_point(child_prev_pose, wp.transform_get_translation(X_c_prev))
+    g.child_anchor_q = wp.mul(wp.transform_get_rotation(child_pose), wp.transform_get_rotation(X_c))
+    g.child_anchor_q_prev = wp.mul(wp.transform_get_rotation(child_prev_pose), wp.transform_get_rotation(X_c_prev))
+    # Rest frames are undeformed, matching the local VBD joint evaluation.
+    g.child_rest_q = wp.mul(wp.transform_get_rotation(child_rest_pose), wp.transform_get_rotation(joint_X_c[joint]))
+
+    if parent >= 0:
+        parent_pose = body_q[parent]
+        parent_prev_pose = body_q_prev[parent]
+        parent_rest_pose = body_q_rest[parent]
+        g.parent_anchor = wp.transform_point(parent_pose, wp.transform_get_translation(X_p))
+        g.parent_anchor_prev = wp.transform_point(parent_prev_pose, wp.transform_get_translation(X_p_prev))
+        g.parent_anchor_q = wp.mul(wp.transform_get_rotation(parent_pose), wp.transform_get_rotation(X_p))
+        g.parent_anchor_q_prev = wp.mul(
+            wp.transform_get_rotation(parent_prev_pose), wp.transform_get_rotation(X_p_prev)
+        )
+        g.parent_rest_q = wp.mul(
+            wp.transform_get_rotation(parent_rest_pose), wp.transform_get_rotation(joint_X_p[joint])
+        )
+    else:
+        g.parent_anchor = wp.transform_get_translation(X_p)
+        g.parent_anchor_prev = g.parent_anchor
+        g.parent_anchor_q = wp.transform_get_rotation(X_p)
+        g.parent_anchor_q_prev = g.parent_anchor_q
+        g.parent_rest_q = g.parent_anchor_q
+
+    c_start = joint_constraint_start[joint]
+    qd_start = joint_qd_start[joint]
+    lin_count = int(0)
+    ang_count = int(0)
+    if jt == JointType.REVOLUTE:
+        ang_count = 1
+    elif jt == JointType.PRISMATIC:
+        lin_count = 1
+    elif jt == JointType.D6:
+        lin_count = joint_dof_dim[joint, 0]
+        ang_count = joint_dof_dim[joint, 1]
+    g.c_start = c_start
+    g.qd_start = qd_start
+    g.lin_count = lin_count
+    g.ang_count = ang_count
+
+    P_lin = wp.identity(3, float)
+    P_ang = wp.identity(3, float)
+    if jt == JointType.REVOLUTE or jt == JointType.PRISMATIC or jt == JointType.D6:
+        P_lin, P_ang = _joint_projectors(jt, joint_axis, qd_start, lin_count, ang_count, g.parent_anchor_q)
+    g.P_lin = P_lin
+    g.P_ang = P_ang
+
+    lin_lambda = wp.vec3(0.0)
+    lin_C0 = wp.vec3(0.0)
+    lin_alpha = float(0.0)
+    linear_hard = joint_is_hard[c_start] == 1
+    if linear_hard or joint_compliant_alm == 1:
+        lin_lambda = joint_lambda_lin[joint]
+        lin_C0 = joint_C0_lin[joint]
+        lin_alpha = avbd_alpha
+
+    ang_lambda = wp.vec3(0.0)
+    ang_C0 = wp.vec3(0.0)
+    ang_alpha = float(0.0)
+    ang_hard = int(0)
+    if jt != JointType.BALL:
+        ang_hard = joint_is_hard[c_start + 1]
+        if ang_hard == 1 or joint_compliant_alm == 1:
+            ang_lambda = joint_lambda_ang[joint]
+            ang_C0 = joint_C0_ang[joint]
+            ang_alpha = avbd_alpha
+
+    solve_weight_linear, solve_weight_angular, material_k_linear, material_k_angular, kd_linear, kd_angular = (
+        _load_sparse_structural_coefficients(
+            jt,
+            c_start,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_penalty_kd,
+            joint_compliant_alm,
+        )
+    )
+    k_linear, lin_lambda = _material_force_terms(
+        solve_weight_linear, material_k_linear, lin_lambda, joint_compliant_alm
+    )
+    k_angular, ang_lambda = _material_force_terms(
+        solve_weight_angular, material_k_angular, ang_lambda, joint_compliant_alm
+    )
+    g.lin_lambda = lin_lambda
+    g.lin_C0 = lin_C0
+    g.lin_alpha = lin_alpha
+    g.ang_lambda = ang_lambda
+    g.ang_C0 = ang_C0
+    g.ang_alpha = ang_alpha
+    g.k_linear = k_linear
+    g.k_angular = k_angular
+    g.kd_linear = kd_linear
+    g.kd_angular = kd_angular
+    return g
+
+
+@wp.func
+def _sparse_joint_friction_row(
+    joint_coordinates: JointCoordinateData,
+    joint: int,
+    component: int,
+    lin_count: int,
+    dof: int,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    joint_friction: wp.array[float],
+    joint_damping: wp.array[float],
+    dt: float,
+):
+    """Return ``(active, g_parent, g_child, force, hessian)`` of a free DOF's friction and damping row."""
+    friction = joint_friction[dof]
+    damping = wp.max(joint_damping[dof], 0.0)
+    if friction > 0.0 or damping > 0.0:
+        q, gp, gc = evaluate_coordinate(joint_coordinates, joint, component, body_q)
+        q_prev, _gp_prev, _gc_prev = evaluate_coordinate_prev(joint_coordinates, joint, component, body_q_prev)
+        delta = q - q_prev
+        if component >= lin_count:
+            delta = wp.atan2(wp.sin(delta), wp.cos(delta))
+        rate = delta / dt
+        force, hessian = _eval_joint_axis_friction(rate, friction, 1.0 / dt)
+        return True, gp, gc, force + damping * rate, hessian + damping / dt
+    return False, wp.spatial_vector(), wp.spatial_vector(), float(0.0), float(0.0)
+
+
+@wp.func
+def _sparse_joint_armature_row(
+    joint_coordinates: JointCoordinateData,
+    joint: int,
+    qd_start: int,
+    body_q: wp.array[wp.transform],
+    joint_armature: wp.array[float],
+    joint_armature_target: wp.array[float],
+    dt: float,
+):
+    """Return ``(active, g_parent, g_child, force, hessian)`` of a revolute joint's armature row."""
+    armature = joint_armature[qd_start]
+    if armature > 0.0:
+        q, gp, gc = evaluate_coordinate(joint_coordinates, joint, 0, body_q)
+        armature_hessian = armature / (dt * dt)
+        armature_force = armature_hessian * (q - joint_armature_target[qd_start])
+        return True, gp, gc, armature_force, armature_hessian
+    return False, wp.spatial_vector(), wp.spatial_vector(), float(0.0), float(0.0)
+
+
+@wp.func
+def _sparse_angular_drive_limit_row(
+    joint_coordinates: JointCoordinateData,
+    joint: int,
+    coordinate: int,
+    dof_idx: int,
+    target_q_idx: int,
+    penalty_slot: int,
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_penalty_k: wp.array[float],
+    joint_drive_limit_support: wp.array[float],
+    joint_drive_lambda: wp.array[float],
+    joint_limit_lambda: wp.array[float],
+    joint_compliant_alm: int,
+    dt: float,
+):
+    """Return ``(force, hessian, angular_jacobian_world)`` of an angular DOF's drive and limit row.
+
+    ``hessian`` is zero when the DOF has neither a drive nor a limit row.
+    """
+    has_drive = _drive_row_applies_force(joint_target_ke[dof_idx], joint_target_kd[dof_idx])
+    has_limits = _limit_row_exists(joint_limit_ke[dof_idx], joint_limit_lower[dof_idx], joint_limit_upper[dof_idx])
+    if has_drive or has_limits:
+        theta_abs, dtheta_dt, angular_jacobian_world = _evaluate_angular_coordinate(
+            joint_coordinates, joint, coordinate, body_q, body_q_prev, dt
+        )
+        force_scalar, hessian_scalar = _evaluate_sparse_drive_limit(
+            dof_idx,
+            target_q_idx,
+            penalty_slot,
+            theta_abs,
+            dtheta_dt,
+            joint_target_ke,
+            joint_target_kd,
+            joint_target_q,
+            joint_target_vel,
+            joint_limit_lower,
+            joint_limit_upper,
+            joint_limit_ke,
+            joint_limit_kd,
+            joint_penalty_k,
+            joint_drive_limit_support,
+            joint_drive_lambda,
+            joint_limit_lambda,
+            joint_compliant_alm,
+            dt,
+        )
+        return force_scalar, hessian_scalar, angular_jacobian_world
+    return float(0.0), float(0.0), wp.vec3(0.0)
+
+
+@wp.func
+def _sparse_linear_drive_limit_row(
+    dof_idx: int,
+    target_q_idx: int,
+    penalty_slot: int,
+    parent_anchor_q: wp.quat,
+    C_vec: wp.vec3,
+    C_vec_prev: wp.vec3,
+    joint_axis: wp.array[wp.vec3],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_penalty_k: wp.array[float],
+    joint_drive_limit_support: wp.array[float],
+    joint_drive_lambda: wp.array[float],
+    joint_limit_lambda: wp.array[float],
+    joint_compliant_alm: int,
+    dt: float,
+):
+    """Return ``(force, hessian, axis_world)`` of a linear DOF's drive and limit row.
+
+    ``C_vec`` is the child-minus-parent anchor separation; ``hessian`` is zero when the DOF has
+    neither a drive nor a limit row.
+    """
+    has_drive = _drive_row_applies_force(joint_target_ke[dof_idx], joint_target_kd[dof_idx])
+    has_limits = _limit_row_exists(joint_limit_ke[dof_idx], joint_limit_lower[dof_idx], joint_limit_upper[dof_idx])
+    if has_drive or has_limits:
+        axis_world = wp.normalize(wp.quat_rotate(parent_anchor_q, joint_axis[dof_idx]))
+        d_along = wp.dot(C_vec, axis_world)
+        dd_dt = wp.dot((C_vec - C_vec_prev) / dt, axis_world)
+        force_scalar, hessian_scalar = _evaluate_sparse_drive_limit(
+            dof_idx,
+            target_q_idx,
+            penalty_slot,
+            d_along,
+            dd_dt,
+            joint_target_ke,
+            joint_target_kd,
+            joint_target_q,
+            joint_target_vel,
+            joint_limit_lower,
+            joint_limit_upper,
+            joint_limit_ke,
+            joint_limit_kd,
+            joint_penalty_k,
+            joint_drive_limit_support,
+            joint_drive_lambda,
+            joint_limit_lambda,
+            joint_compliant_alm,
+            dt,
+        )
+        return force_scalar, hessian_scalar, axis_world
+    return float(0.0), float(0.0), wp.vec3(0.0)
 
 
 @functools.cache
@@ -1521,6 +1967,11 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
         values_scalar: wp.array[float],
         rhs_scalar: wp.array[float],
     ):
+        """Scatter one joint's terms into the block-sparse system, term by term.
+
+        The term sequence mirrors :func:`_evaluate_articulation_joint_terms`, which accumulates the same
+        blocks per endpoint instead; keep the two walkers in step.
+        """
         joint = articulation_joints[joint_cursor]
         if not joint_enabled[joint]:
             return
@@ -1530,14 +1981,7 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
             armature_incremental = rigid_step_bdf2(step_size, joint_child[joint], armature_incremental)
 
         jt = joint_type[joint]
-        if (
-            jt != JointType.ROD
-            and jt != JointType.BALL
-            and jt != JointType.FIXED
-            and jt != JointType.REVOLUTE
-            and jt != JointType.PRISMATIC
-            and jt != JointType.D6
-        ):
+        if not _sparse_joint_supported(jt):
             return
 
         child = joint_child[joint]
@@ -1679,92 +2123,42 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                 )
             return
 
-        child_pose = body_q[child]
-        child_prev_pose = body_q_prev[child]
-        child_rest_pose = body_q_rest[child]
-        child_anchor = wp.transform_point(child_pose, wp.transform_get_translation(X_c))
-        child_anchor_prev = wp.transform_point(child_prev_pose, wp.transform_get_translation(X_c_prev))
-        child_anchor_q = wp.mul(wp.transform_get_rotation(child_pose), wp.transform_get_rotation(X_c))
-        child_anchor_q_prev = wp.mul(wp.transform_get_rotation(child_prev_pose), wp.transform_get_rotation(X_c_prev))
-        # Rest frames are undeformed, matching the local VBD joint evaluation.
-        child_rest_q = wp.mul(wp.transform_get_rotation(child_rest_pose), wp.transform_get_rotation(joint_X_c[joint]))
-
-        if parent >= 0:
-            parent_pose = body_q[parent]
-            parent_prev_pose = body_q_prev[parent]
-            parent_rest_pose = body_q_rest[parent]
-            parent_anchor = wp.transform_point(parent_pose, wp.transform_get_translation(X_p))
-            parent_anchor_prev = wp.transform_point(parent_prev_pose, wp.transform_get_translation(X_p_prev))
-            parent_anchor_q = wp.mul(wp.transform_get_rotation(parent_pose), wp.transform_get_rotation(X_p))
-            parent_anchor_q_prev = wp.mul(
-                wp.transform_get_rotation(parent_prev_pose), wp.transform_get_rotation(X_p_prev)
-            )
-            parent_rest_q = wp.mul(
-                wp.transform_get_rotation(parent_rest_pose), wp.transform_get_rotation(joint_X_p[joint])
-            )
-        else:
-            parent_anchor = wp.transform_get_translation(X_p)
-            parent_anchor_prev = parent_anchor
-            parent_anchor_q = wp.transform_get_rotation(X_p)
-            parent_anchor_q_prev = parent_anchor_q
-            parent_rest_q = parent_anchor_q
-
-        c_start = joint_constraint_start[joint]
-        qd_start = joint_qd_start[joint]
-        lin_count = int(0)
-        ang_count = int(0)
-        if jt == JointType.REVOLUTE:
-            ang_count = 1
-        elif jt == JointType.PRISMATIC:
-            lin_count = 1
-        elif jt == JointType.D6:
-            lin_count = joint_dof_dim[joint, 0]
-            ang_count = joint_dof_dim[joint, 1]
-
-        P_lin = wp.identity(3, float)
-        P_ang = wp.identity(3, float)
-        if jt == JointType.REVOLUTE or jt == JointType.PRISMATIC or jt == JointType.D6:
-            P_lin, P_ang = _joint_projectors(jt, joint_axis, qd_start, lin_count, ang_count, parent_anchor_q)
-
-        lin_lambda = wp.vec3(0.0)
-        lin_C0 = wp.vec3(0.0)
-        lin_alpha = float(0.0)
-        linear_hard = joint_is_hard[c_start] == 1
-        if linear_hard or joint_compliant_alm == 1:
-            lin_lambda = joint_lambda_lin[joint]
-            lin_C0 = joint_C0_lin[joint]
-            lin_alpha = avbd_alpha
-
-        ang_lambda = wp.vec3(0.0)
-        ang_C0 = wp.vec3(0.0)
-        ang_alpha = float(0.0)
-        ang_hard = int(0)
-        if jt != JointType.BALL:
-            ang_hard = joint_is_hard[c_start + 1]
-            if ang_hard == 1 or joint_compliant_alm == 1:
-                ang_lambda = joint_lambda_ang[joint]
-                ang_C0 = joint_C0_ang[joint]
-                ang_alpha = avbd_alpha
-
-        solve_weight_linear, solve_weight_angular, material_k_linear, material_k_angular, kd_linear, kd_angular = (
-            _load_sparse_structural_coefficients(
-                jt,
-                c_start,
-                joint_penalty_k,
-                joint_rho,
-                joint_material_k,
-                joint_penalty_kd,
-                joint_compliant_alm,
-            )
+        g = _sparse_joint_geometry(
+            joint,
+            jt,
+            parent,
+            child,
+            X_p,
+            X_c,
+            X_p_prev,
+            X_c_prev,
+            body_q,
+            body_q_prev,
+            body_q_rest,
+            joint_X_p,
+            joint_X_c,
+            joint_axis,
+            joint_qd_start,
+            joint_constraint_start,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_penalty_kd,
+            joint_dof_dim,
+            joint_lambda_lin,
+            joint_lambda_ang,
+            joint_C0_lin,
+            joint_C0_ang,
+            joint_is_hard,
+            avbd_alpha,
+            joint_compliant_alm,
         )
-        k_linear, lin_lambda = _material_force_terms(
-            solve_weight_linear, material_k_linear, lin_lambda, joint_compliant_alm
-        )
-        k_angular, ang_lambda = _material_force_terms(
-            solve_weight_angular, material_k_angular, ang_lambda, joint_compliant_alm
-        )
+        c_start = g.c_start
+        qd_start = g.qd_start
+        lin_count = g.lin_count
+        ang_count = g.ang_count
 
-        if k_linear > 0.0 and (jt != JointType.D6 or lin_count < 3):
+        if g.k_linear > 0.0 and (jt != JointType.D6 or lin_count < 3):
             _assemble_linear_joint_scalar(
                 values_scalar,
                 rhs_scalar,
@@ -1775,23 +2169,23 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                 child_local,
                 parent,
                 child,
-                parent_anchor,
-                child_anchor,
-                parent_anchor_prev,
-                child_anchor_prev,
+                g.parent_anchor,
+                g.child_anchor,
+                g.parent_anchor_prev,
+                g.child_anchor_prev,
                 body_q,
                 body_com,
-                k_linear,
-                kd_linear,
+                g.k_linear,
+                g.kd_linear,
                 dt,
-                P_lin,
-                lin_lambda,
-                lin_C0,
-                lin_alpha,
+                g.P_lin,
+                g.lin_lambda,
+                g.lin_C0,
+                g.lin_alpha,
                 cross_slot,
             )
 
-        if k_angular > 0.0 and jt != JointType.BALL and (jt != JointType.D6 or ang_count < 3):
+        if g.k_angular > 0.0 and jt != JointType.BALL and (jt != JointType.D6 or ang_count < 3):
             sigma0 = wp.vec3(0.0)
             C_fric = wp.vec3(0.0)
             _kappa, _J_world = _assemble_angular_joint_scalar(
@@ -1803,21 +2197,21 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                 parent_local,
                 child_local,
                 parent,
-                parent_anchor_q,
-                child_anchor_q,
-                parent_anchor_q_prev,
-                child_anchor_q_prev,
-                parent_rest_q,
-                child_rest_q,
-                k_angular,
-                kd_angular,
+                g.parent_anchor_q,
+                g.child_anchor_q,
+                g.parent_anchor_q_prev,
+                g.child_anchor_q_prev,
+                g.parent_rest_q,
+                g.child_rest_q,
+                g.k_angular,
+                g.kd_angular,
                 dt,
-                P_ang,
+                g.P_ang,
                 sigma0,
                 C_fric,
-                ang_lambda,
-                ang_C0,
-                ang_alpha,
+                g.ang_lambda,
+                g.ang_C0,
+                g.ang_alpha,
                 cross_slot,
                 joint_axis,
                 qd_start + lin_count,
@@ -1826,19 +2220,19 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
 
         if jt == JointType.REVOLUTE or jt == JointType.PRISMATIC or jt == JointType.D6:
             for component in range(lin_count + ang_count):
-                dof = qd_start + component
-                friction = joint_friction[dof]
-                damping = wp.max(joint_damping[dof], 0.0)
-                if friction > 0.0 or damping > 0.0:
-                    q, gp, gc = evaluate_coordinate(joint_coordinates, joint, component, body_q)
-                    q_prev, _gp_prev, _gc_prev = evaluate_coordinate_prev(
-                        joint_coordinates, joint, component, body_q_prev
-                    )
-                    delta = q - q_prev
-                    if component >= lin_count:
-                        delta = wp.atan2(wp.sin(delta), wp.cos(delta))
-                    rate = delta / dt
-                    force, hessian = _eval_joint_axis_friction(rate, friction, 1.0 / dt)
+                active, gp, gc, force, hessian = _sparse_joint_friction_row(
+                    joint_coordinates,
+                    joint,
+                    component,
+                    lin_count,
+                    qd_start + component,
+                    body_q,
+                    body_q_prev,
+                    joint_friction,
+                    joint_damping,
+                    dt,
+                )
+                if active:
                     _assemble_coordinate_row_scalar(
                         values_scalar,
                         rhs_scalar,
@@ -1849,17 +2243,16 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                         child_local,
                         gp,
                         gc,
-                        force + damping * rate,
-                        hessian + damping / dt,
+                        force,
+                        hessian,
                         cross_slot,
                     )
 
         if jt == JointType.REVOLUTE:
-            armature = joint_armature[qd_start]
-            if armature > 0.0:
-                q, gp, gc = evaluate_coordinate(joint_coordinates, joint, 0, body_q)
-                armature_hessian = armature / (dt * dt)
-                residual = q - joint_armature_target[qd_start]
+            active, gp, gc, force, hessian = _sparse_joint_armature_row(
+                joint_coordinates, joint, qd_start, body_q, joint_armature, joint_armature_target, dt
+            )
+            if active:
                 if wp.static(bdf2):
                     if armature_incremental != 0:
                         # BDF2: q(x) - target = (q(x) - q_n) - (target - q_n), with the hinge increment composed
@@ -1876,7 +2269,7 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                             armature_pred_ang,
                         )
                         residual -= armature_delta[qd_start]
-                armature_force = armature_hessian * residual
+                        force = hessian * residual
                 _assemble_coordinate_row_scalar(
                     values_scalar,
                     rhs_scalar,
@@ -1887,227 +2280,145 @@ def _create_assemble_articulation_joint_scalar(bdf2: bool):
                     child_local,
                     gp,
                     gc,
-                    armature_force,
-                    armature_hessian,
+                    force,
+                    hessian,
                     cross_slot,
                 )
 
         if jt == JointType.REVOLUTE:
-            dof_idx = qd_start
-            target_q_idx = joint_target_q_start[joint]
-            has_drive = _drive_row_applies_force(joint_target_ke[dof_idx], joint_target_kd[dof_idx])
-            has_limits = _limit_row_exists(
-                joint_limit_ke[dof_idx], joint_limit_lower[dof_idx], joint_limit_upper[dof_idx]
+            force_scalar, hessian_scalar, angular_jacobian_world = _sparse_angular_drive_limit_row(
+                joint_coordinates,
+                joint,
+                0,
+                qd_start,
+                joint_target_q_start[joint],
+                c_start + 2,
+                body_q,
+                body_q_prev,
+                joint_target_ke,
+                joint_target_kd,
+                joint_target_q,
+                joint_target_vel,
+                joint_limit_lower,
+                joint_limit_upper,
+                joint_limit_ke,
+                joint_limit_kd,
+                joint_penalty_k,
+                joint_drive_limit_support,
+                joint_drive_lambda,
+                joint_limit_lambda,
+                joint_compliant_alm,
+                dt,
             )
-            if has_drive or has_limits:
-                theta_abs, dtheta_dt, angular_jacobian_world = _evaluate_angular_coordinate(
-                    joint_coordinates, joint, 0, body_q, body_q_prev, dt
+            if hessian_scalar > 0.0:
+                _assemble_angular_axis_row_scalar(
+                    values_scalar,
+                    rhs_scalar,
+                    articulation_block_row_offsets,
+                    articulation_block_cols,
+                    body_start,
+                    parent_local,
+                    child_local,
+                    parent,
+                    angular_jacobian_world,
+                    force_scalar,
+                    hessian_scalar,
+                    cross_slot,
                 )
 
-                force_scalar, hessian_scalar = _evaluate_sparse_drive_limit(
-                    dof_idx,
-                    target_q_idx,
-                    c_start + 2,
-                    theta_abs,
-                    dtheta_dt,
-                    joint_target_ke,
-                    joint_target_kd,
-                    joint_target_q,
-                    joint_target_vel,
-                    joint_limit_lower,
-                    joint_limit_upper,
-                    joint_limit_ke,
-                    joint_limit_kd,
-                    joint_penalty_k,
-                    joint_drive_limit_support,
-                    joint_drive_lambda,
-                    joint_limit_lambda,
-                    joint_compliant_alm,
-                    dt,
-                )
-
-                if hessian_scalar > 0.0:
-                    _assemble_angular_axis_row_scalar(
-                        values_scalar,
-                        rhs_scalar,
-                        articulation_block_row_offsets,
-                        articulation_block_cols,
-                        body_start,
-                        parent_local,
-                        child_local,
-                        parent,
-                        angular_jacobian_world,
-                        force_scalar,
-                        hessian_scalar,
-                        cross_slot,
-                    )
-
-        if jt == JointType.PRISMATIC:
-            dof_idx = qd_start
-            target_q_idx = joint_target_q_start[joint]
-            has_drive = _drive_row_applies_force(joint_target_ke[dof_idx], joint_target_kd[dof_idx])
-            has_limits = _limit_row_exists(
-                joint_limit_ke[dof_idx], joint_limit_lower[dof_idx], joint_limit_upper[dof_idx]
-            )
-            if has_drive or has_limits:
-                axis_world = wp.normalize(wp.quat_rotate(parent_anchor_q, joint_axis[dof_idx]))
-                C_vec = child_anchor - parent_anchor
-                C_vec_prev = child_anchor_prev - parent_anchor_prev
-                d_along = wp.dot(C_vec, axis_world)
-                dd_dt = wp.dot((C_vec - C_vec_prev) / dt, axis_world)
-
-                force_scalar, hessian_scalar = _evaluate_sparse_drive_limit(
-                    dof_idx,
-                    target_q_idx,
-                    c_start + 2,
-                    d_along,
-                    dd_dt,
-                    joint_target_ke,
-                    joint_target_kd,
-                    joint_target_q,
-                    joint_target_vel,
-                    joint_limit_lower,
-                    joint_limit_upper,
-                    joint_limit_ke,
-                    joint_limit_kd,
-                    joint_penalty_k,
-                    joint_drive_limit_support,
-                    joint_drive_lambda,
-                    joint_limit_lambda,
-                    joint_compliant_alm,
-                    dt,
-                )
-
-                if hessian_scalar > 0.0:
-                    _assemble_linear_axis_row_scalar(
-                        values_scalar,
-                        rhs_scalar,
-                        articulation_block_row_offsets,
-                        articulation_block_cols,
-                        body_start,
-                        parent_local,
-                        child_local,
-                        parent,
-                        child,
-                        parent_anchor,
-                        child_anchor,
-                        body_q,
-                        body_com,
-                        axis_world,
-                        force_scalar,
-                        hessian_scalar,
-                        cross_slot,
-                    )
-
-        if jt == JointType.D6:
-            C_vec = child_anchor - parent_anchor
-            C_vec_prev = child_anchor_prev - parent_anchor_prev
+        if jt == JointType.PRISMATIC or jt == JointType.D6:
+            C_vec = g.child_anchor - g.parent_anchor
+            C_vec_prev = g.child_anchor_prev - g.parent_anchor_prev
             target_q_base = joint_target_q_start[joint]
             for li in range(3):
                 if li < lin_count:
-                    dof_idx = qd_start + li
-                    target_q_idx = target_q_base + li
-                    has_drive = _drive_row_applies_force(joint_target_ke[dof_idx], joint_target_kd[dof_idx])
-                    has_limits = _limit_row_exists(
-                        joint_limit_ke[dof_idx], joint_limit_lower[dof_idx], joint_limit_upper[dof_idx]
+                    force_scalar, hessian_scalar, axis_world = _sparse_linear_drive_limit_row(
+                        qd_start + li,
+                        target_q_base + li,
+                        c_start + 2 + li,
+                        g.parent_anchor_q,
+                        C_vec,
+                        C_vec_prev,
+                        joint_axis,
+                        joint_target_ke,
+                        joint_target_kd,
+                        joint_target_q,
+                        joint_target_vel,
+                        joint_limit_lower,
+                        joint_limit_upper,
+                        joint_limit_ke,
+                        joint_limit_kd,
+                        joint_penalty_k,
+                        joint_drive_limit_support,
+                        joint_drive_lambda,
+                        joint_limit_lambda,
+                        joint_compliant_alm,
+                        dt,
                     )
-                    if has_drive or has_limits:
-                        axis_world = wp.normalize(wp.quat_rotate(parent_anchor_q, joint_axis[dof_idx]))
-                        d_along = wp.dot(C_vec, axis_world)
-                        dd_dt = wp.dot((C_vec - C_vec_prev) / dt, axis_world)
-                        force_scalar, hessian_scalar = _evaluate_sparse_drive_limit(
-                            dof_idx,
-                            target_q_idx,
-                            c_start + 2 + li,
-                            d_along,
-                            dd_dt,
-                            joint_target_ke,
-                            joint_target_kd,
-                            joint_target_q,
-                            joint_target_vel,
-                            joint_limit_lower,
-                            joint_limit_upper,
-                            joint_limit_ke,
-                            joint_limit_kd,
-                            joint_penalty_k,
-                            joint_drive_limit_support,
-                            joint_drive_lambda,
-                            joint_limit_lambda,
-                            joint_compliant_alm,
-                            dt,
+                    if hessian_scalar > 0.0:
+                        _assemble_linear_axis_row_scalar(
+                            values_scalar,
+                            rhs_scalar,
+                            articulation_block_row_offsets,
+                            articulation_block_cols,
+                            body_start,
+                            parent_local,
+                            child_local,
+                            parent,
+                            child,
+                            g.parent_anchor,
+                            g.child_anchor,
+                            body_q,
+                            body_com,
+                            axis_world,
+                            force_scalar,
+                            hessian_scalar,
+                            cross_slot,
                         )
 
-                        if hessian_scalar > 0.0:
-                            _assemble_linear_axis_row_scalar(
-                                values_scalar,
-                                rhs_scalar,
-                                articulation_block_row_offsets,
-                                articulation_block_cols,
-                                body_start,
-                                parent_local,
-                                child_local,
-                                parent,
-                                child,
-                                parent_anchor,
-                                child_anchor,
-                                body_q,
-                                body_com,
-                                axis_world,
-                                force_scalar,
-                                hessian_scalar,
-                                cross_slot,
-                            )
-
-            if ang_count > 0:
-                for ai in range(3):
-                    if ai < ang_count:
-                        dof_idx = qd_start + lin_count + ai
-                        target_q_idx = target_q_base + lin_count + ai
-                        has_drive = _drive_row_applies_force(joint_target_ke[dof_idx], joint_target_kd[dof_idx])
-                        has_limits = _limit_row_exists(
-                            joint_limit_ke[dof_idx], joint_limit_lower[dof_idx], joint_limit_upper[dof_idx]
+        if jt == JointType.D6:
+            target_q_base = joint_target_q_start[joint]
+            for ai in range(3):
+                if ai < ang_count:
+                    force_scalar, hessian_scalar, angular_jacobian_world = _sparse_angular_drive_limit_row(
+                        joint_coordinates,
+                        joint,
+                        lin_count + ai,
+                        qd_start + lin_count + ai,
+                        target_q_base + lin_count + ai,
+                        c_start + 2 + lin_count + ai,
+                        body_q,
+                        body_q_prev,
+                        joint_target_ke,
+                        joint_target_kd,
+                        joint_target_q,
+                        joint_target_vel,
+                        joint_limit_lower,
+                        joint_limit_upper,
+                        joint_limit_ke,
+                        joint_limit_kd,
+                        joint_penalty_k,
+                        joint_drive_limit_support,
+                        joint_drive_lambda,
+                        joint_limit_lambda,
+                        joint_compliant_alm,
+                        dt,
+                    )
+                    if hessian_scalar > 0.0:
+                        _assemble_angular_axis_row_scalar(
+                            values_scalar,
+                            rhs_scalar,
+                            articulation_block_row_offsets,
+                            articulation_block_cols,
+                            body_start,
+                            parent_local,
+                            child_local,
+                            parent,
+                            angular_jacobian_world,
+                            force_scalar,
+                            hessian_scalar,
+                            cross_slot,
                         )
-                        if has_drive or has_limits:
-                            theta_abs, dtheta_dt, angular_jacobian_world = _evaluate_angular_coordinate(
-                                joint_coordinates, joint, lin_count + ai, body_q, body_q_prev, dt
-                            )
-                            force_scalar, hessian_scalar = _evaluate_sparse_drive_limit(
-                                dof_idx,
-                                target_q_idx,
-                                c_start + 2 + lin_count + ai,
-                                theta_abs,
-                                dtheta_dt,
-                                joint_target_ke,
-                                joint_target_kd,
-                                joint_target_q,
-                                joint_target_vel,
-                                joint_limit_lower,
-                                joint_limit_upper,
-                                joint_limit_ke,
-                                joint_limit_kd,
-                                joint_penalty_k,
-                                joint_drive_limit_support,
-                                joint_drive_lambda,
-                                joint_limit_lambda,
-                                joint_compliant_alm,
-                                dt,
-                            )
-
-                            if hessian_scalar > 0.0:
-                                _assemble_angular_axis_row_scalar(
-                                    values_scalar,
-                                    rhs_scalar,
-                                    articulation_block_row_offsets,
-                                    articulation_block_cols,
-                                    body_start,
-                                    parent_local,
-                                    child_local,
-                                    parent,
-                                    angular_jacobian_world,
-                                    force_scalar,
-                                    hessian_scalar,
-                                    cross_slot,
-                                )
 
     return _assemble_articulation_joint_scalar
 
@@ -2254,6 +2565,746 @@ def create_assemble_articulation_joints_scalar(bdf2: bool):
 
 assemble_articulation_joints_scalar = create_assemble_articulation_joints_scalar(False)
 assemble_articulation_joints_scalar_bdf2 = create_assemble_articulation_joints_scalar(True)
+
+
+@wp.struct
+class JointEndpointTerms:
+    """One joint's terms at both endpoints, evaluated once per iterate for the block-sparse solve.
+
+    Written by :func:`evaluate_articulation_joint_terms`. Endpoint ``e`` is the parent or the child
+    body of the joint. Every quantity uses world axes and refers to the body's center of mass
+    ``c_e = transform_point(body_q[e], body_com[e])`` (the pose-transformed stored center of mass,
+    also for reduced elastic bodies). The endpoint twist is ``dx_e = [dc_e, dtheta_e]`` with
+    ``dc_e`` the center-of-mass displacement [m] and ``dtheta_e`` the world rotation vector [rad]
+    of the update ``q_new = exp(dtheta_e) q``, which is the update convention of the sparse solve.
+
+    - ``wrench_e`` is the generalized force ``-dE/dx_e`` (force [N], then torque about ``c_e``
+      [N m]). It is exactly what the joint adds to the sparse right-hand side row of ``e``; the
+      sparse system is ``H dx = rhs``.
+    - ``hessian_e`` is the self block and ``hessian_cross`` the parent-child block ``H_pc``
+      (parent rows, child columns; ``H_cp = H_pc^T``), as added to the sparse matrix. They keep
+      the existing Hessian policies: Gauss-Newton penalty rows (no residual curvature), the
+      linearized angular rows of :func:`_angular_constraint_force_hessian`, and the PSD split of
+      the ROD helpers.
+    - ``attachment_offset_e`` is ``r_e = a_e - c_e`` with ``a_e`` the joint attachment point in
+      world, deformed by the endpoint's modal coordinates when the body is reduced elastic.
+    - ``rotation_jacobian_e`` is the left Jacobian ``J_l(theta_e)`` (body axes) of the endpoint's
+      modal rotation vector ``theta_e = sum_k psi_k q_k``; identity for rigid endpoints.
+
+    Projection onto elastic generalized coordinates ``[dx_e, dq_e]``: the attachment frame of an
+    elastic endpoint moves under mode ``k`` like the body twist
+    ``G_e,k = [phi_w,k + r_e x psi_w,k ; psi_w,k]`` with ``phi_w,k = R_e phi_k`` and
+    ``psi_w,k = R_e J_l(theta_e) psi_k`` (see :func:`joint_endpoint_mode_twist`). With
+    ``J_e = [I_6 | G_e]`` the joint contributes ``g_i += J_i^T wrench_e`` to the right-hand side
+    rows of body ``i = e`` and ``H_ij += J_i^T K_st J_j`` to the matrix, where ``K_st`` is
+    ``hessian_e`` for ``s = t`` and ``hessian_cross`` (or its transpose) otherwise. Writing
+    ``K_al`` for the angular-linear part of a self block and ``S = [r_e]_x``, the attachment-referred
+    angular-linear block is ``K_al - S K_ll``. The exact ``J^T K J`` equals the attachment-referred
+    form of the local elastic block assembly
+    (``phi^T K_ll phi + psi^T (K_aa - S^T K_ll S) psi`` and frame columns ``K_ll phi``,
+    ``K_al phi + (K_aa - S^T K_ll S) psi``) exactly when ``K_al - S K_ll = 0``, which holds for
+    every point and axis row, angular row and coordinate row whose moment is taken about the
+    attachment. The ROD parent is the exception: its stretch/shear force acts with the lever arm
+    of the child anchor, so ``Kh = K_al - S K_ll != 0`` and ``J^T K J`` differs from the
+    attachment-referred form by ``[Kh^T psi ; Kh S psi]`` in the frame columns and by
+    ``phi^T Kh^T psi + psi^T Kh phi + psi^T (Kh S - S Kh^T) psi`` in the mode-mode block.
+    """
+
+    wrench_parent: vec6f
+    """Generalized force on the parent [N, N m]; zero when ``parent < 0``."""
+    wrench_child: vec6f
+    """Generalized force on the child [N, N m]."""
+    hessian_parent: mat66f
+    """Parent self block of the joint Hessian."""
+    hessian_child: mat66f
+    """Child self block of the joint Hessian."""
+    hessian_cross: mat66f
+    """Parent-child block ``H_pc`` (parent rows, child columns)."""
+    attachment_offset_parent: wp.vec3
+    """World vector from the parent's center of mass to its (deformed) attachment [m]."""
+    attachment_offset_child: wp.vec3
+    """World vector from the child's center of mass to its (deformed) attachment [m]."""
+    rotation_jacobian_parent: wp.mat33
+    """Left Jacobian of the parent attachment's modal rotation vector (body axes)."""
+    rotation_jacobian_child: wp.mat33
+    """Left Jacobian of the child attachment's modal rotation vector (body axes)."""
+    parent: wp.int32
+    """Body that receives the parent terms, or -1 when the joint acts on the child only."""
+    child: wp.int32
+    """Child body index."""
+    evaluated: wp.int32
+    """1 when the joint was evaluated; 0 for disabled, unsupported or childless joints (all terms zero)."""
+
+
+@wp.func
+def _endpoint_terms_add_pair(
+    terms: JointEndpointTerms,
+    rhs_parent: vec6f,
+    rhs_child: vec6f,
+    H_pp: mat66f,
+    H_cc: mat66f,
+    H_pc: mat66f,
+) -> JointEndpointTerms:
+    terms.wrench_parent = terms.wrench_parent + rhs_parent
+    terms.wrench_child = terms.wrench_child + rhs_child
+    terms.hessian_parent = terms.hessian_parent + H_pp
+    terms.hessian_child = terms.hessian_child + H_cc
+    terms.hessian_cross = terms.hessian_cross + H_pc
+    return terms
+
+
+@wp.func
+def _endpoint_terms_add_child(terms: JointEndpointTerms, rhs_child: vec6f, H_cc: mat66f) -> JointEndpointTerms:
+    terms.wrench_child = terms.wrench_child + rhs_child
+    terms.hessian_child = terms.hessian_child + H_cc
+    return terms
+
+
+@wp.func
+def _endpoint_terms_add_constraint(
+    terms: JointEndpointTerms,
+    parent_active: bool,
+    residual: wp.vec3,
+    force_scale: float,
+    hessian_scale: float,
+    P: wp.mat33,
+    r_parent: wp.vec3,
+    r_child: wp.vec3,
+) -> JointEndpointTerms:
+    """Accumulate a three-row anchor constraint, as :func:`_assemble_linear_joint_scalar` scatters it."""
+    if force_scale == 0.0 and hessian_scale <= 0.0:
+        return terms
+    if parent_active:
+        rhs_p, rhs_c, H_pp, H_pc, H_cc = _constraint_pair_blocks(
+            residual, force_scale, hessian_scale, P, r_parent, r_child, True, False, False
+        )
+        return _endpoint_terms_add_pair(terms, rhs_p, rhs_c, H_pp, H_cc, H_pc)
+    rhs_c, H_cc = _constraint_single_blocks(residual, force_scale, hessian_scale, P, r_child, False, False)
+    return _endpoint_terms_add_child(terms, rhs_c, H_cc)
+
+
+@wp.func
+def _endpoint_terms_add_angular(
+    terms: JointEndpointTerms, parent_active: bool, torque_parent: wp.vec3, H_aa: wp.mat33
+) -> JointEndpointTerms:
+    """Accumulate an angular term, as :func:`_assemble_angular_direct_pair_scalar` scatters it."""
+    rhs_p, rhs_c, H_self, H_cross = _angular_direct_pair_blocks(torque_parent, H_aa)
+    if parent_active:
+        return _endpoint_terms_add_pair(terms, rhs_p, rhs_c, H_self, H_self, H_cross)
+    return _endpoint_terms_add_child(terms, rhs_c, H_self)
+
+
+@wp.func
+def _endpoint_terms_add_coordinate(
+    terms: JointEndpointTerms,
+    parent_active: bool,
+    gradient_parent: wp.spatial_vector,
+    gradient_child: wp.spatial_vector,
+    force: float,
+    hessian: float,
+) -> JointEndpointTerms:
+    """Accumulate a joint-coordinate row, as :func:`_assemble_coordinate_row_scalar` scatters it."""
+    rhs_p, rhs_c, H_pp, H_cc, H_pc = _coordinate_row_blocks(gradient_parent, gradient_child, force, hessian)
+    if parent_active:
+        return _endpoint_terms_add_pair(terms, rhs_p, rhs_c, H_pp, H_cc, H_pc)
+    return _endpoint_terms_add_child(terms, rhs_c, H_cc)
+
+
+@wp.func
+def _sparse_joint_endpoint_rotation_jacobian(
+    elastic: SparseElasticJointData, joint: int, body: int, is_parent_side: bool
+) -> wp.mat33:
+    """Return ``J_l(theta)`` of a joint attachment's modal rotation vector, or identity when it is rigid."""
+    J = wp.identity(3, float)
+    if elastic.enabled == 0 or body < 0:
+        return J
+    elastic_index = elastic.body_elastic_index[body]
+    if elastic_index < 0:
+        return J
+    endpoint = elastic.child_endpoint[joint]
+    if is_parent_side:
+        endpoint = elastic.parent_endpoint[joint]
+    if endpoint < 0:
+        return J
+    q_start = elastic.joint_q_start[elastic.elastic_joint[elastic_index]] + 7
+    mode_count = elastic.elastic_mode_count[elastic_index]
+    theta = wp.vec3(0.0)
+    for mode in range(mode_count):
+        theta = theta + elastic.endpoint_psi[endpoint * elastic.max_mode_count + mode] * elastic.joint_q[q_start + mode]
+    return _so3_left_jacobian(theta)
+
+
+@wp.func
+def _evaluate_articulation_joint_terms(
+    joint: int,
+    dt: float,
+    body_articulation_local: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_rod_rest_kb_local: wp.array[wp.vec3],
+    joint_rod_rest_twist: wp.array[float],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_constraint_start: wp.array[int],
+    joint_penalty_k: wp.array[float],
+    joint_rho: wp.array[float],
+    joint_material_k: wp.array[float],
+    joint_penalty_kd: wp.array[float],
+    joint_sigma_start: wp.array[wp.vec3],
+    joint_C_fric: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    joint_coordinates: JointCoordinateData,
+    joint_friction: wp.array[float],
+    joint_damping: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_armature: wp.array[float],
+    joint_armature_target: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_drive_limit_support: wp.array[float],
+    joint_drive_lambda: wp.array[float],
+    joint_limit_lambda: wp.array[float],
+    joint_lambda_lin: wp.array[wp.vec3],
+    joint_lambda_ang: wp.array[wp.vec3],
+    joint_C0_lin: wp.array[wp.vec3],
+    joint_C0_ang: wp.array[wp.vec3],
+    joint_is_hard: wp.array[wp.int32],
+    avbd_alpha: float,
+    joint_compliant_alm: int,
+    elastic: SparseElasticJointData,
+) -> JointEndpointTerms:
+    """Evaluate one joint's endpoint terms; see :class:`JointEndpointTerms`.
+
+    Follows the term sequence and gating of :func:`_assemble_articulation_joint_scalar` (structural
+    rows, friction and damping, armature, drives and limits, ROD through the shared ROD helpers,
+    world parents) and accumulates the same blocks per endpoint instead of scattering them.
+    """
+    terms = JointEndpointTerms()
+    terms.parent = -1
+    terms.child = -1
+    terms.rotation_jacobian_parent = wp.identity(3, float)
+    terms.rotation_jacobian_child = wp.identity(3, float)
+    if not joint_enabled[joint]:
+        return terms
+
+    jt = joint_type[joint]
+    if not _sparse_joint_supported(jt):
+        return terms
+
+    child = joint_child[joint]
+    parent = joint_parent[joint]
+    if child < 0:
+        return terms
+
+    parent_local = -1
+    if parent >= 0:
+        parent_local = body_articulation_local[parent]
+    parent_active = parent >= 0 and parent_local >= 0
+
+    X_p = _sparse_joint_frame(elastic, joint, parent, True, joint_X_p[joint], False)
+    X_c = _sparse_joint_frame(elastic, joint, child, False, joint_X_c[joint], False)
+    X_p_prev = _sparse_joint_frame(elastic, joint, parent, True, joint_X_p[joint], True)
+    X_c_prev = _sparse_joint_frame(elastic, joint, child, False, joint_X_c[joint], True)
+
+    terms.evaluated = 1
+    terms.child = child
+    terms.attachment_offset_child = _anchor_offset(
+        body_q, body_com, child, wp.transform_point(body_q[child], wp.transform_get_translation(X_c))
+    )
+    terms.rotation_jacobian_child = _sparse_joint_endpoint_rotation_jacobian(elastic, joint, child, False)
+    if parent >= 0:
+        terms.attachment_offset_parent = _anchor_offset(
+            body_q, body_com, parent, wp.transform_point(body_q[parent], wp.transform_get_translation(X_p))
+        )
+        terms.rotation_jacobian_parent = _sparse_joint_endpoint_rotation_jacobian(elastic, joint, parent, True)
+
+    if jt == JointType.ROD:
+        child_force, child_torque, child_H_ll, child_H_al, child_H_aa = evaluate_rod_joint_force_hessian(
+            child,
+            joint,
+            body_q,
+            body_q_prev,
+            body_com,
+            joint_parent,
+            joint_child,
+            X_p,
+            X_c,
+            X_p_prev,
+            X_c_prev,
+            joint_rod_rest_kb_local,
+            joint_rod_rest_twist,
+            joint_constraint_start,
+            joint_penalty_k,
+            joint_rho,
+            joint_material_k,
+            joint_penalty_kd,
+            joint_sigma_start,
+            joint_C_fric,
+            joint_lambda_lin,
+            joint_lambda_ang,
+            joint_C0_lin,
+            joint_C0_ang,
+            joint_is_hard,
+            avbd_alpha,
+            joint_compliant_alm,
+            dt,
+        )
+        terms = _endpoint_terms_add_child(
+            terms,
+            _vec6_from_parts(child_force, child_torque),
+            _mat66_from_blocks(child_H_ll, child_H_al, child_H_aa),
+        )
+        if parent >= 0:
+            terms.parent = parent
+            parent_force, parent_torque, parent_H_ll, parent_H_al, parent_H_aa = evaluate_rod_joint_force_hessian(
+                parent,
+                joint,
+                body_q,
+                body_q_prev,
+                body_com,
+                joint_parent,
+                joint_child,
+                X_p,
+                X_c,
+                X_p_prev,
+                X_c_prev,
+                joint_rod_rest_kb_local,
+                joint_rod_rest_twist,
+                joint_constraint_start,
+                joint_penalty_k,
+                joint_rho,
+                joint_material_k,
+                joint_penalty_kd,
+                joint_sigma_start,
+                joint_C_fric,
+                joint_lambda_lin,
+                joint_lambda_ang,
+                joint_C0_lin,
+                joint_C0_ang,
+                joint_is_hard,
+                avbd_alpha,
+                joint_compliant_alm,
+                dt,
+            )
+            cross = _rod_cross_hessian(
+                dt,
+                joint,
+                parent,
+                child,
+                body_q,
+                body_com,
+                X_p,
+                X_c,
+                joint_constraint_start,
+                joint_penalty_k,
+                joint_rho,
+                joint_material_k,
+                joint_penalty_kd,
+                joint_C_fric,
+                joint_is_hard,
+                joint_compliant_alm,
+            )
+            terms.wrench_parent = terms.wrench_parent + _vec6_from_parts(parent_force, parent_torque)
+            terms.hessian_parent = terms.hessian_parent + _mat66_from_blocks(parent_H_ll, parent_H_al, parent_H_aa)
+            terms.hessian_cross = terms.hessian_cross + cross
+        return terms
+
+    if parent_active:
+        terms.parent = parent
+
+    g = _sparse_joint_geometry(
+        joint,
+        jt,
+        parent,
+        child,
+        X_p,
+        X_c,
+        X_p_prev,
+        X_c_prev,
+        body_q,
+        body_q_prev,
+        body_q_rest,
+        joint_X_p,
+        joint_X_c,
+        joint_axis,
+        joint_qd_start,
+        joint_constraint_start,
+        joint_penalty_k,
+        joint_rho,
+        joint_material_k,
+        joint_penalty_kd,
+        joint_dof_dim,
+        joint_lambda_lin,
+        joint_lambda_ang,
+        joint_C0_lin,
+        joint_C0_ang,
+        joint_is_hard,
+        avbd_alpha,
+        joint_compliant_alm,
+    )
+    c_start = g.c_start
+    qd_start = g.qd_start
+    lin_count = g.lin_count
+    ang_count = g.ang_count
+    r_child = _anchor_offset(body_q, body_com, child, g.child_anchor)
+    r_parent = wp.vec3(0.0)
+    if parent_active:
+        r_parent = _anchor_offset(body_q, body_com, parent, g.parent_anchor)
+
+    if g.k_linear > 0.0 and (jt != JointType.D6 or lin_count < 3):
+        force_residual, hessian_scale = _linear_joint_residual(
+            g.parent_anchor,
+            g.child_anchor,
+            g.parent_anchor_prev,
+            g.child_anchor_prev,
+            g.k_linear,
+            g.kd_linear,
+            dt,
+            g.P_lin,
+            g.lin_lambda,
+            g.lin_C0,
+            g.lin_alpha,
+        )
+        terms = _endpoint_terms_add_constraint(
+            terms, parent_active, force_residual, 1.0, hessian_scale, g.P_lin, r_parent, r_child
+        )
+
+    if g.k_angular > 0.0 and jt != JointType.BALL and (jt != JointType.D6 or ang_count < 3):
+        torque_parent, H_aa, _kappa, _J_world = _angular_constraint_force_hessian(
+            g.parent_anchor_q,
+            g.child_anchor_q,
+            g.parent_anchor_q_prev,
+            g.child_anchor_q_prev,
+            g.parent_rest_q,
+            g.child_rest_q,
+            g.k_angular,
+            g.P_ang,
+            wp.vec3(0.0),
+            wp.vec3(0.0),
+            g.ang_lambda,
+            g.ang_C0,
+            g.ang_alpha,
+            g.kd_angular,
+            dt,
+            joint_axis,
+            qd_start + lin_count,
+            ang_count,
+        )
+        terms = _endpoint_terms_add_angular(terms, parent_active, torque_parent, H_aa)
+
+    if jt == JointType.REVOLUTE or jt == JointType.PRISMATIC or jt == JointType.D6:
+        for component in range(lin_count + ang_count):
+            active, gp, gc, force, hessian = _sparse_joint_friction_row(
+                joint_coordinates,
+                joint,
+                component,
+                lin_count,
+                qd_start + component,
+                body_q,
+                body_q_prev,
+                joint_friction,
+                joint_damping,
+                dt,
+            )
+            if active:
+                terms = _endpoint_terms_add_coordinate(terms, parent_active, gp, gc, force, hessian)
+
+    if jt == JointType.REVOLUTE:
+        active, gp, gc, force, hessian = _sparse_joint_armature_row(
+            joint_coordinates, joint, qd_start, body_q, joint_armature, joint_armature_target, dt
+        )
+        if active:
+            terms = _endpoint_terms_add_coordinate(terms, parent_active, gp, gc, force, hessian)
+
+    if jt == JointType.REVOLUTE:
+        force_scalar, hessian_scalar, angular_jacobian_world = _sparse_angular_drive_limit_row(
+            joint_coordinates,
+            joint,
+            0,
+            qd_start,
+            joint_target_q_start[joint],
+            c_start + 2,
+            body_q,
+            body_q_prev,
+            joint_target_ke,
+            joint_target_kd,
+            joint_target_q,
+            joint_target_vel,
+            joint_limit_lower,
+            joint_limit_upper,
+            joint_limit_ke,
+            joint_limit_kd,
+            joint_penalty_k,
+            joint_drive_limit_support,
+            joint_drive_lambda,
+            joint_limit_lambda,
+            joint_compliant_alm,
+            dt,
+        )
+        if hessian_scalar > 0.0:
+            terms = _endpoint_terms_add_angular(
+                terms,
+                parent_active,
+                force_scalar * angular_jacobian_world,
+                hessian_scalar * wp.outer(angular_jacobian_world, angular_jacobian_world),
+            )
+
+    if jt == JointType.PRISMATIC or jt == JointType.D6:
+        C_vec = g.child_anchor - g.parent_anchor
+        C_vec_prev = g.child_anchor_prev - g.parent_anchor_prev
+        target_q_base = joint_target_q_start[joint]
+        for li in range(3):
+            if li < lin_count:
+                force_scalar, hessian_scalar, axis_world = _sparse_linear_drive_limit_row(
+                    qd_start + li,
+                    target_q_base + li,
+                    c_start + 2 + li,
+                    g.parent_anchor_q,
+                    C_vec,
+                    C_vec_prev,
+                    joint_axis,
+                    joint_target_ke,
+                    joint_target_kd,
+                    joint_target_q,
+                    joint_target_vel,
+                    joint_limit_lower,
+                    joint_limit_upper,
+                    joint_limit_ke,
+                    joint_limit_kd,
+                    joint_penalty_k,
+                    joint_drive_limit_support,
+                    joint_drive_lambda,
+                    joint_limit_lambda,
+                    joint_compliant_alm,
+                    dt,
+                )
+                if hessian_scalar > 0.0:
+                    terms = _endpoint_terms_add_constraint(
+                        terms,
+                        parent_active,
+                        axis_world,
+                        force_scalar,
+                        hessian_scalar,
+                        wp.outer(axis_world, axis_world),
+                        r_parent,
+                        r_child,
+                    )
+
+    if jt == JointType.D6:
+        target_q_base = joint_target_q_start[joint]
+        for ai in range(3):
+            if ai < ang_count:
+                force_scalar, hessian_scalar, angular_jacobian_world = _sparse_angular_drive_limit_row(
+                    joint_coordinates,
+                    joint,
+                    lin_count + ai,
+                    qd_start + lin_count + ai,
+                    target_q_base + lin_count + ai,
+                    c_start + 2 + lin_count + ai,
+                    body_q,
+                    body_q_prev,
+                    joint_target_ke,
+                    joint_target_kd,
+                    joint_target_q,
+                    joint_target_vel,
+                    joint_limit_lower,
+                    joint_limit_upper,
+                    joint_limit_ke,
+                    joint_limit_kd,
+                    joint_penalty_k,
+                    joint_drive_limit_support,
+                    joint_drive_lambda,
+                    joint_limit_lambda,
+                    joint_compliant_alm,
+                    dt,
+                )
+                if hessian_scalar > 0.0:
+                    terms = _endpoint_terms_add_angular(
+                        terms,
+                        parent_active,
+                        force_scalar * angular_jacobian_world,
+                        hessian_scalar * wp.outer(angular_jacobian_world, angular_jacobian_world),
+                    )
+
+    return terms
+
+
+@wp.kernel
+def evaluate_articulation_joint_terms(
+    dt: float,
+    joints: wp.array[wp.int32],
+    body_articulation_local: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_q_rest: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_rod_rest_kb_local: wp.array[wp.vec3],
+    joint_rod_rest_twist: wp.array[float],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_constraint_start: wp.array[int],
+    joint_penalty_k: wp.array[float],
+    joint_rho: wp.array[float],
+    joint_material_k: wp.array[float],
+    joint_penalty_kd: wp.array[float],
+    joint_sigma_start: wp.array[wp.vec3],
+    joint_C_fric: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    joint_coordinates: JointCoordinateData,
+    joint_friction: wp.array[float],
+    joint_damping: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_armature: wp.array[float],
+    joint_armature_target: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_limit_ke: wp.array[float],
+    joint_limit_kd: wp.array[float],
+    joint_drive_limit_support: wp.array[float],
+    joint_drive_lambda: wp.array[float],
+    joint_limit_lambda: wp.array[float],
+    joint_lambda_lin: wp.array[wp.vec3],
+    joint_lambda_ang: wp.array[wp.vec3],
+    joint_C0_lin: wp.array[wp.vec3],
+    joint_C0_ang: wp.array[wp.vec3],
+    joint_is_hard: wp.array[wp.int32],
+    avbd_alpha: float,
+    joint_compliant_alm: int,
+    elastic: SparseElasticJointData,
+    terms: wp.array[JointEndpointTerms],
+):
+    """Evaluate the endpoint terms of ``joints[tid]`` into ``terms[tid]``; one thread per listed joint.
+
+    Arguments mean the same as for :func:`assemble_articulation_joints_scalar`; ``body_articulation_local``
+    marks parents outside the articulation (negative), which act like the world.
+    """
+    tid = wp.tid()
+    terms[tid] = _evaluate_articulation_joint_terms(
+        joints[tid],
+        dt,
+        body_articulation_local,
+        body_q,
+        body_q_prev,
+        body_q_rest,
+        body_com,
+        joint_type,
+        joint_enabled,
+        joint_parent,
+        joint_child,
+        joint_X_p,
+        joint_X_c,
+        joint_axis,
+        joint_rod_rest_kb_local,
+        joint_rod_rest_twist,
+        joint_qd_start,
+        joint_target_q_start,
+        joint_constraint_start,
+        joint_penalty_k,
+        joint_rho,
+        joint_material_k,
+        joint_penalty_kd,
+        joint_sigma_start,
+        joint_C_fric,
+        joint_dof_dim,
+        joint_coordinates,
+        joint_friction,
+        joint_damping,
+        joint_target_ke,
+        joint_target_kd,
+        joint_armature,
+        joint_armature_target,
+        joint_target_q,
+        joint_target_vel,
+        joint_limit_lower,
+        joint_limit_upper,
+        joint_limit_ke,
+        joint_limit_kd,
+        joint_drive_limit_support,
+        joint_drive_lambda,
+        joint_limit_lambda,
+        joint_lambda_lin,
+        joint_lambda_ang,
+        joint_C0_lin,
+        joint_C0_ang,
+        joint_is_hard,
+        avbd_alpha,
+        joint_compliant_alm,
+        elastic,
+    )
+
+
+@wp.func
+def joint_endpoint_mode_count(elastic: SparseElasticJointData, joint: int, body: int, is_parent_side: bool) -> int:
+    """Return the number of modes that move a joint attachment, or 0 for rigid endpoints."""
+    if elastic.enabled == 0 or body < 0:
+        return 0
+    elastic_index = elastic.body_elastic_index[body]
+    if elastic_index < 0:
+        return 0
+    endpoint = elastic.child_endpoint[joint]
+    if is_parent_side:
+        endpoint = elastic.parent_endpoint[joint]
+    if endpoint < 0:
+        return 0
+    return elastic.elastic_mode_count[elastic_index]
+
+
+@wp.func
+def joint_endpoint_mode_shape(elastic: SparseElasticJointData, joint: int, is_parent_side: bool, mode: int):
+    """Return the body-axes ``(phi_k, psi_k)`` of mode ``k`` at a joint attachment.
+
+    Only valid for ``mode < joint_endpoint_mode_count(...)``.
+    """
+    endpoint = elastic.child_endpoint[joint]
+    if is_parent_side:
+        endpoint = elastic.parent_endpoint[joint]
+    idx = endpoint * elastic.max_mode_count + mode
+    return elastic.endpoint_phi[idx], elastic.endpoint_psi[idx]
+
+
+@wp.func
+def joint_endpoint_mode_twist(
+    rotation: wp.mat33,
+    rotation_jacobian_world: wp.mat33,
+    attachment_offset: wp.vec3,
+    phi: wp.vec3,
+    psi: wp.vec3,
+) -> vec6f:
+    """Return the projection column ``G_e,k = [R phi + r x psi_w ; psi_w]`` of one mode at an attachment.
+
+    ``rotation`` is the body rotation ``R``, ``rotation_jacobian_world`` is
+    ``R J_l(theta_e)`` (``JointEndpointTerms.rotation_jacobian_*`` premultiplied by ``R``),
+    ``attachment_offset`` is ``r_e`` and ``phi``, ``psi`` are the body-axes mode shapes at the
+    attachment, so ``psi_w = R J_l(theta_e) psi``. ``G_e,k`` is the center-of-mass twist that moves
+    the attachment frame like a unit increment of mode ``k`` (same convention as the Schur columns
+    of ``reduced_elastic_sparse_kernels``).
+    """
+    psi_w = rotation_jacobian_world * psi
+    return _vec6_from_parts(rotation * phi + wp.cross(attachment_offset, psi_w), psi_w)
 
 
 @wp.func
@@ -2564,8 +3615,7 @@ def create_solve_articulation_sparse_serial_scalar(bdf2: bool):
         if assemble:
             for local_body in range(body_start, body_end):
                 diag, rhs_value = _body_diagonal_contribution(
-                    step_size,
-                    dt,
+                    rigid_step_h(step_size, articulation_bodies[local_body], dt),
                     local_body,
                     articulation_bodies,
                     body_q,

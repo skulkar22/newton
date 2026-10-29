@@ -97,7 +97,7 @@ def _elastic_com(model, state):
     return first_moment / mass.sum()
 
 
-def _elastic_com_drift(device, dt, seconds):
+def _elastic_com_drift(device, dt, seconds, backend="schur"):
     """Drive a free rigid link and a reduced elastic link against each other and return the COM drift [m]."""
     length = 0.6
     beam = newton.ModalGeneratorBeam
@@ -138,6 +138,7 @@ def _elastic_com_drift(device, dt, seconds):
         model,
         iterations=12,
         rigid_articulation_solve="block_sparse_joints",
+        rigid_articulation_elastic_solve=backend,
         rigid_articulation_relaxation=0.65,
         rigid_joint_linear_ke=1.0e6,
         rigid_joint_angular_ke=1.0e6,
@@ -158,7 +159,7 @@ def _elastic_com_drift(device, dt, seconds):
     return float(np.linalg.norm(_elastic_com(model, s0) - com0))
 
 
-def test_vbd_sparse_elastic_internal_drive_conserves_com(test, device):
+def test_vbd_sparse_elastic_internal_drive_conserves_com(test, device, backend):
     """Keep the center of mass of a free rigid-elastic articulation fixed under an internal drive.
 
     The elastic link's frame takes the sparse displacement-form update like a rigid body, and its
@@ -166,9 +167,10 @@ def test_vbd_sparse_elastic_internal_drive_conserves_com(test, device):
     first-moment coupling of about 0.9 kg per bending mode, so the measured drift is the float32
     accumulation floor of the coupled frame and modal updates over 2000 steps: about 2.5e-5 m,
     independent of the iteration count (12 to 48) and relaxation (0.65 to 0.9); the local solve gives
-    about 1.3e-5 m at 24 iterations. The bound is set at twice that floor.
+    about 1.3e-5 m at 24 iterations. The bound is set at twice that floor. The coupled backend
+    (one 9-wide row for the elastic link) applies the same displacement-form frame update.
     """
-    drift = _elastic_com_drift(device, dt=0.001, seconds=2.0)
+    drift = _elastic_com_drift(device, dt=0.001, seconds=2.0, backend=backend)
     test.assertLess(drift, 5.0e-5, f"COM drift {drift:.3e} m")
 
 
@@ -182,12 +184,14 @@ add_function_test(
     test_vbd_sparse_internal_drive_conserves_com,
     devices=get_test_devices(),
 )
-add_function_test(
-    TestSolverVBDMomentum,
-    "test_vbd_sparse_elastic_internal_drive_conserves_com",
-    test_vbd_sparse_elastic_internal_drive_conserves_com,
-    devices=get_test_devices(),
-)
+for _backend in ("schur", "coupled"):
+    add_function_test(
+        TestSolverVBDMomentum,
+        f"test_vbd_sparse_elastic_internal_drive_conserves_com_{_backend}",
+        test_vbd_sparse_elastic_internal_drive_conserves_com,
+        devices=get_test_devices(),
+        backend=_backend,
+    )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

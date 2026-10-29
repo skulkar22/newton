@@ -838,6 +838,7 @@ def _elastic_frame_inertial_rows(
 def assemble_elastic_blocks(
     dt: float,
     solve_frame: bool,
+    joint_terms: bool,
     body_ids: wp.array[wp.int32],
     elastic_joint: wp.array[wp.int32],
     elastic_mode_start: wp.array[wp.int32],
@@ -909,6 +910,14 @@ def assemble_elastic_blocks(
     ``D = sum_ij q_i q_j P_ij``. A dynamic frame flagged in ``body_uses_displacement`` (with
     ``use_displacement``) takes its inertial force, torque and ``a_c - g`` from the accumulated
     displacement from the inertial target (see :func:`_apply_elastic_block_delta`).
+
+    With ``joint_terms`` the block also holds the terms of every attached joint with an elastic
+    endpoint on the body (read from ``endpoint_terms``, attachment-referred, body axes): the local
+    block solve and the Schur backend use this. Without it, ``endpoint_terms`` is not read and the
+    block holds only the body's own terms (inertia, modal mass, stiffness and damping, inertial
+    coupling, and the external forces and Hessians of ``external_*``); the coupled articulation
+    backend adds the joint terms through the shared endpoint evaluator instead (see
+    :mod:`~newton._src.solvers.vbd.rigid_sparse_articulation_variable_assembly`).
     """
     slot, column = wp.tid()
     body = body_ids[slot]
@@ -942,6 +951,8 @@ def assemble_elastic_blocks(
 
     adjacent_offset = adjacency.body_adj_joints_offsets[body]
     adjacent_joint_count = get_body_num_adjacent_joints(adjacency, body)
+    if not joint_terms:
+        adjacent_joint_count = 0
     mode = column - 6
 
     if column < 6:

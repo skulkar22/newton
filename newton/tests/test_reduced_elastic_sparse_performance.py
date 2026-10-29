@@ -18,6 +18,8 @@ devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 
 _SPARSE = "block_sparse_joints"
+# The Schur-backend internals below pin the comparison backend explicitly.
+_SCHUR = {"rigid_articulation_elastic_solve": "schur"}
 _DT = 1.0 / 480.0
 
 
@@ -228,7 +230,7 @@ def test_sparse_modal_solve_matches_float64_reference(test, device):
     of the same assembled data to ``rtol = 1e-4``.
     """
     model, state = _make_beam_links_model(device, [64])
-    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=_SPARSE)
+    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=_SPARSE, **_SCHUR)
     test.assertEqual(solver._sparse_elastic_modal_solve[0], "tiled")
     _step(model, state, solver, 3)
     _assert_modal_schur_matches_reference(test, solver, 1.0e-4, "tiled, 64 modes")
@@ -244,7 +246,11 @@ def test_sparse_modal_dense_solve_matches_tiled(test, device):
     for elastic_block_solver, path in (("auto", "tiled"), ("dense", "dense")):
         model, state = _make_beam_links_model(device, [40, 23])
         solver = newton.solvers.SolverVBD(
-            model, iterations=4, rigid_articulation_solve=_SPARSE, elastic_block_solver=elastic_block_solver
+            model,
+            iterations=4,
+            rigid_articulation_solve=_SPARSE,
+            elastic_block_solver=elastic_block_solver,
+            **_SCHUR,
         )
         test.assertEqual(solver._sparse_elastic_modal_solve[0], path)
         state = _step(model, state, solver, 20)
@@ -271,7 +277,7 @@ def test_sparse_modal_fallback_keeps_frames_definite(test, device):
             # The fixture is deliberately inconsistent; its construction warnings are expected.
             warnings.simplefilter("ignore")
             model, state = _make_inconsistent_leaf_link_model(device)
-            solver = newton.solvers.SolverVBD(model, iterations=24, rigid_articulation_solve=mode, **stiff)
+            solver = newton.solvers.SolverVBD(model, iterations=24, rigid_articulation_solve=mode, **stiff, **_SCHUR)
         state_1 = model.state()
         control = model.control()
         series = []
@@ -307,7 +313,7 @@ def test_sparse_modal_fallback_checks_frame_schur(test, device):
         mass = model.elastic_mode_mass_matrix.numpy().reshape(mode_count, mode_count).copy()
         mass[1, 2] = mass[2, 1] = 2.0 * np.sqrt(mass[1, 1] * mass[2, 2])
         model.elastic_mode_mass_matrix.assign(mass.reshape(-1))
-        solver = newton.solvers.SolverVBD(model, iterations=24, rigid_articulation_solve=_SPARSE)
+        solver = newton.solvers.SolverVBD(model, iterations=24, rigid_articulation_solve=_SPARSE, **_SCHUR)
     base_start = state.body_q.numpy()[0, :3].copy()
     state_1 = model.state()
     solver.step(state, state_1, model.control(), None, _DT)
@@ -317,13 +323,13 @@ def test_sparse_modal_fallback_checks_frame_schur(test, device):
     test.assertLess(float(np.max(np.abs(state_1.body_q.numpy()[0, :3] - base_start))), 0.05)
 
 
-def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
+def test_sparse_elastic_revalidates_narrow_model_flags(test, device, backend):
     """Reject unsupported elastic joint terms notified with the narrow model-change flags.
 
     Armature is notified with ``JOINT_DOF_INERTIAL_PROPERTIES``, damping and friction with
     ``JOINT_DOF_FORCE_PROPERTIES``, and mimic relationships with ``CONSTRAINT_PROPERTIES``; none of
     these sets the broad ``JOINT_DOF_PROPERTIES`` or ``JOINT_PROPERTIES`` bit. The local solve keeps
-    accepting the same changes.
+    accepting the same changes. Both ``rigid_articulation_elastic_solve`` backends revalidate.
     """
     flags = newton.ModelFlags
     for attribute, flag in (
@@ -333,7 +339,9 @@ def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
     ):
         for mode in (_SPARSE, "local"):
             model, _state, hinge = sparse_tests._make_leaf_link_model(device)
-            solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=mode)
+            solver = newton.solvers.SolverVBD(
+                model, iterations=2, rigid_articulation_solve=mode, rigid_articulation_elastic_solve=backend
+            )
             values = getattr(model, attribute).numpy()
             values[model.joint_qd_start.numpy()[hinge]] = 0.01
             getattr(model, attribute).assign(values)
@@ -344,7 +352,9 @@ def test_sparse_elastic_revalidates_narrow_model_flags(test, device):
                 solver.notify_model_changed(flag)
 
     model, _state, hinge = sparse_tests._make_leaf_link_model(device)
-    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_articulation_solve=_SPARSE)
+    solver = newton.solvers.SolverVBD(
+        model, iterations=2, rigid_articulation_solve=_SPARSE, rigid_articulation_elastic_solve=backend
+    )
     joint_type = model.joint_type.numpy()
     root = next(
         joint
@@ -364,7 +374,7 @@ def _elastic_chain_series(device, mode: str, iterations: int, steps: int = 120):
     model = sparse_tests._make_elastic_chain_model(device)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
-    solver = sparse_tests._solver(model, mode, iterations=iterations)
+    solver = sparse_tests._solver(model, mode, iterations=iterations, backend="schur")
     series = []
     for _ in range(steps):
         solver.step(state_0, state_1, control, None, _DT)
@@ -395,7 +405,7 @@ def test_sparse_modal_fallback_warns_after_graph_replay(test, device):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model, state_0 = _make_inconsistent_leaf_link_model(device)
-        solver = newton.solvers.SolverVBD(model, iterations=8, rigid_articulation_solve=_SPARSE)
+        solver = newton.solvers.SolverVBD(model, iterations=8, rigid_articulation_solve=_SPARSE, **_SCHUR)
         state_1 = model.state()
         control = model.control()
         # Load the kernels before capture; this step's count is only mirrored to the host.
@@ -421,10 +431,19 @@ for _name, _test in (
     ("test_sparse_modal_dense_solve_matches_tiled", test_sparse_modal_dense_solve_matches_tiled),
     ("test_sparse_modal_fallback_keeps_frames_definite", test_sparse_modal_fallback_keeps_frames_definite),
     ("test_sparse_modal_fallback_checks_frame_schur", test_sparse_modal_fallback_checks_frame_schur),
-    ("test_sparse_elastic_revalidates_narrow_model_flags", test_sparse_elastic_revalidates_narrow_model_flags),
     ("test_sparse_elastic_elastic_chain_converges_to_local", test_sparse_elastic_elastic_chain_converges_to_local),
 ):
+    # Schur-backend internals and convergence; each test pins rigid_articulation_elastic_solve="schur".
     add_function_test(TestReducedElasticSparsePerformance, _name, _test, devices=devices)
+
+for _backend in ("schur", "coupled"):
+    add_function_test(
+        TestReducedElasticSparsePerformance,
+        f"test_sparse_elastic_revalidates_narrow_model_flags_{_backend}",
+        test_sparse_elastic_revalidates_narrow_model_flags,
+        devices=devices,
+        backend=_backend,
+    )
 
 add_function_test(
     TestReducedElasticSparsePerformance,
