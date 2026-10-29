@@ -514,7 +514,7 @@ These three options are off by default with BDF1 and on by default with BDF2.
 | :sup:`13` With ``solve_mode="matrix_free"``, Steel enforces each mimic relationship within one articulation as one bilateral constraint row per follower coordinate; mimics of BALL, FREE, and DISTANCE joints and mimics across articulations are rejected. It also enforces loop-closing BALL joints as point constraints. ``solve_mode="split"`` rejects mimic relationships and loop-closing joints; the propagation contact responses (``articulated_contact_response``) reject loop-closing joints and solve mimic rows iteratively.
 | :sup:`14` See :ref:`Particle-body attachments` for authoring and semantics. Attachments spanning two
   solvers are coupled by :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` instead.
-| :sup:`9` VBD supports revolute-joint armature with the experimental ``block_sparse_joints`` articulation solve.
+| :sup:`9` VBD supports revolute-joint armature with the experimental ``block_sparse_joints`` and ``block_sparse_levels`` articulation solves.
 
 .. _Particle-body attachments:
 
