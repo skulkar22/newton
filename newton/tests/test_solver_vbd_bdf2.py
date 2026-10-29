@@ -185,7 +185,7 @@ def test_bdf2_reset_restarts_world_history(test, device):
 
 
 def test_bdf2_rejects_unsupported_models(test, device):
-    """Reject BDF2 with the local solve, joint mimics, particles or invalid option values."""
+    """Reject BDF2 with the local solve, joint mimics, particles, reduced elastic bodies or invalid option values."""
 
     def pendulum_model(add_mimic: bool = False, add_particle: bool = False) -> newton.Model:
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_GRAVITY))
@@ -206,12 +206,28 @@ def test_bdf2_rejects_unsupported_models(test, device):
         builder.color()
         return builder.finalize(device=device)
 
+    def elastic_model() -> newton.Model:
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_GRAVITY))
+        builder.add_body_elastic(
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-2),
+            mode_count=1,
+            mode_mass=[1.0],
+            mode_stiffness=[100.0],
+            mode_damping=[0.0],
+            mode_shape_fn=lambda _x: np.array([[0.0, 0.0, 0.1]], dtype=np.float32),
+        )
+        builder.color()
+        return builder.finalize(device=device)
+
     with test.assertRaisesRegex(ValueError, "block_sparse_joints"):
         _make_solver(pendulum_model(), rigid_time_integration="bdf2", rigid_articulation_solve="local")
     with test.assertRaisesRegex(ValueError, "mimic"):
         _make_solver(pendulum_model(add_mimic=True), rigid_time_integration="bdf2")
     with test.assertRaisesRegex(ValueError, "particles"):
         _make_solver(pendulum_model(add_particle=True), rigid_time_integration="bdf2")
+    with test.assertRaisesRegex(ValueError, "reduced elastic bodies"):
+        _make_solver(elastic_model(), rigid_time_integration="bdf2")
     with test.assertRaisesRegex(ValueError, "rigid_time_integration"):
         _make_solver(pendulum_model(), rigid_time_integration="bdf3")
     with test.assertRaisesRegex(ValueError, "rigid_bdf2_theta_policy"):

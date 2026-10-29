@@ -4635,14 +4635,18 @@ def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
         newton.solvers.SolverVBD(model, iterations=1, integrate_with_external_rigid_solver=True)
 
 
-def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
+def test_vbd_elastic_body_block_sparse_joints_scope(test, device, backend):
     """Solve articulated elastic bodies in the block-sparse solve and reject the unsupported cases.
 
-    An elastic body's joints must lie in its articulation, as for rigid bodies; its owner joint
-    may stay outside. Joint mimics are not combined with elastic articulation bodies. A single
-    sample has no rotational inertia, so the frames carry extra rigid mass and a nominal inertia
-    rather than the basis rigid properties.
+    Under ``rigid_articulation_elastic_solve="schur"`` an elastic body's joints must lie in its
+    articulation, as for rigid bodies; its owner joint may stay outside. Under ``"coupled"`` an
+    articulation whose only body is elastic is solved by the local block solve, so a joint
+    outside the articulation ranges may attach to it, as to any locally solved body. Joint mimics
+    are not combined with elastic articulation bodies. A single sample has no rotational inertia,
+    so the frames carry extra rigid mass and a nominal inertia rather than the basis rigid
+    properties.
     """
+    sparse = {"rigid_articulation_solve": "block_sparse_joints", "rigid_articulation_elastic_solve": backend}
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -4658,8 +4662,12 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
     model = builder.finalize(device=device)
-    with test.assertRaisesRegex(ValueError, "outside the declared articulation ranges"):
-        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
+    if backend == "schur":
+        with test.assertRaisesRegex(ValueError, "outside the declared articulation ranges"):
+            newton.solvers.SolverVBD(model, iterations=1, **sparse)
+    else:
+        solver = newton.solvers.SolverVBD(model, iterations=1, **sparse)
+        test.assertIsNone(solver.rigid_articulation_sparse_layout)
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     body = builder.add_link_elastic(
@@ -4668,8 +4676,11 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     builder.add_articulation([builder.add_joint_fixed(parent=-1, child=body)])
     builder.color()
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverVBD(model, iterations=4, rigid_articulation_solve="block_sparse_joints")
-    test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 1)
+    solver = newton.solvers.SolverVBD(model, iterations=4, **sparse)
+    if backend == "schur":
+        test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 1)
+    else:
+        test.assertIsNone(solver.rigid_articulation_sparse_layout)
     state_0, state_1 = model.state(), model.state()
     for _ in range(4):
         solver.step(state_0, state_1, None, None, 1.0 / 240.0)
@@ -4689,7 +4700,7 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     builder.color()
     model = builder.finalize(device=device)
     with test.assertRaisesRegex(NotImplementedError, "mimic"):
-        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
+        newton.solvers.SolverVBD(model, iterations=1, **sparse)
 
 
 def test_vbd_elastic_local_graph_capture(test, device):
@@ -7593,12 +7604,14 @@ for device in devices:
         test_vbd_elastic_body_rejects_external_rigid_solver,
         devices=[device],
     )
-    add_function_test(
-        TestReducedElasticBody,
-        "test_vbd_elastic_body_block_sparse_joints_scope",
-        test_vbd_elastic_body_block_sparse_joints_scope,
-        devices=[device],
-    )
+    for backend in ("schur", "coupled"):
+        add_function_test(
+            TestReducedElasticBody,
+            f"test_vbd_elastic_body_block_sparse_joints_scope_{backend}",
+            test_vbd_elastic_body_block_sparse_joints_scope,
+            devices=[device],
+            backend=backend,
+        )
     add_function_test(
         TestReducedElasticBody,
         "test_vbd_elastic_block_solve_falls_back_when_indefinite",
