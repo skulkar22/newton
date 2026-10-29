@@ -191,8 +191,13 @@ def build_rigid_articulation_sparse_layout(
 
     joint_parent = np.asarray(model.joint_parent.to("cpu").numpy(), dtype=np.int32)
     joint_child = np.asarray(model.joint_child.to("cpu").numpy(), dtype=np.int32)
-    joint_type = np.asarray(model.joint_type.to("cpu").numpy(), dtype=np.int32)
-    elastic_owner = joint_type == int(JointType.ELASTIC)
+    # Topology-only models (e.g. the level-ordering test fixtures) carry no joint types and so no
+    # reduced elastic owner joints.
+    if hasattr(model, "joint_type"):
+        joint_type = np.asarray(model.joint_type.to("cpu").numpy(), dtype=np.int32)
+        elastic_owner = joint_type == int(JointType.ELASTIC)
+    else:
+        elastic_owner = np.zeros((model.joint_count,), dtype=bool)
     if int(getattr(model, "elastic_body_count", 0)) > 0:
         body_elastic_index = np.asarray(model.body_elastic_index.to("cpu").numpy(), dtype=np.int32)
         parent_endpoint = np.asarray(model.joint_parent_elastic_endpoint.to("cpu").numpy(), dtype=np.int32)
