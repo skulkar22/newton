@@ -921,6 +921,27 @@ class TestVBDSparseArticulation(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, name):
                     newton.solvers.SolverVBD(model, rigid_compliant_alm=False, **{name: value})
 
+    def test_sparse_articulation_rejects_invalid_levels_block_dim(self):
+        """Accept multiples of 32 up to 512 threads per levels block and reject the rest."""
+        model = _make_single_body_model()
+        for value in (0, 16, 100, 1024, 128.0, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "rigid_articulation_levels_block_dim"):
+                    newton.solvers.SolverVBD(
+                        model,
+                        rigid_compliant_alm=False,
+                        rigid_articulation_solve="block_sparse_levels",
+                        rigid_articulation_levels_block_dim=value,
+                    )
+        for value in (32, 256, 512):
+            solver = newton.solvers.SolverVBD(
+                model,
+                rigid_compliant_alm=False,
+                rigid_articulation_solve="block_sparse_levels",
+                rigid_articulation_levels_block_dim=value,
+            )
+            self.assertEqual(solver.rigid_articulation_levels_block_dim, value)
+
     def test_sparse_articulation_honors_deterministic_option(self):
         """Forward the requested deterministic mode to sparse kernels."""
         original = wp.get_module_options(module=rigid_sparse_articulation_kernels)
@@ -1259,6 +1280,93 @@ def test_sparse_find_block_slot_matches_layout(test, device):
             test.assertGreater(int(np.max(np.diff(rows))), 32, "the hub row must be a dense separator")
             np.testing.assert_array_equal(found.numpy(), np.arange(layout.block_count, dtype=np.int32))
             np.testing.assert_array_equal(missing.numpy(), np.full(row_count, -1, dtype=np.int32))
+
+
+_LEVELS_VARIANT_MODELS: dict[tuple[str, str], tuple[newton.Model, list[tuple[int, int]]]] = {}
+
+
+def _levels_variant_model(device, model_name: str):
+    """Build each levels test model once per device: ``(model, perturbed (body, instance) pairs)``.
+
+    ``"mixed"`` holds articulations of several sizes with closed loops and a 200-body chain whose
+    first elimination levels have more pivot rows than one 128-thread block strides in one round;
+    ``"star"`` is a 6-chain :func:`_make_star_articulation` whose hub row has more than 32 fill
+    blocks (a dense separator).
+    """
+    key = (str(device), model_name)
+    if key not in _LEVELS_VARIANT_MODELS:
+        if model_name == "star":
+            model, middles = _make_star_articulation(device, chains=6, length=20)
+            perturbed = [(body, index) for index, body in enumerate(middles)]
+        else:
+            specs = [(4, True, 0), (1, False, 1), (7, False, 2), (200, False, 3), (4, True, 4), (130, True, 5)]
+            model = _make_mixed_articulations(specs, device)
+            ends = np.cumsum([count for count, _, _ in specs]) - 1
+            perturbed = [(int(end), instance) for end, (_, _, instance) in zip(ends, specs, strict=True)]
+        _LEVELS_VARIANT_MODELS[key] = (model, perturbed)
+    return _LEVELS_VARIANT_MODELS[key]
+
+
+def _run_levels_variant(device, steps: int, graph: bool, model_name: str = "mixed", **options) -> np.ndarray:
+    """Step a cached test model with the given solver options and return ``body_q``.
+
+    The solver runs in ``RUN_TO_RUN`` deterministic mode, so two runs that perform the same
+    operations in the same order give identical results and tests can assert exact equality.
+    The perturbed initial poses make every articulation move.
+    """
+    model, perturbed = _levels_variant_model(device, model_name)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=6,
+        rigid_compliant_alm=True,
+        rigid_articulation_relaxation=1.0,
+        deterministic=wp.DeterministicMode.RUN_TO_RUN,
+        **options,
+    )
+    state_in, state_out = model.state(), model.state()
+    poses = state_in.body_q.numpy()
+    for body, instance in perturbed:
+        poses[body, 2] += 0.02 * (instance + 1)
+        poses[body, 3:7] = _quat_from_axis_angle(np.array([0.2, 0.5, 0.7]), 0.03 * (instance + 1))
+    state_in.body_q.assign(poses)
+    initial = poses.copy()
+
+    def advance():
+        solver.step(state_in, state_out, None, None, 1.0 / 2400.0)
+        solver.step(state_out, state_in, None, None, 1.0 / 2400.0)
+
+    # Warm up (compile, first-step history) before an optional capture, as the examples do.
+    advance()
+    if graph:
+        with wp.ScopedCapture(device=device) as capture:
+            advance()
+        for _ in range(steps // 2 - 1):
+            wp.capture_launch(capture.graph)
+    else:
+        for _ in range(steps // 2 - 1):
+            advance()
+    q = state_in.body_q.numpy()
+    assert float(np.max(np.abs(q - initial))) > 1.0e-5, "the perturbed articulations must move"
+    return q
+
+
+def test_sparse_levels_block_dim_matches_default(test, device):
+    """Other levels block sizes reproduce the 128-thread default exactly under CUDA graph replay.
+
+    The levels kernel is bitwise independent of the block size, and the deterministic mode fixes
+    the order of the joint assembly atomics, so the trajectories must be identical.
+    """
+    reference = _run_levels_variant(device, steps=20, graph=True, rigid_articulation_solve="block_sparse_levels")
+    for block_dim in (32, 256, 512):
+        with test.subTest(block_dim=block_dim):
+            actual = _run_levels_variant(
+                device,
+                steps=20,
+                graph=True,
+                rigid_articulation_solve="block_sparse_levels",
+                rigid_articulation_levels_block_dim=block_dim,
+            )
+            np.testing.assert_array_equal(actual, reference)
 
 
 def _make_mixed_articulations(specs, device):
@@ -2048,6 +2156,12 @@ add_function_test(
     "test_sparse_find_block_slot_matches_layout",
     test_sparse_find_block_slot_matches_layout,
     devices=devices,
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_levels_block_dim_matches_default",
+    test_sparse_levels_block_dim_matches_default,
+    devices=[device for device in devices if device.is_cuda],
 )
 
 

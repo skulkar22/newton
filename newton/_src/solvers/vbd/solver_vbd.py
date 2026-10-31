@@ -754,6 +754,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_articulation_elastic_solve: str = "coupled",
+        rigid_articulation_levels_block_dim: int = 128,
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
@@ -1126,6 +1127,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     ``rigid_articulation_elastic_solve`` and both of its values are experimental and
                     may change or be removed without a deprecation period; ``"schur"`` is kept for
                     comparison only.
+            rigid_articulation_levels_block_dim: Threads per CUDA block of the cooperative
+                ``"block_sparse_levels"`` solve, in which one block factors one articulation. A multiple
+                of 32 in ``[32, 512]``; the default 128 matches the joint assembly launch. More threads
+                shorten the per-thread rounds of a large elimination level of one long articulation at
+                the price of fewer resident blocks when there are many articulations. The block size
+                does not change the arithmetic. The upper bound is a conservative limit for this
+                kernel's register use under the current Warp version. Ignored by the ``"local"`` and
+                ``"block_sparse_joints"`` solves. Experimental.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
                 and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
                 dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
@@ -1642,7 +1651,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 f"rigid_articulation_elastic_solve must be one of {ELASTIC_SOLVE_MODES}, "
                 f"got {rigid_articulation_elastic_solve!r}"
             )
+        if (
+            isinstance(rigid_articulation_levels_block_dim, bool)
+            or not isinstance(rigid_articulation_levels_block_dim, (int, np.integer))
+            or not 32 <= rigid_articulation_levels_block_dim <= 512
+            or rigid_articulation_levels_block_dim % 32 != 0
+        ):
+            raise ValueError(
+                "rigid_articulation_levels_block_dim must be a multiple of 32 in [32, 512], "
+                f"got {rigid_articulation_levels_block_dim!r}"
+            )
         self.rigid_articulation_solve = rigid_articulation_solve
+        self.rigid_articulation_levels_block_dim = int(rigid_articulation_levels_block_dim)
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
         self.rigid_articulation_elastic_solve = rigid_articulation_elastic_solve
@@ -7692,7 +7712,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 if layout.levels is not None:
                     wp.launch(
                         kernel=solve_articulation_sparse_levels,
-                        dim=layout.rigid_articulation_count * SPARSE_ARTICULATION_CTA_THREADS,
+                        dim=layout.rigid_articulation_count * self.rigid_articulation_levels_block_dim,
                         inputs=[
                             layout.articulation_body_offsets,
                             layout.articulation_block_row_offsets,
@@ -7716,7 +7736,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         ],
                         outputs=[self._rigid_articulation_sparse_delta_scalar],
                         device=self.device,
-                        block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                        block_dim=self.rigid_articulation_levels_block_dim,
                     )
                 else:
                     wp.launch(
