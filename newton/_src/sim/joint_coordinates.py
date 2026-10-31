@@ -23,7 +23,10 @@ def unwrap_joint_coordinate(coordinate: float, previous: float, component: int, 
     """
     if component >= linear_count:
         delta = coordinate - previous
-        return previous + wp.atan2(wp.sin(delta), wp.cos(delta))
+        # Wrap only steps of at least pi. Under fast math, atan2(sin, cos) drops steps below ~1e-6 rad.
+        if wp.abs(delta) >= wp.pi:
+            delta = wp.atan2(wp.sin(delta), wp.cos(delta))
+        return previous + delta
     return coordinate
 
 

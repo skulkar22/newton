@@ -9,7 +9,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData, JointCoordinates, evaluate_coordinate
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
 @wp.kernel
@@ -260,6 +260,32 @@ def test_vbd_two_axis_coordinate_gradients(test, device):
             np.testing.assert_allclose((samples[1] - samples[0]) / (2.0 * epsilon), analytic[:, axis], atol=0.0006)
 
 
+def test_vbd_slow_drive_rate_with_fast_math(test, device):
+    """Measure sub-micro-radian joint steps exactly so fast math keeps the drive damping of slow joints."""
+    final = {}
+    for enable_fast_math in (False, True):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+        joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z, target_ke=0.0, target_kd=0.05)
+        builder.add_articulation([joint])
+        builder.color()
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverVBD(
+            model, iterations=8, rigid_compliant_alm=True, enable_fast_math=enable_fast_math
+        )
+        state_0, state_1 = model.state(), model.state()
+        # 1e-3 rad/s at dt = 1/2400 moves the joint about 4e-7 rad per step.
+        state_0.joint_qd.assign(np.array([1.0e-3], dtype=np.float32))
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        control = model.control()
+        for _ in range(240):
+            solver.step(state_0, state_1, control, None, 1.0 / 2400.0)
+            state_0, state_1 = state_1, state_0
+        final[enable_fast_math] = float(state_0.body_qd.numpy()[0][5])
+    test.assertLess(final[False], 0.9e-3)
+    np.testing.assert_allclose(final[True], final[False], rtol=1.0e-3)
+
+
 class TestSolverVBDJointCoordinates(unittest.TestCase):
     pass
 
@@ -274,6 +300,14 @@ for test_function in (
     test_vbd_two_axis_coordinate_gradients,
 ):
     add_function_test(TestSolverVBDJointCoordinates, test_function.__name__, test_function, devices=get_test_devices())
+
+
+add_function_test(
+    TestSolverVBDJointCoordinates,
+    "test_vbd_slow_drive_rate_with_fast_math",
+    test_vbd_slow_drive_rate_with_fast_math,
+    devices=get_cuda_test_devices(),
+)
 
 
 for test_function in (test_vbd_multiturn_drive_limit, test_vbd_multiaxis_d6_drive):

@@ -3875,7 +3875,10 @@ def _evaluate_angular_coordinate(
     q, _g_p, g_c = evaluate_coordinate(data, joint, component, body_q)
     q_prev, _g_p_prev, _g_c_prev = evaluate_coordinate_prev(data, joint, component, body_q_prev)
     delta = q - q_prev
-    rate = wp.atan2(wp.sin(delta), wp.cos(delta)) / dt
+    # Wrap only steps of at least pi. Under fast math, atan2(sin, cos) drops steps below ~1e-6 rad.
+    if wp.abs(delta) >= wp.pi:
+        delta = wp.atan2(wp.sin(delta), wp.cos(delta))
+    rate = delta / dt
     return q, rate, wp.spatial_bottom(g_c)
 
 
