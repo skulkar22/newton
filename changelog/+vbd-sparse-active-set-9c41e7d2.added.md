@@ -1,0 +1,1 @@
+Add the experimental `SolverVBD(rigid_articulation_contact_active_set=True)` option for the block-sparse articulation solves: body-body contacts are linearized on the multiplier's active set (no per-iteration clamp of a compressive contact's force at zero), which removes the contact chatter of the coupled step on light bodies pressed against stiff contacts.

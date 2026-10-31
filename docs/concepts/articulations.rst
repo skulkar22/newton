@@ -1441,6 +1441,18 @@ dense separator, or a Schur destination with many terms, is summed in fixed
 chunks under ``"level"``, which keeps the result deterministic but differs from
 ``"articulation"`` at round-off. Both options are experimental.
 
+Because the coupled step moves every body of an articulation at once, a light
+body pressed against a stiff contact (a cable rod on a drum) can be carried a
+little past separation in one step; the clamped contact force then releases
+the row, the load pushes the body back in, and the iteration can settle into a
+cycle instead of converging. ``rigid_articulation_contact_active_set=True``
+(experimental) linearizes body-body contacts on the multiplier's active set:
+while a contact's dual normal force is compressive its primal force follows
+``k*C + lambda`` without the clamp at zero (it may at most cancel the
+multiplier for one iteration), so an overshoot is pulled back by the penalty;
+the dual update still retires the contact, and friction and damping use the
+compressive part only. The ``local`` solve does not take the option.
+
 The sparse solve is deliberately articulation-centric: bodies outside every
 declared articulation continue through VBD's regular colored local solve.
 Joints between standalone bodies remain on that local path. A joint outside the

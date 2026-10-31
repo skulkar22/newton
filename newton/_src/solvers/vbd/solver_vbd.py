@@ -759,6 +759,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_elastic_solve: str = "coupled",
         rigid_articulation_levels_block_dim: int = 128,
         rigid_articulation_levels_launch: str = "articulation",
+        rigid_articulation_contact_active_set: bool = False,
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
@@ -1154,6 +1155,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 summed in fixed chunks under ``"level"``, so models with a dense separator differ
                 from ``"articulation"`` at round-off. The CPU keeps the serial solve under both
                 values. Ignored by the ``"local"`` and ``"block_sparse_joints"`` solves. Experimental.
+            rigid_articulation_contact_active_set: Block-sparse articulation solves only. Linearize
+                body-body contacts on the multiplier's active set: while a contact's dual normal
+                force is compressive, its primal normal force follows ``k*C + lambda`` without the
+                per-iteration clamp at zero (bounded below by ``-lambda``), so a coupled step that
+                carries a body a little past separation is pulled back by the penalty instead of being
+                released and pushed back in by the load. The dual update still retires the contact
+                when ``lambda + rho*C`` turns non-positive; friction and damping use the compressive
+                part only. The ``local`` solve rejects the option. Experimental; default ``False`` keeps
+                the clamped force.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
                 and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
                 dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
@@ -1695,6 +1705,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_solve = rigid_articulation_solve
         self.rigid_articulation_levels_block_dim = int(rigid_articulation_levels_block_dim)
         self.rigid_articulation_levels_launch = rigid_articulation_levels_launch
+        if not isinstance(rigid_articulation_contact_active_set, (bool, np.bool_)):
+            raise ValueError(
+                f"rigid_articulation_contact_active_set must be a bool, got {rigid_articulation_contact_active_set!r}"
+            )
+        if rigid_articulation_contact_active_set and rigid_articulation_solve == "local":
+            raise ValueError("rigid_articulation_contact_active_set requires a block-sparse rigid_articulation_solve")
+        self.rigid_articulation_contact_active_set = bool(rigid_articulation_contact_active_set)
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
         self.rigid_articulation_elastic_solve = rigid_articulation_elastic_solve
@@ -6831,11 +6848,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         state_out: State | None = None,
         body_contact_block_dim: int = 256,
         particle_contact_block_dim: int = 256,
+        contact_active_set: bool = False,
     ):
         """Accumulate contact and body-particle attachment terms for a body group.
 
         ``state_out.joint_q`` carries the current reduced elastic modal coordinates (the
         previous ones are in ``state_in.joint_q``); without it contacts use ``state_in``.
+        ``contact_active_set`` selects the active-set linearization of body-body contacts
+        (coupled sparse solve); the local sweep passes ``False``.
         """
         model = self.model
         joint_q = state_in.joint_q
@@ -6952,6 +6972,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_contact_alpha,
                     self.rigid_contact_hard,
                     self.rigid_compliant_alm,
+                    int(contact_active_set),
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
@@ -7572,7 +7593,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
         if model.elastic_body_count > 0:
             self._accumulate_elastic_frame_coupling(state_in, state_out, dt)
-        self._accumulate_rigid_contact_forces(state_in, contacts, dt, layout.articulation_bodies, state_out)
+        self._accumulate_rigid_contact_forces(
+            state_in,
+            contacts,
+            dt,
+            layout.articulation_bodies,
+            state_out,
+            contact_active_set=self.rigid_articulation_contact_active_set,
+        )
         if self.rigid_articulation_diagonal_regularization > 0.0:
             # The coupled backend regularizes the frame rows of mixed articulations itself.
             wp.launch(
@@ -8077,6 +8105,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_contact_alpha,
                     self.rigid_contact_hard,
                     self.rigid_compliant_alm,
+                    int(self.rigid_articulation_contact_active_set),
                     self.friction_epsilon,
                     self.body_body_contact_buffer_pre_alloc,
                     self.body_body_contact_counts,

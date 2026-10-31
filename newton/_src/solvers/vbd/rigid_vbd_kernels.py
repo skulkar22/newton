@@ -2727,6 +2727,7 @@ def evaluate_rigid_contact_from_collision(
     contact_compliant_alm: int,
     dt: float,
     friction_c0: wp.vec3,
+    active_set_linear: int,
 ):
     """Compute rigid-contact forces and 3x3 Hessian blocks for a contact pair.
 
@@ -2756,7 +2757,17 @@ def evaluate_rigid_contact_from_collision(
         zero_vec = wp.vec3(0.0)
         zero_mat = wp.mat33(0.0)
         return (zero_vec, zero_vec, zero_mat, zero_mat, zero_mat, zero_vec, zero_vec, zero_mat, zero_mat, zero_mat)
-    f_n = wp.max(f_n, 0.0)
+    # Active-set linearization: while the multiplier is compressive the row stays in the active set
+    # and its force follows the linear law ``k*C + lam``, bounded below by ``-lam`` so the penalty can
+    # at most cancel the multiplier. A coupled step that overshoots into separation is then pulled back
+    # by the penalty instead of being released and pushed back in by the load, which chatters. The
+    # transient tensile force lasts one iteration; the dual update retires the row when ``lam + rho*C``
+    # turns non-positive. Friction and damping use the compressive part ``max(f_n, 0)``.
+    if active_set_linear == 1 and lam_n > 0.0:
+        f_n = wp.max(f_n, -lam_n)
+    else:
+        f_n = wp.max(f_n, 0.0)
+    f_n_compressive = wp.max(f_n, 0.0)
 
     # Only legacy hard retains a zero-force Hessian. Soft and compliant rows release
     # it so separated contacts do not resist free motion.
@@ -2826,7 +2837,7 @@ def evaluate_rigid_contact_from_collision(
     K_t = wp.mat33(0.0)
 
     if legacy_hard_contact == 1 or contact_compliant_alm == 1:
-        if friction_mu > 0.0 and f_n > 0.0:
+        if friction_mu > 0.0 and f_n_compressive > 0.0:
             # Hard/ALM: Coulomb projection of rho_t*(disp + friction_c0) + lambda_t.
             # friction_c0 is (1-alpha)*C0_t from the caller. ALM uses contact_tangent_rho;
             # legacy hard reuses the normal solve weight.
@@ -2837,7 +2848,7 @@ def evaluate_rigid_contact_from_collision(
             lam_t = contact_lam_eff - contact_normal * lam_n
             f_t_vec = rho_t * (tangential_disp + friction_c0) + lam_t
             f_t_len = wp.length(f_t_vec)
-            cone_limit = friction_mu * f_n
+            cone_limit = friction_mu * f_n_compressive
             if contact_compliant_alm == 1 and f_t_len > cone_limit:
                 # Outside the Coulomb cone, the exact projection Jacobian has zero slip-direction
                 # stiffness. Add a conservative PSD solve metric there; force stays unchanged.
@@ -2852,14 +2863,14 @@ def evaluate_rigid_contact_from_collision(
             f_t_vec = _project_coulomb_tangent(f_t_vec, f_t_len, cone_limit)
     else:
         # Soft: IPC regularized Coulomb (force and Hessian).
-        if friction_mu > 0.0 and f_n > 0.0:
+        if friction_mu > 0.0 and f_n_compressive > 0.0:
             f_friction, K_friction = compute_projected_isotropic_friction(
-                friction_mu, f_n, contact_normal, v_t * dt, friction_epsilon * dt
+                friction_mu, f_n_compressive, contact_normal, v_t * dt, friction_epsilon * dt
             )
             f_t_vec = f_friction
             K_t = K_friction
 
-    if contact_kd > 0.0 and v_dot_n < 0.0 and f_n > 0.0:
+    if contact_kd > 0.0 and v_dot_n < 0.0 and f_n_compressive > 0.0:
         f_n_vec = f_n_vec - contact_kd * v_dot_n * contact_normal
         K_n = K_n + (contact_kd / dt) * n_outer
 
@@ -7061,6 +7072,7 @@ def create_accumulate_body_body_contacts_per_body():
         stab_alpha: float,
         legacy_hard_contacts: int,
         contact_compliant_alm: int,
+        contact_active_set_linear: int,
         rigid_contact_count: wp.array[int],
         rigid_contact_shape0: wp.array[int],
         rigid_contact_shape1: wp.array[int],
@@ -7096,6 +7108,9 @@ def create_accumulate_body_body_contacts_per_body():
         """
         Per-body contact force/Hessian accumulation (compliant ALM or legacy penalty)
         with _NUM_CONTACT_THREADS_PER_BODY strided threads.
+
+        ``contact_active_set_linear`` selects the active-set linearization of the normal force
+        (see :func:`evaluate_rigid_contact_from_collision`); the local sweep passes 0.
         """
         tid = wp.tid()
         body_idx_in_group = tid // _NUM_CONTACT_THREADS_PER_BODY
@@ -7284,6 +7299,7 @@ def create_accumulate_body_body_contacts_per_body():
                 contact_compliant_alm,
                 dt,
                 friction_c0,
+                contact_active_set_linear,
             )
 
             if body_id == b0:
@@ -7516,6 +7532,7 @@ def _evaluate_body_body_contact_slot(
         contact_compliant_alm,
         dt,
         friction_c0,
+        0,  # contact-force reporting keeps the clamped law: a reported normal force is never tensile
     )
 
     return b0, b1, point0_world, point1_world, force_0, torque_0, force_1
