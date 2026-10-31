@@ -13,15 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Dipper
-#
-# Demonstrates a flexible dipper arm pinned to a vertical support, driven by a
-# lower prismatic actuator, and loaded by a suspended rigid tip weight.
-#
-# Command: python -m newton.examples basic_reduced_elastic_dipper
-#
-###########################################################################
+"""Example Basic Reduced Elastic Dipper
+
+Demonstrates a flexible dipper arm pinned to a vertical support, driven by a
+lower prismatic actuator, and loaded by a suspended rigid tip weight.
+
+Success criteria:
+- A flexible dipper arm is pinned to a support post, pushed by a hydraulic-style actuator, and carries
+  a hanging tip weight.
+- After a short hold the actuator strokes in and out, raising and lowering the arm tip.
+- The arm bends visibly under the payload without excessive ringing, and the pins and tip weight stay
+  attached.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_dipper`
+"""
 
 import math
 

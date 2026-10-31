@@ -13,17 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Watt
-#
-# Demonstrates a Watt-style straight-line linkage with an elastic coupler and
-# a guided midpoint follower.
-# Driven DOF: the ground-to-left-rocker revolute joint target. The elastic
-# modal DOFs are passive; no direct modal forces are applied in this example.
-#
-# Command: python -m newton.examples basic_reduced_elastic_watt
-#
-###########################################################################
+"""Example Basic Reduced Elastic Watt
+
+Demonstrates a Watt-style straight-line linkage with an elastic coupler and
+a guided midpoint follower.
+Driven DOF: the ground-to-left-rocker revolute joint target. The elastic
+modal DOFs are passive; no direct modal forces are applied in this example.
+
+Success criteria:
+- Two rockers joined by an elastic coupler form a Watt linkage, with a follower on the coupler
+  midpoint.
+- Driving the left rocker swings the right rocker and moves the midpoint follower along its
+  vertical rail.
+- The coupler flexes visibly but boundedly, and all pins stay connected without explosive motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_watt`
+"""
 
 import math
 

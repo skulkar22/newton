@@ -1,34 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Angular Frame Coupling
-#
-# Demonstrates the floating-frame modal-to-frame angular coupling for reduced
-# elastic bodies: the rotational twin of the frame coupling example. Two
-# identical beams float freely in zero gravity with nothing holding or driving
-# them, each carrying a single antisymmetric bending mode (2x/L)(1 - (2x/L)^2)
-# that deflects in y. The mode shape is odd, so its linear coupling S vanishes
-# exactly -- there is no linear recoil -- but it carries angular momentum G qdot
-# about z. Both modes are set oscillating from the rest shape by an initial
-# modal velocity, with the body's total angular momentum kept at zero.
-#
-#   - The "coupled" beam's basis carries per-sample masses, so its moving mode
-#     carries angular momentum; its frame is given the matching counter-rotation
-#     so the total stays zero. As the mode oscillates the frame rocks back and
-#     forth about z (the moment A (G + floor(c) S) qddot) and returns to rest --
-#     the mode visibly turning the frame.
-#   - The "uncoupled" beam's basis has no sample mass (all coupling integrals
-#     are zero), so its mode carries no momentum and its frame needs no
-#     counter-rotation: the mode wiggles while the frame stays put.
-#
-# This is the angular counterpart of the frame coupling example, where a
-# symmetric mode makes the frame translate; here an antisymmetric mode makes the
-# frame rotate.
-#
-# Command: python -m newton.examples basic_reduced_elastic_angular_frame_coupling
-#
-###########################################################################
+"""Example Basic Reduced Elastic Angular Frame Coupling
+
+Demonstrates the floating-frame modal-to-frame angular coupling for reduced
+elastic bodies: the rotational twin of the frame coupling example. Two
+identical beams float freely in zero gravity with nothing holding or driving
+them, each carrying a single antisymmetric bending mode (2x/L)(1 - (2x/L)^2)
+that deflects in y. The mode shape is odd, so its linear coupling S vanishes
+exactly -- there is no linear recoil -- but it carries angular momentum G qdot
+about z. Both modes are set oscillating from the rest shape by an initial
+modal velocity, with the body's total angular momentum kept at zero.
+
+  - The "coupled" beam's basis carries per-sample masses, so its moving mode
+    carries angular momentum; its frame is given the matching counter-rotation
+    so the total stays zero. As the mode oscillates the frame rocks back and
+    forth about z (the moment A (G + floor(c) S) qddot) and returns to rest --
+    the mode visibly turning the frame.
+  - The "uncoupled" beam's basis has no sample mass (all coupling integrals
+    are zero), so its mode carries no momentum and its frame needs no
+    counter-rotation: the mode wiggles while the frame stays put.
+
+This is the angular counterpart of the frame coupling example, where a
+symmetric mode makes the frame translate; here an antisymmetric mode makes the
+frame rotate.
+
+Success criteria:
+- Two free-floating beams oscillate in an antisymmetric S-shaped bending mode in zero gravity.
+- The coupled beam's frame rocks back and forth about the vertical axis in step with the mode and
+  does not spin away or translate.
+- The uncoupled beam's mode wiggles while its frame stays fixed in place and orientation.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_angular_frame_coupling`
+"""
 
 import math
 

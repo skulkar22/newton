@@ -13,20 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Matrix ROM
-#
-# Demonstrates a Simscape-style reduced flexible body workflow on a robot
-# handling beam. A front-facing perforated crossbar is converted from nodal
-# mass, stiffness, and damping matrices into sampled modal shape functions
-# with ModalGeneratorFEM. A robot wrist clamps the left edge, two prismatic
-# gripper carriages attach to solid bottom-edge material, rigid arms reach
-# toward the camera, and a distributed picked-part load is projected into modal
-# forces with Phi.T @ f.
-#
-# Command: python -m newton.examples basic_reduced_elastic_matrix_rom
-#
-###########################################################################
+"""Example Basic Reduced Elastic Matrix ROM
+
+Demonstrates a Simscape-style reduced flexible body workflow on a robot
+handling beam. A front-facing perforated crossbar is converted from nodal
+mass, stiffness, and damping matrices into sampled modal shape functions
+with ModalGeneratorFEM. A robot wrist clamps the left edge, two prismatic
+gripper carriages attach to solid bottom-edge material, rigid arms reach
+toward the camera, and a distributed picked-part load is projected into modal
+forces with Phi.T @ f.
+
+Success criteria:
+- A perforated crossbar is clamped at its left edge by a wrist, with two gripper carriages hanging
+  from its bottom edge.
+- As the picked-part load ramps in and the wrist and carriages lift and lower, the crossbar visibly
+  sags and recovers; the strain coloring and centerline deflection follow the motion.
+- The beam stays attached to the wrist and carriages, with bounded deformation and no explosive
+  motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_matrix_rom`
+"""
 
 import numpy as np
 import warp as wp

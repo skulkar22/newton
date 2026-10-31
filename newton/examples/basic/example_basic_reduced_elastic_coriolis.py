@@ -1,33 +1,38 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Coriolis
-#
-# Demonstrates the floating-frame Coriolis coupling for reduced elastic
-# bodies: two identical beams are clamped to a kinematic hub that spins at a
-# constant rate about the beams' own axis (x). Each beam carries two
-# equal-stiffness cantilever bending modes -- one deflecting in y, one in z.
-# Both beams are deflected in z and released. They share the same modal mass,
-# stiffness, and mode shapes; only the inertia coupling integrals differ.
-#
-#   - The "coupled" beam's basis carries per-sample masses, so as the deflected
-#     z mode vibrates while spinning, the Coriolis term -2 omega . G qdot pumps
-#     energy into the perpendicular y mode and the bending plane rotates
-#     (the spinning-shaft whirl): in the inertial frame the swing plane stays
-#     fixed while the hub turns under it.
-#   - The "uncoupled" beam's basis has no sample mass (all coupling integrals
-#     are zero), so its z vibration never feeds the y mode and its swing plane
-#     simply rotates rigidly with the spinning hub.
-#
-# Each beam's frame sits at its clamp on the spin axis, so the frame origin
-# only rotates (no translational acceleration), the spin is steady (no Euler
-# term), and the on-axis transverse modes carry no centrifugal load -- leaving
-# the Coriolis term as the only thing that couples the two modes.
-#
-# Command: python -m newton.examples basic_reduced_elastic_coriolis
-#
-###########################################################################
+"""Example Basic Reduced Elastic Coriolis
+
+Demonstrates the floating-frame Coriolis coupling for reduced elastic
+bodies: two identical beams are clamped to a kinematic hub that spins at a
+constant rate about the beams' own axis (x). Each beam carries two
+equal-stiffness cantilever bending modes -- one deflecting in y, one in z.
+Both beams are deflected in z and released. They share the same modal mass,
+stiffness, and mode shapes; only the inertia coupling integrals differ.
+
+  - The "coupled" beam's basis carries per-sample masses, so as the deflected
+    z mode vibrates while spinning, the Coriolis term -2 omega . G qdot pumps
+    energy into the perpendicular y mode and the bending plane rotates
+    (the spinning-shaft whirl): in the inertial frame the swing plane stays
+    fixed while the hub turns under it.
+  - The "uncoupled" beam's basis has no sample mass (all coupling integrals
+    are zero), so its z vibration never feeds the y mode and its swing plane
+    simply rotates rigidly with the spinning hub.
+
+Each beam's frame sits at its clamp on the spin axis, so the frame origin
+only rotates (no translational acceleration), the spin is steady (no Euler
+term), and the on-axis transverse modes carry no centrifugal load -- leaving
+the Coriolis term as the only thing that couples the two modes.
+
+Success criteria:
+- Two beams spin about their own axis while vibrating from an initial transverse deflection.
+- The coupled beam's vibration feeds the perpendicular bending mode, so its swing plane stays
+  roughly fixed in the world while the hub turns under it.
+- The uncoupled beam's swing plane rotates rigidly with the hub, with no perpendicular bending.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_coriolis`
+"""
 
 import math
 

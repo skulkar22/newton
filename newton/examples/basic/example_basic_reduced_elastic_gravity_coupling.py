@@ -1,27 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Gravity Coupling
-#
-# Demonstrates the floating-frame gravity coupling for reduced elastic bodies:
-# two identical horizontal cantilevers are clamped to the world and released
-# under gravity with no tip load. They share the same modal mass, stiffness,
-# and mode shape; the only difference is the inertia coupling integral S_i.
-#
-#   - The "coupled" beam's basis carries per-sample masses, so S_i is non-zero
-#     and the modal gravity force S_i . g sags it under its own weight.
-#   - The "uncoupled" beam's basis has no sample mass (S_i = 0), so gravity acts
-#     only on its rigid floating frame (held by the clamp) and the mode stays
-#     undeflected.
-#
-# The clamp uses the cantilever tip mode (phi = 0 at the clamp), so the joint
-# reaction projects to zero on the mode: the only thing that can bend the beam
-# is the gravity coupling. The two beams therefore isolate its effect.
-#
-# Command: python -m newton.examples basic_reduced_elastic_gravity_coupling
-#
-###########################################################################
+"""Example Basic Reduced Elastic Gravity Coupling
+
+Demonstrates the floating-frame gravity coupling for reduced elastic bodies:
+two identical horizontal cantilevers are clamped to the world and released
+under gravity with no tip load. They share the same modal mass, stiffness,
+and mode shape; the only difference is the inertia coupling integral S_i.
+
+  - The "coupled" beam's basis carries per-sample masses, so S_i is non-zero
+    and the modal gravity force S_i . g sags it under its own weight.
+  - The "uncoupled" beam's basis has no sample mass (S_i = 0), so gravity acts
+    only on its rigid floating frame (held by the clamp) and the mode stays
+    undeflected.
+
+The clamp uses the cantilever tip mode (phi = 0 at the clamp), so the joint
+reaction projects to zero on the mode: the only thing that can bend the beam
+is the gravity coupling. The two beams therefore isolate its effect.
+
+Success criteria:
+- Two horizontal cantilevers are clamped to the world under gravity with no tip load.
+- The coupled beam sags under its own weight and settles near the expected static deflection.
+- The uncoupled beam stays straight.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_gravity_coupling`
+"""
 
 import math
 

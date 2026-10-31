@@ -13,14 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Cantilever Weight
-#
-# Demonstrates a cantilever beam carrying a rigid tip weight under gravity.
-#
-# Command: python -m newton.examples basic_reduced_elastic_cantilever_weight
-#
-###########################################################################
+"""Example Basic Reduced Elastic Cantilever Weight
+
+Demonstrates a cantilever beam carrying a rigid tip weight under gravity.
+
+Success criteria:
+- A horizontal elastic cantilever is clamped at its root with a rigid weight attached at its tip.
+- After release from the straight pose the beam visibly bends downward under the weight and
+  settles near the static tip deflection.
+- The weight stays attached to the tip and the root stays clamped.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_cantilever_weight`
+"""
 
 import math
 

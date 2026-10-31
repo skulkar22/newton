@@ -13,14 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Crank Slider
-#
-# Demonstrates a textbook slider-crank with a reduced elastic connecting rod.
-#
-# Command: python -m newton.examples basic_reduced_elastic_crank_slider
-#
-###########################################################################
+"""Example Basic Reduced Elastic Crank Slider
+
+Demonstrates a textbook slider-crank with a reduced elastic connecting rod.
+
+Success criteria:
+- A rigid crank, an elastic connecting rod, and a rigid slider on a rail form a slider-crank.
+- The crank is driven back and forth and the slider follows the slider-crank kinematics along its
+  rail.
+- The connecting rod flexes only moderately, and the pins stay connected without separation or
+  explosive motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_crank_slider`
+"""
 
 import math
 

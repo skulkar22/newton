@@ -1,30 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Frame Coupling
-#
-# Demonstrates the floating-frame modal-to-frame inertia coupling (the
-# back-reaction) for reduced elastic bodies: two identical beams float freely
-# in zero gravity with nothing holding or driving them, each carrying a single
-# transverse bump mode 1 - (2x/L)^2 that is deflected at t = 0 and released.
-#
-#   - The "coupled" beam's basis carries per-sample masses, so the modal
-#     vibration pushes back on its frame through -A . S q_ddot. The frame
-#     recoils against the bulge and the body center of mass stays pinned where
-#     it started, conserving linear momentum.
-#   - The "uncoupled" beam's basis has no sample mass (all coupling integrals
-#     are zero), so its frame stays put while the bulge oscillates and the
-#     center of mass sloshes back and forth, silently violating momentum.
-#
-# The bump mode is symmetric on a uniform bar, so it has net linear coupling
-# but no net angular coupling: the recoil is a pure translation with no induced
-# rotation, exactly the term the current back-coupling implements.
-#
-# Command: python -m newton.examples basic_reduced_elastic_frame_coupling
-#
-###########################################################################
+"""Example Basic Reduced Elastic Frame Coupling
 
+Demonstrates the floating-frame modal-to-frame inertia coupling (the
+back-reaction) for reduced elastic bodies: two identical beams float freely
+in zero gravity with nothing holding or driving them, each carrying a single
+transverse bump mode 1 - (2x/L)^2 that is deflected at t = 0 and released.
+
+  - The "coupled" beam's basis carries per-sample masses, so the modal
+    vibration pushes back on its frame through -A . S q_ddot. The frame
+    recoils against the bulge and the body center of mass stays pinned where
+    it started, conserving linear momentum.
+  - The "uncoupled" beam's basis has no sample mass (all coupling integrals
+    are zero), so its frame stays put while the bulge oscillates and the
+    center of mass sloshes back and forth, silently violating momentum.
+
+The bump mode is symmetric on a uniform bar, so it has net linear coupling
+but no net angular coupling: the recoil is a pure translation with no induced
+rotation, exactly the term the current back-coupling implements.
+
+Success criteria:
+- Two free-floating beams vibrate in a symmetric bump mode in zero gravity.
+- The coupled beam's frame translates back and forth against the bulge so its center of mass stays
+  in place, without rotating.
+- The uncoupled beam's frame stays fixed while its bulge oscillates.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_frame_coupling`
+"""
 
 import numpy as np
 import warp as wp

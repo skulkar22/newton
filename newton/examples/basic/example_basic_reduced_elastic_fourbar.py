@@ -13,14 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Fourbar
-#
-# Demonstrates a closed four-bar linkage with a reduced elastic coupler link.
-#
-# Command: python -m newton.examples basic_reduced_elastic_fourbar
-#
-###########################################################################
+"""Example Basic Reduced Elastic Fourbar
+
+Demonstrates a closed four-bar linkage with a reduced elastic coupler link.
+
+Success criteria:
+- A crank, an elastic coupler, and a rocker form a closed four-bar loop with the ground.
+- The crank oscillates and the rocker follows through the coupler while modal forces flex the coupler.
+- The loop stays closed at every pin, with bounded coupler deformation and no explosive motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_fourbar`
+"""
 
 import math
 

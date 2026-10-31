@@ -13,15 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Bellcrank
-#
-# Demonstrates a two-stage bell-crank transfer with two reduced elastic
-# pushrods connecting rigid rockers.
-#
-# Command: python -m newton.examples basic_reduced_elastic_bellcrank
-#
-###########################################################################
+"""Example Basic Reduced Elastic Bellcrank
+
+Demonstrates a two-stage bell-crank transfer with two reduced elastic
+pushrods connecting rigid rockers.
+
+Success criteria:
+- A driven input rocker, a rigid bell crank, and an output rocker are linked by two elastic pushrods.
+- Driving the input rocker back and forth swings the bell crank and the output rocker through the
+  pushrod chain.
+- The pushrods flex and change length only modestly, and all pin joints stay connected without
+  separation or explosive motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_bellcrank`
+"""
 
 import math
 

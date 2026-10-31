@@ -13,14 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Vertical Weight
-#
-# Demonstrates a vertical elastic bar stretching under a rigid suspended mass.
-#
-# Command: python -m newton.examples basic_reduced_elastic_vertical_weight
-#
-###########################################################################
+"""Example Basic Reduced Elastic Vertical Weight
+
+Demonstrates a vertical elastic bar stretching under a rigid suspended mass.
+
+Success criteria:
+- A vertical elastic bar hangs from a fixed support with a rigid mass attached at its bottom.
+- The bar stretches under the weight, never compresses, and stays near the static extension
+  expected for the hanging mass.
+- The weight stays attached to the bar and the bar keeps its volume.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_vertical_weight`
+"""
 
 import math
 

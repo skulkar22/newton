@@ -1,29 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Centrifugal
-#
-# Demonstrates the floating-frame centrifugal coupling for reduced elastic
-# bodies: two identical beams are clamped to a kinematic hub that spins at a
-# constant rate about the vertical z axis, each carrying a single axial
-# (stretch) mode. They share the same modal mass, stiffness, and mode shape;
-# only the inertia coupling integrals differ.
-#
-#   - The "coupled" beam's basis carries per-sample masses, so the steady
-#     rotation drives the mode through the centrifugal force -floor(omega)^2 . M
-#     and the beam stretches radially outward until stiffness balances it.
-#   - The "uncoupled" beam's basis has no sample mass (all coupling integrals
-#     are zero), so it spins rigidly with no stretch.
-#
-# Each beam's frame sits at its clamp on the spin axis, so the frame origin
-# only rotates (no translational acceleration), the spin is steady (no Euler
-# term), and a single mode has no Coriolis coupling -- leaving the centrifugal
-# term as the only thing that deforms the beam.
-#
-# Command: python -m newton.examples basic_reduced_elastic_centrifugal
-#
-###########################################################################
+"""Example Basic Reduced Elastic Centrifugal
+
+Demonstrates the floating-frame centrifugal coupling for reduced elastic
+bodies: two identical beams are clamped to a kinematic hub that spins at a
+constant rate about the vertical z axis, each carrying a single axial
+(stretch) mode. They share the same modal mass, stiffness, and mode shape;
+only the inertia coupling integrals differ.
+
+  - The "coupled" beam's basis carries per-sample masses, so the steady
+    rotation drives the mode through the centrifugal force -floor(omega)^2 . M
+    and the beam stretches radially outward until stiffness balances it.
+  - The "uncoupled" beam's basis has no sample mass (all coupling integrals
+    are zero), so it spins rigidly with no stretch.
+
+Each beam's frame sits at its clamp on the spin axis, so the frame origin
+only rotates (no translational acceleration), the spin is steady (no Euler
+term), and a single mode has no Coriolis coupling -- leaving the centrifugal
+term as the only thing that deforms the beam.
+
+Success criteria:
+- Two beams clamped to a hub spin steadily about the vertical axis.
+- The coupled beam stretches radially outward while spinning; the uncoupled beam spins rigidly
+  without stretching.
+- Both beams remain attached to the hub without drift or explosive motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_centrifugal`
+"""
 
 import math
 

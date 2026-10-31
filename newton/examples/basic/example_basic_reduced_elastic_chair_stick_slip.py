@@ -13,17 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Chair Stick Slip
-#
-# Demonstrates a reduced elastic monobloc plastic chair on an inclined ramp.
-# The chair mesh is the CC0 "Plastic Monobloc Chair 01" asset from Poly Haven.
-# A POD basis is generated from leg-bending exemplars so that the contact feet
-# can store and release elastic energy during frictional stick/slip motion.
-#
-# Command: python -m newton.examples basic_reduced_elastic_chair_stick_slip
-#
-###########################################################################
+"""Example Basic Reduced Elastic Chair Stick Slip
+
+Demonstrates a reduced elastic monobloc plastic chair on an inclined ramp.
+The chair mesh is the CC0 "Plastic Monobloc Chair 01" asset from Poly Haven.
+A POD basis is generated from leg-bending exemplars so that the contact feet
+can store and release elastic energy during frictional stick/slip motion.
+
+The chair asset is downloaded from Poly Haven on first run.
+
+Success criteria:
+- A plastic chair stands on an inclined ramp and makes contact with the ramp through its four feet.
+- The chair moves down the ramp in alternating stick and slip phases rather than one continuous slide;
+  the feet keep sticking intermittently near the end of the run.
+- The legs visibly flex as the feet stick and release; contact stays seated without bouncing,
+  penetration, or mesh corruption.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_chair_stick_slip`
+"""
 
 from __future__ import annotations
 

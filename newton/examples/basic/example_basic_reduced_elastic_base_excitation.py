@@ -1,27 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Base Excitation
-#
-# Demonstrates the floating-frame acceleration coupling for reduced elastic
-# bodies: two identical cantilevers are clamped to a kinematic base that
-# oscillates vertically. They share the same modal mass, stiffness, and mode
-# shape; only the inertia coupling integral S_i differs.
-#
-#   - The "coupled" beam's basis carries per-sample masses, so the base
-#     acceleration excites the mode through the modal force -S_i . a and the
-#     beam bends as the base shakes.
-#   - The "uncoupled" beam's basis has no sample mass (S_i = 0), so it rides the
-#     base rigidly with no modal deformation.
-#
-# The clamp uses the cantilever tip mode (phi = 0 at the clamp), so the joint
-# reaction projects to zero on the mode; the acceleration coupling is the only
-# thing that bends the beam.
-#
-# Command: python -m newton.examples basic_reduced_elastic_base_excitation
-#
-###########################################################################
+"""Example Basic Reduced Elastic Base Excitation
+
+Demonstrates the floating-frame acceleration coupling for reduced elastic
+bodies: two identical cantilevers are clamped to a kinematic base that
+oscillates vertically. They share the same modal mass, stiffness, and mode
+shape; only the inertia coupling integral S_i differs.
+
+  - The "coupled" beam's basis carries per-sample masses, so the base
+    acceleration excites the mode through the modal force -S_i . a and the
+    beam bends as the base shakes.
+  - The "uncoupled" beam's basis has no sample mass (S_i = 0), so it rides the
+    base rigidly with no modal deformation.
+
+The clamp uses the cantilever tip mode (phi = 0 at the clamp), so the joint
+reaction projects to zero on the mode; the acceleration coupling is the only
+thing that bends the beam.
+
+Success criteria:
+- Two cantilevers clamped to a vertically oscillating base move up and down with it.
+- The coupled beam visibly bends as the base shakes; the uncoupled beam rides the base rigidly and
+  stays straight.
+- Both beams remain attached at the clamp without drift or explosive motion.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_base_excitation`
+"""
 
 import math
 

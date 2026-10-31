@@ -13,15 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Gripper Contact
-#
-# Demonstrates two reduced elastic rubber pads squeezing and lifting a dynamic
-# rigid object through frictional contact.
-#
-# Command: python -m newton.examples basic_reduced_elastic_gripper_contact
-#
-###########################################################################
+"""Example Basic Reduced Elastic Gripper Contact
+
+Demonstrates two reduced elastic rubber pads squeezing and lifting a dynamic
+rigid object through frictional contact.
+
+Success criteria:
+- Two elastic rubber pads close on a rigid part, compress against both of its sides, and lift it.
+- The part rises with the pads without slipping out, separating upward, or drifting out of the gap.
+- After the lift the grasp holds steadily, with contact kept on both sides and no visible vibration
+  or jitter.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_gripper_contact`
+"""
 
 import math
 

@@ -13,15 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Scraper Contact
-#
-# Demonstrates a kinematic reduced elastic scraper leg dragged along the floor,
-# building compression and lateral bending through frictional contact.
-#
-# Command: python -m newton.examples basic_reduced_elastic_scraper_contact
-#
-###########################################################################
+"""Example Basic Reduced Elastic Scraper Contact
+
+Demonstrates a kinematic reduced elastic scraper leg dragged along the floor,
+building compression and lateral bending through frictional contact.
+
+Success criteria:
+- A kinematic elastic scraper leg is pressed onto the floor and dragged across it.
+- Floor friction visibly bends the lower leg along the drag axis while its foot compresses against
+  the floor.
+- Floor contact is kept throughout the drag without dropouts, rebound, or chatter.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_scraper_contact`
+"""
 
 import math
 

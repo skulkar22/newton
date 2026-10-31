@@ -1,38 +1,43 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Base Rotation
-#
-# Demonstrates the floating-frame rotational (Euler) acceleration coupling
-# for reduced elastic bodies, and that it is invariant to the choice of
-# reference-frame origin. Three identical cantilevers occupying the same
-# world span are clamped to a kinematic base that oscillates in rotation
-# about the y axis. They share the same modal mass, stiffness, and mode
-# shape; only the placement of the body frame (and the inertia coupling
-# integrals computed about it) differs.
-#
-#   - "coupled_clamp": the body frame sits at the clamp, on the rotation
-#     axis, so its origin only rotates and never translates. The
-#     translational coupling -S_lin . a stays near zero and the
-#     angular-acceleration term -S_ang . alpha alone bends the beam.
-#   - "coupled_mid": the body frame sits at the beam center, off the axis,
-#     so its origin swings. Here -S_lin . a and -S_ang . alpha both
-#     contribute -- but their sum reproduces the exact same physical
-#     deformation as "coupled_clamp", because the per-point acceleration is
-#     independent of how the frame is split. The two coupled beams track
-#     each other to within a few percent.
-#   - "uncoupled": no sample mass (all coupling integrals are zero), so it
-#     rides the base rigidly with no modal deformation.
-#
-# As with the base-excitation example the clamp uses the cantilever tip
-# mode (phi = 0 at the clamp), so the joint reaction projects to zero on the
-# mode; the floating-frame inertia coupling is the only thing that bends the
-# beam.
-#
-# Command: python -m newton.examples basic_reduced_elastic_base_rotation
-#
-###########################################################################
+"""Example Basic Reduced Elastic Base Rotation
+
+Demonstrates the floating-frame rotational (Euler) acceleration coupling
+for reduced elastic bodies, and that it is invariant to the choice of
+reference-frame origin. Three identical cantilevers occupying the same
+world span are clamped to a kinematic base that oscillates in rotation
+about the y axis. They share the same modal mass, stiffness, and mode
+shape; only the placement of the body frame (and the inertia coupling
+integrals computed about it) differs.
+
+  - "coupled_clamp": the body frame sits at the clamp, on the rotation
+    axis, so its origin only rotates and never translates. The
+    translational coupling -S_lin . a stays near zero and the
+    angular-acceleration term -S_ang . alpha alone bends the beam.
+  - "coupled_mid": the body frame sits at the beam center, off the axis,
+    so its origin swings. Here -S_lin . a and -S_ang . alpha both
+    contribute -- but their sum reproduces the exact same physical
+    deformation as "coupled_clamp", because the per-point acceleration is
+    independent of how the frame is split. The two coupled beams track
+    each other to within a few percent.
+  - "uncoupled": no sample mass (all coupling integrals are zero), so it
+    rides the base rigidly with no modal deformation.
+
+As with the base-excitation example the clamp uses the cantilever tip
+mode (phi = 0 at the clamp), so the joint reaction projects to zero on the
+mode; the floating-frame inertia coupling is the only thing that bends the
+beam.
+
+Success criteria:
+- Three cantilevers clamped to a base that rocks about the y axis rotate with the base.
+- The two coupled beams bend visibly and track each other closely, regardless of where their body
+  frame sits.
+- The uncoupled beam rotates rigidly with the base and stays straight.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_base_rotation`
+"""
 
 import math
 

@@ -13,16 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Beam Vibration
-#
-# Demonstrates a reduced elastic cantilever beam with finite modal mass. The
-# beam is released from an initial deflection and vibrates under its modal
-# stiffness and damping.
-#
-# Command: python -m newton.examples basic_reduced_elastic_beam_vibration
-#
-###########################################################################
+"""Example Basic Reduced Elastic Beam Vibration
+
+Demonstrates a reduced elastic cantilever beam with finite modal mass. The
+beam is released from an initial deflection and vibrates under its modal
+stiffness and damping.
+
+Success criteria:
+- A horizontal cantilever starts deflected and is released in zero gravity.
+- It vibrates about the straight configuration as a lightly damped single-mode oscillator, matching
+  the clamped single-degree-of-freedom reference.
+- The root stays clamped and the beam keeps its volume while it vibrates.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_beam_vibration`
+"""
 
 import math
 

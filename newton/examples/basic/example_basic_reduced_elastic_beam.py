@@ -13,16 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Beam
-#
-# Demonstrates a reduced elastic cantilever beam using the Euler-Bernoulli
-# tip-load shape function. The modal coordinate has the analytic static
-# solution q = P L^3 / (3 E I) for tip load P.
-#
-# Command: python -m newton.examples basic_reduced_elastic_beam
-#
-###########################################################################
+"""Example Basic Reduced Elastic Beam
+
+Demonstrates a reduced elastic cantilever beam using the Euler-Bernoulli
+tip-load shape function. The modal coordinate has the analytic static
+solution q = P L^3 / (3 E I) for tip load P.
+
+Success criteria:
+- A horizontal cantilever is clamped at its root in zero gravity and bends under a tip load.
+- The tip deflection rises and falls smoothly with the slowly oscillating load, following the
+  analytic static deflection without lag or ringing.
+- The beam keeps its cross-section without visible volume change or root separation.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_beam`
+"""
 
 import math
 

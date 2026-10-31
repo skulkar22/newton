@@ -13,17 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Robot UR10 Elastic Panel
-#
-# Shows a UR10-like industrial arm carrying a reduced elastic automotive panel.
-# The robot is treated as a kinematic trajectory source, while the panel is a
-# floating-frame reduced elastic body attached to the end effector through
-# multiple fixed gripper samples.
-#
-# Command: python -m newton.examples robot_ur10_elastic_panel
-#
-###########################################################################
+"""Example Robot UR10 Elastic Panel
+
+Shows a UR10-like industrial arm carrying a reduced elastic automotive panel.
+The robot is treated as a kinematic trajectory source, while the panel is a
+floating-frame reduced elastic body attached to the end effector through
+multiple fixed gripper samples.
+
+By default the panel is a procedural hood frame; `--panel-mesh` loads an STL
+panel instead, and `--carhoods-dir` picks one from a downloaded CarHoods10k
+dataset.
+
+Success criteria:
+- A UR10 arm on a pedestal holds an elastic car panel by a gripper hub at its end effector.
+- The arm sweeps the panel smoothly while an oscillating load visibly flexes it; the strain coloring
+  follows the deformation.
+- The panel stays attached to the gripper, stays well above the floor, and its deformation stays
+  bounded without explosive motion.
+
+Runs:
+- `python -m newton.examples robot_ur10_elastic_panel`
+"""
 
 from __future__ import annotations
 

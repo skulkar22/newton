@@ -1,40 +1,46 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Basic Reduced Elastic Clamp Moment
-#
-# Demonstrates the joint rotational (clamp moment) coupling for reduced elastic
-# bodies: a fixed attachment transmits the parent's rotation into modal
-# deformation through the per-endpoint angular mode shape psi, and the modal
-# deformation reacts the matching moment back on the parent.
-#
-# Two beams are clamped at their base to a fixed support and at their tip to a
-# drum that spins about the beam axis. Each beam carries a single torsion mode
-# and no sample mass, so the coupling is isolated from every other effect:
-#
-#   - Both clamp points lie on the beam centerline, where the translational
-#     mode shape phi is zero, so the linear part of each clamp only pins the
-#     floating frame and cannot drive the mode. The base clamp also sits at the
-#     torsion node (psi = 0) and fully fixes the frame; the tip clamp sits where
-#     psi is non-zero, so only its clamp moment can twist the beam.
-#   - With no sample mass the floating-frame inertia coupling integrals are all
-#     zero, so spinning the drum cannot twist the beam through inertia. Gravity
-#     is off.
-#
-#   - "coupled": the basis carries psi, so the modal twist gives the frame an
-#     extra degree of freedom that satisfies both clamps exactly: the base end
-#     stays aligned with the support while the tip twists to follow the drum.
-#   - "uncoupled": the same basis with psi zeroed, so the clamp moment cannot
-#     reach the mode. With no twist available the beam can only rotate as a
-#     rigid body, and the two clamps are soft penalties that pull its frame
-#     toward the support and toward the drum respectively. They balance at the
-#     midpoint, so the beam rigidly rotates to half the drum angle and stays
-#     visibly misaligned with both ends instead of twisting.
-#
-# Command: python -m newton.examples basic_reduced_elastic_clamp_moment
-#
-###########################################################################
+"""Example Basic Reduced Elastic Clamp Moment
+
+Demonstrates the joint rotational (clamp moment) coupling for reduced elastic
+bodies: a fixed attachment transmits the parent's rotation into modal
+deformation through the per-endpoint angular mode shape psi, and the modal
+deformation reacts the matching moment back on the parent.
+
+Two beams are clamped at their base to a fixed support and at their tip to a
+drum that spins about the beam axis. Each beam carries a single torsion mode
+and no sample mass, so the coupling is isolated from every other effect:
+
+  - Both clamp points lie on the beam centerline, where the translational
+    mode shape phi is zero, so the linear part of each clamp only pins the
+    floating frame and cannot drive the mode. The base clamp also sits at the
+    torsion node (psi = 0) and fully fixes the frame; the tip clamp sits where
+    psi is non-zero, so only its clamp moment can twist the beam.
+  - With no sample mass the floating-frame inertia coupling integrals are all
+    zero, so spinning the drum cannot twist the beam through inertia. Gravity
+    is off.
+
+  - "coupled": the basis carries psi, so the modal twist gives the frame an
+    extra degree of freedom that satisfies both clamps exactly: the base end
+    stays aligned with the support while the tip twists to follow the drum.
+  - "uncoupled": the same basis with psi zeroed, so the clamp moment cannot
+    reach the mode. With no twist available the beam can only rotate as a
+    rigid body, and the two clamps are soft penalties that pull its frame
+    toward the support and toward the drum respectively. They balance at the
+    midpoint, so the beam rigidly rotates to half the drum angle and stays
+    visibly misaligned with both ends instead of twisting.
+
+Success criteria:
+- Two beams are clamped between a fixed support and a drum that rotates about the beam axis.
+- The coupled beam twists along its length: its base stays aligned with the support while its tip
+  follows the drum.
+- The uncoupled beam does not twist; it rotates rigidly to roughly half the drum angle and stays
+  visibly misaligned with both ends.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_clamp_moment`
+"""
 
 import math
 

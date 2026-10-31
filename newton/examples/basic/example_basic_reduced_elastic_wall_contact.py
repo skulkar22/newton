@@ -13,14 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Wall Contact
-#
-# Demonstrates a kinematic reduced elastic rubber pad pressed into a rigid wall.
-#
-# Command: python -m newton.examples basic_reduced_elastic_wall_contact
-#
-###########################################################################
+"""Example Basic Reduced Elastic Wall Contact
+
+Demonstrates a kinematic reduced elastic rubber pad pressed into a rigid wall.
+
+Success criteria:
+- A kinematic elastic rubber pad moves toward a rigid wall and presses into it.
+- The pad visibly compresses against the wall instead of penetrating it.
+- Once the press stops, contact is held steadily without dropouts or visible jitter.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_wall_contact`
+"""
 
 import math
 

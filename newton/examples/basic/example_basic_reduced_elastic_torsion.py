@@ -13,16 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Torsion
-#
-# Demonstrates a reduced elastic rectangular shaft attached through a revolute
-# endpoint. The visible twist is represented by independent linear POD modes
-# extracted from finite-rotation exemplar twists.
-#
-# Command: python -m newton.examples basic_reduced_elastic_torsion
-#
-###########################################################################
+"""Example Basic Reduced Elastic Torsion
+
+Demonstrates a reduced elastic rectangular shaft attached through a revolute
+endpoint. The visible twist is represented by independent linear POD modes
+extracted from finite-rotation exemplar twists.
+
+Success criteria:
+- A rectangular shaft starts twisted along its length and is held briefly before release.
+- After release the twist relaxes as a damped torsional motion without breaking the endpoint
+  attachment.
+- The shaft keeps a plausible rectangular cross-section without visible volume change or mesh
+  corruption.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_torsion`
+"""
 
 import math
 

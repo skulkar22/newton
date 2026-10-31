@@ -13,16 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-###########################################################################
-# Example Basic Reduced Elastic Prismatic
-#
-# Demonstrates a prismatic actuator compressing and stretching a reduced
-# elastic body. The elastic mode is an axial strain field with Poisson lateral
-# strain, so the bar bulges under compression and necks under tension.
-#
-# Command: python -m newton.examples basic_reduced_elastic_prismatic
-#
-###########################################################################
+"""Example Basic Reduced Elastic Prismatic
+
+Demonstrates a prismatic actuator compressing and stretching a reduced
+elastic body. The elastic mode is an axial strain field with Poisson lateral
+strain, so the bar bulges under compression and necks under tension.
+
+Success criteria:
+- An elastic bar is held between a rotating base and a prismatic driver.
+- As the driver oscillates the bar alternately stretches and compresses, necking under tension and
+  bulging under compression with roughly constant volume.
+- The bar rotates together with the oscillating base and stays attached at both ends.
+
+Runs:
+- `python -m newton.examples basic_reduced_elastic_prismatic`
+"""
 
 import math
 
