@@ -56,6 +56,8 @@ from . import (
     rigid_sparse_articulation_variable_assembly,
     rigid_sparse_articulation_variable_kernels,
     rigid_sparse_articulation_variable_metrics,
+    rigid_sparse_level_launch_kernels,
+    rigid_sparse_levels_kernels,
     rigid_vbd_kernels,
     vbd_coupling_kernels,
 )
@@ -130,6 +132,7 @@ from .rigid_sparse_articulation_kernels import (
     vec6f,
     warm_start_body_displacement,
 )
+from .rigid_sparse_level_launch_kernels import build_level_launch_plan, launch_level_scheduled_solve
 from .rigid_sparse_levels_kernels import solve_articulation_sparse_levels
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
@@ -755,6 +758,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_articulation_elastic_solve: str = "coupled",
         rigid_articulation_levels_block_dim: int = 128,
+        rigid_articulation_levels_launch: str = "articulation",
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
@@ -1079,6 +1083,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 sequential work for chains. On CPU it uses the serial solve with the level
                 ordering. Level ordering can increase fill; dense separators still serialize.
                 Neither sparse mode changes contact assembly or numerical precision.
+                ``rigid_articulation_levels_launch`` selects how the level-scheduled solve is launched.
             rigid_articulation_relaxation: Under-relaxation factor for the experimental coupled
                 articulation position update. A value of ``1`` applies the full Newton update.
                 The default damps sparse articulation updates so they do not overstep stale
@@ -1128,13 +1133,27 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     may change or be removed without a deprecation period; ``"schur"`` is kept for
                     comparison only.
             rigid_articulation_levels_block_dim: Threads per CUDA block of the cooperative
-                ``"block_sparse_levels"`` solve, in which one block factors one articulation. A multiple
-                of 32 in ``[32, 512]``; the default 128 matches the joint assembly launch. More threads
+                ``"block_sparse_levels"`` solve, in which one block factors one articulation, and of
+                the tail launch of ``rigid_articulation_levels_launch="level"``. A multiple of 32 in
+                ``[32, 512]``; the default 128 matches the joint assembly launch. More threads
                 shorten the per-thread rounds of a large elimination level of one long articulation at
                 the price of fewer resident blocks when there are many articulations. The block size
                 does not change the arithmetic. The upper bound is a conservative limit for this
                 kernel's register use under the current Warp version. Ignored by the ``"local"`` and
                 ``"block_sparse_joints"`` solves. Experimental.
+            rigid_articulation_levels_launch: How the ``"block_sparse_levels"`` solve is launched on
+                CUDA. ``"articulation"`` (default) runs one cooperative block per articulation through
+                all of its elimination levels, so one long articulation uses one multiprocessor.
+                ``"level"`` launches each phase of each level as one grid over that level's tasks of
+                every articulation, so the large early levels of a long articulation use the whole
+                GPU; the trailing levels, from the first one with fewer pivot rows (summed over
+                articulations) than a fixed threshold, are solved by one cooperative launch. It
+                targets models with few long articulations: many small articulations fill no such
+                tail and should keep ``"articulation"``. Both schedules perform the same operations
+                in the same fixed order; a substitution row or Schur destination with many entries is
+                summed in fixed chunks under ``"level"``, so models with a dense separator differ
+                from ``"articulation"`` at round-off. The CPU keeps the serial solve under both
+                values. Ignored by the ``"local"`` and ``"block_sparse_joints"`` solves. Experimental.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
                 and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
                 dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
@@ -1598,6 +1617,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
+                # The two level-scheduled solves emit no atomics; they are listed so that both
+                # launch schedules always receive the same module options.
+                rigid_sparse_levels_kernels,
+                rigid_sparse_level_launch_kernels,
                 rigid_sparse_articulation_variable_kernels,
                 rigid_sparse_articulation_variable_assembly,
                 reduced_elastic_kernels,
@@ -1661,8 +1684,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "rigid_articulation_levels_block_dim must be a multiple of 32 in [32, 512], "
                 f"got {rigid_articulation_levels_block_dim!r}"
             )
+        if rigid_articulation_levels_launch not in ("articulation", "level"):
+            raise ValueError(
+                "rigid_articulation_levels_launch must be 'articulation' or 'level', "
+                f"got {rigid_articulation_levels_launch!r}"
+            )
         self.rigid_articulation_solve = rigid_articulation_solve
         self.rigid_articulation_levels_block_dim = int(rigid_articulation_levels_block_dim)
+        self.rigid_articulation_levels_launch = rigid_articulation_levels_launch
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
         self.rigid_articulation_elastic_solve = rigid_articulation_elastic_solve
@@ -1808,6 +1837,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_sparse_delta_scalar = None
         self.rigid_articulation_sparse_joint_dof_dim = model.joint_dof_dim
         self._rigid_articulation_sparse_zero_views: tuple[wp.array, ...] = ()
+        self._rigid_articulation_level_launch_plan = None
         if self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels"):
             self.rigid_articulation_sparse_layout = build_rigid_articulation_sparse_layout(
                 model,
@@ -1816,6 +1846,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 use_levels=self.rigid_articulation_solve == "block_sparse_levels",
             )
             layout = self.rigid_articulation_sparse_layout
+            if (
+                self.rigid_articulation_levels_launch == "level"
+                and self.device.is_cuda
+                and layout is not None
+                and layout.levels is not None
+                and layout.rigid_articulation_count > 0
+            ):
+                # Static per-level task lists (built once); the CPU keeps the serial solve.
+                self._rigid_articulation_level_launch_plan = build_level_launch_plan(
+                    layout, self.device, tail_block_dim=self.rigid_articulation_levels_block_dim
+                )
             if layout is not None:
                 self._rigid_articulation_armature_target = wp.zeros_like(model.joint_qd)
                 if layout.elastic_solve == "coupled":
@@ -7709,7 +7750,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         outputs=[self.body_hessian_ll, self.body_hessian_al, self.body_hessian_aa],
                         device=self.device,
                     )
-                if layout.levels is not None:
+                if self._rigid_articulation_level_launch_plan is not None:
+                    launch_level_scheduled_solve(
+                        self._rigid_articulation_level_launch_plan,
+                        layout,
+                        self._rigid_articulation_sparse_values_scalar,
+                        self._rigid_articulation_sparse_rhs_scalar,
+                        self._rigid_articulation_sparse_delta_scalar,
+                        self.device,
+                    )
+                elif layout.levels is not None:
                     wp.launch(
                         kernel=solve_articulation_sparse_levels,
                         dim=layout.rigid_articulation_count * self.rigid_articulation_levels_block_dim,

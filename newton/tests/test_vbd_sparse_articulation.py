@@ -942,6 +942,29 @@ class TestVBDSparseArticulation(unittest.TestCase):
             )
             self.assertEqual(solver.rigid_articulation_levels_block_dim, value)
 
+    def test_sparse_articulation_rejects_invalid_levels_launch(self):
+        """Accept the two launch schedules of the levels solve and reject anything else."""
+        model = _make_single_body_model()
+        for value in ("grid", None, 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "rigid_articulation_levels_launch"):
+                    newton.solvers.SolverVBD(
+                        model,
+                        rigid_compliant_alm=False,
+                        rigid_articulation_solve="block_sparse_levels",
+                        rigid_articulation_levels_launch=value,
+                    )
+        solver = newton.solvers.SolverVBD(
+            model,
+            rigid_compliant_alm=False,
+            rigid_articulation_solve="block_sparse_levels",
+            rigid_articulation_levels_launch="level",
+        )
+        self.assertEqual(solver.rigid_articulation_levels_launch, "level")
+        # The model lives on the CPU, which keeps the serial solve: no per-level plan.
+        self.assertIsNotNone(solver.rigid_articulation_sparse_layout.levels)
+        self.assertIsNone(solver._rigid_articulation_level_launch_plan)
+
     def test_sparse_articulation_honors_deterministic_option(self):
         """Forward the requested deterministic mode to sparse kernels."""
         original = wp.get_module_options(module=rigid_sparse_articulation_kernels)
@@ -1367,6 +1390,72 @@ def test_sparse_levels_block_dim_matches_default(test, device):
                 rigid_articulation_levels_block_dim=block_dim,
             )
             np.testing.assert_array_equal(actual, reference)
+
+
+def test_sparse_levels_launch_level_matches_articulation(test, device):
+    """The per-level launch schedule reproduces the cooperative schedule (CUDA, BDF1 and BDF2).
+
+    In RUN_TO_RUN deterministic mode the mixed model, whose plan splits no task, must match
+    exactly; the star's hub row has more than 32 entries and is summed by the whole tail block,
+    so it matches to round-off. BDF1 runs under graph replay, BDF2 eagerly.
+    """
+    for model_name, integration, graph in (
+        ("mixed", "bdf1", True),
+        ("mixed", "bdf2", False),
+        ("star", "bdf1", True),
+        ("star", "bdf2", False),
+    ):
+        with test.subTest(model=model_name, integration=integration, graph=graph):
+            reference = _run_levels_variant(
+                device,
+                steps=20,
+                graph=graph,
+                model_name=model_name,
+                rigid_articulation_solve="block_sparse_levels",
+                rigid_time_integration=integration,
+            )
+            actual = _run_levels_variant(
+                device,
+                steps=20,
+                graph=graph,
+                model_name=model_name,
+                rigid_articulation_solve="block_sparse_levels",
+                rigid_articulation_levels_launch="level",
+                rigid_time_integration=integration,
+            )
+            if model_name == "mixed":
+                np.testing.assert_array_equal(actual, reference)
+            else:
+                np.testing.assert_allclose(actual, reference, rtol=1.0e-5, atol=1.0e-6)
+
+
+def test_sparse_levels_launch_level_plan(test, device):
+    """Build the per-level plan on CUDA only; the star's hub row takes the tail's split path; the mixed model splits nothing."""
+
+    def plan_of(model_name, **options):
+        model, _ = _levels_variant_model(device, model_name)
+        solver = newton.solvers.SolverVBD(
+            model,
+            rigid_compliant_alm=True,
+            rigid_articulation_solve="block_sparse_levels",
+            rigid_articulation_levels_launch="level",
+            **options,
+        )
+        return solver._rigid_articulation_level_launch_plan
+
+    star = plan_of("star")
+    if not device.is_cuda:
+        test.assertIsNone(star)
+        return
+    test.assertEqual(star.articulation_count, 1)
+    test.assertTrue(star.has_tail)
+    test.assertGreater(star.tail_split_entries, 0)
+    test.assertEqual(star.tail_block_dim, 128)
+    test.assertEqual(plan_of("star", rigid_articulation_levels_block_dim=256).tail_block_dim, 256)
+    mixed = plan_of("mixed")
+    test.assertEqual(mixed.articulation_count, 6)
+    test.assertEqual(mixed.update.long.shape[0] + mixed.forward.long.shape[0] + mixed.backward.long.shape[0], 0)
+    test.assertEqual(mixed.tail_split_entries, 0)
 
 
 def _make_mixed_articulations(specs, device):
@@ -2162,6 +2251,18 @@ add_function_test(
     "test_sparse_levels_block_dim_matches_default",
     test_sparse_levels_block_dim_matches_default,
     devices=[device for device in devices if device.is_cuda],
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_levels_launch_level_matches_articulation",
+    test_sparse_levels_launch_level_matches_articulation,
+    devices=[device for device in devices if device.is_cuda],
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_levels_launch_level_plan",
+    test_sparse_levels_launch_level_plan,
+    devices=devices,
 )
 
 

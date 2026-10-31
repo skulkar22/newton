@@ -1,0 +1,1 @@
+Add two experimental options to the `SolverVBD(rigid_articulation_solve="block_sparse_levels")` articulation solve: `rigid_articulation_levels_launch="level"` launches each elimination level over the whole GPU so that one long articulation no longer runs on a single multiprocessor, and `rigid_articulation_levels_block_dim` sets the block size of the cooperative solve.
