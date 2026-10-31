@@ -91,8 +91,11 @@ def _continuous_euler_angles(angles: wp.vec3, previous: wp.vec3, angular_count: 
     for axis in range(angular_count):
         direct[axis] = unwrap_joint_coordinate(angles[axis], previous[axis], 0, 0)
         alternate[axis] = unwrap_joint_coordinate(other[axis], previous[axis], 0, 0)
-        direct_distance += (direct[axis] - previous[axis]) ** 2.0
-        alternate_distance += (alternate[axis] - previous[axis]) ** 2.0
+        # Square by multiplication: fast-math pow(x, 2) evaluates exp2(2 log2(x)), which is NaN for x < 0.
+        direct_step = direct[axis] - previous[axis]
+        alternate_step = alternate[axis] - previous[axis]
+        direct_distance += direct_step * direct_step
+        alternate_distance += alternate_step * alternate_step
     if alternate_distance < direct_distance:
         return alternate
     return direct

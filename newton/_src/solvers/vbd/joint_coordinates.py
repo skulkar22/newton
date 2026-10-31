@@ -94,9 +94,26 @@ def eval_elastic_endpoint_xform(
 
     angle = wp.length(theta)
     if angle > _SMALL_ANGLE_EPS:
-        q = wp.quat_from_axis_angle(theta / angle, angle) * q
+        q = _quat_from_rotation_vector(theta, angle) * q
 
     return wp.transform(p, q)
+
+
+@wp.func
+def _quat_from_rotation_vector(theta: wp.vec3, angle: float):
+    """Return exp(theta) for ``angle = |theta| > 0``, accurate for small angles under fast math.
+
+    Fast-math sin/cos carry an absolute error near 4e-7, a large relative error for the small
+    rotations of elastic endpoints; below a half angle of 0.1 rad a Taylor series replaces them.
+    """
+    half = 0.5 * angle
+    if half < 0.1:
+        h2 = half * half
+        sin_half_over_angle = 0.5 * (1.0 - h2 / 6.0 * (1.0 - h2 / 20.0 * (1.0 - h2 / 42.0)))
+        cos_half = 1.0 - 0.5 * h2 * (1.0 - h2 / 12.0 * (1.0 - h2 / 30.0))
+        v = theta * sin_half_over_angle
+        return wp.quat(v[0], v[1], v[2], cos_half)
+    return wp.quat_from_axis_angle(theta / angle, angle)
 
 
 @wp.func
