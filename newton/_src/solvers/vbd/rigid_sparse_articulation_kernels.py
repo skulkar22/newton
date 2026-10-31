@@ -275,9 +275,32 @@ def _mat66_from_angular_block(aa: wp.mat33) -> mat66f:
     return A
 
 
+SPARSE_PIVOT_FLOOR_RELATIVE = wp.constant(1.0e-6)
+"""A Cholesky pivot below this fraction of its row's assembled diagonal entry is clamped to it."""
+
+SPARSE_PIVOT_FLOOR_ABSOLUTE = wp.constant(1.0e-30)
+"""Smallest clamped pivot, for rows whose assembled diagonal entry is itself zero or negative."""
+
+
 @wp.func
-def _cholesky66_serial(A_in: mat66f) -> mat66f:
-    """Factor one diagonal block in the serial block-sparse Cholesky path."""
+def _guard_pivot(value: float, diagonal: float, pivot_clamped: wp.array[wp.int32]) -> float:
+    """Return the pivot, or its floor when it is not positive enough (or not a number), counting the clamp.
+
+    The floor is ``SPARSE_PIVOT_FLOOR_RELATIVE`` times the magnitude of the row's assembled diagonal
+    entry, at least ``SPARSE_PIVOT_FLOOR_ABSOLUTE``. A pivot above the floor is returned unchanged, so
+    the factorization is bitwise the same as without the guard whenever nothing is clamped. A non-zero
+    count means the float32 factorization of that step was not trustworthy.
+    """
+    floor = wp.max(SPARSE_PIVOT_FLOOR_RELATIVE * wp.abs(diagonal), SPARSE_PIVOT_FLOOR_ABSOLUTE)
+    if value > floor:
+        return value
+    wp.atomic_add(pivot_clamped, 0, 1)
+    return floor
+
+
+@wp.func
+def _cholesky66_serial(A_in: mat66f, pivot_clamped: wp.array[wp.int32]) -> mat66f:
+    """Factor one diagonal block in the serial block-sparse Cholesky path (guarded pivots)."""
     L = mat66f(0.0)
     for i in range(6):
         for j in range(6):
@@ -287,7 +310,7 @@ def _cholesky66_serial(A_in: mat66f) -> mat66f:
                     if k < j:
                         value = value - L[i, k] * L[j, k]
                 if i == j:
-                    L[i, j] = wp.sqrt(value)
+                    L[i, j] = wp.sqrt(_guard_pivot(value, A_in[i, i], pivot_clamped))
                 else:
                     L[i, j] = value / L[j, j]
     return L
@@ -3319,7 +3342,7 @@ def joint_endpoint_mode_twist(
 
 
 @wp.func
-def _cholesky66_scalar(values: wp.array[float], slot: int):
+def _cholesky66_scalar(values: wp.array[float], slot: int, pivot_clamped: wp.array[wp.int32]):
     for i in range(6):
         for j in range(6):
             if j <= i:
@@ -3328,7 +3351,8 @@ def _cholesky66_scalar(values: wp.array[float], slot: int):
                     if k < j:
                         value = value - _scalar_block_get(values, slot, i, k) * _scalar_block_get(values, slot, j, k)
                 if i == j:
-                    value = wp.sqrt(value)
+                    # The (i, i) entry still holds the assembled diagonal: it is overwritten below.
+                    value = wp.sqrt(_guard_pivot(value, _scalar_block_get(values, slot, i, i), pivot_clamped))
                 else:
                     value = value / _scalar_block_get(values, slot, j, j)
                 _scalar_block_set(values, slot, i, j, value)
@@ -3386,6 +3410,7 @@ def solve_articulation_sparse_block32_scalar(
     articulation_diag_slots: wp.array[wp.int32],
     values_scalar: wp.array[float],
     rhs_scalar: wp.array[float],
+    pivot_clamped: wp.array[wp.int32],
     delta_scalar: wp.array[float],
 ):
     thread_id = wp.tid()
@@ -3405,7 +3430,7 @@ def solve_articulation_sparse_block32_scalar(
         diag_slot = articulation_diag_slots[row_k]
 
         if lane == 0:
-            _cholesky66_scalar(values_scalar, diag_slot)
+            _cholesky66_scalar(values_scalar, diag_slot, pivot_clamped)
 
         _block_sync()
 
@@ -3614,6 +3639,7 @@ def create_solve_articulation_sparse_serial_scalar(bdf2: bool):
         body_disp: wp.array[wp.vec3],
         body_disp_ang: wp.array[wp.vec3],
         use_displacement: int,
+        pivot_clamped: wp.array[wp.int32],
         body_q_new: wp.array[wp.transform],
     ):
         articulation_id = wp.tid()
@@ -3737,7 +3763,7 @@ def create_solve_articulation_sparse_serial_scalar(bdf2: bool):
                     Lks = values[slot_ks]
                     Akk = Akk - Lks * wp.transpose(Lks)
 
-            Lkk = _cholesky66_serial(Akk)
+            Lkk = _cholesky66_serial(Akk, pivot_clamped)
             values[diag_slot] = Lkk
 
             for local_i in range(local_k + 1, body_count):

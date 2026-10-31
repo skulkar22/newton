@@ -173,11 +173,12 @@ def level_launch_diag(
     task_begin: int,
     task_rows: wp.array[wp.int32],
     diag_slots: wp.array[wp.int32],
+    pivot_clamped: wp.array[wp.int32],
     values: wp.array[float],
 ):
     """Factor the diagonal block of each pivot row of one level."""
     row = task_rows[task_begin + wp.tid()]
-    _cholesky66_scalar(values, diag_slots[row])
+    _cholesky66_scalar(values, diag_slots[row], pivot_clamped)
 
 
 @wp.kernel
@@ -468,6 +469,7 @@ def solve_articulation_sparse_levels_tail(
     rhs: wp.array[float],
     split_entries: int,
     tail_partial: wp.array[float],
+    pivot_clamped: wp.array[wp.int32],
     delta: wp.array[float],
 ):
     """Factor, forward- and back-solve each articulation's levels ``>= level_start`` in one block.
@@ -490,7 +492,7 @@ def solve_articulation_sparse_levels_tail(
         begin = level_body_offsets[level]
         end = level_body_offsets[level + 1]
         for row in range(begin + lane, end, threads):
-            _cholesky66_scalar(values, diag_slots[row])
+            _cholesky66_scalar(values, diag_slots[row], pivot_clamped)
         _block_sync()
 
         column_begin = level_column_offsets[level]
@@ -850,13 +852,15 @@ def launch_level_scheduled_solve(
     rhs: wp.array[float],
     delta: wp.array[float],
     device: wp.context.Devicelike,
+    pivot_clamped: wp.array[wp.int32],
     *,
     block_dim: int = LEVEL_LAUNCH_BLOCK_DIM,
 ) -> None:
     """Solve ``A delta = rhs`` for the level-ordered articulations with per-level launches.
 
     Equivalent to one launch of ``solve_articulation_sparse_levels`` over
-    ``plan.articulation_count`` blocks. ``values`` is overwritten by the factor. All launch sizes
+    ``plan.articulation_count`` blocks. ``values`` is overwritten by the factor; ``pivot_clamped[0]``
+    counts clamped pivots. All launch sizes
     come from the plan, so the sequence can be captured in a CUDA graph. ``block_dim`` is the
     block size of the per-level launches; the tail uses ``plan.tail_block_dim``.
     """
@@ -871,7 +875,7 @@ def launch_level_scheduled_solve(
 
     for level in range(plan.leading_level_count):
         begin, count = offsets_range(plan.row_offsets, level)
-        launch(level_launch_diag, count, [begin, plan.rows, layout.articulation_diag_slots], [values])
+        launch(level_launch_diag, count, [begin, plan.rows, layout.articulation_diag_slots, pivot_clamped], [values])
         begin, count = offsets_range(plan.column_offsets, level)
         launch(
             level_launch_column,
@@ -975,6 +979,7 @@ def launch_level_scheduled_solve(
                 rhs,
                 plan.tail_split_entries,
                 plan.tail_partial,
+                pivot_clamped,
             ],
             outputs=[delta],
             device=device,

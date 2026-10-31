@@ -158,7 +158,7 @@ def _solve_levels(layout, original, rhs, device, block_dim=128):
     wp.launch(
         solve_articulation_sparse_levels,
         block_dim * layout.articulation_count,
-        inputs=[*_levels_inputs(layout), values, rhs],
+        inputs=[*_levels_inputs(layout), values, rhs, wp.zeros(1, dtype=wp.int32, device=device)],
         outputs=[solution],
         device=device,
         block_dim=block_dim,
@@ -175,7 +175,7 @@ def test_levels_dense_oracle(test, device):
             expected = np.linalg.solve(matrix, rhs_host.astype(np.float64))
             values = wp.empty_like(original)
             solution = wp.empty_like(rhs)
-            inputs = [*_levels_inputs(layout), values, rhs]
+            inputs = [*_levels_inputs(layout), values, rhs, wp.zeros(1, dtype=wp.int32, device=device)]
 
             def solve(values=values, original=original, layout=layout, inputs=inputs, solution=solution):
                 wp.copy(values, original)
@@ -373,7 +373,9 @@ def test_level_launch_serial_matches_levels(test, device):
                 )
                 values = wp.clone(original)
                 solution = wp.zeros_like(rhs)
-                launch_level_scheduled_solve(plan, layout, values, rhs, solution, device, block_dim=1)
+                launch_level_scheduled_solve(
+                    plan, layout, values, rhs, solution, device, wp.zeros(1, dtype=wp.int32, device=device), block_dim=1
+                )
                 label = f"serial {name} tail_rows={tail_rows} split={split_name}"
                 _assert_launch_matches(test, plan, values, solution, ref_values, ref_solution, label)
 
@@ -393,7 +395,9 @@ def test_level_launch_matches_levels(test, device):
 
                 def solve(plan=plan, layout=layout, values=values, solution=solution, original=original, rhs=rhs):
                     wp.copy(values, original)
-                    launch_level_scheduled_solve(plan, layout, values, rhs, solution, device)
+                    launch_level_scheduled_solve(
+                        plan, layout, values, rhs, solution, device, wp.zeros(1, dtype=wp.int32, device=device)
+                    )
 
                 solve()
                 actual = solution.numpy()

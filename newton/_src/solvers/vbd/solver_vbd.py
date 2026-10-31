@@ -1858,7 +1858,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_sparse_joint_dof_dim = model.joint_dof_dim
         self._rigid_articulation_sparse_zero_views: tuple[wp.array, ...] = ()
         self._rigid_articulation_level_launch_plan = None
+        self.rigid_articulation_pivot_clamped = None
         if self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels"):
+            # Block-Cholesky pivots clamped to the floor during the current step (device int32[1], reset at
+            # the start of every step). A non-zero count means the float32 factorization of that step was
+            # not trustworthy; see ``SPARSE_PIVOT_FLOOR_RELATIVE``.
+            self.rigid_articulation_pivot_clamped = wp.zeros(1, dtype=wp.int32, device=self.device)
             self.rigid_articulation_sparse_layout = build_rigid_articulation_sparse_layout(
                 model,
                 self.device,
@@ -4626,6 +4631,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             preserve_history=self.rigid_contact_history,
         )
 
+        if self.rigid_articulation_pivot_clamped is not None:
+            self.rigid_articulation_pivot_clamped.zero_()
         for iter_num in range(self.iterations):
             rigid_due = self.collision_pipeline is not None and self._rigid_collision_is_due(iter_num)
             soft_due = self.particle_enable_self_contact and self._self_contact_is_due(iter_num)
@@ -7763,6 +7770,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._body_disp,
                         self._body_disp_ang,
                         self._use_body_displacement,
+                        self.rigid_articulation_pivot_clamped,
                     ],
                     outputs=[state_in.body_q],
                     device=self.device,
@@ -7789,6 +7797,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._rigid_articulation_sparse_rhs_scalar,
                         self._rigid_articulation_sparse_delta_scalar,
                         self.device,
+                        self.rigid_articulation_pivot_clamped,
                     )
                 elif layout.levels is not None:
                     wp.launch(
@@ -7814,6 +7823,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                             layout.levels.level_update_right_slots,
                             self._rigid_articulation_sparse_values_scalar,
                             self._rigid_articulation_sparse_rhs_scalar,
+                            self.rigid_articulation_pivot_clamped,
                         ],
                         outputs=[self._rigid_articulation_sparse_delta_scalar],
                         device=self.device,
@@ -7837,6 +7847,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                             layout.articulation_diag_slots,
                             self._rigid_articulation_sparse_values_scalar,
                             self._rigid_articulation_sparse_rhs_scalar,
+                            self.rigid_articulation_pivot_clamped,
                         ],
                         outputs=[self._rigid_articulation_sparse_delta_scalar],
                         device=self.device,
