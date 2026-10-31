@@ -1,21 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Cable Machine
-#
-# Cable machine with three pulleys of varying sizes routing a single
-# tendon from a light capsule weight to a heavy box weight.  The box
-# descends under gravity, pulling the capsule upward through the pulley
-# chain.  All three pulleys rotate through the frictional rolling
-# constraints.
-#
-# Demonstrates complex multi-pulley routing with diverse body shapes
-# (capsules, boxes, cylinders).
-#
-# Command: python -m newton.examples tendon_cable_machine
-#
-###########################################################################
+"""Example Tendon Cable Machine
+
+Cable machine with three pulleys of varying sizes routing a single
+tendon from a light capsule weight to a heavy box weight.  The box
+descends under gravity, pulling the capsule upward through the pulley
+chain.  All three pulleys rotate through the frictional rolling
+constraints.
+
+Demonstrates complex multi-pulley routing with diverse body shapes
+(capsules, boxes, cylinders).
+
+Success criteria:
+- A single cable runs from a light capsule weight over three pulleys of different sizes to a heavy
+  box weight.
+- The box descends and pulls the capsule upward; all three pulleys visibly rotate as the cable moves.
+- The capsule's cable attachment stays below the first pulley, the cable stays on its route, and the
+  weights move smoothly without jumps.
+
+Runs:
+- `python -m newton.examples tendon_cable_machine`
+"""
 
 import numpy as np
 import warp as wp

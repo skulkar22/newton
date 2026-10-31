@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Gear Pulley
-#
-# Five-pulley block-and-tackle mechanism based on the one-to-four gear
-# system in Muller et al.'s Cable Joints paper.  The route is a pure
-# rolling-contact cable: fixed dead-end -> moving block pulley -> fixed
-# block pulley -> moving block pulley -> fixed block pulley -> fixed
-# redirect pulley -> free counterweight.
-#
-# Command: python -m newton.examples tendon_gear_pulley
-#
-###########################################################################
+"""Example Tendon Gear Pulley
+
+Five-pulley block-and-tackle mechanism based on the one-to-four gear
+system in Muller et al.'s Cable Joints paper.  The route is a pure
+rolling-contact cable: fixed dead-end -> moving block pulley -> fixed
+block pulley -> moving block pulley -> fixed block pulley -> fixed
+redirect pulley -> free counterweight.
+
+Success criteria:
+- A block-and-tackle with a moving lower block, fixed upper pulleys, and a redirect pulley carries a
+  free counterweight on the far end of the cable.
+- The light counterweight falls while the moving block rises; the counterweight travels several
+  times farther than the block, as the gear ratio predicts.
+- All five pulleys rotate with the cable, stay on their mounts, and do not spin up; the weights
+  move without jumps.
+
+Runs:
+- `python -m newton.examples tendon_gear_pulley`
+"""
 
 import numpy as np
 import warp as wp

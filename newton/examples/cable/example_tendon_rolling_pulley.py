@@ -1,21 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Rolling Pulley
-#
-# Atwood machine: two weights connected by a tendon routed over a
-# dynamic pulley constrained by a hinge joint.  The heavier weight
-# descends, pulling the lighter weight up; the pulley rotates freely
-# under cable tension — no kinematic rotation tracking needed.
-#
-# The pulley has finite mass and inertia, so the XPBD constraint
-# solve correctly transmits force between the two sides of the cable
-# through the pulley body.
-#
-# Command: python -m newton.examples tendon_rolling_pulley
-#
-###########################################################################
+"""Example Tendon Rolling Pulley
+
+Atwood machine: two weights connected by a tendon routed over a
+dynamic pulley constrained by a hinge joint.  The heavier weight
+descends, pulling the lighter weight up; the pulley rotates freely
+under cable tension — no kinematic rotation tracking needed.
+
+The pulley has finite mass and inertia, so the XPBD constraint
+solve correctly transmits force between the two sides of the cable
+through the pulley body.
+
+Success criteria:
+- Two unequal weights hang from a cable over a hinged pulley.
+- The heavier weight descends, the lighter weight rises, and the pulley visibly rotates with the
+  cable travel.
+- The light weight approaches the pulley but stays below its crown, and both weights move without
+  frame-to-frame jumps.
+
+Runs:
+- `python -m newton.examples tendon_rolling_pulley`
+"""
 
 import numpy as np
 import warp as wp

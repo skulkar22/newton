@@ -1,24 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon MuJoCo Switch Matrix
-#
-# Four active-set route switching lanes cover all optional-wrap neighbor
-# combinations:
-#
-# - attachment -> optional rolling -> attachment
-# - rolling    -> optional rolling -> attachment
-# - attachment -> optional rolling -> rolling
-# - rolling    -> optional rolling -> rolling
-#
-# The candidate capstan in every lane is driven horizontally through the
-# bypass span.  Rolling neighbors must be tested using tangent points, so the
-# matrix catches centerline predicates that activate/deactivate too late.
-#
-# Command: python -m newton.examples tendon_mujoco_switch_matrix
-#
-###########################################################################
+"""Example Tendon MuJoCo Switch Matrix
+
+Four active-set route switching lanes cover all optional-wrap neighbor
+combinations:
+
+- attachment -> optional rolling -> attachment
+- rolling    -> optional rolling -> attachment
+- attachment -> optional rolling -> rolling
+- rolling    -> optional rolling -> rolling
+
+The candidate capstan in every lane is driven horizontally through the
+bypass span.  Rolling neighbors must be tested using tangent points, so the
+matrix catches centerline predicates that activate/deactivate too late.
+
+Success criteria:
+- Four lanes each show a cable span and a candidate capstan that is driven horizontally into the
+  span and back out.
+- In every lane the cable starts straight, wraps around the capstan once it pushes into the span,
+  and returns to the straight bypass when it pulls back out; each lane switches on and off once.
+- Wrapped cables follow the capstan surface on the correct side, and the diagnostic markers turn
+  green only while the wrap is active.
+
+Runs:
+- `python -m newton.examples tendon_mujoco_switch_matrix`
+"""
 
 from __future__ import annotations
 

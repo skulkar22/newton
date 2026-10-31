@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon XY Table
-#
-# Cross-base cable-driven XY table topology inspired by the MathWorks
-# sm_pulleys_xytable_cross example.  This reproduces its Pulley Angles
-# mode: a single tendon routes from one side of the table through seven
-# dynamic pulleys to the other side, the platform is constrained to X/Y
-# sliders, and only the two base pulleys are driven.
-#
-# Command: python -m newton.examples tendon_xy_table
-#
-###########################################################################
+"""Example Tendon XY Table
+
+Cross-base cable-driven XY table topology inspired by the MathWorks
+sm_pulleys_xytable_cross example.  This reproduces its Pulley Angles
+mode: a single tendon routes from one side of the table through seven
+dynamic pulleys to the other side, the platform is constrained to X/Y
+sliders, and only the two base pulleys are driven.
+
+Success criteria:
+- An XY table platform on passive X/Y sliders is moved by a single cable routed over seven pulleys,
+  with only the two base pulleys driven.
+- The platform follows the blue reference path through its phases: an X stroke, a Y stroke, a
+  diagonal stroke, and circular paths, staying close to the reference throughout.
+- All pulleys rotate with the cable without slipping, and the platform stays within its travel range
+  without drift or jitter.
+
+Runs:
+- `python -m newton.examples tendon_xy_table`
+"""
 
 import numpy as np
 import warp as wp

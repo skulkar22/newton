@@ -1,25 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Cable Spline
-#
-# Demonstrates ModelBuilder.add_cable_spline(): cables are authored as
-# Catmull-Rom splines through control points and assembled into capsule
-# chains with rotation-minimizing frames. Five pre-shaped cables are
-# dropped onto the ground: two open ropes (a single and a double overhand
-# knot) and three closed loops (trefoil, figure-eight knot, and a
-# cinquefoil torus knot). Because cable strain is measured relative to
-# the built configuration, all cables hold their knotted rest shapes
-# while settling under gravity and contact.
-#
-# Run interactively:
-#   uv run --extra examples python -m newton.examples.cable.example_cable_spline
-#
-# Run as a test:
-#   uv run --extra examples python -m newton.examples.cable.example_cable_spline --test --viewer null
-#
-###########################################################################
+"""Example Cable Spline
+
+Demonstrates ModelBuilder.add_cable_spline(): cables are authored as
+Catmull-Rom splines through control points and assembled into capsule
+chains with rotation-minimizing frames. Five pre-shaped cables are
+dropped onto the ground: two open ropes (a single and a double overhand
+knot) and three closed loops (trefoil, figure-eight knot, and a
+cinquefoil torus knot). Because cable strain is measured relative to
+the built configuration, all cables hold their knotted rest shapes
+while settling under gravity and contact.
+
+Success criteria:
+- Five knotted cables appear: two open ropes with overhand knots and three closed knot loops.
+- The cables fall, land on the ground, and settle while keeping their knotted shapes instead of
+  unraveling or collapsing flat.
+- Capsule segments stay connected, without gaps, explosive motion, or ground penetration.
+
+Runs:
+- `python -m newton.examples cable_spline`
+"""
 
 import math
 

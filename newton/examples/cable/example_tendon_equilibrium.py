@@ -1,17 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Equilibrium
-#
-# Two equal-mass weights connected by a tendon over a dynamic pulley.
-# With equal masses, neither side should move — the system stays in
-# static equilibrium, verifying that the XPBD tendon constraint
-# correctly balances symmetric loads.
-#
-# Command: python -m newton.examples tendon_equilibrium
-#
-###########################################################################
+"""Example Tendon Equilibrium
+
+Two equal-mass weights connected by a tendon over a dynamic pulley.
+With equal masses, neither side should move — the system stays in
+static equilibrium, verifying that the XPBD tendon constraint
+correctly balances symmetric loads.
+
+Success criteria:
+- Two equal weights hang on either side of a pulley, connected by one cable.
+- Both weights stay at their starting heights; neither side drifts up or down.
+- The cable keeps its length and the scene stays still, without jitter.
+
+Runs:
+- `python -m newton.examples tendon_equilibrium`
+"""
 
 import numpy as np
 import warp as wp

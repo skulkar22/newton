@@ -1,23 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Pinhole Friction
-#
-# Three side-by-side Atwood machines threaded through fixed pinholes:
-#
-#   Left:   mu = 0.0
-#   Center: mu = 0.2
-#   Right:  mu = 10.0
-#
-# A pinhole is a zero-radius body-local routing point.  Its friction coefficient
-# bounds rest-length transfer between adjacent spans using the local bend angle:
-# zero friction slips freely, finite friction reduces slip, and high friction
-# locks cable transfer against the fixed guide point.
-#
-# Command: python -m newton.examples tendon_pinhole_friction
-#
-###########################################################################
+"""Example Tendon Pinhole Friction
+
+Three side-by-side Atwood machines threaded through fixed pinholes:
+
+  Left:   mu = 0.0
+  Center: mu = 0.2
+  Right:  mu = 10.0
+
+A pinhole is a zero-radius body-local routing point.  Its friction coefficient
+bounds rest-length transfer between adjacent spans using the local bend angle:
+zero friction slips freely, finite friction reduces slip, and high friction
+locks cable transfer against the fixed guide point.
+
+Success criteria:
+- Three Atwood machines are threaded through fixed pinhole guides, with friction increasing from
+  left to right.
+- On the left the heavy weight descends and the light weight rises freely through the pinhole; the
+  center machine slips less, and the right machine stays nearly locked.
+- The weights stay below the guides and move smoothly without frame-to-frame jumps.
+
+Runs:
+- `python -m newton.examples tendon_pinhole_friction`
+"""
 
 import numpy as np
 import warp as wp

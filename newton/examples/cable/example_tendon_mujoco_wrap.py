@@ -1,18 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon MuJoCo Wrap
-#
-# Minimal MuJoCo-style dynamic tendon routing prototype.  A vertical cable
-# starts as a straight inactive route.  Three authored rolling links move
-# horizontally into the cable at the same time from alternating sides.  The
-# tendon solver updates the active set once per substep and builds either the
-# straight bypass or the wrapped route.
-#
-# Command: python -m newton.examples tendon_mujoco_wrap
-#
-###########################################################################
+"""Example Tendon MuJoCo Wrap
+
+Minimal MuJoCo-style dynamic tendon routing prototype.  A vertical cable
+starts as a straight inactive route.  Three authored rolling links move
+horizontally into the cable at the same time from alternating sides.  The
+tendon solver updates the active set once per substep and builds either the
+straight bypass or the wrapped route.
+
+Success criteria:
+- A vertical cable starts straight while three capstans approach it from alternating sides.
+- As the capstans push into the cable, it wraps around each of them on the correct side, with all
+  three active at the same time; the diagnostic markers turn green while a wrap is active.
+- After the capstans withdraw the cable returns to its original straight line, without crossing past
+  the centerline or switching erratically.
+
+Runs:
+- `python -m newton.examples tendon_mujoco_wrap`
+"""
 
 from __future__ import annotations
 

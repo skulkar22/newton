@@ -1,17 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Compound Pulley
-#
-# Compound pulley system with two dynamic pulleys and balanced weights.
-# The main cable routes: two linked left weights -> P1 (rolling) -> P2
-# (rolling) -> right weight.  The two equal left weights are connected by a
-# short secondary cable, and their combined mass equals the right-side mass.
-#
-# Command: python -m newton.examples tendon_compound_pulley
-#
-###########################################################################
+"""Example Tendon Compound Pulley
+
+Compound pulley system with two dynamic pulleys and balanced weights.
+The main cable routes: two linked left weights -> P1 (rolling) -> P2
+(rolling) -> right weight.  The two equal left weights are connected by a
+short secondary cable, and their combined mass equals the right-side mass.
+
+Success criteria:
+- Two linked weights on the left and one weight on the right hang from a cable routed over two
+  pulleys.
+- Because the masses balance, all weights stay near their starting heights instead of running away
+  to one side.
+- The short cable between the two left weights stays taut, the pulleys stay on their axles, and no
+  weight jumps between frames.
+
+Runs:
+- `python -m newton.examples tendon_compound_pulley`
+"""
 
 import numpy as np
 import warp as wp

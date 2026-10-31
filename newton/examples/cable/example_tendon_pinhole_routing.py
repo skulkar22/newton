@@ -1,19 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Pinhole Routing
-#
-# Alternating prismatic sliders pull a cable back and forth through four
-# zero-radius pinholes on a smooth non-spherical cam body.  Only one endpoint is
-# actively driven at a time, and the cam is free to rotate about its hinge under
-# the routed cable loads from the frictional pinholes.  White/yellow diagnostic
-# tick marks are fixed cable-material coordinates, so pinhole slip is visible as
-# ticks moving through the body-local guide points.
-#
-# Command: python -m newton.examples tendon_pinhole_routing
-#
-###########################################################################
+"""Example Tendon Pinhole Routing
+
+Alternating prismatic sliders pull a cable back and forth through four
+zero-radius pinholes on a smooth non-spherical cam body.  Only one endpoint is
+actively driven at a time, and the cam is free to rotate about its hinge under
+the routed cable loads from the frictional pinholes.  White/yellow diagnostic
+tick marks are fixed cable-material coordinates, so pinhole slip is visible as
+ticks moving through the body-local guide points.
+
+Success criteria:
+- A cable runs from a left slider through four pinholes on a hinged cam to a right slider; a marker
+  shows which slider is currently driven.
+- The sliders alternately pull the cable in each direction while the other follows, and the passive
+  cam rotates under the cable loads.
+- The cable stays threaded through the pinholes as the cam turns; the material ticks visibly slide
+  through the pinholes, slack spans are drawn as sagging curves, and the sliders stay on their
+  rails.
+
+Runs:
+- `python -m newton.examples tendon_pinhole_routing`
+"""
 
 import math
 

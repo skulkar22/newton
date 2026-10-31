@@ -1,24 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Capstan Kinematic
-#
-# Three side-by-side asymmetric Atwood machines with
-# kinematic (fixed) pulleys and different placeholder capstan friction
-# coefficients:
-#
-#   Left:   mu = 0.0
-#   Center: mu = 0.05
-#   Right:  mu = 10.0
-#
-# The unified capstan projection uses the same path for all three cases:
-# zero friction slips freely, finite friction reduces slip, and high friction
-# locks against the fixed pulley.
-#
-# Command: python -m newton.examples tendon_capstan_kinematic
-#
-###########################################################################
+"""Example Tendon Capstan Kinematic
+
+Three side-by-side asymmetric Atwood machines with
+kinematic (fixed) pulleys and different placeholder capstan friction
+coefficients:
+
+  Left:   mu = 0.0
+  Center: mu = 0.05
+  Right:  mu = 10.0
+
+The unified capstan projection uses the same path for all three cases:
+zero friction slips freely, finite friction reduces slip, and high friction
+locks against the fixed pulley.
+
+Success criteria:
+- Three Atwood machines hang over fixed, non-rotating pulleys with friction increasing from left to
+  right.
+- On the left the heavy weight descends freely as the cable slips over the pulley; the center
+  machine slips less, and the right machine stays essentially locked.
+- Light weights never sink and heavy weights never rise; the slipping weights move smoothly without
+  stick-slip jumps and stay below their pulleys.
+
+Runs:
+- `python -m newton.examples tendon_capstan_kinematic`
+"""
 
 import numpy as np
 import warp as wp
