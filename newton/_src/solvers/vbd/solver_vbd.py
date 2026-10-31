@@ -1628,6 +1628,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 accumulate_body_body_contacts_per_body.module,
                 compute_rigid_contact_forces.module,
                 update_duals_body_body_contacts.module,
+                # The BDF2 joint assembly compiles as its own module; its float atomics need the
+                # same deterministic option as the BDF1 assembly in rigid_sparse_articulation_kernels.
+                assemble_articulation_joints_scalar_bdf2.module,
             )
             for module in rigid_modules:
                 self._set_module_options(options, module=module)
