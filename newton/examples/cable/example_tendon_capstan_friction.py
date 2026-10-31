@@ -1,34 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example Tendon Capstan Friction
-#
-# Three side-by-side asymmetric Atwood machines with
-# different capstan friction coefficients on the pulley:
-#
-#   Left:   mu = 0.0   (frictionless)
-#   Center: mu = 0.40  (finite friction, sufficient for sticking here)
-#   Right:  mu = 10.0  (no-slip)
-#
-# Each pulley is a dynamic body on a hinge joint, free to rotate about Y.
-# The Euler-Eytelwein capstan equation bounds the tension ratio across
-# a frictional contact: T_tight / T_slack <= exp(mu * theta).
-#
-# For dynamic pulleys with mu>0 the cable grips the pulley (stick mode).
-# The XPBD constraint solver couples the pulley's rotational inertia
-# I/R^2 to the system through the shared body.  The capstan bound
-# activates only when the required tension ratio exceeds exp(mu*theta).
-# The pulleys use explicit high inertia and the planar weights keep a
-# fixed orientation so contact with the pulley does not tumble the
-# light body over the rim.
-# Friction above the sticking threshold should not further change the motion.
-# The red tab on each pulley marks rim rotation; the frictionless pulley
-# should translate the cable without spinning.
-#
-# Command: python -m newton.examples tendon_capstan_friction
-#
-###########################################################################
+"""Example Tendon Capstan Friction
+
+Three side-by-side asymmetric Atwood machines with
+different capstan friction coefficients on the pulley:
+
+  Left:   mu = 0.0   (frictionless)
+  Center: mu = 0.40  (finite friction, sufficient for sticking here)
+  Right:  mu = 10.0  (no-slip)
+
+Each pulley is a dynamic body on a hinge joint, free to rotate about Y.
+The Euler-Eytelwein capstan equation bounds the tension ratio across
+a frictional contact: T_tight / T_slack <= exp(mu * theta).
+
+For dynamic pulleys with mu>0 the cable grips the pulley (stick mode).
+The XPBD constraint solver couples the pulley's rotational inertia
+I/R^2 to the system through the shared body.  The capstan bound
+activates only when the required tension ratio exceeds exp(mu*theta).
+The pulleys use explicit high inertia and the planar weights keep a
+fixed orientation so contact with the pulley does not tumble the
+light body over the rim.
+Friction above the sticking threshold should not further change the motion.
+The red tab on each pulley marks rim rotation; the frictionless pulley
+should translate the cable without spinning.
+
+Success criteria:
+- Three side-by-side Atwood machines compare capstan friction coefficients of 0.0, 0.40, and 10.0
+  from left to right.
+- The heavier weights descend and the lighter weights rise; the planar weights keep a fixed
+  orientation and stay below their pulleys without tumbling over the rim.
+- The frictionless pulley translates the cable with almost no rotation; the middle and right pulleys
+  grip the cable and rotate by about the same angle, because friction above the sticking threshold
+  does not change the motion further.
+- Red rim tabs make the pulley rotations visible; the cable routes stay bounded without abrupt
+  weight jumps.
+
+Runs:
+- `python -m newton.examples tendon_capstan_friction`
+"""
 
 import numpy as np
 import warp as wp

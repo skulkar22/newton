@@ -72,7 +72,10 @@ _SMALL_LENGTH_EPS = wp.constant(1.0e-9)
 """Small length tolerance (e.g., segment length checks)"""
 
 _USE_SMALL_ANGLE_APPROX = wp.constant(True)
-"""If True use first-order small-angle rotation approximation; if False use closed-form rotation update"""
+"""If True use first-order small-angle rotation approximation; if False use closed-form rotation update.
+
+Keep enabled when using fast math: the closed form needs accurate small-angle sin/cos.
+"""
 
 _DAHL_KAPPADOT_DEADBAND = wp.constant(1.0e-6)
 """Deadband threshold for hysteresis direction selection"""
@@ -8172,7 +8175,8 @@ def compute_body_particle_contact_forces(
     contact_force[tid] = wp.spatial_vector(f_body, wp.cross(cp_world - com_world, f_body))
 
 
-@wp.kernel
+# Separate module so SolverVBD can enable fast math; keep small-angle sin/cos out of reachable code
+@wp.kernel(module="unique", enable_backward=False)
 def solve_rigid_body(
     step_size: RigidStepSize,
     dt: float,
@@ -8594,7 +8598,8 @@ def solve_rigid_body(
     body_q_new[body_index] = wp.transform(pos_new, rot_new)
 
 
-@wp.kernel
+# Separate module for fast math, same constraint as solve_rigid_body
+@wp.kernel(module="unique", enable_backward=False)
 def update_duals_joint(
     step_size: RigidStepSize,
     # Inputs
