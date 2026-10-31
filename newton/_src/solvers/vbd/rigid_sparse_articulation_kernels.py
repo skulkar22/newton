@@ -233,13 +233,24 @@ def _find_block_slot(
     row_local: int,
     col_local: int,
 ) -> int:
+    # The columns of a row are sorted (the symbolic pattern emits them in
+    # increasing order and the layout builder checks it), so a binary search
+    # returns the slot the linear scan returned. This keeps joint assembly
+    # short on rows with many fill blocks, such as a dense separator.
     row = body_start + row_local
-    begin = articulation_block_row_offsets[row]
+    lo = articulation_block_row_offsets[row]
     end = articulation_block_row_offsets[row + 1]
+    hi = end
+    while lo < hi:
+        mid = lo + (hi - lo) // 2
+        if articulation_block_cols[mid] < col_local:
+            lo = mid + 1
+        else:
+            hi = mid
     slot = int(-1)
-    for s in range(begin, end):
-        if articulation_block_cols[s] == col_local:
-            slot = s
+    if lo < end:
+        if articulation_block_cols[lo] == col_local:
+            slot = lo
     return slot
 
 

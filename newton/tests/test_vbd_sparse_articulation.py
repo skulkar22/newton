@@ -1161,6 +1161,106 @@ def test_sparse_factorizes_closed_loop_articulation(test, device, mode="block_sp
     test.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
 
 
+def _make_star_articulation(device, chains: int = 12, length: int = 40):
+    """One articulation of chains that start and end at a hub fixed to the world (loop closures).
+
+    The hub is a dense separator: its sparse row collects a fill block from every chain and its
+    diagonal receives one Schur term per adjacent pivot of a level. Returns the model and the
+    middle body of every chain.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    inertia = wp.mat33(np.diag([0.1, 0.2, 0.3]).astype(np.float32))
+    hub_position = wp.vec3(0.0, 0.0, 1.0)
+    hub = builder.add_link(xform=wp.transform(hub_position, wp.quat_identity()), mass=5.0, inertia=inertia)
+    joints = [
+        builder.add_joint_fixed(parent=-1, child=hub, parent_xform=wp.transform(hub_position, wp.quat_identity()))
+    ]
+
+    def connect(parent, child, parent_position, child_position):
+        midpoint = 0.5 * (parent_position + child_position)
+        joints.append(
+            builder.add_joint_fixed(
+                parent=parent,
+                child=child,
+                parent_xform=wp.transform(midpoint - parent_position, wp.quat_identity()),
+                child_xform=wp.transform(midpoint - child_position, wp.quat_identity()),
+            )
+        )
+
+    middles = []
+    for chain in range(chains):
+        angle = 2.0 * math.pi * chain / chains
+        direction = wp.vec3(math.cos(angle), math.sin(angle), 0.0)
+        positions = [hub_position + direction * (0.05 * (i + 1)) + wp.vec3(0.0, 0.0, 0.002 * i) for i in range(length)]
+        bodies = [
+            builder.add_link(
+                xform=wp.transform(position, wp.quat_identity()), mass=0.5 + 0.01 * (i + chain), inertia=inertia
+            )
+            for i, position in enumerate(positions)
+        ]
+        connect(hub, bodies[0], hub_position, positions[0])
+        for i in range(1, length):
+            connect(bodies[i - 1], bodies[i], positions[i - 1], positions[i])
+        connect(bodies[-1], hub, positions[-1], hub_position)
+        middles.append(bodies[length // 2])
+    builder.add_articulation(joints, allow_closed_loops=True)
+    builder.color()
+    return builder.finalize(device=device), middles
+
+
+@wp.kernel
+def _lookup_block_slots(
+    block_row_offsets: wp.array[wp.int32],
+    block_cols: wp.array[wp.int32],
+    body_offsets: wp.array[wp.int32],
+    row_articulation: wp.array[wp.int32],
+    found: wp.array[wp.int32],
+    missing: wp.array[wp.int32],
+):
+    row = wp.tid()
+    body_start = body_offsets[row_articulation[row]]
+    begin = block_row_offsets[row]
+    end = block_row_offsets[row + 1]
+    for slot in range(begin, end):
+        col = block_cols[slot]
+        found[slot] = rigid_sparse_articulation_kernels._find_block_slot(
+            block_row_offsets, block_cols, body_start, row - body_start, col
+        )
+    # A column the row does not hold: one past its last column (the diagonal is the last entry).
+    missing[row] = rigid_sparse_articulation_kernels._find_block_slot(
+        block_row_offsets, block_cols, body_start, row - body_start, block_cols[end - 1] + 1
+    )
+
+
+def test_sparse_find_block_slot_matches_layout(test, device):
+    """Find every stored block of every row, including a dense separator row, and no other."""
+    for use_levels in (False, True):
+        model, _ = _make_star_articulation(device, chains=6, length=20)
+        layout = build_rigid_articulation_sparse_layout(model, device, use_levels=use_levels)
+        body_offsets = layout.articulation_body_offsets.numpy()
+        rows = layout.articulation_block_row_offsets.numpy()
+        row_count = len(rows) - 1
+        row_articulation = np.searchsorted(body_offsets, np.arange(row_count), side="right") - 1
+        found = wp.full(layout.block_count, -2, dtype=wp.int32, device=device)
+        missing = wp.full(row_count, -2, dtype=wp.int32, device=device)
+        wp.launch(
+            _lookup_block_slots,
+            dim=row_count,
+            inputs=[
+                layout.articulation_block_row_offsets,
+                layout.articulation_block_cols,
+                layout.articulation_body_offsets,
+                wp.array(row_articulation.astype(np.int32), dtype=wp.int32, device=device),
+            ],
+            outputs=[found, missing],
+            device=device,
+        )
+        with test.subTest(use_levels=use_levels):
+            test.assertGreater(int(np.max(np.diff(rows))), 32, "the hub row must be a dense separator")
+            np.testing.assert_array_equal(found.numpy(), np.arange(layout.block_count, dtype=np.int32))
+            np.testing.assert_array_equal(missing.numpy(), np.full(row_count, -1, dtype=np.int32))
+
+
 def _make_mixed_articulations(specs, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     for body_count, closed, instance in specs:
@@ -1941,6 +2041,12 @@ add_function_test(
     TestVBDSparseArticulationDevices,
     "test_sparse_multi_axis_d6_matches_local",
     test_sparse_multi_axis_d6_matches_local,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_find_block_slot_matches_layout",
+    test_sparse_find_block_slot_matches_layout,
     devices=devices,
 )
 
