@@ -8,8 +8,14 @@ has 4 N*m of Coulomb friction. The inner pair sticks because its applied torque
 is below the friction bound. The outer pair slides in opposite directions with
 4 N*m net torque. Dry joint friction requires the compliant-ALM rigid path.
 
-Run with:
-    uv run --extra examples -m newton.examples vbd_joint_friction
+Success criteria:
+- Four identical hinged bodies receive constant torques of different size and sign.
+- The two inner hinges stay at rest, held by static friction.
+- The two outer hinges spin up in opposite directions with steadily increasing speed, matching the
+  net torque left after friction.
+
+Runs:
+- `python -m newton.examples vbd_joint_friction`
 """
 
 import numpy as np

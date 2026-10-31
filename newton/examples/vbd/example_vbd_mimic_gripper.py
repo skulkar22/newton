@@ -3,9 +3,6 @@
 
 """Passive VBD gripper: drag a finger against friction and viscous damping.
 
-Run with the example dependencies installed:
-    uv run --extra examples -m newton.examples vbd_mimic_gripper
-
 Right-drag either fingertip. The viewer draws the picking spring. Compare
 friction = 0 with friction = 0.15 N*m; release the mouse to observe stopping.
 Expand "Example Options" for the right hinge's friction and damping sliders
@@ -15,10 +12,23 @@ The plots show mirrored angles and speeds. Local compliant ALM supports
 static sticking when the coupled load is within the friction bounds.
 The fingers are 30 cm long and about 0.8 kg each.
 
-For a reproducible coast-down without picking:
-    uv run --extra examples -m newton.examples vbd_mimic_gripper --initial-speed 0.5
-    uv run --extra examples -m newton.examples vbd_mimic_gripper --initial-speed 0.5 --friction 0
-    uv run --extra examples -m newton.examples vbd_mimic_gripper --initial-speed 0.5 --friction 0 --damping 0.3
+The `--initial-speed` runs give a reproducible coast-down without picking.
+
+Success criteria:
+- Two hinged gripper fingers always move as mirror images through the mimic joint; the plotted
+  angles and speeds of the two fingers coincide.
+- The fingers stay within their hinge limits, without jitter or explosive motion.
+
+Runs:
+- `python -m newton.examples vbd_mimic_gripper`
+  - The fingers stay at rest until a fingertip is right-dragged; dragging either fingertip moves both
+    fingers, and after release friction stops them and holds them in place.
+- `python -m newton.examples vbd_mimic_gripper --initial-speed 0.5`
+  - The fingers start opening and friction stops them almost immediately.
+- `python -m newton.examples vbd_mimic_gripper --initial-speed 0.5 --friction 0`
+  - With no resistance, the fingers keep opening at constant speed until the hinge limits stop them.
+- `python -m newton.examples vbd_mimic_gripper --initial-speed 0.5 --friction 0 --damping 0.3`
+  - Viscous damping slows the fingers smoothly to rest.
 """
 
 import math

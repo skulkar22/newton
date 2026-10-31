@@ -9,8 +9,14 @@ rod stays horizontal. The middle rods dissipate energy and stop away from
 the downward equilibrium; the first has no joint friction (but still has
 time-integration dissipation). There are no contacts or passive dampers.
 
-Run with:
-    uv run --extra examples -m newton.examples vbd_joint_friction_pendulum
+Success criteria:
+- Four rod pendulums start horizontal with joint friction increasing from the first to the last.
+- The frictionless rod keeps swinging; the two middle rods swing down, lose energy, and come to rest
+  at angles away from straight down, where gravity no longer overcomes their friction.
+- The rod with the largest friction stays horizontal throughout.
+
+Runs:
+- `python -m newton.examples vbd_joint_friction_pendulum`
 """
 
 import numpy as np

@@ -3,9 +3,6 @@
 
 """Measure a driven pendulum's hinge load with VBD's experimental force query.
 
-Run with:
-    uv run --extra examples -m newton.examples vbd_joint_forces
-
 The Viewer plots the force magnitude, reported torque about the hinge axis, and
 motor-effort estimate. Wrenches act from parent to child, in the child joint
 frame, about the joint origin. The hinge torque includes friction and damping;
@@ -16,6 +13,15 @@ excludes the rotor-inertia reaction; it is not a separate load-side sensor.
 
 Each plotted sample is from the last substep, not an average over the frame.
 Right-drag the pendulum to apply an external load and see the readings change.
+
+Success criteria:
+- A pendulum hangs from a hinge and swings back and forth, driven by a sinusoidal position target.
+- The plots show finite, smoothly varying force magnitude, hinge torque, and motor effort; the force
+  magnitude stays nonzero because the hinge supports the pendulum against gravity.
+- Right-dragging the pendulum visibly changes the plotted readings.
+
+Runs:
+- `python -m newton.examples vbd_joint_forces`
 """
 
 import numpy as np
