@@ -146,6 +146,7 @@ def _assemble(capture, layout, model, device, grad, matrix, values=None, rhs=Non
         twists=wp.zeros(assembly.twist_scratch_size(layout), dtype=vec6f, device=device),
         values=values,
         rhs=rhs,
+        angular_regularization=diag["angular_regularization"],
         device=device,
     )
     return values.numpy().astype(np.float64), rhs.numpy().astype(np.float64), terms.numpy()
@@ -999,8 +1000,77 @@ def test_rigid_rows_match_legacy_body_diagonal(test, device):
     test.assertEqual(rigid_rows, 1)
 
 
-def _launch_body_diagonal(layout, model, capture, values, rhs, device, body_inv_mass=None):
+def _expected_angular_shift(values, blocks, delta):
+    """Return ``values`` with ``delta`` added in float32 to the angular diagonal of each ``(6, 6)`` view in ``blocks``."""
+    expected = values.copy()
+    for block in blocks(expected):
+        for i in range(3, 6):
+            block[i, i] = np.float32(block[i, i]) + np.float32(delta)
+    return expected
+
+
+def test_angular_regularization_shifts_only_the_angular_diagonal(test, device):
+    """Add the angular regularization to the three angular diagonal entries only, leaving the right-hand side.
+
+    Both diagonal kernels are launched on the captured inputs with the regularization at 0 and at ``delta``. Every
+    stored value except the three angular diagonal entries of each dynamic rigid row, and the whole right-hand side,
+    must be bitwise equal; those entries must equal the float32 sum of the unshifted value and ``delta``. Static
+    rows keep ``1e30 I_6``.
+    """
+    model, _joints, capture, layout = _fixture(device)
+    delta = 0.5
+    body_inv_mass = capture["diag"]["body_inv_mass"].numpy()
+
+    # 6 x 6 scalar kernel (rigid articulations; CUDA path of both sparse modes).
+    kernel = sparse_kernels.assemble_articulation_body_diagonal_scalar
+    results = []
+    for reg in (0.0, delta):
+        diag = dict(capture["diag"], angular_regularization=reg)
+        diag["values_scalar"] = wp.zeros_like(diag["values_scalar"])
+        diag["rhs_scalar"] = wp.zeros_like(diag["rhs_scalar"])
+        wp.launch(kernel, dim=capture["diag_dim"], inputs=[diag[a.label] for a in kernel.adj.args], device=device)
+        results.append((diag["values_scalar"].numpy(), diag["rhs_scalar"].numpy()))
+    (v0, r0), (v1, r1) = results
+    bodies = capture["diag"]["articulation_bodies"].numpy()[: capture["diag_dim"]]
+    slots = capture["diag"]["articulation_diag_slots"].numpy()
+    dynamic = [row for row, body in enumerate(bodies) if body_inv_mass[body] != 0.0]
+    test.assertGreater(len(dynamic), 0)
+
+    def scalar_blocks(values):
+        return [values[36 * slots[row] : 36 * slots[row] + 36].reshape(6, 6) for row in dynamic]
+
+    np.testing.assert_array_equal(r1, r0)
+    np.testing.assert_array_equal(v1, _expected_angular_shift(v0, scalar_blocks, delta))
+    test.assertFalse(np.array_equal(v1, v0))
+
+    # Variable-size kernel (rigid rows of mixed articulations, coupled elastic solve).
+    results = []
+    for reg in (0.0, delta):
+        values, rhs = _coupled_storage(layout, device)
+        _launch_body_diagonal(layout, model, capture, values, rhs, device, angular_regularization=reg)
+        results.append((values.numpy(), rhs.numpy()))
+    (v0, r0), (v1, r1) = results
+    L = _Layout(layout)
+    body_elastic_index = model.body_elastic_index.numpy()
+    rows = [
+        row
+        for row in range(layout.rigid_body_row_count, layout.articulation_body_count)
+        if body_elastic_index[L.articulation_bodies[row]] < 0 and body_inv_mass[L.articulation_bodies[row]] != 0.0
+    ]
+    test.assertGreater(len(rows), 0)
+
+    def variable_blocks(values):
+        return [L.block(values, L.articulation_diag_slots[row])[:6, :6] for row in rows]
+
+    np.testing.assert_array_equal(r1, r0)
+    np.testing.assert_array_equal(v1, _expected_angular_shift(v0, variable_blocks, delta))
+    test.assertFalse(np.array_equal(v1, v0))
+
+
+def _launch_body_diagonal(layout, model, capture, values, rhs, device, body_inv_mass=None, angular_regularization=None):
     diag = capture["diag"]
+    if angular_regularization is None:
+        angular_regularization = diag["angular_regularization"]
     wp.launch(
         assembly.assemble_articulation_body_diagonal_variable,
         dim=layout.articulation_body_count - layout.rigid_body_row_count,
@@ -1027,6 +1097,7 @@ def _launch_body_diagonal(layout, model, capture, values, rhs, device, body_inv_
             diag["body_disp"],
             diag["body_disp_ang"],
             diag["use_displacement"],
+            angular_regularization,
         ],
         outputs=[values, rhs],
         device=device,
@@ -1100,6 +1171,7 @@ def test_assembly_leaves_rigid_prefix_and_validates_inputs(test, device):
         "twists": None,
         "values": values,
         "rhs": rhs,
+        "angular_regularization": 1.0e-6,
     }
     schur_layout = build_rigid_articulation_sparse_layout(model, device, elastic_solve="schur")
     with test.assertRaisesRegex(ValueError, "coupled"):
@@ -1191,6 +1263,12 @@ add_function_test(
     TestVBDSparseVariableAssembly,
     "test_rigid_rows_match_legacy_body_diagonal",
     test_rigid_rows_match_legacy_body_diagonal,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSparseVariableAssembly,
+    "test_angular_regularization_shifts_only_the_angular_diagonal",
+    test_angular_regularization_shifts_only_the_angular_diagonal,
     devices=devices,
 )
 add_function_test(TestVBDSparseVariableAssembly, "test_static_frames", test_static_frames, devices=devices)

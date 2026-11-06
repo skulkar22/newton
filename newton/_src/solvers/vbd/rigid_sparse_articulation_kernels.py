@@ -1013,6 +1013,7 @@ def _body_diagonal_contribution(
     body_disp: wp.array[wp.vec3],
     body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
+    angular_regularization: float,
 ):
     body = articulation_bodies[local_body]
     q_current = body_q[body]
@@ -1062,9 +1063,10 @@ def _body_diagonal_contribution(
         H_ll[2, 2] = H_ll[2, 2] + inertial_coeff
         H_al = body_hessian_al[body]
         H_aa = body_hessian_aa[body] + I_world * dt_inv_sqr
-        H_aa[0, 0] = H_aa[0, 0] + 1.0e-6
-        H_aa[1, 1] = H_aa[1, 1] + 1.0e-6
-        H_aa[2, 2] = H_aa[2, 2] + 1.0e-6
+        # Hessian-only angular shift [N m/rad]; the right-hand side is not changed.
+        H_aa[0, 0] = H_aa[0, 0] + angular_regularization
+        H_aa[1, 1] = H_aa[1, 1] + angular_regularization
+        H_aa[2, 2] = H_aa[2, 2] + angular_regularization
 
         diag = _mat66_from_blocks(H_ll, H_al, H_aa)
         rhs_value = _vec6_from_parts(f_lin, tau_world)
@@ -1554,6 +1556,7 @@ def assemble_articulation_body_diagonal_scalar(
     body_disp: wp.array[wp.vec3],
     body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
+    angular_regularization: float,
     values_scalar: wp.array[float],
     rhs_scalar: wp.array[float],
 ):
@@ -1576,6 +1579,7 @@ def assemble_articulation_body_diagonal_scalar(
         body_disp,
         body_disp_ang,
         use_displacement,
+        angular_regularization,
     )
     diag_slot = articulation_diag_slots[local_body]
     for i in range(6):
@@ -3639,6 +3643,7 @@ def create_solve_articulation_sparse_serial_scalar(bdf2: bool):
         body_disp: wp.array[wp.vec3],
         body_disp_ang: wp.array[wp.vec3],
         use_displacement: int,
+        angular_regularization: float,
         pivot_clamped: wp.array[wp.int32],
         body_q_new: wp.array[wp.transform],
     ):
@@ -3669,6 +3674,7 @@ def create_solve_articulation_sparse_serial_scalar(bdf2: bool):
                     body_disp,
                     body_disp_ang,
                     use_displacement,
+                    angular_regularization,
                 )
                 rhs[local_body] = rhs_value
                 values[articulation_diag_slots[local_body]] = diag

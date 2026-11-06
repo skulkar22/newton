@@ -756,6 +756,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_solve: str = "local",
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
+        rigid_articulation_angular_regularization: float = 1.0e-6,
         rigid_articulation_elastic_solve: str = "coupled",
         rigid_articulation_levels_block_dim: int = 128,
         rigid_articulation_levels_launch: str = "articulation",
@@ -1095,6 +1096,26 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 ``rigid_articulation_elastic_solve="coupled"`` it is also added to the six frame
                 diagonal entries of every body of an articulation that contains a reduced elastic
                 body, including the elastic bodies' frames.
+            rigid_articulation_angular_regularization: Non-negative stiffness [N·m/rad] added to the
+                three angular diagonal entries of every rigid body of an articulation solved by
+                ``"block_sparse_joints"`` or ``"block_sparse_levels"``, on top of the inertial term
+                ``I / dt^2`` and of ``rigid_articulation_diagonal_regularization``. It changes the
+                Hessian only, not the right-hand side, so the solution the iterations converge to is
+                unchanged; with a fixed iteration count the result does depend on it. Raise it when
+                bodies with very small rotational inertia (for example short rod segments with their
+                authored inertia) take large rotation steps in the sparse solve: ``I_ref / dt^2``
+                gives the angular step of a body with inertia ``I_ref`` (5.76 for ``I_ref = 1e-6``
+                kg·m² at ``dt = 1/2400`` s). The value is not scaled by the time step, so the same
+                ``I_ref`` at half the step needs four times the value. Much larger values slow angular
+                convergence. Bodies solved by the local block solve (the ``"local"`` mode, bodies
+                outside articulations, articulations of a single elastic body) are unaffected. The
+                default ``1e-6`` is the shift the sparse assembly used before this option existed.
+                The value is read at every step and validated only at construction; a CUDA graph
+                keeps the value it was captured with.
+
+                .. experimental::
+                    ``rigid_articulation_angular_regularization`` is experimental and may change or
+                    be removed.
             rigid_articulation_elastic_solve: How ``"block_sparse_joints"`` and ``"block_sparse_levels"``
                 solve articulations that contain reduced elastic bodies; ignored by the ``"local"``
                 articulation solve.
@@ -1679,8 +1700,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
         if not isfinite(rigid_articulation_diagonal_regularization) or rigid_articulation_diagonal_regularization < 0.0:
             raise ValueError(
-                "rigid_articulation_diagonal_regularization must be non-negative, "
+                "rigid_articulation_diagonal_regularization must be finite and non-negative, "
                 f"got {rigid_articulation_diagonal_regularization}"
+            )
+        if not isfinite(rigid_articulation_angular_regularization) or rigid_articulation_angular_regularization < 0.0:
+            raise ValueError(
+                "rigid_articulation_angular_regularization must be finite and non-negative, "
+                f"got {rigid_articulation_angular_regularization}"
             )
         if rigid_articulation_elastic_solve not in ELASTIC_SOLVE_MODES:
             raise ValueError(
@@ -1713,7 +1739,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError("rigid_articulation_contact_active_set requires a block-sparse rigid_articulation_solve")
         self.rigid_articulation_contact_active_set = bool(rigid_articulation_contact_active_set)
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
-        self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
+        self.rigid_articulation_diagonal_regularization = float(rigid_articulation_diagonal_regularization)
+        self.rigid_articulation_angular_regularization = float(rigid_articulation_angular_regularization)
         self.rigid_articulation_elastic_solve = rigid_articulation_elastic_solve
 
         if model.tendon_count and integrate_with_external_rigid_solver:
@@ -7720,6 +7747,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._body_disp,
                         self._body_disp_ang,
                         self._use_body_displacement,
+                        self.rigid_articulation_angular_regularization,
                     ],
                     outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
                     device=self.device,
@@ -7770,6 +7798,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._body_disp,
                         self._body_disp_ang,
                         self._use_body_displacement,
+                        self.rigid_articulation_angular_regularization,
                         self.rigid_articulation_pivot_clamped,
                     ],
                     outputs=[state_in.body_q],
@@ -8356,6 +8385,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             twists=self._coupled_twists,
             values=values,
             rhs=rhs,
+            angular_regularization=self.rigid_articulation_angular_regularization,
             device=self.device,
         )
         metrics = self._coupled_metric_values is not None
