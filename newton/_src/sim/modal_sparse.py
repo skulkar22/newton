@@ -41,6 +41,17 @@ _RESIDUAL_TOLERANCE_FACTOR = 10.0
 _RESIDUAL_EPS_MULTIPLE = 1.0e3
 """Multiple of machine epsilon that replaces the ARPACK tolerance ``0`` (machine precision) in the residual check."""
 
+EIGENVALUE_SCALE_ITERATIONS = 30
+"""Power iterations on ``M^-1 K`` used by :func:`generalized_eigenvalue_scale` [count]."""
+
+EIGENVALUE_SCALE_SAFETY = 2.0
+"""Factor on the power-iteration estimate in :func:`generalized_eigenvalue_scale` [dimensionless].
+
+The Rayleigh quotient of a power iterate never exceeds the largest eigenvalue,
+so the factor keeps the scale at or above it when the iteration has not fully
+converged; the Gershgorin bound still caps the result.
+"""
+
 
 def is_sparse(matrix: Any) -> bool:
     """Return whether ``matrix`` is a SciPy sparse matrix or array.
@@ -271,13 +282,12 @@ def generalized_eigenvalue_bound(stiffness: Any, mass: Any) -> float:
     zero-energy threshold when it is of the same order of magnitude.
 
     On three-DOF lattices with lumped or consistent mass the bound is 1.2 to
-    1.9 times the largest eigenvalue. Consistent-mass shells with rotational
-    DOFs inflate it, because their rotary-inertia diagonals are small against
-    the off-diagonal coupling: on a six-DOF shell panel it is 41 times the
-    largest eigenvalue, which puts a threshold of ``1e-12`` relative to it at
-    about 0.6 Hz, close to genuine soft modes. A tighter scale, for example
-    from a few power iterations on ``M^-1 K``, is needed before such models
-    rely on a threshold relative to this bound.
+    1.9 times the largest eigenvalue. Six-DOF shells inflate it, because their
+    rotary-inertia diagonals are small against the rotational stiffness: on a
+    consistent-mass shell panel it is 41 times the largest eigenvalue, and on
+    a welded two-panel shell with lumped mass and drilling-ratio rotary
+    inertia it is about 1.2e3 times. Zero-energy thresholds therefore use
+    :func:`generalized_eigenvalue_scale`, which tightens this bound.
     """
     if is_sparse(stiffness):
         row_sums = np.asarray(abs(stiffness).sum(axis=1)).reshape(-1)
@@ -287,6 +297,59 @@ def generalized_eigenvalue_bound(stiffness: Any, mass: Any) -> float:
     if row_sums.shape[0] == 0:
         return 0.0
     return float(np.max(row_sums / np.maximum(diagonal, np.finfo(np.float64).tiny)))
+
+
+def generalized_eigenvalue_scale(
+    stiffness: Any, mass: Any, iterations: int = EIGENVALUE_SCALE_ITERATIONS
+) -> tuple[float, str]:
+    """Return a scale of the largest eigenvalue of ``K phi = lambda M phi`` [1/s^2] and its source.
+
+    The scale sets relative zero-energy thresholds. It is the smaller of
+    :func:`generalized_eigenvalue_bound` and :data:`EIGENVALUE_SCALE_SAFETY`
+    times the Rayleigh quotient after ``iterations`` power iterations on
+    ``M^-1 K`` from :func:`arpack_start_vector`. The Rayleigh quotient never
+    exceeds the largest eigenvalue, and on a mass matrix with small rotary
+    inertia it is up to three orders of magnitude below the bound, which
+    otherwise lifts the threshold above genuine elastic modes. The bound is
+    returned when ``mass`` cannot be factored or the iteration does not give a
+    finite positive value.
+
+    Args:
+        stiffness: Symmetric positive semi-definite stiffness matrix, dense or sparse.
+        mass: Symmetric positive definite mass matrix, dense or sparse.
+        iterations: Number of power iterations.
+
+    Returns:
+        ``(scale, source)`` with ``source`` ``"power_iteration"`` or ``"gershgorin_bound"``.
+    """
+    bound = generalized_eigenvalue_bound(stiffness, mass)
+    size = int(stiffness.shape[0])
+    if size == 0 or not np.isfinite(bound) or bound <= 0.0:
+        return bound, "gershgorin_bound"
+    try:
+        if is_sparse(stiffness) or is_sparse(mass):
+            solve = _symmetric_splu(to_csc(mass)).solve
+        else:
+            factor = np.linalg.cholesky(to_dense(mass))
+
+            def solve(rhs: np.ndarray) -> np.ndarray:
+                return np.linalg.solve(factor.T, np.linalg.solve(factor, rhs))
+
+    except (RuntimeError, ValueError, np.linalg.LinAlgError):
+        return bound, "gershgorin_bound"
+    vector = arpack_start_vector(size)
+    estimate = 0.0
+    for _ in range(max(int(iterations), 1)):
+        vector = np.asarray(solve(matmul(stiffness, vector)), dtype=np.float64).reshape(-1)
+        mass_norm_squared = quadratic_form(vector, mass)
+        if not np.isfinite(mass_norm_squared) or mass_norm_squared <= 0.0:
+            return bound, "gershgorin_bound"
+        vector /= np.sqrt(mass_norm_squared)
+        estimate = quadratic_form(vector, stiffness)
+    scaled = EIGENVALUE_SCALE_SAFETY * estimate
+    if not np.isfinite(scaled) or scaled <= 0.0 or scaled >= bound:
+        return bound, "gershgorin_bound"
+    return float(scaled), "power_iteration"
 
 
 def default_shift(stiffness: Any, mass: Any, shift_fraction: float = SHIFT_FRACTION_DEFAULT) -> float:

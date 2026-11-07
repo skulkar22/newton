@@ -288,6 +288,7 @@ class ModalGeneratorCraigBamptonFEM:
 
         self.craig_bampton: ModalGeneratorCraigBampton | None = None
         self.report: dict[str, Any] = {}
+        self._zero_energy_scale: tuple[float, str] = (math.nan, "")
 
     def _coerce_interfaces(self, interfaces: Sequence[Mapping[str, Any]]) -> list[_Interface]:
         """Validate the interface specifications and fill in their defaults."""
@@ -552,9 +553,11 @@ class ModalGeneratorCraigBamptonFEM:
         standard = np.linalg.solve(chol_m, np.linalg.solve(chol_m, stiffness_ii).T).T
         values, vectors = np.linalg.eigh(0.5 * (standard + standard.T))
         relative = max(self.eigenvalue_tolerance, 8.0 * stiffness_ii.shape[0] * np.finfo(np.float64).eps)
-        threshold = relative * float(np.max(np.abs(values), initial=0.0))
+        scale = float(np.max(np.abs(values), initial=0.0))
+        self._zero_energy_scale = (scale, "dense_eigenvalues")
+        threshold = relative * scale
         if values.shape[0] > 0 and values[0] <= threshold:
-            raise ValueError(self._mechanism_message())
+            raise ValueError(self._mechanism_message(float(values[0]), threshold))
         modes = np.linalg.solve(chol_m.T, vectors[:, :count])
         return constraint_modes, values[:count], modes, pivot_ratio, threshold
 
@@ -593,12 +596,14 @@ class ModalGeneratorCraigBamptonFEM:
             stop = min(start + self._SOLVE_CHUNK_COLUMNS, rhs.shape[1])
             constraint_modes[:, start:stop] = -stiffness_factorization.solve(np.ascontiguousarray(rhs[:, start:stop]))
 
-        # The bound overestimates the largest eigenvalue of consistent-mass six-DOF shells by up to about
-        # 40 times (see generalized_eigenvalue_bound), which raises the mechanism threshold accordingly.
-        bound = modal_sparse.generalized_eigenvalue_bound(stiffness_ii, mass_ii)
+        # The Gershgorin bound alone overestimates the largest eigenvalue of six-DOF shells by up to three
+        # orders of magnitude (small rotary inertia), which would lift the mechanism threshold above genuine
+        # elastic modes; generalized_eigenvalue_scale tightens it with a few power iterations.
+        scale, scale_source = modal_sparse.generalized_eigenvalue_scale(stiffness_ii, mass_ii)
+        self._zero_energy_scale = (scale, scale_source)
         row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness_ii), 1)
         relative = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
-        threshold = relative * bound
+        threshold = relative * scale
         if count == 0:
             return constraint_modes, np.zeros(0), np.zeros((stiffness_ii.shape[0], 0)), pivot_ratio, threshold
         values, modes = modal_sparse.lowest_generalized_eigenpairs(
@@ -614,16 +619,26 @@ class ModalGeneratorCraigBamptonFEM:
             factorization=factorization,
         )
         if values[0] <= threshold:
-            raise ValueError(self._mechanism_message())
+            raise ValueError(self._mechanism_message(float(values[0]), threshold))
         return constraint_modes, values[:count], modes[:, :count], pivot_ratio, threshold
 
     @staticmethod
-    def _mechanism_message() -> str:
-        return (
+    def _mechanism_message(lowest: float | None = None, threshold: float | None = None) -> str:
+        message = (
             "The interior stiffness matrix (every interface frame fixed) is singular or not positive definite: "
             "the model has a zero-energy mechanism, for example a part that is not tied to the rest or an "
             "unrestrained DOF without stiffness. Check constraints, interfaces, and the stiffness matrix"
         )
+        if lowest is not None and threshold is not None:
+
+            def hertz(value: float) -> float:
+                return math.sqrt(max(value, 0.0)) / (2.0 * math.pi)
+
+            message += (
+                f" (lowest fixed-interface eigenvalue {lowest:.6g} 1/s^2 = {hertz(lowest):.4g} Hz is at or below "
+                f"the zero-energy threshold {threshold:.6g} 1/s^2 = {hertz(threshold):.4g} Hz)"
+            )
+        return message
 
     def _lumped_sample_mass(self) -> np.ndarray:
         """Return the row-sum lumped translational mass [kg] of each sample node."""
@@ -813,6 +828,8 @@ class ModalGeneratorCraigBamptonFEM:
             "fixed_interface_eigenvalues": self.fixed_interface_eigenvalues.tolist(),
             "fixed_interface_frequencies_hz": self.fixed_interface_frequencies.tolist(),
             "zero_energy_threshold": float(threshold),
+            "zero_energy_scale": float(self._zero_energy_scale[0]),
+            "zero_energy_scale_source": self._zero_energy_scale[1],
             "constraint_mode_residual": constraint_mode_residual,
             "eigen_residual": eigen_residual,
             "rigid_stiffness_residual": rigid_residual,

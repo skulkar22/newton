@@ -12,6 +12,7 @@ available (set ``NEWTON_CB_PANEL_DIR`` to the folder that contains
 
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import numpy as np
 
 import newton
 import newton.utils
+from newton._src.sim import modal_sparse
 from newton.tests.test_reduced_elastic_body import _lattice_craig_bampton, _spring_lattice
 from newton.tests.unittest_utils import add_function_test
 
@@ -853,6 +855,131 @@ def test_load_sparse_matrix(test, device):
             newton.utils.load_sparse_matrix(folder / "a.txt")
 
 
+def _frame_beam(element_count=40, length=1.0, rotary_fraction=1.0e-6, offset=(0.0, 0.0, 0.0)):
+    """Return node positions, lumped mass, and stiffness of a straight six-DOF frame-element beam along x.
+
+    Steel, 10 mm square section. The rotary inertia of each node is ``rotary_fraction`` times its
+    translational mass [kg m^2 per kg], small as in shell models with drilling-ratio rotary inertia;
+    the Gershgorin bound then exceeds the largest eigenvalue by orders of magnitude.
+    """
+    from scipy import sparse
+
+    young, shear, density, side = 2.0e11, 8.0e10, 7850.0, 0.01
+    area, inertia, torsion = side * side, side**4 / 12.0, 0.1406 * side**4
+    step = length / element_count
+    node_count = element_count + 1
+    points = np.zeros((node_count, 3))
+    points[:, 0] = np.linspace(0.0, length, node_count)
+    points += np.asarray(offset, dtype=np.float64)
+    a, t, b = young * area / step, shear * torsion / step, young * inertia
+    element = np.zeros((12, 12))
+    for i, j, value in ((0, 0, a), (0, 6, -a), (3, 3, t), (3, 9, -t)):
+        element[i, j] += value
+    element[6, 6] += a
+    element[9, 9] += t
+    # Bending about z (v, theta_z = DOFs 1, 5, 7, 11) and about y (w, theta_y = DOFs 2, 4, 8, 10).
+    for (v1, r1, v2, r2), sign in (((1, 5, 7, 11), 1.0), ((2, 4, 8, 10), -1.0)):
+        k = (
+            b
+            / step**3
+            * np.array(
+                [
+                    [12.0, sign * 6.0 * step, -12.0, sign * 6.0 * step],
+                    [sign * 6.0 * step, 4.0 * step**2, -sign * 6.0 * step, 2.0 * step**2],
+                    [-12.0, -sign * 6.0 * step, 12.0, -sign * 6.0 * step],
+                    [sign * 6.0 * step, 2.0 * step**2, -sign * 6.0 * step, 4.0 * step**2],
+                ]
+            )
+        )
+        index = np.array([v1, r1, v2, r2])
+        element[np.ix_(index, index)] += k
+    element = np.triu(element) + np.triu(element, 1).T
+    stiffness = sparse.lil_matrix((6 * node_count, 6 * node_count))
+    nodal_mass = np.zeros(node_count)
+    for e in range(element_count):
+        dofs = np.arange(6 * e, 6 * e + 12)
+        stiffness[np.ix_(dofs, dofs)] = stiffness[np.ix_(dofs, dofs)].toarray() + element
+        nodal_mass[e : e + 2] += 0.5 * density * area * step
+    diagonal = np.repeat(nodal_mass, 6) * np.tile([1.0, 1.0, 1.0] + [rotary_fraction] * 3, node_count)
+    return points, sparse.diags(diagonal).tocsc(), stiffness.tocsc()
+
+
+def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
+    """Keep genuine elastic modes of six-DOF models whose Gershgorin bound far exceeds the largest eigenvalue.
+
+    Small rotary inertia inflates the Gershgorin bound by orders of magnitude, so a threshold relative to the
+    bound alone rejected genuine fixed-interface modes as mechanisms (welded two-panel shell: bound 1.2e3
+    times the largest eigenvalue, 27.9 Hz mode against a 46.6 Hz threshold). The threshold now uses
+    generalized_eigenvalue_scale, and a part that is not tied to the rest is still rejected.
+    """
+    from scipy import linalg, sparse
+
+    points, mass, stiffness = _frame_beam()
+    clamp = [{"name": "root", "node_indices": [0], "coupling": "node"}]
+    interior = np.arange(6, stiffness.shape[0])
+    stiffness_ii = stiffness[interior][:, interior]
+    mass_ii = mass[interior][:, interior]
+    exact = linalg.eigh(stiffness_ii.toarray(), mass_ii.toarray(), eigvals_only=True)
+    bound = modal_sparse.generalized_eigenvalue_bound(stiffness_ii, mass_ii)
+    test.assertGreater(bound / exact[-1], 50.0)
+    # A tolerance between the two scales: relative to the bound it lies above the first mode, relative to the
+    # largest eigenvalue well below it.
+    tolerance = math.sqrt(exact[0] / exact[-1] * exact[0] / bound)
+    test.assertGreater(tolerance * bound, exact[0])
+    test.assertLess(4.0 * tolerance * exact[-1], exact[0])
+
+    generator = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, clamp, fixed_mode_count=4, eigensolver="arpack", eigenvalue_tolerance=tolerance
+    )
+    generator.reduce()
+    np.testing.assert_allclose(generator.fixed_interface_eigenvalues, exact[:4], rtol=1.0e-6)
+    report = generator.report
+    test.assertEqual(report["zero_energy_scale_source"], "power_iteration")
+    test.assertGreaterEqual(report["zero_energy_scale"], exact[-1])
+    test.assertLessEqual(report["zero_energy_scale"], 2.0 * exact[-1] * (1.0 + 1.0e-9))
+    test.assertLess(report["zero_energy_threshold"], exact[0])
+    scale, source = modal_sparse.generalized_eigenvalue_scale(stiffness_ii, mass_ii)
+    test.assertEqual((scale, source), (report["zero_energy_scale"], "power_iteration"))
+    np.testing.assert_allclose(
+        modal_sparse.generalized_eigenvalue_scale(stiffness_ii.toarray(), mass_ii.toarray())[0], scale, rtol=1.0e-6
+    )
+    # Without a factorable mass matrix the scale falls back to the bound (infinite for a zero mass diagonal).
+    singular = sparse.lil_matrix(mass_ii)
+    singular[0, 0] = 0.0
+    with np.errstate(over="ignore"):
+        fallback = modal_sparse.generalized_eigenvalue_scale(stiffness_ii, singular.tocsc())
+    test.assertEqual(fallback[1], "gershgorin_bound")
+
+    # The dense path uses the exact largest eigenvalue and agrees.
+    dense = newton.ModalGeneratorCraigBamptonFEM(
+        points,
+        mass.toarray(),
+        stiffness.toarray(),
+        clamp,
+        fixed_mode_count=4,
+        eigensolver="dense",
+        eigenvalue_tolerance=tolerance,
+    )
+    dense.reduce()
+    test.assertEqual(dense.report["zero_energy_scale_source"], "dense_eigenvalues")
+    np.testing.assert_allclose(dense.fixed_interface_eigenvalues, exact[:4], rtol=1.0e-6)
+
+    # A second beam that is not tied to the clamped one is a mechanism and is still rejected.
+    second_points, second_mass, second_stiffness = _frame_beam(offset=(0.0, 0.1, 0.0))
+    pair = (
+        np.vstack((points, second_points)),
+        sparse.block_diag((mass, second_mass), format="csc"),
+        sparse.block_diag((stiffness, second_stiffness), format="csc"),
+    )
+    for eigensolver in ("arpack", "dense"):
+        matrices = pair[1:] if eigensolver == "arpack" else (pair[1].toarray(), pair[2].toarray())
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            pair[0], *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver, eigenvalue_tolerance=tolerance
+        )
+        with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
+            generator.reduce()
+
+
 class TestModalCraigBamptonFem(unittest.TestCase):
     pass
 
@@ -869,6 +996,7 @@ _TESTS = (
     test_cb_fem_constraint_errors_name_interfaces,
     test_transformation_rank_checked,
     test_cb_fem_reduce_rejects_non_rigid_constraints,
+    test_cb_fem_small_rotary_inertia_is_not_a_mechanism,
     test_cb_fem_large_tiled_model,
     test_load_sparse_matrix,
 )

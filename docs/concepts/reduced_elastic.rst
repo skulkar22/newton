@@ -305,13 +305,17 @@ which require a negative shift because their rigid-body eigenvalues are zero;
 for constrained meshes whose stiffest and softest modes differ by many
 decades, an ``arpack_shift`` just below the lowest wanted eigenvalue
 converges faster. A shift at an eigenvalue raises. On this path the
-zero-energy threshold is relative to a Gershgorin-type bound
-:math:`\max_i \sum_j |K_{ij}| / M_{ii}` on the largest eigenvalue, which is
-close for three-DOF meshes but can exceed it about 40 times for
-consistent-mass shells with rotational DOFs, as in the six-DOF interior of
-:class:`ModalGeneratorCraigBamptonFEM`, whose fixed-interface eigenvalues at
-or below ``eigenvalue_tolerance`` times that bound are reported as
-mechanisms. The
+zero-energy threshold is relative to a scale of the largest eigenvalue: the
+smaller of the Gershgorin-type bound
+:math:`\max_i \sum_j |K_{ij}| / M_{ii}` and twice the Rayleigh quotient
+after 30 power iterations on :math:`\mathbf{M}^{-1}\mathbf{K}`. The bound
+alone is close for three-DOF meshes but exceeds the largest eigenvalue 41
+times on a consistent-mass shell panel and about 1200 times on a welded
+two-panel shell with small (drilling-ratio) rotary inertia, which would put
+the threshold above genuine elastic modes. Fixed-interface eigenvalues of
+:class:`ModalGeneratorCraigBamptonFEM` at or below ``eigenvalue_tolerance``
+times this scale are reported as mechanisms, and the reduction report
+records the scale and its source. The
 factorization dominates time and memory: its fill grows much faster for
 volume meshes than for shell meshes of the same size. For large models, also
 pass ``sample_node_indices`` (sample points that coincide with nodes are
