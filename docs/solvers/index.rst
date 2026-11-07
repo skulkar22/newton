@@ -416,6 +416,14 @@ overshooting when a light link is driven through a large armature at large time 
 and ``rigid_external_force_mode="solve"`` applies ``State.body_f`` and the mapped
 ``Control.joint_f`` inside the rigid solve instead of shifting the inertial target.
 These three options are off by default with BDF1 and on by default with BDF2.
+In the ``"block_sparse_joints"`` and ``"block_sparse_levels"`` articulation solves,
+``rigid_limit_rho_floor`` also keeps a loaded joint limit from chattering when the limited
+coordinate is held through stiff joints (``rigid_joint_linear_ke`` or ``rigid_joint_angular_ke``
+around ``1e6`` or more) at a small fixed iteration count such as 16. Without the floor the limit
+force converges by only a small factor per iteration there; with it, the limit row converges like
+the structural rows, at the cost of one kernel launch per step.
+``rigid_articulation_angular_regularization`` does not act on limit rows; values above
+``I_ref / dt^2`` damp the angular Newton step of the sparse solves further.
 
 .. experimental::
     ``rigid_time_integration="bdf2"``, ``rigid_bdf2_theta_policy``, ``rigid_axis_support_armature``,

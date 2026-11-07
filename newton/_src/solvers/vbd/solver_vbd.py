@@ -1244,8 +1244,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_limit_rho_floor: Floor the ALM support of every revolute, prismatic and D6
                 joint-limit row at ``9 (K + D/h)``, as drive and structural rows already are. Without
                 it a limit next to a light link acts mostly through its slowly growing multiplier and
-                overshoots. ``None`` (default) enables it for ``rigid_time_integration="bdf2"`` and
-                disables it for ``"bdf1"``.
+                overshoots. The same happens in the ``"block_sparse_joints"`` and
+                ``"block_sparse_levels"`` articulation solves when the limited coordinate is loaded through
+                stiff joints (``rigid_joint_linear_ke`` or ``rigid_joint_angular_ke`` around ``1e6`` or
+                more) at a small fixed iteration count such as 16: the limit force then converges by only a
+                small factor per iteration, and a loaded limit chatters from step to step. Enable the floor
+                in that case; it costs one kernel launch per step. ``None`` (default) enables the floor for
+                ``rigid_time_integration="bdf2"`` and disables it for ``"bdf1"``.
+                ``rigid_articulation_angular_regularization`` is a separate lever: it does not change the
+                limit rows, and values above ``I_ref / dt^2`` damp the angular Newton step further.
 
                 .. experimental::
                     ``rigid_limit_rho_floor`` is experimental and may change or be removed.
