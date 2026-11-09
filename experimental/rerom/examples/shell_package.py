@@ -81,7 +81,8 @@ def run_fe(a, mesh, model, out):
                 tag = f"{name}_{kind}" + (f"_inc{n_incr}" if kind == "nlgeom" else "")
                 t0 = time.perf_counter()
                 r = model.static(
-                    fixed, g, nlgeom=(kind == "nlgeom"), rigid_clamps=released, welds=True, n_incr=n_incr, label=tag
+                    fixed, g, nlgeom=(kind == "nlgeom"), rigid_clamps=released, welds=True, n_incr=n_incr, label=tag,
+                    controls=not a.default_controls,
                 )
                 s = summary(model, r["u"], tag)
                 s.update(wall_s=time.perf_counter() - t0, increments=r["increments"], active=active, released=released)
@@ -184,6 +185,8 @@ def main():
     fe.add_argument("--linear", action="store_true")
     fe.add_argument("--nlgeom", action="store_true")
     fe.add_argument("--n-incr", type=int, nargs="+", default=[10])
+    fe.add_argument("--default-controls", action="store_true",
+                    help="NLGEOM with CalculiX's default convergence criteria instead of the tight 1e-6 residual")
     fe.add_argument("--mg-load", action="store_true",
                     help="also a linear static with gravity as M g on the nodes (the load Newton's ROM sees)")
     nw = sub.add_parser("newton")
