@@ -857,6 +857,7 @@ class GroundedScene(PanelScene):
             floor = float(lam[lam > 0].min())
             self.clipped = int(np.count_nonzero(lam <= 0))
             lam = np.where(lam > 0, lam, floor)
+        self.used_eigenvalues = lam  # the clamped eigenvalues the scene uses (after any clipping)
         Phi = cb.T[:, keep] @ V  # (n_dof, m) M-orthonormal
         self.Phi_nodal = Phi
         self.modal_matrix = V
@@ -1215,7 +1216,7 @@ class PanelReROM:
             "lowest_clamped_eigenvalue": lowest,
             "modes": int(scene.nm),
             "rigid_residual_free_free": cb.info["rigid_residual_before_projection"],
-            "clamped_hz_first": (np.sqrt(scene.clamped_eigenvalues[:3]) / (2 * np.pi)).tolist(),
+            "clamped_hz_first": (np.sqrt(scene.used_eigenvalues[:3]) / (2 * np.pi)).tolist(),
             "modal_residual_at_ref": resid,
             "ke_before": ke_old,
             "ke_after": ke_new,

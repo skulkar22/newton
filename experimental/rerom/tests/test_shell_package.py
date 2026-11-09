@@ -28,7 +28,7 @@ import scipy.io
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from rerom.ccx import CCX_DEFAULT, ShellMesh, rotvec_to_matrix
-from rerom.panel import PanelCcxModel, PanelReROM, SolidCB, interface_list
+from rerom.panel import GroundedScene, IndefiniteTangentError, PanelCcxModel, PanelReROM, SolidCB, interface_list
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from shell_package import nr_static  # noqa: E402
@@ -329,6 +329,35 @@ class TestShellPackageCcx(unittest.TestCase):
             rel = np.abs(r["u"] - u).max() / np.abs(u).max()
             self.assertLess(rel, 1e-5, cfg)  # ccx prints 7 significant digits
             self.assertLess(np.abs(C @ r["u"]).max(), 1e-6 * np.abs(r["u"]).max())
+
+    def test_indefinite_tangent_clip(self):
+        """A clamped tangent with negative eigenvalues stops the grounded scene by default; with clip_negative the
+        scene keeps the tangent's eigenvectors and raises only the non-positive eigenvalues to the smallest
+        positive one."""
+        model, K, M = self.model, self.K, self.M
+        itf = interface_list(model)
+        active = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["reduced"] == 1]
+        scb = SolidCB(model.solid_points, model.weld_rows(), itf, weld_dependents=model.weld_dependents)
+        cb0 = scb.reduce(K, M, 12, rigid_project_tol=None)
+        keep = np.ones(cb0.T.shape[1], bool)
+        for k in active:
+            keep[6 * k : 6 * k + 6] = False
+        import scipy.linalg as sla  # noqa: PLC0415
+
+        lam0 = sla.eigh(cb0.Kr[np.ix_(keep, keep)], cb0.Mr[np.ix_(keep, keep)], eigvals_only=True)
+        alpha = 0.5 * (lam0[1] + lam0[2])  # about two clamped eigenvalues below zero after the shift
+        cb = scb.reduce(sp.csr_matrix(K - alpha * M), M, 12, rigid_project_tol=None)
+        kw = dict(gravity=[0.0, 0.0, -9.81], shift=model.mesh.points.mean(0))
+        with self.assertRaises(IndefiniteTangentError):
+            GroundedScene(cb, model.solid_points, active, M, **kw)
+        sc = GroundedScene(cb, model.solid_points, active, M, clip_negative=True, **kw)
+        lam = sc.clamped_eigenvalues
+        self.assertEqual(sc.clipped, int(np.count_nonzero(lam <= 0)))
+        self.assertGreaterEqual(sc.clipped, 1)
+        stiff = np.asarray(sc.basis.mode_stiffness, float)
+        floor = lam[lam > 0].min()
+        np.testing.assert_allclose(stiff[lam > 0], lam[lam > 0], rtol=1e-6)  # stored as float32
+        np.testing.assert_allclose(stiff[lam <= 0], floor, rtol=1e-6)
 
     def test_tangent_matches_finite_difference(self):
         """K_T from ccx at a deformed state matches central differences of f_int (NLGEOM)."""
