@@ -128,8 +128,8 @@ class ShellMesh:
         return nn / np.linalg.norm(nn, axis=1)[:, None]
 
     @classmethod
-    def from_hmg_package(cls, pkg):
-        """Read a DATA_CONTRACT package (nodes/elements/panels.csv, C.mtx weld ties, clamps)."""
+    def from_shell_package(cls, pkg):
+        """Read a shell package (nodes/elements/panels.csv, C.mtx weld ties, clamps)."""
         pkg = Path(pkg)
         rd = lambda f: list(csv.DictReader(open(pkg / f)))  # noqa: E731
         nodes = rd("nodes.csv")

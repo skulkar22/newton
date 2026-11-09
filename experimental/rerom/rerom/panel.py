@@ -20,7 +20,7 @@ Pieces
   ``ModalGeneratorCraigBampton`` order).  At rest it reproduces ``ModalGeneratorCraigBamptonFEM``
   (tests/test_panel_rerom.py).  About a deformed state it is called with the deformed node positions
   and the tangent ``K_T`` (total Lagrangian: ``M`` is the reference mass and does not change).
-* :class:`PanelScene` -- the Newton scene of the HMG example (one elastic body, one FIXED joint per
+* :class:`PanelScene` -- the Newton scene of the panel example (one elastic body, one FIXED joint per
   clamp at its interface frame, joints enabled per configuration) built from a reduction, with a
   float64 read-out of the nodal displacement from the joint state.
 * :class:`PanelReROM` -- re-ROM driver: residual-mismatch trigger evaluated with ccx on the recovered
@@ -571,7 +571,7 @@ def rigid_free_project(Kr, R, Mr):
 # Newton scene
 # ----------------------------------------------------------------------------------------------
 def modal_damping(Mr, Kr, zeta):
-    """Uniform modal damping in reduced coordinates, zero on the six rigid modes (HMG solve_newton)."""
+    """Uniform modal damping in reduced coordinates, zero on the six rigid modes (as in the fixed-basis panel example)."""
     import scipy.linalg as la
 
     w, V = la.eigh(Kr, Mr)
@@ -581,7 +581,7 @@ def modal_damping(Mr, Kr, zeta):
 
 
 class PanelScene:
-    """HMG-style Newton scene of one CB elastic body with FIXED clamp joints (package frame shifted
+    """Newton scene of one CB elastic body with FIXED clamp joints (package frame shifted
     by ``shift`` so the float32 solver sees planform-centred coordinates)."""
 
     def __init__(
@@ -727,7 +727,7 @@ class GroundedScene(PanelScene):
     elastic eigenvalues, see notes/v2_wp4_panel.md), while the clamped tangent is positive definite.
     The rigid mass properties and the linear/angular coupling integrals are exact from the consistent
     mass M (as ModalGeneratorFEM computes them); no sample_mass (no centrifugal/quadratic integrals),
-    as in the HMG static example."""
+    as in the panel static example."""
 
     def __init__(
         self,
@@ -840,7 +840,7 @@ class GroundedScene(PanelScene):
 
 
 class PanelReROM:
-    """Fixed-basis (``rerom=False``, HMG free-free CB + one FIXED joint per clamp) or re-ROM
+    """Fixed-basis (``rerom=False``, free-free CB + one FIXED joint per clamp) or re-ROM
     (``rerom=True``) Newton run of a CB panel body (see module doc).
 
     Re-ROM: the body is a :class:`GroundedScene`; it is rebuilt (forced update) whenever the active
