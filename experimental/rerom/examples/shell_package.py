@@ -171,7 +171,7 @@ def run_newton(a, mesh, model, out):
     (out / f"newton_{a.method}.log").write_text("\n".join(log_lines))
 
 
-def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=None, nthreads=16):
+def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=None, nthreads=16, u0=None):
     """Full-order nonlinear static equilibrium (Newton-Raphson, load steps) of the constrained thin-solid model.
 
     CalculiX supplies the NLGEOM element internal force and tangent at each state (CcxModel.evaluate, the same call
@@ -209,6 +209,17 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
     Coff.eliminate_zeros()
     u = np.zeros(n)
     hist = []
+    if u0 is not None:  # start from a given state: released pads' frames from a rigid (Kabsch) fit of their nodes
+        u = np.asarray(u0, float).copy()
+        U0 = u.reshape(-1, 3)
+        for k in released:
+            nodes = itf[k]["nodes"]
+            c = itf[k]["position"]
+            A, B = X[nodes], X[nodes] + U0[nodes]
+            ca, cb = A.mean(0), B.mean(0)
+            Uu, _, Vt = np.linalg.svd((A - ca).T @ (B - cb))
+            R = Vt.T @ np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ Uu.T))]) @ Uu.T
+            frames[k] = (cb - c - R @ (ca - c), R)
 
     def place_pads(u):
         U = u.reshape(-1, 3)
@@ -226,6 +237,9 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
                 return
         raise RuntimeError("tie dependents did not resolve (cyclic chain?)")
 
+    if u0 is not None:
+        place_pads(u)
+        apply_ties(u)
     for lam in steps:
         for it in range(max_iter):
             t0 = time.perf_counter()
