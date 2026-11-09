@@ -11,6 +11,7 @@ available (set ``NEWTON_CB_PANEL_DIR`` to the folder that contains
 """
 
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -980,6 +981,253 @@ def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
             generator.reduce()
 
 
+def _frame_grid(nx=8, ny=5, spacing=0.1, rotary_fraction=1.0e-3):
+    """Return node positions, lumped mass, and stiffness of a flat six-DOF grillage of frame elements in the xy plane.
+
+    Steel, 10 mm square section, ``nx`` by ``ny`` nodes; a plate-like free-free model whose stiffness preserves
+    rigid-body motion exactly.
+    """
+    from scipy import sparse
+
+    young, shear, density, side = 2.0e11, 8.0e10, 7850.0, 0.01
+    area, inertia, torsion = side * side, side**4 / 12.0, 0.1406 * side**4
+    a, t, b, s = young * area / spacing, shear * torsion / spacing, young * inertia, spacing
+    local = np.zeros((12, 12))
+    for i, j, value in ((0, 0, a), (0, 6, -a), (6, 6, a), (3, 3, t), (3, 9, -t), (9, 9, t)):
+        local[i, j] += value
+    for (v1, r1, v2, r2), sign in (((1, 5, 7, 11), 1.0), ((2, 4, 8, 10), -1.0)):
+        k = (b / s**3) * np.array(
+            [
+                [12.0, sign * 6.0 * s, -12.0, sign * 6.0 * s],
+                [sign * 6.0 * s, 4.0 * s * s, -sign * 6.0 * s, 2.0 * s * s],
+                [-12.0, -sign * 6.0 * s, 12.0, -sign * 6.0 * s],
+                [sign * 6.0 * s, 2.0 * s * s, -sign * 6.0 * s, 4.0 * s * s],
+            ]
+        )
+        index = np.array([v1, r1, v2, r2])
+        local[np.ix_(index, index)] += k
+    local = np.triu(local) + np.triu(local, 1).T
+    # Elements along y: local axes (y, -x, z) in global coordinates.
+    rotation = np.kron(np.eye(4), np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]))
+    along_y = rotation.T @ local @ rotation
+    node = np.arange(nx * ny).reshape(ny, nx)
+    points = np.zeros((nx * ny, 3))
+    points[:, 0] = np.tile(np.arange(nx) * spacing, ny)
+    points[:, 1] = np.repeat(np.arange(ny) * spacing, nx)
+    stiffness = sparse.lil_matrix((6 * nx * ny, 6 * nx * ny))
+    nodal_mass = np.zeros(nx * ny)
+    pairs = [(node[j, i], node[j, i + 1], local) for j in range(ny) for i in range(nx - 1)]
+    pairs += [(node[j, i], node[j + 1, i], along_y) for j in range(ny - 1) for i in range(nx)]
+    for first, second, element in pairs:
+        dofs = np.concatenate((np.arange(6 * first, 6 * first + 6), np.arange(6 * second, 6 * second + 6)))
+        stiffness[np.ix_(dofs, dofs)] = stiffness[np.ix_(dofs, dofs)].toarray() + element
+        nodal_mass[[first, second]] += 0.5 * density * area * spacing
+    diagonal = np.repeat(nodal_mass, 6) * np.tile([1.0, 1.0, 1.0] + [rotary_fraction] * 3, nx * ny)
+    return points, sparse.diags(diagonal).tocsc(), stiffness.tocsc()
+
+
+def _grid_interfaces(coupling, nx=8, ny=5):
+    """Two four-node corner patches of :func:`_frame_grid` with the given coupling."""
+    node = np.arange(nx * ny).reshape(ny, nx)
+    return [
+        {"name": "near", "node_indices": node[:2, :2].reshape(-1), "coupling": coupling},
+        {"name": "far", "node_indices": node[-2:, -2:].reshape(-1), "coupling": coupling},
+    ]
+
+
+def _rotation_drift(stiffness, relative):
+    """Return a diagonal stiffness on the rotational DOFs, ``relative`` times their mean diagonal [N m/rad].
+
+    It resists rigid rotation only, like the rotational rigid-body residual of shells on a non-conformal mesh.
+    """
+    from scipy import sparse
+
+    diagonal = stiffness.diagonal()
+    rotational = np.zeros(diagonal.shape[0], dtype=bool)
+    rotational[3::6] = rotational[4::6] = rotational[5::6] = True
+    return sparse.diags(np.where(rotational, relative * float(np.mean(diagonal[rotational])), 0.0)).tocsc()
+
+
+_GRID_DRIFT = 1.0e-6
+"""Relative rotational drift stiffness of the :func:`_frame_grid` rigid-consistency tests."""
+
+_GRID_GROUND_SPRING = 1.0e4
+"""Translational ground spring [N/m] of the rigid-consistency guard test."""
+
+
+def _external_rigid_projection(craig_bampton):
+    """Project a Craig-Bampton model onto rigid consistency outside the generator, on its public attributes.
+
+    The algebra of an external correction applied between ``reduce()`` and ``build()``, kept
+    separate from the generator code as the reference for ``rigid_consistency="project"``.
+    """
+    rigid = craig_bampton._rigid_map()
+    rigid_pinv = np.linalg.pinv(rigid)
+    projector = np.eye(craig_bampton.reduced_dof_count) - rigid @ rigid_pinv
+    stiffness = projector.T @ craig_bampton.stiffness_matrix @ projector
+    stiffness = 0.5 * (stiffness + stiffness.T)
+    points = craig_bampton.sample_points
+    sample_rigid = np.hstack(
+        (np.tile(np.eye(3), (points.shape[0], 1)), np.vstack([-craig_bampton._skew(p) for p in points]))
+    )
+    recovery = craig_bampton.recovery_matrix + (sample_rigid - craig_bampton.recovery_matrix @ rigid) @ rigid_pinv
+    spatial = rigid.T @ craig_bampton.mass_matrix @ rigid
+    target = spatial.copy()
+    target[:3, :3] = np.trace(spatial[:3, :3]) / 3.0 * np.eye(3)
+    moment = 0.5 * (spatial[:3, 3:] - spatial[:3, 3:].T)
+    target[:3, 3:] = moment
+    target[3:, :3] = moment.T
+    mass = craig_bampton.mass_matrix + rigid_pinv.T @ (target - spatial) @ rigid_pinv
+    return stiffness, 0.5 * (mass + mass.T), recovery
+
+
+def test_cb_fem_rigid_consistency_projection(test, device):
+    """Remove a small rigid-body residual with rigid_consistency="project", as an external projection would.
+
+    The default check rejects the model in ModalGeneratorCraigBampton.build() (on this stiff grillage at the
+    rigid-mode gate, which precedes the recovery gate). The projected generator matches the external projection
+    (external correction algebra) to 1e-10, reports the residuals before and after, and its full recovery
+    reproduces rigid motion and agrees with the sample recovery.
+    """
+    points, mass, stiffness = _frame_grid()
+    drifting = stiffness + _rotation_drift(stiffness, _GRID_DRIFT)
+    for coupling in ("rbe2", "rbe3"):
+        interfaces = _grid_interfaces(coupling)
+        checked = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, drifting, interfaces, fixed_mode_count=6, sample_mass="lumped"
+        )
+        with test.assertRaisesRegex(ValueError, "six global rigid-body modes|recovery_matrix is inconsistent"):
+            checked.build()
+        test.assertIsNone(checked.report["rigid_projection"])
+        reference = checked.craig_bampton
+        stiffness_ref, mass_ref, recovery_ref = _external_rigid_projection(reference)
+        reference.stiffness_matrix, reference.mass_matrix, reference.recovery_matrix = (
+            stiffness_ref,
+            mass_ref,
+            recovery_ref,
+        )
+        reference.build()
+
+        projected = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, drifting, interfaces, fixed_mode_count=6, sample_mass="lumped", rigid_consistency="project"
+        )
+        projected.build()
+        for name, value, expected in (
+            ("stiffness", projected.reduced_stiffness_matrix, stiffness_ref),
+            ("mass", projected.reduced_mass_matrix, mass_ref),
+            ("recovery", projected.recovery_matrix, recovery_ref),
+            ("frequencies", projected.craig_bampton.frequencies, reference.frequencies),
+        ):
+            error = float(np.max(np.abs(value - expected))) / float(np.max(np.abs(expected)))
+            test.assertLess(error, 1.0e-10, f"{coupling} {name}")
+
+        report = projected.report["rigid_projection"]
+        test.assertGreater(report["recovery_residual_before"], 1.0e-6)
+        test.assertLess(report["recovery_residual_before"], projected.rigid_projection_limit)
+        for name in ("stiffness", "recovery", "mass"):
+            test.assertLess(report[f"{name}_residual_after"], 1.0e-12, f"{coupling} {name}")
+        test.assertLess(report["max_elastic_eigenvalue_shift"], projected.rigid_projection_eigenvalue_tolerance)
+
+        # The full recovery carries the same correction: it reproduces rigid motion exactly and its sample rows
+        # are the recovery matrices.
+        full = projected.full_recovery_matrix()
+        rigid = projected.craig_bampton._rigid_map()
+        exact = modal_sparse.rigid_vectors(points, 6, np.zeros(3))
+        test.assertLess(float(np.max(np.abs(full @ rigid - exact))), 1.0e-12)
+        np.testing.assert_allclose(full[_translation_rows(points.shape[0])], projected.recovery_matrix, atol=1.0e-12)
+        np.testing.assert_allclose(
+            full[_translation_rows(points.shape[0]) + 3], projected.rotation_recovery_matrix, atol=1.0e-12
+        )
+        exported = projected.to_arrays(full_recovery=False)
+        np.testing.assert_array_equal(exported["stiffness_matrix"], projected.reduced_stiffness_matrix)
+        np.testing.assert_array_equal(exported["recovery_matrix"], projected.recovery_matrix)
+
+
+def test_cb_fem_rigid_consistency_guards(test, device):
+    """Refuse to project a residual that is a modeling error rather than discretization drift."""
+    from scipy import sparse
+
+    points, mass, stiffness = _frame_grid()
+    interfaces = _grid_interfaces("rbe3")
+    middle = int(np.argmin(np.linalg.norm(points - points.mean(axis=0), axis=1)))
+
+    def generator(matrix, **options):
+        options.setdefault("rigid_consistency", "project")
+        return newton.ModalGeneratorCraigBamptonFEM(points, mass, matrix, interfaces, fixed_mode_count=6, **options)
+
+    # A support left in the stiffness matrix: a translational spring to ground at an interior node.
+    grounded = sparse.lil_matrix(stiffness)
+    for dof in range(6 * middle, 6 * middle + 3):
+        grounded[dof, dof] += _GRID_GROUND_SPRING
+    grounded = grounded.tocsc()
+    with test.assertRaisesRegex(ValueError, "beyond rigid_projection_limit"):
+        generator(grounded).reduce()
+    # Below an (unreasonably) relaxed limit the projection is still refused: it would change the elastic
+    # eigenvalues or make the mass matrix indefinite.
+    with test.assertRaisesRegex(ValueError, "moves elastic eigenvalue|mass matrix indefinite"):
+        generator(grounded, rigid_projection_limit=1.0).reduce()
+    # Small drift passes the default guards but not a zero eigenvalue tolerance.
+    drifting = stiffness + _rotation_drift(stiffness, _GRID_DRIFT)
+    generator(drifting).reduce()
+    with test.assertRaisesRegex(ValueError, "moves elastic eigenvalue"):
+        generator(drifting, rigid_projection_eigenvalue_tolerance=0.0).reduce()
+    # Constraints that ground the body are rejected in either mode.
+    spc = np.zeros((1, stiffness.shape[0]))
+    spc[0, 6 * middle] = 1.0
+    with test.assertRaisesRegex(ValueError, "constraints do not admit rigid-body motion"):
+        generator(stiffness, constraints=spc).reduce()
+    with test.assertRaisesRegex(ValueError, "rigid_consistency must be 'check' or 'project'"):
+        generator(stiffness, rigid_consistency="ignore")
+    with test.assertRaisesRegex(ValueError, "rigid_projection_limit must be non-negative"):
+        generator(stiffness, rigid_projection_limit=-1.0)
+    with test.assertRaisesRegex(ValueError, "rigid_projection_eigenvalue_tolerance must be non-negative"):
+        generator(stiffness, rigid_projection_eigenvalue_tolerance=float("nan"))
+    with test.assertRaisesRegex(ValueError, "rigid_recovery_tolerance must be non-negative"):
+        generator(stiffness, rigid_recovery_tolerance=-1.0).reduce()
+
+
+def test_cb_fem_rigid_consistency_defaults(test, device):
+    """Keep the default behavior: check mode, the former tolerances, and no change to consistent models."""
+    fem = inspect.signature(newton.ModalGeneratorCraigBamptonFEM).parameters
+    test.assertEqual(fem["rigid_consistency"].default, "check")
+    test.assertEqual(fem["rigid_recovery_tolerance"].default, 1.0e-6)
+    test.assertEqual(fem["rigid_mode_tolerance"].default, 1.0e-8)
+    craig_bampton = inspect.signature(newton.ModalGeneratorCraigBampton).parameters
+    test.assertEqual(craig_bampton["rigid_recovery_tolerance"].default, 1.0e-6)
+
+    points, mass, stiffness = _frame_grid()
+    for coupling in ("rbe2", "rbe3"):
+        interfaces = _grid_interfaces(coupling)
+        default = newton.ModalGeneratorCraigBamptonFEM(points, mass, stiffness, interfaces, fixed_mode_count=6)
+        default.build()
+        test.assertEqual(default.report["rigid_consistency"], "check")
+        test.assertIsNone(default.report["rigid_projection"])
+        # On a model that preserves rigid motion the projection changes nothing beyond roundoff.
+        projected = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, fixed_mode_count=6, rigid_consistency="project"
+        )
+        projected.build()
+        for value, expected in (
+            (projected.reduced_stiffness_matrix, default.reduced_stiffness_matrix),
+            (projected.reduced_mass_matrix, default.reduced_mass_matrix),
+            (projected.recovery_matrix, default.recovery_matrix),
+            (projected.craig_bampton.frequencies, default.craig_bampton.frequencies),
+        ):
+            test.assertLess(float(np.max(np.abs(value - expected))) / float(np.max(np.abs(expected))), 1.0e-9)
+        test.assertLess(projected.report["rigid_projection"]["max_elastic_eigenvalue_shift"], 1.0e-9)
+
+    # The recovery tolerance of the Craig-Bampton build, formerly fixed at 1e-6, is now a parameter with the same
+    # default: a drift whose recovery error (about 1e-7) passes the default fails a tighter tolerance.
+    drifting = stiffness + _rotation_drift(stiffness, 1.0e-8)
+    interfaces = _grid_interfaces("rbe2")
+    newton.ModalGeneratorCraigBamptonFEM(points, mass, drifting, interfaces, fixed_mode_count=6).build()
+    tight = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, drifting, interfaces, fixed_mode_count=6, rigid_recovery_tolerance=1.0e-8
+    )
+    with test.assertRaisesRegex(ValueError, "recovery_matrix is inconsistent.*rigid_recovery_tolerance 1e-08"):
+        tight.build()
+
+
 class TestModalCraigBamptonFem(unittest.TestCase):
     pass
 
@@ -997,6 +1245,9 @@ _TESTS = (
     test_transformation_rank_checked,
     test_cb_fem_reduce_rejects_non_rigid_constraints,
     test_cb_fem_small_rotary_inertia_is_not_a_mechanism,
+    test_cb_fem_rigid_consistency_projection,
+    test_cb_fem_rigid_consistency_guards,
+    test_cb_fem_rigid_consistency_defaults,
     test_cb_fem_large_tiled_model,
     test_load_sparse_matrix,
 )

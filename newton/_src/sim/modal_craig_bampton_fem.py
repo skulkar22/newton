@@ -114,6 +114,29 @@ class ModalGeneratorCraigBamptonFEM:
     :class:`ModalGeneratorCraigBampton`), and ``report`` with sizes,
     residuals, conditioning, and stage timings.
 
+    The reduced model must reproduce rigid-body motion: zero stiffness and
+    damping on the rigid motion ``R`` of the interface frames, a recovery
+    that maps ``R`` to the rigid motion of the samples, and a rigid block
+    ``R^T M R`` with a physical mass and center of mass. A stiffness matrix
+    that resists rigid motion slightly, as the shells of a non-conformal
+    (for example ray-cast) mid-surface mesh can, leaves a small residual
+    that :meth:`ModalGeneratorCraigBampton.build` rejects with the default
+    ``rigid_consistency="check"``. ``rigid_consistency="project"`` removes
+    it in :meth:`reduce` with the smallest (Frobenius-norm) corrections that
+    make the model exactly consistent: ``K <- P^T K P`` and ``D <- P^T D P``
+    with the orthogonal projector ``P = I - R R^+``, ``X <- X + (X_R - X R)
+    R^+`` for the sample and full recoveries ``X`` with their exact rigid
+    motion ``X_R``, and ``M <- M + (R^+)^T (S - R^T M R) R^+``, where ``S``
+    is ``R^T M R`` with an isotropic translational mass and a skew-symmetric
+    mass moment. It raises instead when a residual exceeds
+    ``rigid_projection_limit`` or when the projection moves an elastic
+    eigenvalue of the reduced model by more than
+    ``rigid_projection_eigenvalue_tolerance``: such a residual is a modeling
+    error, such as a support left in the stiffness matrix, not discretization
+    drift. ``report["rigid_projection"]`` records the residuals before and
+    after the projection and the largest eigenvalue shift; the reduced
+    matrices, recoveries, and :meth:`to_arrays` are the projected ones.
+
     Args:
         node_positions: Rest node positions [m], shape ``[node_count, 3]``.
         mass_matrix: Nodal mass matrix [kg, kg m^2 for rotational DOFs],
@@ -170,6 +193,16 @@ class ModalGeneratorCraigBamptonFEM:
         damping_projection: Passed to :class:`ModalGeneratorCraigBampton`.
         interface_match_tolerance: Passed to :class:`ModalGeneratorCraigBampton`.
         interface_recovery_tolerance: Passed to :class:`ModalGeneratorCraigBampton`.
+        rigid_recovery_tolerance: Passed to :class:`ModalGeneratorCraigBampton`.
+        rigid_consistency: ``"check"`` rejects a reduced model that does not
+            reproduce rigid-body motion; ``"project"`` projects a small
+            rigid-body residual out, as described above.
+        rigid_projection_limit: Largest relative rigid-body residual of the
+            reduced stiffness, damping, recovery, or rigid mass block that
+            ``rigid_consistency="project"`` removes; a larger one raises.
+        rigid_projection_eigenvalue_tolerance: Largest relative change of any
+            elastic eigenvalue of the reduced model that the projection may
+            cause; a larger one raises.
     """
 
     _ARPACK_MARGIN: ClassVar[int] = 2
@@ -212,6 +245,10 @@ class ModalGeneratorCraigBamptonFEM:
         damping_projection: Literal["diagonal", "error"] = "diagonal",
         interface_match_tolerance: float = 1.0e-7,
         interface_recovery_tolerance: float = 1.0e-6,
+        rigid_recovery_tolerance: float = 1.0e-6,
+        rigid_consistency: Literal["check", "project"] = "check",
+        rigid_projection_limit: float = 1.0e-3,
+        rigid_projection_eigenvalue_tolerance: float = 1.0e-2,
     ):
         if int(dofs_per_node) not in (3, 6):
             raise ValueError(f"dofs_per_node must be 3 or 6, got {dofs_per_node}")
@@ -246,7 +283,20 @@ class ModalGeneratorCraigBamptonFEM:
             "damping_projection": damping_projection,
             "interface_match_tolerance": interface_match_tolerance,
             "interface_recovery_tolerance": interface_recovery_tolerance,
+            "rigid_recovery_tolerance": rigid_recovery_tolerance,
         }
+        if rigid_consistency not in ("check", "project"):
+            raise ValueError(f"rigid_consistency must be 'check' or 'project', got '{rigid_consistency}'")
+        self.rigid_consistency = rigid_consistency
+        self.rigid_projection_limit = float(rigid_projection_limit)
+        if not self.rigid_projection_limit >= 0.0:
+            raise ValueError(f"rigid_projection_limit must be non-negative, got {self.rigid_projection_limit}")
+        self.rigid_projection_eigenvalue_tolerance = float(rigid_projection_eigenvalue_tolerance)
+        if not self.rigid_projection_eigenvalue_tolerance >= 0.0:
+            raise ValueError(
+                "rigid_projection_eigenvalue_tolerance must be non-negative, "
+                f"got {self.rigid_projection_eigenvalue_tolerance}"
+            )
 
         size = self.dof_count
         self.mass_matrix = modal_sparse.coerce_symmetric_matrix(mass_matrix, size, "mass_matrix")
@@ -289,6 +339,7 @@ class ModalGeneratorCraigBamptonFEM:
         self.craig_bampton: ModalGeneratorCraigBampton | None = None
         self.report: dict[str, Any] = {}
         self._zero_energy_scale: tuple[float, str] = (math.nan, "")
+        self._rigid_projection: tuple[np.ndarray, np.ndarray] | None = None
 
     def _coerce_interfaces(self, interfaces: Sequence[Mapping[str, Any]]) -> list[_Interface]:
         """Validate the interface specifications and fill in their defaults."""
@@ -760,7 +811,8 @@ class ModalGeneratorCraigBamptonFEM:
         )
         if rigid_residual > self._RIGID_RESIDUAL_TOLERANCE:
             # Reject here rather than in build(), so that save_npz() never exports such a model; tell
-            # constraints that resist rigid motion apart from a stiffness matrix that does.
+            # constraints that resist rigid motion apart from a stiffness matrix that does. Constraints that
+            # ground the body are rejected even when rigid_consistency="project".
             message = (
                 "The reduced stiffness matrix does not preserve the six rigid-body modes (relative residual "
                 f"{rigid_residual:.3g})"
@@ -773,7 +825,11 @@ class ModalGeneratorCraigBamptonFEM:
                     "different positions without the lever arm of a rigid link; a Craig-Bampton model must stay "
                     "free-free, with supports applied through its interfaces"
                 )
-            raise ValueError(f"{message}: check that stiffness_matrix is the free-free stiffness of the model")
+            if self.rigid_consistency == "check":
+                raise ValueError(
+                    f"{message}: check that stiffness_matrix is the free-free stiffness of the model; a small "
+                    "residual of a non-conformal mesh can be removed with rigid_consistency='project'"
+                )
 
         dofs = self.dofs_per_node
         translation_rows = (dofs * self.sample_node_indices[:, None] + np.arange(3)).reshape(-1)
@@ -783,6 +839,19 @@ class ModalGeneratorCraigBamptonFEM:
         if dofs == 6:
             rotation_rows = translation_rows + 3
             rotation_recovery = np.asarray(transform_rows[rotation_rows] @ basis)
+        self._rigid_projection = None
+        projection_report = None
+        if self.rigid_consistency == "project":
+            (
+                reduced_stiffness,
+                reduced_mass,
+                reduced_damping,
+                recovery,
+                rotation_recovery,
+                projection_report,
+            ) = self._project_rigid_consistency(
+                rigid, reduced_stiffness, reduced_mass, reduced_damping, recovery, rotation_recovery
+            )
         timings["reduction"] = time.perf_counter() - clock
 
         self.transformation = transform
@@ -814,6 +883,7 @@ class ModalGeneratorCraigBamptonFEM:
             damping_projection=self._craig_bampton_options["damping_projection"],
             interface_match_tolerance=self._craig_bampton_options["interface_match_tolerance"],
             interface_recovery_tolerance=self._craig_bampton_options["interface_recovery_tolerance"],
+            rigid_recovery_tolerance=self._craig_bampton_options["rigid_recovery_tolerance"],
         )
         self.report = {
             "dof_count": self.dof_count,
@@ -833,11 +903,117 @@ class ModalGeneratorCraigBamptonFEM:
             "constraint_mode_residual": constraint_mode_residual,
             "eigen_residual": eigen_residual,
             "rigid_stiffness_residual": rigid_residual,
+            "rigid_consistency": self.rigid_consistency,
+            "rigid_projection": projection_report,
             "interior_stiffness_pivot_ratio": pivot_ratio,
             "reduced_mass_condition": float(np.linalg.cond(reduced_mass)),
             "timings_s": timings,
         }
         return self.craig_bampton
+
+    @staticmethod
+    def _rigid_residuals(
+        rigid, stiffness, mass, damping, recovery, sample_rigid
+    ) -> tuple[dict[str, float], np.ndarray]:
+        """Return the relative rigid-body residuals of a reduced model and the physical target of ``R^T M R``.
+
+        The stiffness and damping residuals are those of :meth:`ModalGeneratorCraigBampton.build`, the recovery
+        residual is its recovery error relative to the sample rigid motion, and the mass residual is the largest
+        deviation of ``R^T M R`` from an isotropic translational mass and a skew-symmetric mass moment, relative
+        to its largest entry.
+        """
+        rigid_scale = max(float(np.linalg.norm(rigid, ord=np.inf)), 1.0)
+
+        def stiffness_like(matrix):
+            scale = max(float(np.linalg.norm(matrix, ord=np.inf)), 1.0)
+            return float(np.linalg.norm(matrix @ rigid, ord=np.inf)) / (scale * rigid_scale)
+
+        spatial = rigid.T @ mass @ rigid
+        target = spatial.copy()
+        target[:3, :3] = float(np.trace(spatial[:3, :3]) / 3.0) * np.eye(3)
+        moment = 0.5 * (spatial[:3, 3:] - spatial[:3, 3:].T)
+        target[:3, 3:] = moment
+        target[3:, :3] = moment.T
+        residuals = {
+            "stiffness": stiffness_like(stiffness),
+            "damping": 0.0 if damping is None else stiffness_like(damping),
+            "recovery": float(np.max(np.abs(recovery @ rigid - sample_rigid)))
+            / max(float(np.max(np.abs(sample_rigid))), 1.0),
+            "mass": float(np.max(np.abs(spatial - target))) / max(float(np.max(np.abs(spatial))), 1.0),
+        }
+        return residuals, target
+
+    def _project_rigid_consistency(self, rigid, stiffness, mass, damping, recovery, rotation_recovery):
+        """Project a small rigid-body residual out of the reduced model (``rigid_consistency="project"``).
+
+        Returns:
+            The projected stiffness, mass, damping, recovery, and rotation recovery, and the projection report.
+
+        Raises:
+            ValueError: If a residual exceeds ``rigid_projection_limit``, the projected mass matrix is not
+                positive definite, or an elastic eigenvalue moves by more than
+                ``rigid_projection_eigenvalue_tolerance``.
+        """
+        sample_rigid = modal_sparse.rigid_vectors(self.sample_points, 3, np.zeros(3))
+        before, target = self._rigid_residuals(rigid, stiffness, mass, damping, recovery, sample_rigid)
+        worst = max(before, key=before.get)
+        if before[worst] > self.rigid_projection_limit:
+            raise ValueError(
+                f"The reduced model resists rigid-body motion beyond rigid_projection_limit "
+                f"{self.rigid_projection_limit:.3g} (relative {worst} residual {before[worst]:.3g}); this is not "
+                "discretization drift that rigid_consistency='project' may remove. Check that stiffness_matrix is "
+                "the free-free stiffness of the model, without supports or grounding springs"
+            )
+
+        rigid_pinv = np.linalg.pinv(rigid)
+        projector = np.eye(rigid.shape[0]) - rigid @ rigid_pinv
+
+        def project(matrix):
+            projected = projector.T @ matrix @ projector
+            return 0.5 * (projected + projected.T)
+
+        new_stiffness = project(stiffness)
+        new_damping = None if damping is None else project(damping)
+        new_recovery = recovery + (sample_rigid - recovery @ rigid) @ rigid_pinv
+        new_rotation_recovery = None
+        if rotation_recovery is not None:
+            rotation_rigid = np.zeros_like(sample_rigid)
+            rotation_rigid[:, 3:] = np.tile(np.eye(3), (self.sample_points.shape[0], 1))
+            new_rotation_recovery = rotation_recovery + (rotation_rigid - rotation_recovery @ rigid) @ rigid_pinv
+        new_mass = mass + rigid_pinv.T @ (target - rigid.T @ mass @ rigid) @ rigid_pinv
+        new_mass = 0.5 * (new_mass + new_mass.T)
+
+        def eigenvalues(matrix_k, matrix_m):
+            factor = np.linalg.cholesky(matrix_m)
+            standard = np.linalg.solve(factor, np.linalg.solve(factor, matrix_k).T).T
+            return np.linalg.eigvalsh(0.5 * (standard + standard.T))
+
+        try:
+            projected_values = eigenvalues(new_stiffness, new_mass)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("The rigid-consistency projection made the reduced mass matrix indefinite") from exc
+        original_values = eigenvalues(stiffness, mass)
+        rigid_count = rigid.shape[1]
+        shift = np.abs(projected_values[rigid_count:] - original_values[rigid_count:]) / np.maximum(
+            np.abs(projected_values[rigid_count:]), np.finfo(np.float64).tiny
+        )
+        largest_shift = float(np.max(shift, initial=0.0))
+        if largest_shift > self.rigid_projection_eigenvalue_tolerance:
+            mode = int(np.argmax(shift))
+            raise ValueError(
+                f"The rigid-consistency projection moves elastic eigenvalue {mode} of the reduced model from "
+                f"{original_values[rigid_count + mode]:.6g} to {projected_values[rigid_count + mode]:.6g} 1/s^2 "
+                f"(relative {largest_shift:.3g} > rigid_projection_eigenvalue_tolerance "
+                f"{self.rigid_projection_eigenvalue_tolerance:.3g}); the rigid-body residual is not separated from "
+                "the elastic modes, so it is not removed"
+            )
+
+        after, _ = self._rigid_residuals(rigid, new_stiffness, new_mass, new_damping, new_recovery, sample_rigid)
+        self._rigid_projection = (rigid, rigid_pinv)
+        report = {f"{name}_residual_before": value for name, value in before.items()}
+        report.update({f"{name}_residual_after": value for name, value in after.items()})
+        report["max_elastic_eigenvalue_shift"] = largest_shift
+        return new_stiffness, new_mass, new_damping, new_recovery, new_rotation_recovery, report
 
     def build(self) -> ModalBasis:
         """Reduce the model and build the mass-normalized elastic modal basis.
@@ -855,10 +1031,17 @@ class ModalGeneratorCraigBamptonFEM:
         """Return the recovery of every nodal DOF from the reduced coordinates, shape ``[dof_count, reduced_dof_count]``.
 
         The matrix is dense; for large models prefer ``recovery_matrix`` and
-        ``rotation_recovery_matrix``, which cover the sample nodes only.
+        ``rotation_recovery_matrix``, which cover the sample nodes only. With
+        ``rigid_consistency="project"`` it carries the same rigid-motion
+        correction as those matrices.
         """
         self._require_reduced()
-        return np.asarray(self.transformation @ self.reduction_basis)
+        recovery = np.asarray(self.transformation @ self.reduction_basis)
+        if self._rigid_projection is not None:
+            rigid, rigid_pinv = self._rigid_projection
+            full_rigid = modal_sparse.rigid_vectors(self.node_positions, self.dofs_per_node, np.zeros(3))
+            recovery = recovery + (full_rigid - recovery @ rigid) @ rigid_pinv
+        return recovery
 
     def to_arrays(self, *, full_recovery: bool = True) -> dict[str, np.ndarray]:
         """Return the reduced model as arrays named like a Craig-Bampton import file.

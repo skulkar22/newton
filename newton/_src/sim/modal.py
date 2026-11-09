@@ -1455,6 +1455,12 @@ class ModalGeneratorCraigBampton:
             interface translation rows and the recovered translation of a
             coincident sample for which the interface is treated as direct
             (RBE2-style) rather than distributing.
+        rigid_recovery_tolerance: Largest error of ``recovery_matrix`` applied
+            to the rigid-body motion of the interfaces, relative to the
+            sample rigid motion (``max(1, max |x_sample|)``), above which
+            :meth:`build` raises. A recovery that does not reproduce rigid
+            motion means the model resists rigid-body motion; see
+            ``rigid_consistency`` of :class:`ModalGeneratorCraigBamptonFEM`.
     """
 
     def __init__(
@@ -1474,6 +1480,7 @@ class ModalGeneratorCraigBampton:
         damping_projection: Literal["diagonal", "error"] = "diagonal",
         interface_match_tolerance: float = 1.0e-7,
         interface_recovery_tolerance: float = 1.0e-6,
+        rigid_recovery_tolerance: float = 1.0e-6,
     ):
         self.interface_positions = np.asarray(interface_positions, dtype=np.float64)
         if self.interface_positions.ndim != 2 or self.interface_positions.shape[1] != 3:
@@ -1550,6 +1557,9 @@ class ModalGeneratorCraigBampton:
             raise ValueError(
                 f"interface_recovery_tolerance must be non-negative, got {self.interface_recovery_tolerance}"
             )
+        self.rigid_recovery_tolerance = float(rigid_recovery_tolerance)
+        if not self.rigid_recovery_tolerance >= 0.0:
+            raise ValueError(f"rigid_recovery_tolerance must be non-negative, got {self.rigid_recovery_tolerance}")
         self.label = label
 
         self.fixed_interface_mode_count = self.reduced_dof_count - self.interface_dof_count
@@ -1686,10 +1696,11 @@ class ModalGeneratorCraigBampton:
         )
         recovery_scale = max(float(np.max(np.abs(sample_rigid))), 1.0)
         recovery_rigid_error = float(np.max(np.abs(self.recovery_matrix @ rigid - sample_rigid)))
-        if recovery_rigid_error > 1.0e-6 * recovery_scale:
+        if recovery_rigid_error > self.rigid_recovery_tolerance * recovery_scale:
             raise ValueError(
                 "recovery_matrix is inconsistent with rigid motion of sample_points "
-                f"(maximum error {recovery_rigid_error:.3g})"
+                f"(maximum error {recovery_rigid_error:.3g}, relative {recovery_rigid_error / recovery_scale:.3g} > "
+                f"rigid_recovery_tolerance {self.rigid_recovery_tolerance:.3g})"
             )
 
         recovered_modes = self.recovery_matrix @ modal_matrix
