@@ -794,6 +794,14 @@ class PanelScene:
 # ----------------------------------------------------------------------------------------------
 # re-ROM driver
 # ----------------------------------------------------------------------------------------------
+class IndefiniteTangentError(ValueError):
+    """The clamped reduced tangent at a re-ROM update is not positive definite (lowest eigenvalue ``lowest``)."""
+
+    def __init__(self, lowest):
+        super().__init__(f"clamped reduced tangent is not positive definite (lowest {lowest:.3g})")
+        self.lowest = float(lowest)
+
+
 class GroundedScene(PanelScene):
     """Newton scene of a GROUNDED Craig-Bampton body: the active clamp frames are eliminated (held),
     the remaining coordinates (released frames' constraint modes + fixed-interface modes + Ritz
@@ -821,6 +829,7 @@ class GroundedScene(PanelScene):
         ke=1e10,
         ka=1e9,
         device="cpu",
+        clip_negative=False,
     ):
         import scipy.linalg as la
         import warp as wp
@@ -840,8 +849,14 @@ class GroundedScene(PanelScene):
         Kc, Mc = cb.Kr[np.ix_(keep, keep)], cb.Mr[np.ix_(keep, keep)]
         lam, V = la.eigh(Kc, Mc)
         self.clamped_eigenvalues = lam
+        self.clipped = 0
         if lam[0] <= 0:
-            raise ValueError(f"clamped reduced tangent is not positive definite (lowest {lam[0]:.3g})")
+            if not clip_negative or lam[-1] <= 0:
+                raise IndefiniteTangentError(lam[0])
+            # keep the tangent's eigenvectors; raise the non-positive eigenvalues to the smallest positive one
+            floor = float(lam[lam > 0].min())
+            self.clipped = int(np.count_nonzero(lam <= 0))
+            lam = np.where(lam > 0, lam, floor)
         Phi = cb.T[:, keep] @ V  # (n_dof, m) M-orthonormal
         self.Phi_nodal = Phi
         self.modal_matrix = V
@@ -955,6 +970,7 @@ class PanelReROM:
         settle_tol=1e-3,
         rigid_pads=True,
         weld_dependents=None,
+        indefinite_tangent="error",
     ):
         self.ccx = ccx
         self.M = sp.csr_matrix(M)
@@ -969,6 +985,9 @@ class PanelReROM:
         self.rerom = bool(rerom)
         self.tol_full, self.settle_tol = float(tol_full), float(settle_tol)
         self.rigid_pads = bool(rigid_pads)
+        if indefinite_tangent not in ("error", "clip"):
+            raise ValueError(f"indefinite_tangent must be 'error' or 'clip', got {indefinite_tangent!r}")
+        self.indefinite_tangent = indefinite_tangent
         self._full_lu = None
         self._u_prev_check = None
         self.tol, self.check_every, self.min_interval = float(tol), int(check_every), int(min_interval)
@@ -1151,22 +1170,20 @@ class PanelReROM:
         cb = scb.reduce(K_T, self.M, self.n_modes, ritz_loads=ritz, rigid_project_tol=None)
         for k, v_ in cb.timings.items():
             tw[k] = v_
-        tw["full_factorization"] = self._factor_full(scb, K_T)
-        t0 = time.perf_counter()
         old_scene = self.scene
+
+        t0 = time.perf_counter()
+        # Negative clamped eigenvalues (a state far from equilibrium, e.g. right after a release) are either an
+        # error or, with indefinite_tangent="clip", raised to the smallest positive one: the basis stays the
+        # tangent's, the reference force stays f_int, and every check still compares with the exact force.
         scene = GroundedScene(
-            cb,
-            pts_new,
-            self.active,
-            self.M,
-            gravity=self.g,
-            shift=self.shift,
-            zeta=self.zeta,
-            iterations=self.iterations,
-            ke=self.ke,
-            ka=self.ka,
-            device=self.device,
+            cb, pts_new, self.active, self.M, gravity=self.g, shift=self.shift, zeta=self.zeta,
+            iterations=self.iterations, ke=self.ke, ka=self.ka, device=self.device,
+            clip_negative=(self.indefinite_tangent == "clip"),
         )
+        lowest = float(scene.clamped_eigenvalues[0])
+        tangent = "clipped" if scene.clipped else "current"
+        tw["full_factorization"] = self._factor_full(scb, K_T)
         tw["basis_build"] = scene.timings["basis_build"]
         tw["model_build"] = scene.timings["model_build"]
         t1 = time.perf_counter()
@@ -1193,6 +1210,9 @@ class PanelReROM:
             "wall": tw,
             "ritz_kept": cb.n_ritz,
             "negative_pivots": cb.info["negative_pivots"],
+            "tangent": tangent,
+            "clipped_modes": int(scene.clipped),
+            "lowest_clamped_eigenvalue": lowest,
             "modes": int(scene.nm),
             "rigid_residual_free_free": cb.info["rigid_residual_before_projection"],
             "clamped_hz_first": (np.sqrt(scene.clamped_eigenvalues[:3]) / (2 * np.pi)).tolist(),
@@ -1208,7 +1228,7 @@ class PanelReROM:
             f"  update {len(self.events)} at step {step} ({reason}): total {tw['total']:.2f}s "
             f"ccx {tw['ccx_eval']:.2f} fact {tw['factorization']:.3f} cmodes {tw['constraint_modes']:.2f} "
             f"eig {tw['eigensolve']:.2f} rewrite {tw['rewrite_total']:.2f}; sag_ref {ev['max_sag_ref_mm']:.4f} mm, "
-            f"ritz {cb.n_ritz}, f1 {ev['clamped_hz_first'][0]:.2f} Hz, resid@ref {resid:.2e}, KE {ke_old:.3e}->{ke_new:.3e}"
+            f"ritz {cb.n_ritz}, tangent {tangent}{f' ({scene.clipped} clipped, lowest {lowest:.3g})' if scene.clipped else ''}, f1 {ev['clamped_hz_first'][0]:.2f} Hz, resid@ref {resid:.2e}, KE {ke_old:.3e}->{ke_new:.3e}"
         )
         return ev
 
