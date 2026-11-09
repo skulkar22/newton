@@ -130,7 +130,7 @@ def run_newton(a, mesh, model, out):
         n_modes=a.modes, n_ritz=a.ritz, gravity=g, shift=shift, zeta=a.zeta, iterations=a.iterations,
         recovery="rotated", tol=a.tol, check_every=a.check_every, min_interval=a.min_interval,
         device=a.device, ke=a.ke, ka=a.ka, rerom=(a.method == "rerom"), log=log, weld_dependents=deps,
-        indefinite_tangent=a.indefinite_tangent,
+        indefinite_tangent=a.indefinite_tangent, settle_force_tol=a.settle_force_tol,
     )
     hist, snaps = [], []
     step = 0
@@ -158,7 +158,7 @@ def run_newton(a, mesh, model, out):
         "method": a.method, "modes": a.modes, "ritz": a.ritz, "dt": a.dt, "steps_per_phase": a.steps,
         "steps_release": a.release_steps, "phase_names": list(cfg),
         "iterations": a.iterations, "zeta": a.zeta, "ke": a.ke, "ka": a.ka, "tol": a.tol,
-        "check_every": a.check_every, "min_interval": a.min_interval, "device": a.device, "indefinite_tangent": a.indefinite_tangent,
+        "check_every": a.check_every, "min_interval": a.min_interval, "device": a.device, "indefinite_tangent": a.indefinite_tangent, "settle_force_tol": a.settle_force_tol,
         "gravity_factor": a.gravity_factor, "refine": a.refine, "phases": phase_res,
         "updates": run.events, "checks": run.checks, "wall_matrices_s": t_mat, "init_wall_s": run.init_wall,
         "cb_info": run.cb.info if a.method == "fixed" else None, "dofs": int(model.n_dof),
@@ -355,6 +355,8 @@ def main():
     nw.add_argument("--tol", type=float, default=0.01, help="re-ROM displacement-correction trigger")
     nw.add_argument("--check-every", type=int, default=10)
     nw.add_argument("--min-interval", type=int, default=10)
+    nw.add_argument("--settle-force-tol", type=float, default=None,
+                    help="re-ROM: also update when settled but the projected force mismatch exceeds this (off by default)")
     nw.add_argument("--device", default="cpu")
     nw.add_argument("--indefinite-tangent", choices=["error", "clip"], default="error",
                     help="re-ROM update whose clamped tangent is not positive definite: stop, or clip its negative eigenvalues")

@@ -969,6 +969,7 @@ class PanelReROM:
         log=print,
         tol_full=0.002,
         settle_tol=1e-3,
+        settle_force_tol=None,
         rigid_pads=True,
         weld_dependents=None,
         indefinite_tangent="error",
@@ -985,6 +986,7 @@ class PanelReROM:
         self.recovery = recovery
         self.rerom = bool(rerom)
         self.tol_full, self.settle_tol = float(tol_full), float(settle_tol)
+        self.settle_force_tol = None if settle_force_tol is None else float(settle_force_tol)
         self.rigid_pads = bool(rigid_pads)
         if indefinite_tangent not in ("error", "clip"):
             raise ValueError(f"indefinite_tangent must be 'error' or 'clip', got {indefinite_tangent!r}")
@@ -1272,6 +1274,11 @@ class PanelReROM:
             # with the stale reference tangent (e_full) underestimates the remaining error here because the
             # sagging panel softens (see notes/v2_wp4_panel.md), so the move itself is the criterion.
             reason = "settled_move"
+        elif settled and self.settle_force_tol is not None and self._last_force_mismatch > self.settle_force_tol:
+            # settled close to the reference but still out of balance (projected force mismatch): the reference
+            # state carries a misfit the displacement measures do not see; re-linearise there, where the basis
+            # gains the residual as a Ritz vector.
+            reason = "settled_unbalanced"
         else:
             return None
         self._u_prev_check = None
