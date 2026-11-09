@@ -395,6 +395,52 @@ class CBResult:
     info: dict = field(default_factory=dict)
 
 
+
+class _PardisoFactor:
+    """MKL PARDISO factorization (pypardiso) with a ``solve(b)`` like SuperLU's: factor once, then solve phase 33
+    without pypardiso's per-call matrix hashing. Used above ``_PARDISO_MIN_DOF`` (SciPy's SuperLU has 32-bit
+    indices and fails with MemoryError on the factor of a ~1.8M-DOF thin-solid shell)."""
+
+    def __init__(self, A):
+        import pypardiso
+
+        self.A = sp.csr_matrix(A)
+        self.A.sort_indices()
+        self.ps = pypardiso.PyPardisoSolver()  # mtype 11 (real general LU): no assumptions on definiteness
+        self.ps.factorize(self.A)
+        self.negative_pivots = None
+
+    def solve(self, b):
+        self.ps.set_phase(33)
+        b2 = self.ps._check_b(self.A, np.asarray(b, float))
+        return self.ps._call_pardiso(self.A, b2)
+
+
+_PARDISO_MIN_DOF = 200_000
+
+
+def _factorize(A):
+    """SuperLU below _PARDISO_MIN_DOF (bit-identical to the recorded runs), MKL PARDISO above it or when
+    $REROM_FACTOR=pardiso."""
+    import os
+
+    A = sp.csc_matrix(A)
+    if A.shape[0] >= _PARDISO_MIN_DOF or os.environ.get("REROM_FACTOR", "") == "pardiso":
+        return _PardisoFactor(A)
+    return _SuperLUFactor(A)
+
+
+class _SuperLUFactor:
+    """SciPy SuperLU (the recorded runs' factorization) with the negative-pivot count of its U diagonal."""
+
+    def __init__(self, A):
+        self.lu = spla.splu(A, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options={"SymmetricMode": True})
+        self.negative_pivots = int(np.count_nonzero(self.lu.U.diagonal() <= 0))
+
+    def solve(self, b):
+        return self.lu.solve(b)
+
+
 class SolidCB:
     """Fixed-interface Craig-Bampton on 3-DOF nodes with exact weld elimination and RBE2 pads."""
 
@@ -496,10 +542,10 @@ class SolidCB:
         Mii = Mz[:ni, :ni].tocsc()
         tm["projection_in"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        lu = spla.splu(Kii, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options={"SymmetricMode": True})
+        lu = _factorize(Kii)
         tm["factorization"] = time.perf_counter() - t0
-        diagU = lu.U.diagonal()
-        neg = int(np.count_nonzero(diagU <= 0))
+        tm["factor_backend"] = "pardiso" if isinstance(lu, _PardisoFactor) else "superlu"
+        neg = lu.negative_pivots
         t0 = time.perf_counter()
         Psi = -lu.solve(Kib)
         tm["constraint_modes"] = time.perf_counter() - t0
@@ -1003,10 +1049,7 @@ class PanelReROM:
             keep[scb.ni + 6 * j : scb.ni + 6 * j + 6] = False
         Sf = scb.S[:, keep].tocsc()
         Kf = (Sf.T @ (sp.csr_matrix(K_T) @ Sf)).tocsc()
-        self._full_lu = (
-            Sf,
-            spla.splu(Kf, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options={"SymmetricMode": True}),
-        )
+        self._full_lu = (Sf, _factorize(Kf))
         return time.perf_counter() - t0
 
     def full_step(self, u_eval, f_int):
