@@ -2694,6 +2694,59 @@ def test_elastic_rendering_respects_layer_transform_and_visibility(test, device)
     test.assertTrue(all(viewer.mesh_hidden.values()))
 
 
+def test_elastic_rendering_matches_host_recovery(test, device):
+    """Check the device recovery of elastic render vertices and strain colors against the host formula.
+
+    The viewer recovers ``x_rest + sum_k phi_k q_k`` on the device, applies the body transform, and colors the
+    displacement magnitude with the Matlab jet ramp; the reference evaluates the same expressions with NumPy.
+    """
+
+    def two_mode_shape(x):
+        return np.array([[0.0, 0.0, float(x[0]) ** 2], [0.0, float(x[0]), 0.0]], dtype=np.float32)
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), mode_count=2, mode_shape_fn=two_mode_shape)
+    builder.add_shape_box(body, hx=0.5, hy=0.04, hz=0.03)
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])])
+    q = state.joint_q.numpy()
+    axis = np.array([0.3, 0.5, 0.8]) / np.linalg.norm([0.3, 0.5, 0.8])
+    q[q_start : q_start + 3] = [0.1, -0.2, 0.3]
+    q[q_start + 3 : q_start + 7] = [*(np.sin(0.35) * axis), np.cos(0.35)]
+    q[q_start + 7 : q_start + 9] = [0.05, -0.03]
+    state.joint_q.assign(q)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+    viewer = _ElasticMeshColorProbe()
+    viewer.set_model(model)
+    viewer.show_elastic_strain = True
+    viewer.elastic_strain_color_max = 0.02
+    viewer.log_state(state)
+    test.assertEqual(len(viewer.mesh_points), 1)
+    name = next(iter(viewer.mesh_points))
+
+    rest = model.elastic_shape_vertex_local.numpy().astype(np.float64)
+    max_modes = int(model.elastic_max_mode_count)
+    phi = model.elastic_shape_vertex_phi.numpy().astype(np.float64).reshape(rest.shape[0], max_modes, 3)
+    local = rest + np.einsum("vmc,m->vc", phi[:, :2], q[q_start + 7 : q_start + 9].astype(np.float64))
+    xform = state.body_q.numpy()[body].astype(np.float64)
+    imag, real = xform[3:6], xform[6]
+    world = xform[:3] + local + 2.0 * np.cross(imag, np.cross(imag, local) + real * local)
+    np.testing.assert_allclose(viewer.mesh_points[name], world, atol=1.0e-5)
+    s = np.clip(np.linalg.norm(local - rest, axis=1) / 0.02, 0.0, 1.0)
+    test.assertGreater(float(np.ptp(s)), 0.1)
+    expected = np.stack([np.clip(1.5 - np.abs(4.0 * s - c), 0.0, 1.0) for c in (3.0, 2.0, 1.0)], axis=1)
+    np.testing.assert_allclose(viewer.mesh_colors[name], expected, atol=1.0e-5)
+
+    # Turning the strain coloring off sends no colors; the points are unchanged.
+    viewer.show_elastic_strain = False
+    viewer.log_state(state)
+    test.assertIsNone(viewer.mesh_colors[name])
+    np.testing.assert_allclose(viewer.mesh_points[name], world, atol=1.0e-5)
+
+
 def test_torsion_render_shape_sampling(test, device):
     """Check the torsion mode values sampled at a tip vertex of an elastic box mesh."""
     length = 1.0
@@ -7519,6 +7572,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_rendering_respects_layer_transform_and_visibility",
         test_elastic_rendering_respects_layer_transform_and_visibility,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_rendering_matches_host_recovery",
+        test_elastic_rendering_matches_host_recovery,
         devices=[device],
     )
     add_function_test(
