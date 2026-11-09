@@ -280,6 +280,37 @@ bodies, including every entity of a model built without
 ``integrate_with_external_rigid_solver=True`` only particles contribute. VBD also
 records this value for every iteration; see :ref:`vbd_residual_history`.
 
+With ``rigid_articulation_solve="block_sparse_joints"`` or
+``"block_sparse_levels"``, every body of a sparse articulation, including a free
+body that :meth:`~newton.ModelBuilder.add_body` places in its own one-body
+articulation, is solved together with the rest of its articulation, and the
+articulation is the block. It contributes one stationarity residual
+
+.. math::
+
+   r^{\mathsf{T}} A^{-1} r
+
+[J] for all of its bodies together, where :math:`r` stacks the force and torque
+residuals of its bodies (and, under ``rigid_articulation_elastic_solve="coupled"``,
+the modal residuals of its reduced elastic bodies) and :math:`A` is the
+articulation's sparse Hessian, including ``rigid_articulation_diagonal_regularization``
+and ``rigid_articulation_angular_regularization``. It is sampled after the
+iteration's sparse solve, from the unrelaxed step and before
+``rigid_articulation_relaxation`` is applied, so the world entry is the largest
+residual of any of its articulations, particles, and locally solved bodies; the
+history records it for every iteration. With ``rigid_time_integration="bdf2"``
+the residual is that of the BDF2 step equations, whose inertial term uses
+:math:`h = \tfrac{2}{3}\Delta t` and the BDF2 inertial target, and a BDF1 step of
+a BDF2 solver reports the implicit Euler residual.
+Under ``rigid_articulation_elastic_solve="schur"`` an articulation with reduced
+elastic bodies reports the residual of its Schur-reduced frame system, which
+leaves out the modal part :math:`r_m^{\mathsf{T}} A_{mm}^{-1} r_m` of the eliminated
+modes and is therefore a lower bound of the full residual. A failed coupled
+factorization reports the residual of its fallback Jacobi step, and a
+factorization with clamped pivots that of the clamped factor. Reduced elastic
+bodies solved by the local block solve, as with ``rigid_articulation_solve="local"``,
+record nothing.
+
 Solver-specific observables
 ---------------------------
 

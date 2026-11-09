@@ -127,6 +127,7 @@ from .rigid_sparse_articulation_kernels import (
     mat66f,
     predict_articulation_armature,
     predict_articulation_armature_bdf2,
+    record_articulation_sparse_residual,
     regularize_articulation_body_hessian,
     save_articulation_body_hessians,
     solve_articulation_sparse_block32_scalar,
@@ -4769,8 +4770,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 When ``CONTACT_F`` is requested, evaluate one wrench per body-body and rigid-soft
                 contact record at the final configuration. See :ref:`vbd_contact_forces`.
                 When ``SOLVER_RESIDUAL`` is requested, record each world's stationarity residual from the
-                last iteration; ``SOLVER_RESIDUAL_HISTORY`` records one row per iteration. See
-                :ref:`solver_residual_observable` and :ref:`vbd_residual_history`.
+                last iteration; ``SOLVER_RESIDUAL_HISTORY`` records one row per iteration. With
+                ``rigid_articulation_solve="block_sparse_joints"`` or ``"block_sparse_levels"``, each sparse
+                articulation is one block: it contributes the stationarity residual ``r^T A^-1 r`` of all its
+                bodies together, sampled after the iteration's sparse solve and before relaxation. With
+                ``rigid_time_integration="bdf2"`` the residual is that of the BDF2 step equations. Reduced
+                elastic bodies on the local block solve record nothing. See :ref:`solver_residual_observable`
+                and :ref:`vbd_residual_history`.
 
         Raises:
             RuntimeError: If required rigid contact-matching data is unavailable, or contact-history storage would
@@ -8312,6 +8318,24 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         if layout.mixed_articulation_count > 0:
             self._solve_coupled_articulations(state_in, state_out, control, contacts, dt, joint_inputs)
+
+        if world_residual is not None:
+            # Every sparse backend (serial, block32, levels, level launch, coupled) leaves this
+            # iteration's right-hand side and unrelaxed step in the flat scalar arrays.
+            wp.launch(
+                kernel=record_articulation_sparse_residual,
+                dim=layout.articulation_count,
+                inputs=[
+                    layout.articulation_body_offsets,
+                    layout.articulation_row_scalar_offsets,
+                    layout.articulation_bodies,
+                    model.body_world,
+                    self._rigid_articulation_sparse_rhs_scalar,
+                    self._rigid_articulation_sparse_delta_scalar,
+                ],
+                outputs=[world_residual],
+                device=self.device,
+            )
 
         if layout.local_body_count > 0:
             self._solve_rigid_body_iteration_local(

@@ -33,6 +33,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     compute_kappa_dot,
     evaluate_rod_joint_force_hessian,
     quat_from_rotation_vector,
+    record_world_residual,
     rigid_step_bdf2,
     rigid_step_h,
     rotation_vector_compose,
@@ -3551,6 +3552,38 @@ def apply_articulation_sparse_delta_scalar(
         use_displacement,
         body_q_new,
     )
+
+
+@wp.kernel
+def record_articulation_sparse_residual(
+    articulation_body_offsets: wp.array[wp.int32],
+    articulation_row_scalar_offsets: wp.array[wp.int32],
+    articulation_bodies: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    rhs_scalar: wp.array[float],
+    delta_scalar: wp.array[float],
+    world_residual: wp.array[float],
+):
+    """Raise each articulation's world residual to its stationarity residual ``r^T A^-1 r`` [J].
+
+    One thread per sparse articulation; the articulation is the block. ``r`` is the residual of
+    the step equations of all its bodies together (implicit Euler, or BDF2 on BDF2 steps) and
+    ``A`` the articulation's sparse Hessian. ``rhs`` holds the force ``f = -r``: force and torque
+    (and, for a reduced elastic body of a mixed articulation, the modal force) of every row,
+    and ``delta = A^-1 rhs`` the unrelaxed step the sparse solve returned for it, so the sum of
+    ``rhs * delta`` over the articulation's scalars equals ``r^T A^-1 r``. Covers the rigid
+    prefix (6 scalars per row) and the mixed articulations of the coupled backend (``6 + m``
+    scalars per row) through ``articulation_row_scalar_offsets``.
+    """
+    articulation = wp.tid()
+    row_start = articulation_body_offsets[articulation]
+    row_end = articulation_body_offsets[articulation + 1]
+    if row_end <= row_start:
+        return
+    decrement = float(0.0)
+    for i in range(articulation_row_scalar_offsets[row_start], articulation_row_scalar_offsets[row_end]):
+        decrement = decrement + rhs_scalar[i] * delta_scalar[i]
+    record_world_residual(world_residual, body_world[articulation_bodies[row_start]], decrement)
 
 
 def create_solve_articulation_sparse_serial_scalar(bdf2: bool):

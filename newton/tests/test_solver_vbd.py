@@ -9882,5 +9882,173 @@ add_function_test(
     devices=devices,
 )
 
+
+def _make_sparse_residual_model(device) -> newton.Model:
+    """Two worlds, each with a five-link revolute chain under gravity and a free box on the ground."""
+    source = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    parent = -1
+    joints = []
+    for i in range(5):
+        link = source.add_link(
+            xform=wp.transform((0.1 * i + 0.05, 0.0, 1.0), wp.quat_identity()),
+            mass=0.2,
+            inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3),
+        )
+        source.add_shape_box(link, hx=0.05, hy=0.02, hz=0.02)
+        parent_xform = wp.transform((0.0, 0.0, 1.0) if parent < 0 else (0.05, 0.0, 0.0), wp.quat_identity())
+        joints.append(
+            source.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=newton.Axis.Y,
+                parent_xform=parent_xform,
+                child_xform=wp.transform((-0.05, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        parent = link
+    source.add_articulation(joints)
+    # ``add_body`` places the box in its own one-body articulation, so the sparse solve owns it too.
+    box = source.add_body(xform=wp.transform((1.0, 0.0, 0.12), wp.quat_identity()))
+    source.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    builder.add_ground_plane()
+    builder.replicate(source, copy_count=2)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _sparse_world_residual(
+    model,
+    mode: str,
+    iterations: int,
+    request: bool = True,
+    nan_body: int | None = None,
+    **options,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray]:
+    """Step ``model`` with a sparse rigid articulation solve.
+
+    Returns the final per-world residual, its per-iteration history, and the final
+    body poses. With ``request=False`` no observable is passed and both residual
+    arrays are ``None``. ``nan_body`` sets that body's initial pose to NaN.
+    """
+    solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_articulation_solve=mode, **options)
+    layout = solver.rigid_articulation_sparse_layout
+    assert layout is not None and layout.local_body_count == 0, "every body must be solved by the sparse solve"
+    observables = None
+    if request:
+        observables = solver.observables(
+            {solver.ObservableKind.SOLVER_RESIDUAL, solver.ObservableKind.SOLVER_RESIDUAL_HISTORY}
+        )
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    if nan_body is not None:
+        body_q = state_0.body_q.numpy()
+        body_q[nan_body] = np.nan
+        state_0.body_q.assign(body_q)
+    control = model.control()
+    for _ in range(5):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0, observables=observables)
+        state_0, state_1 = state_1, state_0
+    if observables is None:
+        return None, None, state_0.body_q.numpy()
+    return observables.solver_residual.numpy(), observables.solver_residual_history.numpy(), state_0.body_q.numpy()
+
+
+def test_sparse_solver_residual_decreases_with_iterations(test, device):
+    """Report the articulation stationarity residual in both block-sparse modes.
+
+    Every body of the sparse modes, including the free box, is solved by the sparse
+    articulation solve and never by the per-body solve, so the residual comes only
+    from the sparse right-hand side and step. The history has one row per iteration
+    and ends with the reported residual, requesting the observables leaves the
+    trajectory unchanged, and a NaN body reports infinity in its own world.
+    """
+    model = _make_sparse_residual_model(device)
+    variants = [("block_sparse_joints", {}), ("block_sparse_levels", {})]
+    if device.is_cuda:
+        variants.append(("block_sparse_levels", {"rigid_articulation_levels_launch": "level"}))
+    nan_body = model.body_count - 1  # the free box of world 1
+    test.assertEqual(model.body_world.numpy()[nan_body], 1)
+    for mode, options in variants:
+        with test.subTest(mode=mode, **options):
+            few, few_history, _ = _sparse_world_residual(model, mode, 2, **options)
+            many, many_history, body_q = _sparse_world_residual(model, mode, 16, **options)
+            test.assertEqual(few.shape, (model.world_count + 1,))
+            test.assertTrue(np.all(np.isfinite(few)) and np.all(np.isfinite(many)))
+            test.assertEqual(few[-1], 0.0)
+            test.assertTrue(np.all(few[:2] > 0.0))
+            test.assertLess(many[:2].max(), 0.1 * few[:2].min())
+
+            test.assertEqual(few_history.shape, (2, model.world_count + 1))
+            test.assertEqual(many_history.shape, (16, model.world_count + 1))
+            np.testing.assert_array_equal(few_history[-1], few)
+            np.testing.assert_array_equal(many_history[-1], many)
+            test.assertTrue(np.all(np.isfinite(many_history)))
+            test.assertTrue(np.all(many_history[:, :2] > 0.0))
+            test.assertTrue(np.all(many_history[:, -1] == 0.0))
+            test.assertLess(many_history[-1, :2].max(), 0.1 * many_history[0, :2].min())
+
+            _, _, body_q_unrequested = _sparse_world_residual(model, mode, 16, request=False, **options)
+            np.testing.assert_array_equal(body_q, body_q_unrequested)
+
+            nan_residual, nan_history, _ = _sparse_world_residual(model, mode, 2, nan_body=nan_body, **options)
+            test.assertEqual(nan_residual[1], np.inf)
+            test.assertEqual(nan_history[0, 1], np.inf)
+
+
+def test_sparse_solver_residual_graph_capture(test, device):
+    """Record the sparse residual and its history during CUDA graph replay.
+
+    Each replay must overwrite every history row and the residual, so both are
+    filled with a sentinel before a replay. Contacts are left out to keep the
+    captured step free of host-side collision work.
+    """
+    model = _make_sparse_residual_model(device)
+    variants = [
+        ("block_sparse_joints", {}),
+        ("block_sparse_levels", {}),
+        ("block_sparse_levels", {"rigid_articulation_levels_launch": "level"}),
+    ]
+    for mode, options in variants:
+        with test.subTest(mode=mode, **options):
+            solver = newton.solvers.SolverVBD(model, iterations=4, rigid_articulation_solve=mode, **options)
+            observables = solver.observables(
+                {solver.ObservableKind.SOLVER_RESIDUAL, solver.ObservableKind.SOLVER_RESIDUAL_HISTORY}
+            )
+            state_0, state_1 = model.state(), model.state()
+            control = model.control()
+            # Compile outside the capture.
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0, observables=observables)
+            with wp.ScopedCapture(device=device) as capture:
+                solver.step(state_0, state_1, control, None, 1.0 / 240.0, observables=observables)
+            for _ in range(3):
+                observables.solver_residual.fill_(-1.0)
+                observables.solver_residual_history.fill_(-1.0)
+                wp.capture_launch(capture.graph)
+                residual = observables.solver_residual.numpy()
+                history = observables.solver_residual_history.numpy()
+                test.assertEqual(history.shape, (4, model.world_count + 1))
+                np.testing.assert_array_equal(history[-1], residual)
+                test.assertTrue(np.all(np.isfinite(history)))
+                test.assertTrue(np.all(history[:, :2] > 0.0))
+                test.assertTrue(np.all(history[:, -1] == 0.0))
+
+
+add_function_test(
+    TestVBDSolverResidual,
+    "test_sparse_solver_residual_decreases_with_iterations",
+    test_sparse_solver_residual_decreases_with_iterations,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSolverResidual,
+    "test_sparse_solver_residual_graph_capture",
+    test_sparse_solver_residual_graph_capture,
+    devices=cuda_devices,
+)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

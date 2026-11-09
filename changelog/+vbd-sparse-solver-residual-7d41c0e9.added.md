@@ -1,0 +1,1 @@
+Support `SolverBase.ObservableKind.SOLVER_RESIDUAL` and `SolverVBD.ObservableKind.SOLVER_RESIDUAL_HISTORY` in `SolverVBD` with `rigid_articulation_solve="block_sparse_joints"` and `"block_sparse_levels"`, where each sparse articulation is one block and reports its stationarity residual `r^T A^-1 r` from the unrelaxed step of every iteration.
