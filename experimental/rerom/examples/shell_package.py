@@ -171,7 +171,7 @@ def run_newton(a, mesh, model, out):
     (out / f"newton_{a.method}.log").write_text("\n".join(log_lines))
 
 
-def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=print, nthreads=16):
+def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=None, nthreads=16):
     """Full-order nonlinear static equilibrium (Newton-Raphson, load steps) of the constrained thin-solid model.
 
     CalculiX supplies the NLGEOM element internal force and tangent at each state (CcxModel.evaluate, the same call
@@ -185,6 +185,10 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
     import scipy.sparse as sp
 
     from rerom.ccx import rotvec_to_matrix
+
+    if log is None:
+        def log(msg):
+            print(msg, flush=True)
     from rerom.panel import SolidCB, _factorize
 
     X = model.solid_points
@@ -196,9 +200,13 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
     dep = np.asarray(deps, np.int64)
     is_dep = np.zeros(n, bool)
     is_dep[dep] = True
-    Cnd = Cc.copy()
-    Cnd.data[is_dep[Cnd.indices]] = 0.0  # independent part of each row (dependents form an identity block)
-    Cnd.eliminate_zeros()
+    # each row minus its own dependent (coefficient 1): u_dep = -(Coff @ u). Rows may reference OTHER rows'
+    # dependents (pad-tie masters shared with other ties), so the update is a fixed-point iteration (acyclic, short)
+    Coff = Cc.tolil()
+    for r, d_ in enumerate(dep):
+        Coff[r, d_] = 0.0
+    Coff = Coff.tocsr()
+    Coff.eliminate_zeros()
     u = np.zeros(n)
     hist = []
 
@@ -210,8 +218,13 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
             U[nodes] = c + t + (X[nodes] - c) @ R.T - X[nodes]
 
     def apply_ties(u):
-        u[dep] = 0.0
-        u[dep] = -(Cnd @ u)
+        for _ in range(20):
+            new = -(Coff @ u)
+            change = float(np.abs(new - u[dep]).max()) if len(dep) else 0.0
+            u[dep] = new
+            if change <= 1e-15 * max(float(np.abs(u).max()), 1e-300):
+                return
+        raise RuntimeError("tie dependents did not resolve (cyclic chain?)")
 
     for lam in steps:
         for it in range(max_iter):
@@ -248,9 +261,18 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
             log(f"  NR load {lam:.3f} iter {it}: sag {sag:.6f} mm, |du|/|u| {rel:.3e}, |r|/|f| (before) {rn:.3e}, ccx {t_ccx:.1f}s")
             if rel < tol:
                 break
+            # noise floor: CalculiX prints forces to 7 digits; accept once corrections stop shrinking below 1e-5
+            r3 = [x["rel_du"] for x in hist[-3:] if x["load"] == lam]
+            if len(r3) == 3 and max(r3) < 1e-5 and r3[-1] > 0.5 * r3[0]:
+                hist[-1]["converged_at_noise_floor"] = True
+                log(f"  NR load {lam:.3f}: accepted at the noise floor (|du|/|u| {rel:.2e})")
+                break
         else:
-            raise RuntimeError(f"Newton-Raphson did not converge at load {lam} in {max_iter} iterations")
+            hist.append({"load": lam, "not_converged": True})
+            log(f"  NR load {lam:.3f}: NOT converged in {max_iter} iterations (state returned, flagged)")
+            break
     tie_res = float(np.abs(Cc @ u).max() / max(np.abs(u).max(), 1e-300)) if Cc.shape[0] else 0.0
+    hist.append({"tie_residual_rel": tie_res})
     log(f"  NR done: tie residual {tie_res:.2e}")
     return u, hist
 
