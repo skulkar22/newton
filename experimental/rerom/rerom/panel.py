@@ -1012,7 +1012,34 @@ class PanelReROM:
         if self.rigid_pads and self.active is not None:
             pads = [it["nodes"] for k, it in enumerate(self.itf0) if k not in set(self.active)]
             u = rigidify_pads(self.rest_pts, u, pads)
-        return u
+        return self._enforce_ties(u)
+
+    def _enforce_ties(self, u):
+        """Restore general (linear) tie constraints after the nonlinear recovery.
+
+        The director-rotated recovery and the rigid pads move a tie's dependent node and its masters
+        independently, which breaks linear ties by O(theta^2) per update; carried in u_ref, the violation
+        accumulates (5.4 um on the synthetic welded package at 10 g) and acts as a built-in weld misfit
+        that shifts the equilibrium (1.6 % of the sag) while the projected residual checks stay at ~1e-6.
+        Every dependent DOF is recomputed from its row (fixed point: rows may reference other rows'
+        dependents). Coincident welds (weld_dependents None) are exact for finite rotation and untouched."""
+        if self.weld_dependents is None or self.C is None or sp.csr_matrix(self.C).shape[0] == 0:
+            return u
+        if getattr(self, "_tie_off", None) is None:
+            C = sp.csr_matrix(self.C).tolil()
+            for r, d_ in enumerate(self.weld_dependents):
+                C[r, d_] = 0.0
+            self._tie_off = C.tocsr()
+            self._tie_off.eliminate_zeros()
+        u = np.array(u, float, copy=True)
+        dep = self.weld_dependents
+        for _ in range(20):
+            new = -(self._tie_off @ u)
+            change = float(np.abs(new - u[dep]).max())
+            u[dep] = new
+            if change <= 1e-15 * max(float(np.abs(u).max()), 1e-300):
+                return u
+        raise RuntimeError("tie dependents did not resolve (cyclic chain?)")
 
     def set_active(self, active_idx, step=0, t=0.0):
         changed = self.active is None or sorted(active_idx) != sorted(self.active)
