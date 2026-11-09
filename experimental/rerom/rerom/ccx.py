@@ -171,7 +171,7 @@ class ShellMesh:
                 "rho": float(p["density_kg_m3"]),
             }
         n0 = len(X)
-        pts = [x for x in X]
+        pts = list(X)
         parents = [(i,) for i in range(n0)]
         edge_mid = {}
 
@@ -527,8 +527,8 @@ class CcxModel:
             pad_nodes.update(int(v) for v in c["nodes"])
         tri_of = {}
         if self.mesh.source_tris is not None:
-            for t in self.mesh.source_tris:
-                t = tuple(int(v) for v in t)
+            for t_raw in self.mesh.source_tris:
+                t = tuple(int(v) for v in t_raw)
                 tri_of.setdefault(tuple(sorted(t)), t)
                 for a, b in ((t[0], t[1]), (t[1], t[2]), (t[0], t[2])):
                     tri_of.setdefault(tuple(sorted((a, b))), t)
@@ -557,7 +557,7 @@ class CcxModel:
                 if v != 0.0:
                     acc[col] = acc.get(col, 0.0) + v
 
-            def expand(cols, vals):
+            def expand(cols, vals, dep=dep, nT=nT, tri=tri, g=g):
                 acc = {}
                 for col, v in zip(cols, vals, strict=True):
                     k, a = int(col) // 6, int(col) % 6

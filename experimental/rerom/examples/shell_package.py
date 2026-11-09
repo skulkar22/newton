@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-# ruff: noqa: TID253
 """Run a shell package (triangles, offset weld ties, RBE2 clamp pads) through the re-ROM
 CalculiX panel path: CalculiX linear / NLGEOM statics of the thin-solid model, and Newton runs with the fixed
 Craig-Bampton basis or with re-ROM, for the package's clamp configurations (the ``active_<name>`` columns of
@@ -30,8 +29,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rerom.ccx import ShellMesh  # noqa: E402
-from rerom.panel import PanelCcxModel, PanelReROM, interface_list  # noqa: E402
+from rerom.ccx import ShellMesh, rotvec_to_matrix
+from rerom.panel import PanelCcxModel, PanelReROM, SolidCB, _factorize, interface_list
 
 
 def build(pkg, work, refine=0, nthreads=16):
@@ -81,8 +80,14 @@ def run_fe(a, mesh, model, out):
                 tag = f"{name}_{kind}" + (f"_inc{n_incr}" if kind == "nlgeom" else "")
                 t0 = time.perf_counter()
                 r = model.static(
-                    fixed, g, nlgeom=(kind == "nlgeom"), rigid_clamps=([] if a.released_free else released), welds=True,
-                    n_incr=n_incr, label=tag, controls=not a.default_controls,
+                    fixed,
+                    g,
+                    nlgeom=(kind == "nlgeom"),
+                    rigid_clamps=([] if a.released_free else released),
+                    welds=True,
+                    n_incr=n_incr,
+                    label=tag,
+                    controls=not a.default_controls,
                 )
                 s = summary(model, r["u"], tag)
                 s.update(wall_s=time.perf_counter() - t0, increments=r["increments"], active=active, released=released)
@@ -99,8 +104,15 @@ def run_fe(a, mesh, model, out):
             released = [ids[k] for k in range(len(ids)) if k not in cfg[name]]
             tag = f"{name}_linear_mg"
             t0 = time.perf_counter()
-            r = model.static(model.clamp_dofs(active), [0.0, 0.0, 0.0], nlgeom=False, rigid_clamps=released,
-                             welds=True, label=tag, nodal_forces=f)
+            r = model.static(
+                model.clamp_dofs(active),
+                [0.0, 0.0, 0.0],
+                nlgeom=False,
+                rigid_clamps=released,
+                welds=True,
+                label=tag,
+                nodal_forces=f,
+            )
             s = summary(model, r["u"], tag)
             s.update(wall_s=time.perf_counter() - t0, wall_matrices_s=t_m, active=active, released=released)
             res[tag] = s
@@ -126,11 +138,29 @@ def run_newton(a, mesh, model, out):
         print(s, flush=True)
 
     run = PanelReROM(
-        model, M, K, C, itf,
-        n_modes=a.modes, n_ritz=a.ritz, gravity=g, shift=shift, zeta=a.zeta, iterations=a.iterations,
-        recovery="rotated", tol=a.tol, check_every=a.check_every, min_interval=a.min_interval,
-        device=a.device, ke=a.ke, ka=a.ka, rerom=(a.method == "rerom"), log=log, weld_dependents=deps,
-        indefinite_tangent=a.indefinite_tangent, settle_force_tol=a.settle_force_tol,
+        model,
+        M,
+        K,
+        C,
+        itf,
+        n_modes=a.modes,
+        n_ritz=a.ritz,
+        gravity=g,
+        shift=shift,
+        zeta=a.zeta,
+        iterations=a.iterations,
+        recovery="rotated",
+        tol=a.tol,
+        check_every=a.check_every,
+        min_interval=a.min_interval,
+        device=a.device,
+        ke=a.ke,
+        ka=a.ka,
+        rerom=(a.method == "rerom"),
+        log=log,
+        weld_dependents=deps,
+        indefinite_tangent=a.indefinite_tangent,
+        settle_force_tol=a.settle_force_tol,
     )
     hist, snaps = [], []
     step = 0
@@ -155,25 +185,53 @@ def run_newton(a, mesh, model, out):
         save_field(out / f"newton_{a.method}_{name}.npz", model, u_eval)
         print(json.dumps(s), flush=True)
     res = {
-        "method": a.method, "modes": a.modes, "ritz": a.ritz, "dt": a.dt, "steps_per_phase": a.steps,
-        "steps_release": a.release_steps, "phase_names": list(cfg),
-        "iterations": a.iterations, "zeta": a.zeta, "ke": a.ke, "ka": a.ka, "tol": a.tol,
-        "check_every": a.check_every, "min_interval": a.min_interval, "device": a.device, "indefinite_tangent": a.indefinite_tangent, "settle_force_tol": a.settle_force_tol,
-        "gravity_factor": a.gravity_factor, "refine": a.refine, "phases": phase_res,
-        "updates": run.events, "checks": run.checks, "wall_matrices_s": t_mat, "init_wall_s": run.init_wall,
-        "cb_info": run.cb.info if a.method == "fixed" else None, "dofs": int(model.n_dof),
-        "interfaces": [it["name"] for it in itf], "configs": {k: [ids[i] for i in v] for k, v in cfg.items()},
+        "method": a.method,
+        "modes": a.modes,
+        "ritz": a.ritz,
+        "dt": a.dt,
+        "steps_per_phase": a.steps,
+        "steps_release": a.release_steps,
+        "phase_names": list(cfg),
+        "iterations": a.iterations,
+        "zeta": a.zeta,
+        "ke": a.ke,
+        "ka": a.ka,
+        "tol": a.tol,
+        "check_every": a.check_every,
+        "min_interval": a.min_interval,
+        "device": a.device,
+        "indefinite_tangent": a.indefinite_tangent,
+        "settle_force_tol": a.settle_force_tol,
+        "gravity_factor": a.gravity_factor,
+        "refine": a.refine,
+        "phases": phase_res,
+        "updates": run.events,
+        "checks": run.checks,
+        "wall_matrices_s": t_mat,
+        "init_wall_s": run.init_wall,
+        "cb_info": run.cb.info if a.method == "fixed" else None,
+        "dofs": int(model.n_dof),
+        "interfaces": [it["name"] for it in itf],
+        "configs": {k: [ids[i] for i in v] for k, v in cfg.items()},
     }
     (out / f"newton_{a.method}.json").write_text(json.dumps(res, indent=1, default=float))
-    np.savez_compressed(out / f"newton_{a.method}_history.npz", hist=np.array([h[:3] for h in hist]),
-                        phase=np.array([h[3] for h in hist]))
+    np.savez_compressed(
+        out / f"newton_{a.method}_history.npz",
+        hist=np.array([h[:3] for h in hist]),
+        phase=np.array([h[3] for h in hist]),
+    )
     if snaps:
-        np.savez_compressed(out / f"newton_{a.method}_frames.npz", step=np.array([s[0] for s in snaps]),
-                            u_mid=np.stack([s[1] for s in snaps]))
+        np.savez_compressed(
+            out / f"newton_{a.method}_frames.npz",
+            step=np.array([s[0] for s in snaps]),
+            u_mid=np.stack([s[1] for s in snaps]),
+        )
     (out / f"newton_{a.method}.log").write_text("\n".join(log_lines))
 
 
-def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=None, nthreads=16, u0=None):
+def nr_static(
+    model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=None, nthreads=16, u0=None
+):
     """Full-order nonlinear static equilibrium (Newton-Raphson, load steps) of the constrained thin-solid model.
 
     CalculiX supplies the NLGEOM element internal force and tangent at each state (CcxModel.evaluate, the same call
@@ -186,12 +244,10 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
     7 digits, so the attainable floor is ~1e-7). Returns (u (6N), history)."""
     import scipy.sparse as sp
 
-    from rerom.ccx import rotvec_to_matrix
-
     if log is None:
+
         def log(msg):
             print(msg, flush=True)
-    from rerom.panel import SolidCB, _factorize
 
     X = model.solid_points
     n = X.size
@@ -248,7 +304,10 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
             r = model.evaluate(u, tangent=True, strains=False)
             t_ccx = time.perf_counter() - t0
             pos = X + u.reshape(-1, 3)
-            itf_cur = [dict(it_, position=it_["position"] + (frames[k][0] if k in frames else 0.0)) for k, it_ in enumerate(itf)]
+            itf_cur = [
+                dict(it_, position=it_["position"] + (frames[k][0] if k in frames else 0.0))
+                for k, it_ in enumerate(itf)
+            ]
             scb = SolidCB(pos, C, itf_cur, weld_dependents=deps)
             keep = np.ones(scb.S.shape[1], bool)
             for k in active_idx:
@@ -273,8 +332,12 @@ def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol
             rel = float(np.abs(du).max() / max(np.abs(u).max(), 1e-300))
             rn = float(np.linalg.norm(res) / max(np.linalg.norm(S.T @ (lam * f_g)), 1e-300))
             sag = -1e3 * float(model.mid_and_director(u)[0][: model.mesh.orig_count, 2].min())
-            hist.append({"load": lam, "iter": it, "rel_du": rel, "rel_residual_before": rn, "sag_mm": sag, "wall_ccx_s": t_ccx})
-            log(f"  NR load {lam:.3f} iter {it}: sag {sag:.6f} mm, |du|/|u| {rel:.3e}, |r|/|f| (before) {rn:.3e}, ccx {t_ccx:.1f}s")
+            hist.append(
+                {"load": lam, "iter": it, "rel_du": rel, "rel_residual_before": rn, "sag_mm": sag, "wall_ccx_s": t_ccx}
+            )
+            log(
+                f"  NR load {lam:.3f} iter {it}: sag {sag:.6f} mm, |du|/|u| {rel:.3e}, |r|/|f| (before) {rn:.3e}, ccx {t_ccx:.1f}s"
+            )
             if rel < tol:
                 break
             # noise floor: CalculiX prints forces to 7 digits; accept once corrections stop shrinking below 1e-5
@@ -305,11 +368,19 @@ def run_fe_nr(a, mesh, model, out):
     res = {}
     for name in a.configs or list(cfg):
         t0 = time.perf_counter()
-        u, hist = nr_static(model, K, M, C, deps, itf, cfg[name], g, steps=tuple(a.steps), tol=a.tol, max_iter=a.max_iter)
+        u, hist = nr_static(
+            model, K, M, C, deps, itf, cfg[name], g, steps=tuple(a.steps), tol=a.tol, max_iter=a.max_iter
+        )
         tag = f"{name}_nr"
         s = summary(model, u, tag)
-        s.update(wall_s=time.perf_counter() - t0, wall_matrices_s=t_m, history=hist, steps=list(a.steps), tol=a.tol,
-                 active=[ids[k] for k in cfg[name]])
+        s.update(
+            wall_s=time.perf_counter() - t0,
+            wall_matrices_s=t_m,
+            history=hist,
+            steps=list(a.steps),
+            tol=a.tol,
+            active=[ids[k] for k in cfg[name]],
+        )
         res[tag] = s
         save_field(out / f"fe_{tag}.npz", model, u)
         print(json.dumps({k: v for k, v in s.items() if k != "history"}), flush=True)
@@ -330,12 +401,21 @@ def main():
     fe.add_argument("--linear", action="store_true")
     fe.add_argument("--nlgeom", action="store_true")
     fe.add_argument("--n-incr", type=int, nargs="+", default=[10])
-    fe.add_argument("--released-free", action="store_true",
-                    help="no *RIGID BODY for released pads (e.g. with a package whose pad elements are made stiff)")
-    fe.add_argument("--default-controls", action="store_true",
-                    help="NLGEOM with CalculiX's default convergence criteria instead of the tight 1e-6 residual")
-    fe.add_argument("--mg-load", action="store_true",
-                    help="also a linear static with gravity as M g on the nodes (the load Newton's ROM sees)")
+    fe.add_argument(
+        "--released-free",
+        action="store_true",
+        help="no *RIGID BODY for released pads (e.g. with a package whose pad elements are made stiff)",
+    )
+    fe.add_argument(
+        "--default-controls",
+        action="store_true",
+        help="NLGEOM with CalculiX's default convergence criteria instead of the tight 1e-6 residual",
+    )
+    fe.add_argument(
+        "--mg-load",
+        action="store_true",
+        help="also a linear static with gravity as M g on the nodes (the load Newton's ROM sees)",
+    )
     fr = sub.add_parser("fe-nr", help="full-order Newton-Raphson NLGEOM equilibrium (CalculiX element forces)")
     fr.add_argument("--configs", nargs="+", default=None, help="default: all of the package's configurations")
     fr.add_argument("--steps", type=float, nargs="+", default=[0.5, 1.0])
@@ -347,7 +427,9 @@ def main():
     nw.add_argument("--ritz", type=int, default=2)
     nw.add_argument("--dt", type=float, default=1e-3)
     nw.add_argument("--steps", type=int, default=6000, help="steps per clamp phase")
-    nw.add_argument("--release-steps", type=int, default=None, help="steps for the phases after the first (default --steps)")
+    nw.add_argument(
+        "--release-steps", type=int, default=None, help="steps for the phases after the first (default --steps)"
+    )
     nw.add_argument("--iterations", type=int, default=10)
     nw.add_argument("--zeta", type=float, default=1.0)
     nw.add_argument("--ke", type=float, default=1e10)
@@ -355,11 +437,19 @@ def main():
     nw.add_argument("--tol", type=float, default=0.01, help="re-ROM displacement-correction trigger")
     nw.add_argument("--check-every", type=int, default=10)
     nw.add_argument("--min-interval", type=int, default=10)
-    nw.add_argument("--settle-force-tol", type=float, default=None,
-                    help="re-ROM: also update when settled but the projected force mismatch exceeds this (off by default)")
+    nw.add_argument(
+        "--settle-force-tol",
+        type=float,
+        default=None,
+        help="re-ROM: also update when settled but the projected force mismatch exceeds this (off by default)",
+    )
     nw.add_argument("--device", default="cpu")
-    nw.add_argument("--indefinite-tangent", choices=["error", "clip"], default="error",
-                    help="re-ROM update whose clamped tangent is not positive definite: stop, or clip its negative eigenvalues")
+    nw.add_argument(
+        "--indefinite-tangent",
+        choices=["error", "clip"],
+        default="error",
+        help="re-ROM update whose clamped tangent is not positive definite: stop, or clip its negative eigenvalues",
+    )
     nw.add_argument("--history-every", type=int, default=10)
     nw.add_argument("--snapshot-every", type=int, default=25)
     a = ap.parse_args()
@@ -385,15 +475,30 @@ def model_info(mesh, model):
     ids, cfg = configs(mesh)
     C, deps = (model.weld_rows(), model.weld_dependents) if mesh.shell_C is not None else (model.weld_rows(), None)
     return {
-        "shell_nodes": int(mesh.n_nodes), "source_nodes": int(mesh.orig_count), "quads": int(len(Q)),
-        "dof": int(model.n_dof), "mass_kg": float(sum(mass.values())), "mass_per_panel_kg": mass,
-        "materials": {p: {"E": v["E"], "nu": v["nu"], "rho": v["rho"], "t": v["thickness"]} for p, v in mesh.parts.items()},
-        "clamps": {c["clamp_id"]: {"pad_shell_nodes": int(len(c["nodes"])), "source_pad_nodes": int(len(c["source_nodes"])),
-                                    "centre": [float(v) for v in c.get("centre", [])]} for c in mesh.clamps},
-        "configs": {k: {"active": [ids[i] for i in v], "released": [ids[i] for i in range(len(ids)) if i not in v]}
-                    for k, v in cfg.items()},
+        "shell_nodes": int(mesh.n_nodes),
+        "source_nodes": int(mesh.orig_count),
+        "quads": int(len(Q)),
+        "dof": int(model.n_dof),
+        "mass_kg": float(sum(mass.values())),
+        "mass_per_panel_kg": mass,
+        "materials": {
+            p: {"E": v["E"], "nu": v["nu"], "rho": v["rho"], "t": v["thickness"]} for p, v in mesh.parts.items()
+        },
+        "clamps": {
+            c["clamp_id"]: {
+                "pad_shell_nodes": int(len(c["nodes"])),
+                "source_pad_nodes": int(len(c["source_nodes"])),
+                "centre": [float(v) for v in c.get("centre", [])],
+            }
+            for c in mesh.clamps
+        },
+        "configs": {
+            k: {"active": [ids[i] for i in v], "released": [ids[i] for i in range(len(ids)) if i not in v]}
+            for k, v in cfg.items()
+        },
         "source_tie_rows": None if mesh.shell_C is None else int(mesh.shell_C.shape[0]),
-        "solid_tie_rows": int(C.shape[0]), "dependents_unique": None if deps is None else bool(len(set(deps.tolist())) == len(deps)),
+        "solid_tie_rows": int(C.shape[0]),
+        "dependents_unique": None if deps is None else bool(len(set(deps.tolist())) == len(deps)),
     }
 
 

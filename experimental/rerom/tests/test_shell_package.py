@@ -31,7 +31,7 @@ from rerom.ccx import CCX_DEFAULT, ShellMesh, rotvec_to_matrix
 from rerom.panel import GroundedScene, IndefiniteTangentError, PanelCcxModel, PanelReROM, SolidCB, interface_list
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from shell_package import nr_static  # noqa: E402
+from shell_package import nr_static
 
 HAVE_CCX = Path(CCX_DEFAULT).exists()
 TA, TB = 0.0012, 0.0015
@@ -118,7 +118,17 @@ def write_package(path, *, camber=0.004, pad_weld=True):
             wr.writerow([e + 1, panel[t[0]], *nid[t], ""])
     with open(path / "panels.csv", "w", newline="") as fh:
         wr = csv.writer(fh)
-        wr.writerow(["panel_id", "part_name", "material_code", "thickness_m", "density_kg_m3", "youngs_modulus_pa", "poisson_ratio"])
+        wr.writerow(
+            [
+                "panel_id",
+                "part_name",
+                "material_code",
+                "thickness_m",
+                "density_kg_m3",
+                "youngs_modulus_pa",
+                "poisson_ratio",
+            ]
+        )
         wr.writerow(["A", "A", "m", TA, MAT["rho"], MAT["E"], MAT["nu"]])
         wr.writerow(["B", "B", "m", TB, MAT["rho"], MAT["E"], MAT["nu"]])
 
@@ -132,8 +142,22 @@ def write_package(path, *, camber=0.004, pad_weld=True):
     }
     with open(path / "clamps.csv", "w", newline="") as fh:
         wr = csv.writer(fh)
-        wr.writerow(["clamp_id", "panel_id", "centre_x_m", "centre_y_m", "centre_z_m", "normal_x", "normal_y", "normal_z",
-                     "pad_type", "constrained_dofs", "active_full", "active_reduced"])
+        wr.writerow(
+            [
+                "clamp_id",
+                "panel_id",
+                "centre_x_m",
+                "centre_y_m",
+                "centre_z_m",
+                "normal_x",
+                "normal_y",
+                "normal_z",
+                "pad_type",
+                "constrained_dofs",
+                "active_full",
+                "active_reduced",
+            ]
+        )
         for cid, (pid, ks, af, ar) in clamps.items():
             c = P[ks].mean(0)
             wr.writerow([cid, pid, *c, 0, 0, 1, "clamp", 123456, af, ar])
@@ -143,7 +167,12 @@ def write_package(path, *, camber=0.004, pad_weld=True):
         for cid, (_pid, ks, _af, _ar) in clamps.items():
             for k in ks:
                 wr.writerow([cid, nid[k]])
-    return {"n_nodes": len(P), "n_tris": len(T), "welded_rows": welded, "pad_rows": {k: v[1] for k, v in clamps.items()}}
+    return {
+        "n_nodes": len(P),
+        "n_tris": len(T),
+        "welded_rows": welded,
+        "pad_rows": {k: v[1] for k, v in clamps.items()},
+    }
 
 
 def stiff_pad_package(src, dst, clamp_ids, factor=1.0e3):
@@ -168,7 +197,9 @@ def stiff_pad_package(src, dst, clamp_ids, factor=1.0e3):
         wr.writeheader()
         for p in panels:
             wr.writerow(p)
-            wr.writerow(p | {"panel_id": "S" + p["panel_id"], "youngs_modulus_pa": float(p["youngs_modulus_pa"]) * factor})
+            wr.writerow(
+                p | {"panel_id": "S" + p["panel_id"], "youngs_modulus_pa": float(p["youngs_modulus_pa"]) * factor}
+            )
 
 
 class TestShellPackageLoader(unittest.TestCase):
@@ -277,7 +308,17 @@ class TestShellPackageCcx(unittest.TestCase):
                 wr.writerow([e + 1, "A", *(t + 1), ""])
         with open(d / "panels.csv", "w", newline="") as fh:
             wr = csv.writer(fh)
-            wr.writerow(["panel_id", "part_name", "material_code", "thickness_m", "density_kg_m3", "youngs_modulus_pa", "poisson_ratio"])
+            wr.writerow(
+                [
+                    "panel_id",
+                    "part_name",
+                    "material_code",
+                    "thickness_m",
+                    "density_kg_m3",
+                    "youngs_modulus_pa",
+                    "poisson_ratio",
+                ]
+            )
             wr.writerow(["A", "A", "m", TA, MAT["rho"], MAT["E"], MAT["nu"]])
         with open(d / "clamps.csv", "w", newline="") as fh:
             wr = csv.writer(fh)
@@ -316,7 +357,11 @@ class TestShellPackageCcx(unittest.TestCase):
             active = self._active(cfg)
             released = [c["clamp_id"] for c in self.mesh.clamps if c["clamp_id"] not in active]
             r = model.static(
-                model.clamp_dofs(active), [0.0, 0.0, 0.0], nlgeom=False, rigid_clamps=released, label=f"lin_{cfg}",
+                model.clamp_dofs(active),
+                [0.0, 0.0, 0.0],
+                nlgeom=False,
+                rigid_clamps=released,
+                label=f"lin_{cfg}",
                 nodal_forces=f,
             )
             scb = SolidCB(model.solid_points, C, itf, weld_dependents=deps)
@@ -342,12 +387,12 @@ class TestShellPackageCcx(unittest.TestCase):
         keep = np.ones(cb0.T.shape[1], bool)
         for k in active:
             keep[6 * k : 6 * k + 6] = False
-        import scipy.linalg as sla  # noqa: PLC0415
+        import scipy.linalg as sla
 
         lam0 = sla.eigh(cb0.Kr[np.ix_(keep, keep)], cb0.Mr[np.ix_(keep, keep)], eigvals_only=True)
         alpha = 0.5 * (lam0[1] + lam0[2])  # about two clamped eigenvalues below zero after the shift
         cb = scb.reduce(sp.csr_matrix(K - alpha * M), M, 12, rigid_project_tol=None)
-        kw = dict(gravity=[0.0, 0.0, -9.81], shift=model.mesh.points.mean(0))
+        kw = {"gravity": [0.0, 0.0, -9.81], "shift": model.mesh.points.mean(0)}
         with self.assertRaises(IndefiniteTangentError):
             GroundedScene(cb, model.solid_points, active, M, **kw)
         sc = GroundedScene(cb, model.solid_points, active, M, clip_negative=True, **kw)
@@ -369,9 +414,21 @@ class TestShellPackageCcx(unittest.TestCase):
         full = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["full"] == 1]
         red = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["reduced"] == 1]
         run = PanelReROM(
-            model, M, K, model.weld_rows(), itf, n_modes=24, gravity=self.G10, shift=model.mesh.points.mean(0),
-            iterations=10, tol=0.01, check_every=10, min_interval=10, log=lambda s: None,
-            weld_dependents=model.weld_dependents, settle_force_tol=1e-9,
+            model,
+            M,
+            K,
+            model.weld_rows(),
+            itf,
+            n_modes=24,
+            gravity=self.G10,
+            shift=model.mesh.points.mean(0),
+            iterations=10,
+            tol=0.01,
+            check_every=10,
+            min_interval=10,
+            log=lambda s: None,
+            weld_dependents=model.weld_dependents,
+            settle_force_tol=1e-9,
         )
         step = 0
         for act in (full, red):
@@ -383,11 +440,13 @@ class TestShellPackageCcx(unittest.TestCase):
         reasons = [e["reason"] for e in run.events]
         self.assertIn("settled_unbalanced", reasons)
         s = self._sag(run.eval_state(run.total_displacement()))
-        self.assertLess(abs(s / self._sag(ref["nl"]) - 1.0), 1e-3, f"re-ROM {s:.6g} vs NLGEOM {self._sag(ref['nl']):.6g}")
+        self.assertLess(
+            abs(s / self._sag(ref["nl"]) - 1.0), 1e-3, f"re-ROM {s:.6g} vs NLGEOM {self._sag(ref['nl']):.6g}"
+        )
 
     def test_tangent_matches_finite_difference(self):
         """K_T from ccx at a deformed state matches central differences of f_int (NLGEOM)."""
-        model, K = self.model, self.K
+        model = self.model
         rng = np.random.default_rng(3)
         X = model.rest_q.reshape(-1, 3)
         Q = rotvec_to_matrix(np.array([0.05, -0.08, 0.03]))
@@ -420,8 +479,19 @@ class TestShellPackageCcx(unittest.TestCase):
             lin = rm.static(rm.clamp_dofs(active), self.G10, nlgeom=False, label="lin_ref")
             itf = interface_list(model)
             red = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["reduced"] == 1]
-            u_nr, hist = nr_static(model, self.K, self.M, model.weld_rows(), model.weld_dependents, itf, red, self.G10,
-                                steps=(0.25, 0.5, 0.75, 1.0), tol=3e-7, log=lambda s: None)
+            u_nr, hist = nr_static(
+                model,
+                self.K,
+                self.M,
+                model.weld_rows(),
+                model.weld_dependents,
+                itf,
+                red,
+                self.G10,
+                steps=(0.25, 0.5, 0.75, 1.0),
+                tol=3e-7,
+                log=lambda s: None,
+            )
             cls._refs = {"nl": nl["u"], "lin": lin["u"], "nr": u_nr, "nr_hist": hist, "released": released}
         return cls._refs
 
@@ -435,8 +505,11 @@ class TestShellPackageCcx(unittest.TestCase):
         model, released = self.model, ref["released"]
         u_nr = ref["nr"]
         self.assertFalse(any(h.get("not_converged") for h in ref["nr_hist"]), "NR did not converge")
-        self.assertLess(abs(self._sag(u_nr) / self._sag(ref["nl"]) - 1.0), 5e-4,
-                        f"NR {self._sag(u_nr):.6g} vs stiff-pad NLGEOM {self._sag(ref['nl']):.6g}")
+        self.assertLess(
+            abs(self._sag(u_nr) / self._sag(ref["nl"]) - 1.0),
+            5e-4,
+            f"NR {self._sag(u_nr):.6g} vs stiff-pad NLGEOM {self._sag(ref['nl']):.6g}",
+        )
         self.assertLess(np.abs(model.weld_rows() @ u_nr).max(), 1e-9 * np.abs(u_nr).max())
         X = model.solid_points
         u = u_nr.reshape(-1, 3)
@@ -468,9 +541,21 @@ class TestShellPackageCcx(unittest.TestCase):
         # at 1 g); re-ROM rebuilds its basis at the release and runs stably at 1 ms
         for method, dt in (("fixed", 2.5e-4), ("rerom", 1e-3)):
             run = PanelReROM(
-                model, M, K, model.weld_rows(), itf, n_modes=24, gravity=g, shift=model.mesh.points.mean(0),
-                iterations=10, tol=0.01, check_every=10, min_interval=10, rerom=(method == "rerom"),
-                log=lambda s: None, weld_dependents=model.weld_dependents,
+                model,
+                M,
+                K,
+                model.weld_rows(),
+                itf,
+                n_modes=24,
+                gravity=g,
+                shift=model.mesh.points.mean(0),
+                iterations=10,
+                tol=0.01,
+                check_every=10,
+                min_interval=10,
+                rerom=(method == "rerom"),
+                log=lambda s: None,
+                weld_dependents=model.weld_dependents,
             )
             step = 0
             for act in (full, red):
@@ -484,7 +569,9 @@ class TestShellPackageCcx(unittest.TestCase):
         err_rerom = abs(out["rerom"] / s_nl - 1.0)
         err_fixed = abs(out["fixed"] / s_nl - 1.0)
         self.assertLess(err_rerom, 1e-3, f"re-ROM {out['rerom']:.6g} vs NLGEOM {s_nl:.6g}")
-        self.assertGreater(err_fixed, 5.0 * err_rerom, f"fixed {out['fixed']:.6g}, re-ROM {out['rerom']:.6g}, NLGEOM {s_nl:.6g}")
+        self.assertGreater(
+            err_fixed, 5.0 * err_rerom, f"fixed {out['fixed']:.6g}, re-ROM {out['rerom']:.6g}, NLGEOM {s_nl:.6g}"
+        )
 
 
 if __name__ == "__main__":

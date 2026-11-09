@@ -1,4 +1,4 @@
-# ruff: noqa: TID253, B007, PLC0415  (moved as-is from the experiment package)
+# ruff: noqa: TID253, PLC0415  (moved as-is from the experiment package)
 """WP4 (v2): Craig-Bampton ROM / re-ROM of thin-solid (C3D8I) shell panels coupled to CalculiX.
 
 Pieces
@@ -393,7 +393,6 @@ class CBResult:
     eigenvalues: np.ndarray
     timings: dict = field(default_factory=dict)
     info: dict = field(default_factory=dict)
-
 
 
 class _PardisoFactor:
@@ -1007,7 +1006,9 @@ class PanelReROM:
         self.steps_since = 0
         t0 = time.perf_counter()
         if initial_cb is None:
-            initial_cb = SolidCB(self.rest_pts, weld_C, self.itf0, weld_dependents=weld_dependents).reduce(K0, self.M, n_modes)
+            initial_cb = SolidCB(self.rest_pts, weld_C, self.itf0, weld_dependents=weld_dependents).reduce(
+                K0, self.M, n_modes
+            )
         self.cb = initial_cb
         self.scene = None
         if not self.rerom:
@@ -1180,8 +1181,17 @@ class PanelReROM:
         # error or, with indefinite_tangent="clip", raised to the smallest positive one: the basis stays the
         # tangent's, the reference force stays f_int, and every check still compares with the exact force.
         scene = GroundedScene(
-            cb, pts_new, self.active, self.M, gravity=self.g, shift=self.shift, zeta=self.zeta,
-            iterations=self.iterations, ke=self.ke, ka=self.ka, device=self.device,
+            cb,
+            pts_new,
+            self.active,
+            self.M,
+            gravity=self.g,
+            shift=self.shift,
+            zeta=self.zeta,
+            iterations=self.iterations,
+            ke=self.ke,
+            ka=self.ka,
+            device=self.device,
             clip_negative=(self.indefinite_tangent == "clip"),
         )
         lowest = float(scene.clamped_eigenvalues[0])
