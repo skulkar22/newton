@@ -3,7 +3,8 @@
 # ruff: noqa: TID253
 """Run a shell package (triangles, offset weld ties, RBE2 clamp pads) through the re-ROM
 CalculiX panel path: CalculiX linear / NLGEOM statics of the thin-solid model, and Newton runs with the fixed
-Craig-Bampton basis or with re-ROM, for the package's 'full' and 'reduced' clamp configurations.
+Craig-Bampton basis or with re-ROM, for the package's clamp configurations (the ``active_<name>`` columns of
+clamps.csv, in column order; Newton runs them as consecutive phases, e.g. all pads held, then some released).
 
 The thin-solid model is one layer of C3D8I bricks built from the package mesh with every triangle split into
 three quads (``--refine`` subdivides further); the package ties (C.mtx) map to the thin-solid layout exactly
@@ -40,11 +41,10 @@ def build(pkg, work, refine=0, nthreads=16):
 
 
 def configs(mesh):
+    """Clamp ids and, per configuration (package column order), the indices of its active clamps."""
     ids = [c["clamp_id"] for c in mesh.clamps]
-    out = {}
-    for name in ("full", "reduced"):
-        out[name] = [k for k, c in enumerate(mesh.clamps) if c["active"].get(name, 0) == 1]
-    return ids, out
+    names = list(dict.fromkeys(k for c in mesh.clamps for k in c["active"]))
+    return ids, {name: [k for k, c in enumerate(mesh.clamps) if c["active"].get(name, 0) == 1] for name in names}
 
 
 def mid_at_source(model, u):
@@ -72,7 +72,7 @@ def run_fe(a, mesh, model, out):
     ids, cfg = configs(mesh)
     g = np.array([0.0, 0.0, -9.81]) * a.gravity_factor
     res = {}
-    for name in a.configs:
+    for name in a.configs or list(cfg):
         active = [ids[k] for k in cfg[name]]
         released = [ids[k] for k in range(len(ids)) if k not in cfg[name]]
         fixed = model.clamp_dofs(active)
@@ -94,7 +94,7 @@ def run_fe(a, mesh, model, out):
         _K, M = model.rest_matrices()
         f = model.gravity_load(M, g)
         t_m = time.perf_counter() - t0
-        for name in a.configs:
+        for name in a.configs or list(cfg):
             active = [ids[k] for k in cfg[name]]
             released = [ids[k] for k in range(len(ids)) if k not in cfg[name]]
             tag = f"{name}_linear_mg"
@@ -134,9 +134,9 @@ def run_newton(a, mesh, model, out):
     hist, snaps = [], []
     step = 0
     phase_res = {}
-    for name in ("full", "reduced"):
+    for i_ph, name in enumerate(cfg):
         run.set_active(cfg[name], step=step, t=step * a.dt)
-        for _ in range(a.steps):
+        for _ in range(a.steps if i_ph == 0 or a.release_steps is None else a.release_steps):
             run.scene.step(a.dt)
             step += 1
             run.maybe_update(step, step * a.dt)
@@ -155,6 +155,7 @@ def run_newton(a, mesh, model, out):
         print(json.dumps(s), flush=True)
     res = {
         "method": a.method, "modes": a.modes, "ritz": a.ritz, "dt": a.dt, "steps_per_phase": a.steps,
+        "steps_release": a.release_steps, "phase_names": list(cfg),
         "iterations": a.iterations, "zeta": a.zeta, "ke": a.ke, "ka": a.ka, "tol": a.tol,
         "check_every": a.check_every, "min_interval": a.min_interval, "device": a.device,
         "gravity_factor": a.gravity_factor, "refine": a.refine, "phases": phase_res,
@@ -301,7 +302,7 @@ def run_fe_nr(a, mesh, model, out):
     t_m = time.perf_counter() - t0
     g = np.array([0.0, 0.0, -9.81]) * a.gravity_factor
     res = {}
-    for name in a.configs:
+    for name in a.configs or list(cfg):
         t0 = time.perf_counter()
         u, hist = nr_static(model, K, M, C, deps, itf, cfg[name], g, steps=tuple(a.steps), tol=a.tol, max_iter=a.max_iter)
         tag = f"{name}_nr"
@@ -324,7 +325,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="build the model, print the preflight facts, stop")
     sub = ap.add_subparsers(dest="cmd", required=True)
     fe = sub.add_parser("fe")
-    fe.add_argument("--configs", nargs="+", default=["full", "reduced"])
+    fe.add_argument("--configs", nargs="+", default=None, help="default: all of the package's configurations")
     fe.add_argument("--linear", action="store_true")
     fe.add_argument("--nlgeom", action="store_true")
     fe.add_argument("--n-incr", type=int, nargs="+", default=[10])
@@ -335,7 +336,7 @@ def main():
     fe.add_argument("--mg-load", action="store_true",
                     help="also a linear static with gravity as M g on the nodes (the load Newton's ROM sees)")
     fr = sub.add_parser("fe-nr", help="full-order Newton-Raphson NLGEOM equilibrium (CalculiX element forces)")
-    fr.add_argument("--configs", nargs="+", default=["full", "reduced"])
+    fr.add_argument("--configs", nargs="+", default=None, help="default: all of the package's configurations")
     fr.add_argument("--steps", type=float, nargs="+", default=[0.5, 1.0])
     fr.add_argument("--tol", type=float, default=1e-6)
     fr.add_argument("--max-iter", type=int, default=15)
@@ -345,6 +346,7 @@ def main():
     nw.add_argument("--ritz", type=int, default=2)
     nw.add_argument("--dt", type=float, default=1e-3)
     nw.add_argument("--steps", type=int, default=6000, help="steps per clamp phase")
+    nw.add_argument("--release-steps", type=int, default=None, help="steps for the phases after the first (default --steps)")
     nw.add_argument("--iterations", type=int, default=10)
     nw.add_argument("--zeta", type=float, default=1.0)
     nw.add_argument("--ke", type=float, default=1e10)
