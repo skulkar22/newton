@@ -81,8 +81,8 @@ def run_fe(a, mesh, model, out):
                 tag = f"{name}_{kind}" + (f"_inc{n_incr}" if kind == "nlgeom" else "")
                 t0 = time.perf_counter()
                 r = model.static(
-                    fixed, g, nlgeom=(kind == "nlgeom"), rigid_clamps=released, welds=True, n_incr=n_incr, label=tag,
-                    controls=not a.default_controls,
+                    fixed, g, nlgeom=(kind == "nlgeom"), rigid_clamps=([] if a.released_free else released), welds=True,
+                    n_incr=n_incr, label=tag, controls=not a.default_controls,
                 )
                 s = summary(model, r["u"], tag)
                 s.update(wall_s=time.perf_counter() - t0, increments=r["increments"], active=active, released=released)
@@ -171,50 +171,88 @@ def run_newton(a, mesh, model, out):
     (out / f"newton_{a.method}.log").write_text("\n".join(log_lines))
 
 
-def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-7, max_iter=12, log=print, nthreads=16):
+def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-6, max_iter=15, log=print, nthreads=16):
     """Full-order nonlinear static equilibrium (Newton-Raphson, load steps) of the constrained thin-solid model.
 
-    CalculiX supplies the NLGEOM element internal force and tangent at a prescribed state (CcxModel.evaluate,
-    the same call re-ROM uses); the ties and RBE2 pads are eliminated exactly through SolidCB's S (active pad
-    frames held, released pads free and rigid); the state is evaluated with the released pads rigidified to
-    finite rotation (as re-ROM and CalculiX's *RIGID BODY do). Load = M g, the convention of the Newton models.
-    Returns (u (6N), history)."""
+    CalculiX supplies the NLGEOM element internal force and tangent at each state (CcxModel.evaluate, the same call
+    re-ROM uses). Released clamp pads are EXACT rigid bodies: each carries a frame (translation t, rotation R,
+    updated by the exponential map), its nodes sit at c + t + R (X - c), and the constraint tangent S is rebuilt
+    at the current pad orientation every iteration (SolidCB at the current positions, as CalculiX's *RIGID BODY
+    and re-ROM's update do). Active pads are held. The ties stay linear in the displacements (as in the package's model
+    and CalculiX's *EQUATION): every dependent DOF is recomputed from its tie row after each update.
+    Load = M g (the Newton models' convention). Convergence: max|du| / max|u| < tol (CalculiX prints forces to
+    7 digits, so the attainable floor is ~1e-7). Returns (u (6N), history)."""
     import scipy.sparse as sp
 
-    from rerom.panel import SolidCB, _factorize, rigidify_pads
+    from rerom.ccx import rotvec_to_matrix
+    from rerom.panel import SolidCB, _factorize
 
-    scb = SolidCB(model.solid_points, C, itf, weld_dependents=deps)
-    keep = np.ones(scb.S.shape[1], bool)
-    for k in active_idx:
-        keep[scb.ni + 6 * k : scb.ni + 6 * k + 6] = False
-    S = scb.S[:, keep].tocsc()
+    X = model.solid_points
+    n = X.size
     f_g = model.gravity_load(M, np.asarray(g, float))
-    pads = [it["nodes"] for k, it in enumerate(itf) if k not in set(active_idx)]
-    z = np.zeros(S.shape[1])
+    released = [k for k in range(len(itf)) if k not in set(active_idx)]
+    frames = {k: (np.zeros(3), np.eye(3)) for k in released}
+    Cc = sp.csr_matrix(C)
+    dep = np.asarray(deps, np.int64)
+    is_dep = np.zeros(n, bool)
+    is_dep[dep] = True
+    Cnd = Cc.copy()
+    Cnd.data[is_dep[Cnd.indices]] = 0.0  # independent part of each row (dependents form an identity block)
+    Cnd.eliminate_zeros()
+    u = np.zeros(n)
     hist = []
+
+    def place_pads(u):
+        U = u.reshape(-1, 3)
+        for k, (t, R) in frames.items():
+            nodes = itf[k]["nodes"]
+            c = itf[k]["position"]
+            U[nodes] = c + t + (X[nodes] - c) @ R.T - X[nodes]
+
+    def apply_ties(u):
+        u[dep] = 0.0
+        u[dep] = -(Cnd @ u)
+
     for lam in steps:
         for it in range(max_iter):
-            u = S @ z
-            ue = rigidify_pads(model.solid_points, u, pads) if pads else u
             t0 = time.perf_counter()
-            r = model.evaluate(ue, tangent=True, strains=False)
+            r = model.evaluate(u, tangent=True, strains=False)
             t_ccx = time.perf_counter() - t0
+            pos = X + u.reshape(-1, 3)
+            itf_cur = [dict(it_, position=it_["position"] + (frames[k][0] if k in frames else 0.0)) for k, it_ in enumerate(itf)]
+            scb = SolidCB(pos, C, itf_cur, weld_dependents=deps)
+            keep = np.ones(scb.S.shape[1], bool)
+            for k in active_idx:
+                keep[scb.ni + 6 * k : scb.ni + 6 * k + 6] = False
+            S = scb.S[:, keep].tocsc()
             res = S.T @ (lam * f_g - r["f_int"])
             Kz = (S.T @ (sp.csr_matrix(r["K_T"]) @ S)).tocsc()
             dz = _factorize(Kz).solve(res)
-            z = z + dz
-            du = S @ dz
-            rel = float(np.abs(du).max() / max(np.abs(S @ z).max(), 1e-300))
+            du_lin = S @ dz
+            u_new = u + du_lin
+            # exact rigid update of the released pads from their frame increments
+            col = np.cumsum(keep) - 1
+            for k in released:
+                j = col[scb.ni + 6 * k]
+                dt, dth = dz[j : j + 3], dz[j + 3 : j + 6]
+                t, R = frames[k]
+                frames[k] = (t + dt, rotvec_to_matrix(dth) @ R)
+            place_pads(u_new)
+            apply_ties(u_new)
+            du = u_new - u
+            u = u_new
+            rel = float(np.abs(du).max() / max(np.abs(u).max(), 1e-300))
             rn = float(np.linalg.norm(res) / max(np.linalg.norm(S.T @ (lam * f_g)), 1e-300))
-            sag = -1e3 * float(model.mid_and_director(S @ z)[0][: model.mesh.orig_count, 2].min())
-            hist.append({"load": lam, "iter": it, "rel_du": rel, "rel_residual": rn, "sag_mm": sag, "wall_ccx_s": t_ccx})
-            log(f"  NR load {lam:.3f} iter {it}: sag {sag:.6f} mm, |du|/|u| {rel:.3e}, |r|/|f| {rn:.3e}, ccx {t_ccx:.1f}s")
+            sag = -1e3 * float(model.mid_and_director(u)[0][: model.mesh.orig_count, 2].min())
+            hist.append({"load": lam, "iter": it, "rel_du": rel, "rel_residual_before": rn, "sag_mm": sag, "wall_ccx_s": t_ccx})
+            log(f"  NR load {lam:.3f} iter {it}: sag {sag:.6f} mm, |du|/|u| {rel:.3e}, |r|/|f| (before) {rn:.3e}, ccx {t_ccx:.1f}s")
             if rel < tol:
                 break
         else:
             raise RuntimeError(f"Newton-Raphson did not converge at load {lam} in {max_iter} iterations")
-    u = S @ z
-    return (rigidify_pads(model.solid_points, u, pads) if pads else u), hist
+    tie_res = float(np.abs(Cc @ u).max() / max(np.abs(u).max(), 1e-300)) if Cc.shape[0] else 0.0
+    log(f"  NR done: tie residual {tie_res:.2e}")
+    return u, hist
 
 
 def run_fe_nr(a, mesh, model, out):
@@ -254,6 +292,8 @@ def main():
     fe.add_argument("--linear", action="store_true")
     fe.add_argument("--nlgeom", action="store_true")
     fe.add_argument("--n-incr", type=int, nargs="+", default=[10])
+    fe.add_argument("--released-free", action="store_true",
+                    help="no *RIGID BODY for released pads (e.g. with a package whose pad elements are made stiff)")
     fe.add_argument("--default-controls", action="store_true",
                     help="NLGEOM with CalculiX's default convergence criteria instead of the tight 1e-6 residual")
     fe.add_argument("--mg-load", action="store_true",
@@ -261,8 +301,8 @@ def main():
     fr = sub.add_parser("fe-nr", help="full-order Newton-Raphson NLGEOM equilibrium (CalculiX element forces)")
     fr.add_argument("--configs", nargs="+", default=["full", "reduced"])
     fr.add_argument("--steps", type=float, nargs="+", default=[0.5, 1.0])
-    fr.add_argument("--tol", type=float, default=1e-7)
-    fr.add_argument("--max-iter", type=int, default=12)
+    fr.add_argument("--tol", type=float, default=1e-6)
+    fr.add_argument("--max-iter", type=int, default=15)
     nw = sub.add_parser("newton")
     nw.add_argument("--method", choices=["fixed", "rerom"], required=True)
     nw.add_argument("--modes", type=int, default=64)
