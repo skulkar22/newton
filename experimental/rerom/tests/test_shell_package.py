@@ -18,6 +18,7 @@ import _fixtures  # noqa: F401  (puts the rerom package on sys.path)
 
 import csv
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,9 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from rerom.ccx import CCX_DEFAULT, ShellMesh, rotvec_to_matrix
 from rerom.panel import PanelCcxModel, PanelReROM, SolidCB, interface_list
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
+from shell_package import nr_static  # noqa: E402
 
 HAVE_CCX = Path(CCX_DEFAULT).exists()
 TA, TB = 0.0012, 0.0015
@@ -140,6 +144,31 @@ def write_package(path, *, camber=0.004, pad_weld=True):
             for k in ks:
                 wr.writerow([cid, nid[k]])
     return {"n_nodes": len(P), "n_tris": len(T), "welded_rows": welded, "pad_rows": {k: v[1] for k, v in clamps.items()}}
+
+
+def stiff_pad_package(src, dst, clamp_ids, factor=1.0e3):
+    """Copy a package with the elements inside the given clamp pads made `factor` times stiffer (own panel ids), so
+    a solver can carry those pads as near-rigid elements instead of MPCs."""
+    src, dst = Path(src), Path(dst)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    with open(src / "clamp_nodes.csv") as fh:
+        pad = {r["node_id"] for r in csv.DictReader(fh) if r["clamp_id"] in set(clamp_ids)}
+    with open(src / "elements.csv") as fh:
+        els = list(csv.DictReader(fh))
+    with open(dst / "elements.csv", "w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(els[0].keys()))
+        wr.writeheader()
+        for e in els:
+            nodes = {e[k] for k in ("n1", "n2", "n3", "n4") if e.get(k)}
+            wr.writerow(e | {"panel_id": "S" + e["panel_id"]} if nodes <= pad else e)
+    with open(src / "panels.csv") as fh:
+        panels = list(csv.DictReader(fh))
+    with open(dst / "panels.csv", "w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(panels[0].keys()))
+        wr.writeheader()
+        for p in panels:
+            wr.writerow(p)
+            wr.writerow(p | {"panel_id": "S" + p["panel_id"], "youngs_modulus_pa": float(p["youngs_modulus_pa"]) * factor})
 
 
 class TestShellPackageLoader(unittest.TestCase):
@@ -316,14 +345,46 @@ class TestShellPackageCcx(unittest.TestCase):
         fd = (fp - fm) / 2.0
         self.assertLess(np.linalg.norm(KT @ v - fd) / np.linalg.norm(fd), 1e-3)
 
-    def test_rigid_pad_under_nlgeom(self):
-        """Released pads stay rigid in the ccx NLGEOM static (exact *RIGID BODY)."""
-        model = self.model
-        active = self._active("reduced")
-        released = [c["clamp_id"] for c in self.mesh.clamps if c["clamp_id"] not in active]
-        r = model.static(model.clamp_dofs(active), [0, 0, -9.81 * 50], nlgeom=True, rigid_clamps=released, label="nl_pad")
+    # 10 g: NLGEOM vs linear differs by 0.75 % and the two nonlinear references agree to 0.011 %. Above ~15 g the
+    # cambered strip nears snap-through and the full-order NR no longer converges (measured at 20 and 30 g).
+    G10 = np.array([0.0, 0.0, -9.81 * 10.0])
+
+    def _references(self):
+        """Released configuration at 10 g, computed once: CalculiX NLGEOM and linear statics with the released pads
+        as stiff elements (E x 1000, no MPC), and the full-order Newton-Raphson with exact rigid pad frames.
+        CalculiX's *RIGID BODY pads are not used: with NLGEOM and the *EQUATION ties the increments shrink until
+        CalculiX stops (exit 201)."""
+        cls = type(self)
+        if getattr(cls, "_refs", None) is None:
+            model, active = self.model, self._active("reduced")
+            released = [c["clamp_id"] for c in self.mesh.clamps if c["clamp_id"] not in active]
+            stiff_pad_package(self.work / "pkg", self.work / "pkg_stiff", released)
+            ms = ShellMesh.from_shell_package(self.work / "pkg_stiff", triangles="split", refine=1)
+            rm = PanelCcxModel(ms, self.work / "ccx_stiff")
+            nl = rm.static(rm.clamp_dofs(active), self.G10, nlgeom=True, n_incr=40, controls=False, label="nl_ref")
+            lin = rm.static(rm.clamp_dofs(active), self.G10, nlgeom=False, label="lin_ref")
+            itf = interface_list(model)
+            red = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["reduced"] == 1]
+            u_nr, hist = nr_static(model, self.K, self.M, model.weld_rows(), model.weld_dependents, itf, red, self.G10,
+                                steps=(0.25, 0.5, 0.75, 1.0), tol=3e-7, log=lambda s: None)
+            cls._refs = {"nl": nl["u"], "lin": lin["u"], "nr": u_nr, "nr_hist": hist, "released": released}
+        return cls._refs
+
+    def _sag(self, u):
+        return -self.model.mid_and_director(u)[0][:, 2].min()  # same nodes in the stiff-pad model
+
+    def test_nr_equilibrium_rigid_pads_and_ties(self):
+        """Full-order nonlinear equilibrium (NR, 10 g): released pads stay rigid, the ties hold, and the sag agrees
+        with CalculiX NLGEOM with stiff pads within 0.05 % (two independent nonlinear references)."""
+        ref = self._references()
+        model, released = self.model, ref["released"]
+        u_nr = ref["nr"]
+        self.assertFalse(any(h.get("not_converged") for h in ref["nr_hist"]), "NR did not converge")
+        self.assertLess(abs(self._sag(u_nr) / self._sag(ref["nl"]) - 1.0), 5e-4,
+                        f"NR {self._sag(u_nr):.6g} vs stiff-pad NLGEOM {self._sag(ref['nl']):.6g}")
+        self.assertLess(np.abs(model.weld_rows() @ u_nr).max(), 1e-9 * np.abs(u_nr).max())
         X = model.solid_points
-        u = r["u"].reshape(-1, 3)
+        u = u_nr.reshape(-1, 3)
         for c in self.mesh.clamps:
             if c["clamp_id"] not in released:
                 continue
@@ -336,23 +397,21 @@ class TestShellPackageCcx(unittest.TestCase):
             self.assertLess(resid, 1e-6 * np.abs(u[nodes]).max(), c["clamp_id"])
 
     def test_rerom_matches_nlgeom_static(self):
-        """End to end: release R and PB under a load with clear geometric nonlinearity; the settled re-ROM sag
-        matches the ccx NLGEOM static within 0.1 % of the sag, the fixed basis does not."""
+        """End to end: release R and PB at 10 g (clear geometric nonlinearity); the settled re-ROM sag matches
+        CalculiX NLGEOM with stiff pads (see _references) within 0.1 %, the fixed basis does not."""
         model, K, M = self.model, self.K, self.M
-        gf = 60.0
-        g = np.array([0.0, 0.0, -9.81 * gf])
-        active = self._active("reduced")
-        released = [c["clamp_id"] for c in self.mesh.clamps if c["clamp_id"] not in active]
-        ref = model.static(model.clamp_dofs(active), g, nlgeom=True, rigid_clamps=released, n_incr=20, label="nl_ref")
-        lin = model.static(model.clamp_dofs(active), g, nlgeom=False, rigid_clamps=released, label="lin_ref")
-        sag = lambda u: -model.mid_and_director(u)[0][:, 2].min()  # noqa: E731
-        s_nl, s_lin = sag(ref["u"]), sag(lin["u"])
-        self.assertGreater(abs(s_nl / s_lin - 1.0), 0.02)  # the load case is clearly nonlinear
+        g = self.G10
+        ref = self._references()
+        sag = self._sag
+        s_nl, s_lin = sag(ref["nl"]), sag(ref["lin"])
+        self.assertGreater(abs(s_nl / s_lin - 1.0), 0.005)  # nonlinear well beyond the 0.1 % acceptance band
         itf = interface_list(model)
         full = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["full"] == 1]
         red = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["reduced"] == 1]
         out = {}
-        for method in ("fixed", "rerom"):
+        # the fixed basis needs dt = 0.25 ms on this small model (at 1 ms it diverges right after the release, also
+        # at 1 g); re-ROM rebuilds its basis at the release and runs stably at 1 ms
+        for method, dt in (("fixed", 2.5e-4), ("rerom", 1e-3)):
             run = PanelReROM(
                 model, M, K, model.weld_rows(), itf, n_modes=24, gravity=g, shift=model.mesh.points.mean(0),
                 iterations=10, tol=0.01, check_every=10, min_interval=10, rerom=(method == "rerom"),
@@ -361,16 +420,16 @@ class TestShellPackageCcx(unittest.TestCase):
             step = 0
             for act in (full, red):
                 run.set_active(act, step=step)
-                for _ in range(1500):
-                    run.scene.step(1e-3)
+                for _ in range(int(round(1.5 / dt))):
+                    run.scene.step(dt)
                     step += 1
-                    run.maybe_update(step, step * 1e-3)
+                    run.maybe_update(step, step * dt)
             u = run.total_displacement()
             out[method] = sag(run.eval_state(u) if method == "rerom" else u)
         err_rerom = abs(out["rerom"] / s_nl - 1.0)
         err_fixed = abs(out["fixed"] / s_nl - 1.0)
         self.assertLess(err_rerom, 1e-3, f"re-ROM {out['rerom']:.6g} vs NLGEOM {s_nl:.6g}")
-        self.assertGreater(err_fixed, 5.0 * err_rerom)
+        self.assertGreater(err_fixed, 5.0 * err_rerom, f"fixed {out['fixed']:.6g}, re-ROM {out['rerom']:.6g}, NLGEOM {s_nl:.6g}")
 
 
 if __name__ == "__main__":
