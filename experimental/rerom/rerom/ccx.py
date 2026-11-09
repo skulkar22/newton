@@ -82,6 +82,16 @@ class ShellMesh:
     node_ids: np.ndarray | None = None
     elem_ids: np.ndarray | None = None
     clamps: list = field(default_factory=list)  # [dict(clamp_id, nodes(rows), active{...}, ...)]
+    # General linear tie constraints of the source package in its 6-DOF shell layout (u, theta per node,
+    # node-major, columns indexed by this mesh's node rows): C_shell q_shell = 0. Used when the package
+    # ties are not coincident-node pairs (e.g. offset welds to a triangle); see CcxModel.weld_rows().
+    shell_C: object = None
+    # For meshes refined from a source mesh: parents[i] = tuple of the source/parent rows node i interpolates
+    # (a single row for an original node). orig_count = number of source nodes (rows 0..orig_count-1).
+    parents: list | None = None
+    orig_count: int | None = None
+    # Source triangles (rows), used for the in-plane rotation (curl) of a triangle in the tie constraints.
+    source_tris: np.ndarray | None = None
 
     def __post_init__(self):
         self.points = np.asarray(self.points, float)
@@ -128,8 +138,20 @@ class ShellMesh:
         return nn / np.linalg.norm(nn, axis=1)[:, None]
 
     @classmethod
-    def from_shell_package(cls, pkg):
-        """Read a shell package (nodes/elements/panels.csv, C.mtx weld ties, clamps)."""
+    def from_shell_package(cls, pkg, triangles="error", refine=0):
+        """Read a shell package (nodes/elements/panels.csv, C.mtx ties, clamps).
+
+        ``triangles``: what to do with 3-node elements. "error" (default) refuses them; "split" divides every
+        triangle into three quads (vertex, edge midpoints, centroid), keeping every source node at its row and
+        appending the new nodes. One-layer thin-solid wedges lock in bending (a clamped plate under self-weight
+        sags 72 % too little at a 5 mm element size), so triangles are not written as wedges.
+        ``refine``: subdivide every quad into four (edge midpoints, centroid) this many times after the split.
+        Ties in C.mtx that are coincident-node pairs become ``welds`` (exact for finite rotation, as before);
+        any other tie rows are kept as ``shell_C`` in the 6-DOF shell layout and mapped to the thin-solid
+        layout by :meth:`CcxModel.weld_rows`. Clamp patches grow with the refinement: a new node belongs to a
+        patch when all nodes it interpolates do. Clamp centres are read from clamps.csv when present."""
+        import scipy.io
+
         pkg = Path(pkg)
         rd = lambda f: list(csv.DictReader(open(pkg / f)))  # noqa: E731
         nodes = rd("nodes.csv")
@@ -137,9 +159,9 @@ class ShellMesh:
         X = np.array([[float(r[k]) for k in ("x_m", "y_m", "z_m")] for r in nodes])
         row = {v: i for i, v in enumerate(node_ids.tolist())}
         els = rd("elements.csv")
-        if any((e.get("n4") or "").strip() == "" for e in els):
-            raise ValueError("triangles are not supported by this probe")
-        quads = np.array([[row[int(e[k])] for k in ("n1", "n2", "n3", "n4")] for e in els])
+        is_tri = np.array([(e.get("n4") or "").strip() == "" for e in els])
+        if is_tri.any() and triangles != "split":
+            raise ValueError("the package has triangles; pass triangles='split' (one-layer wedges lock in bending)")
         parts = {}
         for p in rd("panels.csv"):
             parts[p["panel_id"].strip()] = {
@@ -148,26 +170,86 @@ class ShellMesh:
                 "nu": float(p["poisson_ratio"]),
                 "rho": float(p["density_kg_m3"]),
             }
-        welds = []
-        if (pkg / "C.mtx").exists():
-            import scipy.io
+        n0 = len(X)
+        pts = [x for x in X]
+        parents = [(i,) for i in range(n0)]
+        edge_mid = {}
 
+        def mid(a, b):
+            key = (min(a, b), max(a, b))
+            if key not in edge_mid:
+                edge_mid[key] = len(pts)
+                pts.append(0.5 * (pts[a] + pts[b]))
+                parents.append(key)
+            return edge_mid[key]
+
+        quads, quad_part, src_tris, quad_src = [], [], [], []
+        for k, e in enumerate(els):
+            part = e["panel_id"].strip()
+            if is_tri[k]:
+                a, b, c = (row[int(e[f])] for f in ("n1", "n2", "n3"))
+                src_tris.append((a, b, c))
+                mab, mbc, mca = mid(a, b), mid(b, c), mid(c, a)
+                g = len(pts)
+                pts.append((X[a] + X[b] + X[c]) / 3.0)
+                parents.append((a, b, c))
+                quads += [(a, mab, g, mca), (b, mbc, g, mab), (c, mca, g, mbc)]
+                quad_part += [part] * 3
+                quad_src += [int(e["element_id"])] * 3
+            else:
+                quads.append(tuple(row[int(e[f])] for f in ("n1", "n2", "n3", "n4")))
+                quad_part.append(part)
+                quad_src.append(int(e["element_id"]))
+        for _ in range(int(refine)):
+            edge_mid = {}
+            new_q, new_part, new_src = [], [], []
+            for q, part, src in zip(quads, quad_part, quad_src, strict=True):
+                m = [mid(q[i], q[(i + 1) % 4]) for i in range(4)]
+                c = len(pts)
+                pts.append(np.mean([pts[v] for v in q], axis=0))
+                parents.append(tuple(q))
+                new_q += [(q[0], m[0], c, m[3]), (m[0], q[1], m[1], c), (c, m[1], q[2], m[2]), (m[3], c, m[2], q[3])]
+                new_part += [part] * 4
+                new_src += [src] * 4
+            quads, quad_part, quad_src = new_q, new_part, new_src
+        P = np.array(pts)
+        n_all = len(P)
+        welds, shell_C = [], None
+        if (pkg / "C.mtx").exists():
             C = sp.csr_matrix(scipy.io.mmread(pkg / "C.mtx"))
-            seen = set()
+            coincident = True
             for r in range(C.shape[0]):
                 cols = C.indices[C.indptr[r] : C.indptr[r + 1]]
                 vals = C.data[C.indptr[r] : C.indptr[r + 1]]
                 if len(cols) != 2 or cols[0] % 6 != cols[1] % 6 or abs(vals.sum()) > 1e-12 * abs(vals).max():
-                    raise ValueError(f"C row {r} is not a coincident-node tie")
-                pair = (int(cols[np.argmax(vals)] // 6), int(cols[np.argmin(vals)] // 6))
-                if pair not in seen:
-                    seen.add(pair)
-                    welds.append(pair)
+                    coincident = False
+                    break
+            if coincident:
+                seen = set()
+                for r in range(C.shape[0]):
+                    cols = C.indices[C.indptr[r] : C.indptr[r + 1]]
+                    vals = C.data[C.indptr[r] : C.indptr[r + 1]]
+                    pair = (int(cols[np.argmax(vals)] // 6), int(cols[np.argmin(vals)] // 6))
+                    if pair not in seen:
+                        seen.add(pair)
+                        welds.append(pair)
+            else:  # general ties: re-index the columns to this mesh (source rows keep their index)
+                Cc = C.tocoo()
+                shell_C = sp.csr_matrix((Cc.data, (Cc.row, Cc.col)), shape=(C.shape[0], 6 * n_all))
         elif (pkg / "weld_pairs.csv").exists():
             welds = [(row[int(w["node_a"])], row[int(w["node_b"])]) for w in rd("weld_pairs.csv")]
         for a, b in welds:
             if np.linalg.norm(X[a] - X[b]) > 1e-9:
                 raise ValueError("weld pairs must be coincident")
+
+        # patch membership through the refinement
+        def grow(rows):
+            inside = np.zeros(n_all, bool)
+            inside[list(rows)] = True
+            for i in range(n0, n_all):
+                inside[i] = all(inside[p] for p in parents[i])
+            return np.nonzero(inside)[0]
+
         clamps = []
         if (pkg / "clamps.csv").exists():
             patch = {}
@@ -175,23 +257,30 @@ class ShellMesh:
                 patch.setdefault(r["clamp_id"].strip(), []).append(row[int(r["node_id"])])
             for c in rd("clamps.csv"):
                 cid = c["clamp_id"].strip()
-                clamps.append(
-                    {
-                        "clamp_id": cid,
-                        "panel_id": c["panel_id"].strip(),
-                        "nodes": np.array(sorted(patch[cid])),
-                        "active": {k[7:]: int(v) for k, v in c.items() if k.startswith("active_")},
-                    }
-                )
+                rec = {
+                    "clamp_id": cid,
+                    "panel_id": c["panel_id"].strip(),
+                    "nodes": grow(patch[cid]),
+                    "source_nodes": np.array(sorted(patch[cid])),
+                    "active": {k[7:]: int(v) for k, v in c.items() if k.startswith("active_")},
+                }
+                if all(k in c for k in ("centre_x_m", "centre_y_m", "centre_z_m")):
+                    rec["centre"] = np.array([float(c[k]) for k in ("centre_x_m", "centre_y_m", "centre_z_m")])
+                clamps.append(rec)
+        new_ids = np.concatenate([node_ids, -np.arange(1, n_all - n0 + 1)])  # generated nodes: negative ids
         return cls(
-            points=X,
-            quads=quads,
-            elem_part=np.array([e["panel_id"].strip() for e in els]),
+            points=P,
+            quads=np.array(quads, np.int64),
+            elem_part=np.array(quad_part),
             parts=parts,
             welds=welds,
-            node_ids=node_ids,
-            elem_ids=np.array([int(e["element_id"]) for e in els]),
+            node_ids=new_ids,
+            elem_ids=np.array(quad_src),
             clamps=clamps,
+            shell_C=shell_C,
+            parents=parents,
+            orig_count=n0,
+            source_tris=np.array(src_tris, np.int64) if src_tris else None,
         )
 
 
@@ -375,7 +464,12 @@ class CcxModel:
         return out.reshape(-1)
 
     def weld_rows(self):
-        """C (6 per weld, C q = 0): node b bottom/top expressed through node a (exact, see doc)."""
+        """C (6 per weld, C q = 0): node b bottom/top expressed through node a (exact, see doc).
+
+        With general package ties (``mesh.shell_C``) the rows come from :meth:`general_tie_rows` instead and
+        :attr:`weld_dependents` names the dependent 6N DOF of every row."""
+        if self.mesh.shell_C is not None:
+            return self.general_tie_rows()[0]
         rows, cols, vals = [], [], []
         r = 0
         for a, b in self.mesh.welds:
@@ -388,6 +482,198 @@ class CcxModel:
                     vals += [1.0, -ca_bot, -ca_top]
                     r += 1
         return sp.csr_matrix((vals, (rows, cols)), shape=(r, self.n_dof))
+
+    # ---------------- general (offset) ties ----------------
+    def _tri_curl(self, tri):
+        """Coefficients g_i (3 nodes x 3) with theta_n = sum_i g_i . u_mid_i: in-plane rotation (half the curl of
+        the linear in-plane displacement) of a source triangle about its face normal. Exact for rigid motion."""
+        X = self.mesh.points[list(tri)]
+        n = np.cross(X[1] - X[0], X[2] - X[0])
+        n /= np.linalg.norm(n)
+        e1 = (X[1] - X[0]) / np.linalg.norm(X[1] - X[0])
+        e2 = np.cross(n, e1)
+        xy = np.stack([(X - X[0]) @ e1, (X - X[0]) @ e2], axis=1)
+        a2 = (xy[1, 0] - xy[0, 0]) * (xy[2, 1] - xy[0, 1]) - (xy[2, 0] - xy[0, 0]) * (xy[1, 1] - xy[0, 1])
+        g = np.zeros((3, 3))
+        for i in range(3):
+            j, k = (i + 1) % 3, (i + 2) % 3
+            dNdx = (xy[j, 1] - xy[k, 1]) / a2
+            dNdy = (xy[k, 0] - xy[j, 0]) / a2
+            g[i] = 0.5 * (dNdx * e2 - dNdy * e1)
+        return g, n
+
+    def general_tie_rows(self, cond_max=1e8):
+        """Map the package's 6-DOF shell ties (``mesh.shell_C``) to the thin-solid 6N layout.
+
+        Shell DOFs of node k in terms of its bottom/top solid displacements (n_k nodal normal, t_k thickness):
+            u_k      = (bot_k + top_k) / 2
+            theta_k  = theta_perp + n_k (w - theta_perp . n_T) / (n_k . n_T),   theta_perp = n_k x (top_k - bot_k) / t_k,
+        w being the in-plane rotation (half curl) of the tie's source triangle about its face normal n_T (thin
+        solids have no drilling DOF); the form is exact for rigid rotation. Per tie (one dependent node): its three translation rows are mapped as they are; its three rotation
+        rows are projected onto the dependent node's tangent plane (two rows), because the dependent node has no
+        drilling DOF and its thickness stretch stays free. Each tie gives five rows, normalised so that five
+        chosen dependent DOFs form an identity block (the dependent node's own solid DOFs, or the master nodes'
+        when the dependent lies in a clamp pad). Both mapped forms are exact for rigid translation and, to first
+        order, rigid rotation. Returns (C (r x 6N) csr, dependents (r,)) and stores ``weld_dependents``."""
+        import scipy.linalg
+
+        if getattr(self, "_general_ties", None) is not None:
+            return self._general_ties
+        C = sp.csr_matrix(self.mesh.shell_C)
+        N = self.mesh.n_nodes
+        nrm, th = self.normals, self.thickness
+        pad_nodes = set()
+        for c in self.mesh.clamps:
+            pad_nodes.update(int(v) for v in c["nodes"])
+        tri_of = {}
+        if self.mesh.source_tris is not None:
+            for t in self.mesh.source_tris:
+                t = tuple(int(v) for v in t)
+                tri_of.setdefault(tuple(sorted(t)), t)
+                for a, b in ((t[0], t[1]), (t[1], t[2]), (t[0], t[2])):
+                    tri_of.setdefault(tuple(sorted((a, b))), t)
+        # group rows by dependent shell node (the +1 entry)
+        groups = {}
+        for r in range(C.shape[0]):
+            cols = C.indices[C.indptr[r] : C.indptr[r + 1]]
+            vals = C.data[C.indptr[r] : C.indptr[r + 1]]
+            one = np.nonzero(vals == 1.0)[0]
+            if len(one) != 1:
+                raise ValueError(f"tie row {r} has no unique +1 dependent entry")
+            j = int(cols[one[0]])
+            groups.setdefault(j // 6, {})[j % 6] = (cols, vals)
+        out_rows, deps, used, pad_groups = [], [], set(), []
+        skew = lambda v: np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])  # noqa: E731
+        for dep, comps in groups.items():
+            if sorted(comps) != [0, 1, 2, 3, 4, 5]:
+                raise ValueError(f"tie of node row {dep} does not have the 6 rows ux..rz")
+            masters = sorted({int(c) // 6 for c in comps[0][0]} - {dep})
+            tri = tri_of.get(tuple(masters))
+            if tri is None:
+                raise ValueError(f"no source triangle contains the masters {masters} of tie node row {dep}")
+            g, nT = self._tri_curl(tri)
+
+            def add(acc, col, v):
+                if v != 0.0:
+                    acc[col] = acc.get(col, 0.0) + v
+
+            def expand(cols, vals):
+                acc = {}
+                for col, v in zip(cols, vals, strict=True):
+                    k, a = int(col) // 6, int(col) % 6
+                    if a < 3:
+                        add(acc, 6 * k + a, 0.5 * v)
+                        add(acc, 6 * k + 3 + a, 0.5 * v)
+                        continue
+                    a -= 3
+                    S = skew(nrm[k])  # theta_perp = S(n) (top - bot) / t
+                    for b in range(3):
+                        add(acc, 6 * k + 3 + b, v * S[a, b] / th[k])
+                        add(acc, 6 * k + b, -v * S[a, b] / th[k])
+                    if k != dep:
+                        # rotation about the node normal from the triangle's in-plane rotation (about its face
+                        # normal nT): theta.n_k = (curl - theta_perp.nT) / (n_k.nT), exact for rigid rotation
+                        cn = nrm[k][a] / float(nrm[k] @ nT)
+                        for i, ti in enumerate(tri):
+                            for b in range(3):
+                                c = v * cn * g[i, b]
+                                add(acc, 6 * ti + b, 0.5 * c)
+                                add(acc, 6 * ti + 3 + b, 0.5 * c)
+                        SnT = nT @ S  # theta_perp . nT = sum_b (nT^T S)_b (top_b - bot_b) / t
+                        for b in range(3):
+                            add(acc, 6 * k + 3 + b, -v * cn * SnT[b] / th[k])
+                            add(acc, 6 * k + b, v * cn * SnT[b] / th[k])
+                return acc
+
+            trans = [expand(*comps[a]) for a in range(3)]
+            rot = [expand(*comps[3 + a]) for a in range(3)]
+            n = nrm[dep]
+            e1 = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])
+            e1 /= np.linalg.norm(e1)
+            e2 = np.cross(n, e1)
+            proj = []
+            for e in (e1, e2):
+                acc = {}
+                for a in range(3):
+                    for col, v in rot[a].items():
+                        add(acc, col, e[a] * v)
+                proj.append(acc)
+            rows5 = trans + proj
+            if dep in pad_nodes:
+                pad_groups.append((dep, masters, rows5))
+                continue
+            allcols = sorted(set().union(*[r.keys() for r in rows5]))
+            pos = {c: i for i, c in enumerate(allcols)}
+            A = np.zeros((5, len(allcols)))
+            for i, r in enumerate(rows5):
+                for col, v in r.items():
+                    A[i, pos[col]] = v
+            cand = [c for c in (6 * dep + j for j in range(6)) if c in pos and c not in used]
+            _, _, piv = scipy.linalg.qr(A[:, [pos[c] for c in cand]], pivoting=True)
+            sel = [cand[i] for i in piv[:5]]
+            B = A[:, [pos[c] for c in sel]]
+            if np.linalg.cond(B) > cond_max:
+                raise ValueError(f"tie of node row {dep}: dependent block is ill-conditioned ({np.linalg.cond(B):.3g})")
+            A = np.linalg.solve(B, A)
+            A[np.abs(A) < 1e-14 * np.abs(A).max()] = 0.0
+            for i, c in enumerate(sel):
+                A[:, pos[c]] = 0.0
+                A[i, pos[c]] = 1.0
+                used.add(c)
+                deps.append(c)
+                out_rows.append({allcols[j]: A[i, j] for j in np.nonzero(A[i])[0]})
+        # Ties whose dependent node lies in a clamp pad (rigid): their dependents come from the master panel. Masters
+        # are shared between neighbouring ties, so all such rows are made explicit TOGETHER (one pivoted QR), which
+        # also leaves no chained dependents. Numerically redundant rows (relative pivot < 1e-10) are dropped and counted.
+        self.tie_redundant_rows = 0
+        if pad_groups:
+            rows_p = [r for _d, _m, rs in pad_groups for r in rs]
+            allcols = sorted(set().union(*[r.keys() for r in rows_p]))
+            pos = {c: i for i, c in enumerate(allcols)}
+            A = np.zeros((len(rows_p), len(allcols)))
+            for i, r in enumerate(rows_p):
+                for col, v in r.items():
+                    A[i, pos[col]] = v
+            cand = [c for c in allcols if (c // 6) not in pad_nodes and c not in used]
+            Ac = A[:, [pos[c] for c in cand]]
+            # row rank of the pad-tie rows on the candidate DOFs
+            _, Rr, _ = scipy.linalg.qr(Ac.T, pivoting=True)
+            d = np.abs(np.diag(Rr))
+            rank = int(np.sum(d > 1e-10 * d.max()))
+            dfull = np.abs(np.diag(scipy.linalg.qr(A.T, pivoting=True, mode="r")[0]))
+            rank_full = int(np.sum(dfull > 1e-10 * dfull.max()))
+            self.tie_pad_rank = {"rows": len(rows_p), "rank_non_pad_dofs": rank, "rank_all_dofs": rank_full}
+            if rank < rank_full:
+                raise ValueError(f"pad ties need pad DOFs as dependents (rank {rank} < {rank_full}); not supported")
+            if rank < len(rows_p):  # truly redundant rows: keep a maximal independent subset
+                _, _, prow = scipy.linalg.qr(Ac.T, pivoting=True)
+                keep_rows = np.sort(prow[:rank])
+                self.tie_redundant_rows = len(rows_p) - rank
+                A, Ac = A[keep_rows], Ac[keep_rows]
+            _, _, piv = scipy.linalg.qr(Ac, pivoting=True)
+            sel = [cand[i] for i in piv[: A.shape[0]]]
+            B = A[:, [pos[c] for c in sel]]
+            if np.linalg.cond(B) > cond_max:
+                raise ValueError(f"pad ties: dependent block is ill-conditioned ({np.linalg.cond(B):.3g})")
+            A = np.linalg.solve(B, A)
+            A[np.abs(A) < 1e-14 * np.abs(A).max()] = 0.0
+            for i, c in enumerate(sel):
+                A[:, pos[c]] = 0.0
+                A[i, pos[c]] = 1.0
+                used.add(c)
+                deps.append(c)
+                out_rows.append({allcols[j]: A[i, j] for j in np.nonzero(A[i])[0]})
+            self.tie_pad_rows = int(A.shape[0])
+        rr, cc, vv = [], [], []
+        for i, r in enumerate(out_rows):
+            for col, v in r.items():
+                rr.append(i)
+                cc.append(col)
+                vv.append(v)
+        Cs = sp.csr_matrix((vv, (rr, cc)), shape=(len(out_rows), 6 * N))
+        self.weld_dependents = np.array(deps, np.int64)
+        self._general_ties = (Cs, self.weld_dependents)
+        return self._general_ties
 
     def clamp_dofs(self, clamp_ids):
         rows = np.concatenate([c["nodes"] for c in self.mesh.clamps if c["clamp_id"] in set(clamp_ids)])
@@ -437,21 +723,26 @@ class CcxModel:
                 L.append(f"*SOLID SECTION, ELSET=E_{p}, MATERIAL=M_{p}")
             else:
                 L += [f"*SHELL SECTION, ELSET=E_{p}, MATERIAL=M_{p}", f"{prop['thickness']:.13e}"]
-        if welds and m.welds:
+        if welds and (m.welds or m.shell_C is not None):
             if self.element != "C3D8I":
                 raise NotImplementedError("welds are only written for the thin-solid model")
             C = self.weld_rows().tocsr()
+            dep = self.weld_dependents if m.shell_C is not None else None
             for r in range(C.shape[0]):
                 cols = C.indices[C.indptr[r] : C.indptr[r + 1]]
                 vals = C.data[C.indptr[r] : C.indptr[r + 1]]
-                order = sorted(
-                    range(len(cols)), key=lambda k: 0 if (cols[k] // 6 == self.mesh.welds[r // 6][1]) else 1
-                )  # dependent first
+                if dep is not None:
+                    order = sorted(range(len(cols)), key=lambda k: 0 if cols[k] == dep[r] else 1)
+                else:
+                    order = sorted(
+                        range(len(cols)), key=lambda k: 0 if (cols[k] // 6 == self.mesh.welds[r // 6][1]) else 1
+                    )  # dependent first
                 terms = []
                 for k in order:
                     node = 2 * (cols[k] // 6) + (cols[k] % 6) // 3 + 1
                     terms.append(f"{node}, {cols[k] % 3 + 1}, {vals[k]:.13e}")
-                L += ["*EQUATION", str(len(terms)), ", ".join(terms)]
+                # ccx reads at most 12 entries (4 terms) per line
+                L += ["*EQUATION", str(len(terms))] + [", ".join(terms[i : i + 4]) for i in range(0, len(terms), 4)]
         return L
 
     def _run(self, label, lines, env_extra=None):

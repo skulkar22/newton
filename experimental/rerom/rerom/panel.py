@@ -182,9 +182,21 @@ class PanelCcxModel(CcxModel):
         return (["*NODE", *extra_nodes] if extra_nodes else []) + L
 
     def static(
-        self, fixed_dofs, g_vec, *, nlgeom=True, rigid_clamps=(), welds=True, n_incr=10, controls=True, label="static"
+        self,
+        fixed_dofs,
+        g_vec,
+        *,
+        nlgeom=True,
+        rigid_clamps=(),
+        welds=True,
+        n_incr=10,
+        controls=True,
+        label="static",
+        nodal_forces=None,
     ):
-        """Gravity static (linear or NLGEOM); fixed 6N DOFs held at zero, released pads rigid."""
+        """Gravity static (linear or NLGEOM); fixed 6N DOFs held at zero, released pads rigid.
+        ``nodal_forces``: optional (6N,) force vector on the solid nodes, applied as *CLOAD (zero-gravity
+        ``g_vec`` drops the body load)."""
         fixed = np.unique(np.asarray(fixed_dofs, np.int64))
         L = [f"** {label}", *self._mesh_cards(welds=welds), *self._rigid_cards(set(rigid_clamps))]
         g = np.asarray(g_vec, float)
@@ -195,7 +207,12 @@ class PanelCcxModel(CcxModel):
             L += ["*STEP, NLGEOM, INC=1000", "*STATIC", f"{1.0 / n_incr}, 1., 1e-6, {1.0 / n_incr}"]
         else:
             L += ["*STEP", "*STATIC"]
-        L += ["*DLOAD", f"EALL, GRAV, {gn:.13e}, {g[0] / gn:.13e}, {g[1] / gn:.13e}, {g[2] / gn:.13e}"]
+        if gn > 0.0:
+            L += ["*DLOAD", f"EALL, GRAV, {gn:.13e}, {g[0] / gn:.13e}, {g[1] / gn:.13e}, {g[2] / gn:.13e}"]
+        if nodal_forces is not None:
+            F = np.asarray(nodal_forces, float).reshape(-1, 3)
+            nz = np.argwhere(F != 0.0)
+            L += ["*CLOAD"] + [f"{k + 1}, {d + 1}, {F[k, d]:.13e}" for k, d in nz]
         if controls and nlgeom:
             # tighten the force-residual criterion (default 0.5 % of the mean force) to 1e-6
             L += ["*CONTROLS, PARAMETERS=FIELD", "1e-6, 1e-6, 1e-8, , 0.02, 1e-5, 1e-3, 1e-8"]
@@ -381,10 +398,14 @@ class CBResult:
 class SolidCB:
     """Fixed-interface Craig-Bampton on 3-DOF nodes with exact weld elimination and RBE2 pads."""
 
-    def __init__(self, points, weld_C, interfaces):
+    def __init__(self, points, weld_C, interfaces, weld_dependents=None):
+        """``weld_dependents``: dependent DOF of every row of ``weld_C`` (coefficient 1, see
+        CcxModel.general_tie_rows); None picks the +1 entry of each row (coincident welds). Rows may chain
+        (a dependent may appear as an independent term of another row); chains are resolved."""
         self.points = np.asarray(points, float)  # (n_nodes, 3) positions used for RBE2 lever arms
         self.n = 3 * len(self.points)
         self.interfaces = interfaces
+        self.weld_dependents = None if weld_dependents is None else np.asarray(weld_dependents, np.int64)
         self._build_S(sp.csr_matrix(weld_C) if weld_C is not None else None)
 
     def _build_S(self, C):
@@ -394,14 +415,17 @@ class SolidCB:
             for r in range(C.shape[0]):
                 cols = C.indices[C.indptr[r] : C.indptr[r + 1]]
                 vals = C.data[C.indptr[r] : C.indptr[r + 1]]
-                k = int(np.argmax(vals == 1.0))
+                if self.weld_dependents is not None:
+                    hit = np.nonzero(cols == self.weld_dependents[r])[0]
+                    if len(hit) != 1 or vals[hit[0]] != 1.0:
+                        raise ValueError(f"weld row {r}: its dependent DOF does not have coefficient 1")
+                    k = int(hit[0])
+                else:
+                    k = int(np.argmax(vals == 1.0))
                 d = int(cols[k])
                 if d in dep_coef:
                     raise ValueError("DOF dependent in two weld rows")
                 dep_coef[d] = [(int(c), -float(v)) for j, (c, v) in enumerate(zip(cols, vals, strict=False)) if j != k]
-        for d, terms in dep_coef.items():
-            if any(c in dep_coef for c, _ in terms):
-                raise ValueError("chained weld rows are not supported")
         pad = {}
         for k, itf in enumerate(self.interfaces):
             for node in itf["nodes"]:
@@ -418,9 +442,24 @@ class SolidCB:
         rows, cols, vals = [], [], []
         A_cache = {}
 
+        resolved, active = {}, set()
+
         def expr(dof):
             if dof in col_of:
                 return [(col_of[dof], 1.0)]
+            if dof in dep_coef:  # chained tie: resolve recursively (memoised; a cycle is an error)
+                if dof in resolved:
+                    return resolved[dof]
+                if dof in active:
+                    raise ValueError("cyclic weld rows")
+                active.add(dof)
+                acc = {}
+                for c, v in dep_coef[dof]:
+                    for cc, vv in expr(c):
+                        acc[cc] = acc.get(cc, 0.0) + v * vv
+                active.discard(dof)
+                resolved[dof] = list(acc.items())
+                return resolved[dof]
             k, a, node = pad[dof]
             key = (k, node)
             if key not in A_cache:
@@ -429,14 +468,7 @@ class SolidCB:
             return [(ni + 6 * k + j, A[a, j]) for j in range(6) if A[a, j] != 0.0]
 
         for dof in range(n):
-            if dof in dep_coef:
-                acc = {}
-                for c, v in dep_coef[dof]:
-                    for cc, vv in expr(c):
-                        acc[cc] = acc.get(cc, 0.0) + v * vv
-                items = acc.items()
-            else:
-                items = expr(dof)
+            items = expr(dof)
             for c, v in items:
                 rows.append(dof)
                 cols.append(c)
@@ -876,10 +908,12 @@ class PanelReROM:
         tol_full=0.002,
         settle_tol=1e-3,
         rigid_pads=True,
+        weld_dependents=None,
     ):
         self.ccx = ccx
         self.M = sp.csr_matrix(M)
         self.C = weld_C
+        self.weld_dependents = weld_dependents
         self.itf0 = [dict(it) for it in interfaces]
         self.n_modes, self.n_ritz = int(n_modes), int(n_ritz)
         self.g = np.asarray(gravity, float)
@@ -905,7 +939,7 @@ class PanelReROM:
         self.steps_since = 0
         t0 = time.perf_counter()
         if initial_cb is None:
-            initial_cb = SolidCB(self.rest_pts, weld_C, self.itf0).reduce(K0, self.M, n_modes)
+            initial_cb = SolidCB(self.rest_pts, weld_C, self.itf0, weld_dependents=weld_dependents).reduce(K0, self.M, n_modes)
         self.cb = initial_cb
         self.scene = None
         if not self.rerom:
@@ -955,7 +989,7 @@ class PanelReROM:
                 ka=self.ka,
                 device=self.device,
             )
-            self._factor_full(SolidCB(self.rest_pts, self.C, self.itf0), self.K0)
+            self._factor_full(SolidCB(self.rest_pts, self.C, self.itf0, weld_dependents=self.weld_dependents), self.K0)
             self.init_wall += time.perf_counter() - t0
         elif changed:
             self.update(step, t, "clamp_change")
@@ -1041,7 +1075,7 @@ class PanelReROM:
             fr = rigid_fit(self.rest_pts[it["nodes"]], u_eval.reshape(-1, 3)[it["nodes"]], it["position"])
             itf.append(dict(it, position=it["position"] + fr[:3]))
         t0 = time.perf_counter()
-        scb = SolidCB(pts_new, self.C, itf)
+        scb = SolidCB(pts_new, self.C, itf, weld_dependents=self.weld_dependents)
         tw["elimination"] = time.perf_counter() - t0
         ritz = [self.f_g, self.f_g - f_int][: self.n_ritz]
         cb = scb.reduce(K_T, self.M, self.n_modes, ritz_loads=ritz, rigid_project_tol=None)
