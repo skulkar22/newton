@@ -2694,6 +2694,59 @@ def test_elastic_rendering_respects_layer_transform_and_visibility(test, device)
     test.assertTrue(all(viewer.mesh_hidden.values()))
 
 
+def test_elastic_rendering_matches_host_recovery(test, device):
+    """Check the device recovery of elastic render vertices and strain colors against the host formula.
+
+    The viewer recovers ``x_rest + sum_k phi_k q_k`` on the device, applies the body transform, and colors the
+    displacement magnitude with the Matlab jet ramp; the reference evaluates the same expressions with NumPy.
+    """
+
+    def two_mode_shape(x):
+        return np.array([[0.0, 0.0, float(x[0]) ** 2], [0.0, float(x[0]), 0.0]], dtype=np.float32)
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body_elastic(mass=1.0, inertia=_identity_inertia(), mode_count=2, mode_shape_fn=two_mode_shape)
+    builder.add_shape_box(body, hx=0.5, hy=0.04, hz=0.03)
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    q_start = int(model.joint_q_start.numpy()[int(model.elastic_joint.numpy()[0])])
+    q = state.joint_q.numpy()
+    axis = np.array([0.3, 0.5, 0.8]) / np.linalg.norm([0.3, 0.5, 0.8])
+    q[q_start : q_start + 3] = [0.1, -0.2, 0.3]
+    q[q_start + 3 : q_start + 7] = [*(np.sin(0.35) * axis), np.cos(0.35)]
+    q[q_start + 7 : q_start + 9] = [0.05, -0.03]
+    state.joint_q.assign(q)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+    viewer = _ElasticMeshColorProbe()
+    viewer.set_model(model)
+    viewer.show_elastic_strain = True
+    viewer.elastic_strain_color_max = 0.02
+    viewer.log_state(state)
+    test.assertEqual(len(viewer.mesh_points), 1)
+    name = next(iter(viewer.mesh_points))
+
+    rest = model.elastic_shape_vertex_local.numpy().astype(np.float64)
+    max_modes = int(model.elastic_max_mode_count)
+    phi = model.elastic_shape_vertex_phi.numpy().astype(np.float64).reshape(rest.shape[0], max_modes, 3)
+    local = rest + np.einsum("vmc,m->vc", phi[:, :2], q[q_start + 7 : q_start + 9].astype(np.float64))
+    xform = state.body_q.numpy()[body].astype(np.float64)
+    imag, real = xform[3:6], xform[6]
+    world = xform[:3] + local + 2.0 * np.cross(imag, np.cross(imag, local) + real * local)
+    np.testing.assert_allclose(viewer.mesh_points[name], world, atol=1.0e-5)
+    s = np.clip(np.linalg.norm(local - rest, axis=1) / 0.02, 0.0, 1.0)
+    test.assertGreater(float(np.ptp(s)), 0.1)
+    expected = np.stack([np.clip(1.5 - np.abs(4.0 * s - c), 0.0, 1.0) for c in (3.0, 2.0, 1.0)], axis=1)
+    np.testing.assert_allclose(viewer.mesh_colors[name], expected, atol=1.0e-5)
+
+    # Turning the strain coloring off sends no colors; the points are unchanged.
+    viewer.show_elastic_strain = False
+    viewer.log_state(state)
+    test.assertIsNone(viewer.mesh_colors[name])
+    np.testing.assert_allclose(viewer.mesh_points[name], world, atol=1.0e-5)
+
+
 def test_torsion_render_shape_sampling(test, device):
     """Check the torsion mode values sampled at a tip vertex of an elastic box mesh."""
     length = 1.0
@@ -4635,14 +4688,18 @@ def test_vbd_elastic_body_rejects_external_rigid_solver(test, device):
         newton.solvers.SolverVBD(model, iterations=1, integrate_with_external_rigid_solver=True)
 
 
-def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
+def test_vbd_elastic_body_block_sparse_joints_scope(test, device, backend):
     """Solve articulated elastic bodies in the block-sparse solve and reject the unsupported cases.
 
-    An elastic body's joints must lie in its articulation, as for rigid bodies; its owner joint
-    may stay outside. Joint mimics are not combined with elastic articulation bodies. A single
-    sample has no rotational inertia, so the frames carry extra rigid mass and a nominal inertia
-    rather than the basis rigid properties.
+    Under ``rigid_articulation_elastic_solve="schur"`` an elastic body's joints must lie in its
+    articulation, as for rigid bodies; its owner joint may stay outside. Under ``"coupled"`` an
+    articulation whose only body is elastic is solved by the local block solve, so a joint
+    outside the articulation ranges may attach to it, as to any locally solved body. Joint mimics
+    are not combined with elastic articulation bodies. A single sample has no rotational inertia,
+    so the frames carry extra rigid mass and a nominal inertia rather than the basis rigid
+    properties.
     """
+    sparse = {"rigid_articulation_solve": "block_sparse_joints", "rigid_articulation_elastic_solve": backend}
     basis = newton.ModalBasis(
         sample_points=[[0.0, 0.0, 0.0]],
         sample_phi=[[[1.0, 0.0, 0.0]]],
@@ -4658,8 +4715,12 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     builder.add_joint_fixed(parent=-1, child=body)
     builder.color()
     model = builder.finalize(device=device)
-    with test.assertRaisesRegex(ValueError, "outside the declared articulation ranges"):
-        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
+    if backend == "schur":
+        with test.assertRaisesRegex(ValueError, "outside the declared articulation ranges"):
+            newton.solvers.SolverVBD(model, iterations=1, **sparse)
+    else:
+        solver = newton.solvers.SolverVBD(model, iterations=1, **sparse)
+        test.assertIsNone(solver.rigid_articulation_sparse_layout)
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     body = builder.add_link_elastic(
@@ -4668,8 +4729,11 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     builder.add_articulation([builder.add_joint_fixed(parent=-1, child=body)])
     builder.color()
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverVBD(model, iterations=4, rigid_articulation_solve="block_sparse_joints")
-    test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 1)
+    solver = newton.solvers.SolverVBD(model, iterations=4, **sparse)
+    if backend == "schur":
+        test.assertEqual(solver.rigid_articulation_sparse_layout.elastic_body_count, 1)
+    else:
+        test.assertIsNone(solver.rigid_articulation_sparse_layout)
     state_0, state_1 = model.state(), model.state()
     for _ in range(4):
         solver.step(state_0, state_1, None, None, 1.0 / 240.0)
@@ -4689,7 +4753,7 @@ def test_vbd_elastic_body_block_sparse_joints_scope(test, device):
     builder.color()
     model = builder.finalize(device=device)
     with test.assertRaisesRegex(NotImplementedError, "mimic"):
-        newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
+        newton.solvers.SolverVBD(model, iterations=1, **sparse)
 
 
 def test_vbd_elastic_local_graph_capture(test, device):
@@ -7523,6 +7587,12 @@ for device in devices:
     )
     add_function_test(
         TestReducedElasticBody,
+        "test_elastic_rendering_matches_host_recovery",
+        test_elastic_rendering_matches_host_recovery,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
         "test_torsion_render_shape_sampling",
         test_torsion_render_shape_sampling,
         devices=[device],
@@ -7593,12 +7663,14 @@ for device in devices:
         test_vbd_elastic_body_rejects_external_rigid_solver,
         devices=[device],
     )
-    add_function_test(
-        TestReducedElasticBody,
-        "test_vbd_elastic_body_block_sparse_joints_scope",
-        test_vbd_elastic_body_block_sparse_joints_scope,
-        devices=[device],
-    )
+    for backend in ("schur", "coupled"):
+        add_function_test(
+            TestReducedElasticBody,
+            f"test_vbd_elastic_body_block_sparse_joints_scope_{backend}",
+            test_vbd_elastic_body_block_sparse_joints_scope,
+            devices=[device],
+            backend=backend,
+        )
     add_function_test(
         TestReducedElasticBody,
         "test_vbd_elastic_block_solve_falls_back_when_indefinite",

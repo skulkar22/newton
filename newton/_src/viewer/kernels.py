@@ -155,6 +155,50 @@ def update_pick_target_kernel(
 
 
 @wp.kernel
+def deform_elastic_shape_vertices(
+    vertex_local: wp.array[wp.vec3],
+    vertex_phi: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    body_q: wp.array[wp.transform],
+    world_offsets: wp.array[wp.vec3],
+    vertex_start: int,
+    max_modes: int,
+    mode_count: int,
+    q_start: int,
+    body: int,
+    world: int,
+    with_colors: int,
+    inv_color_max: float,
+    points: wp.array[wp.vec3],
+    colors: wp.array[wp.vec3],
+):
+    """Recover the world vertices of a reduced elastic shape and their displacement colors (Matlab jet).
+
+    ``u = x_rest + sum_k phi_k q_k`` in body coordinates, then the body transform and the world offset are
+    applied. ``mode_count = 0`` gives the rest shape.
+    """
+    i = wp.tid()
+    vertex = vertex_start + i
+    rest = vertex_local[vertex]
+    local = rest
+    for mode in range(mode_count):
+        local = local + vertex_phi[vertex * max_modes + mode] * joint_q[q_start + mode]
+    point = local
+    if body >= 0:
+        point = wp.transform_point(body_q[body], local)
+    if world >= 0 and world_offsets.shape[0] > 0:
+        point = point + world_offsets[world]
+    points[i] = point
+    if with_colors != 0:
+        s = wp.clamp(wp.length(local - rest) * inv_color_max, 0.0, 1.0)
+        colors[i] = wp.vec3(
+            wp.clamp(1.5 - wp.abs(4.0 * s - 3.0), 0.0, 1.0),
+            wp.clamp(1.5 - wp.abs(4.0 * s - 2.0), 0.0, 1.0),
+            wp.clamp(1.5 - wp.abs(4.0 * s - 1.0), 0.0, 1.0),
+        )
+
+
+@wp.kernel
 def update_shape_xforms(
     shape_xforms: wp.array[wp.transform],
     shape_parents: wp.array[int],

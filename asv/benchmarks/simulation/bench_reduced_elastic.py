@@ -15,6 +15,7 @@
 
 from importlib import import_module
 
+import numpy as np
 import warp as wp
 from asv_runner.benchmarks.mark import skip_benchmark_if
 
@@ -111,6 +112,92 @@ class FastVBDRigidBaseline:
         wp.synchronize_device()
 
 
+def _make_mixed_elastic_articulations(articulation_count, mode_count=8):
+    """Replicate a rigid base, two directly hinged elastic beams and a rigid tip, hinged in a chain."""
+    beam = newton.ModalGeneratorBeam
+    kinds = (beam.Mode.BENDING_Y, beam.Mode.BENDING_Z)
+    specs = [
+        {"type": kinds[k % 2], "boundary": beam.Boundary.PINNED_PINNED, "order": k // 2 + 1} for k in range(mode_count)
+    ]
+    length = 0.6
+    basis = beam(
+        length=length, half_width_y=0.03, half_width_z=0.02, young_modulus=2.0e6, density=1000.0, mode_specs=specs
+    ).build()
+    rigid_inertia = wp.mat33(*np.diag([0.002, 0.02, 0.02]).ravel())
+    half = wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity())
+    minus_half = wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity())
+    axis = (0.0, 0.0, 1.0)
+
+    builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    for index in range(articulation_count):
+        z = 0.5 * index
+        base = builder.add_link(
+            xform=wp.transform(wp.vec3(-0.5 * length, 0.0, z), wp.quat_identity()), mass=1.0, inertia=rigid_inertia
+        )
+        links = [
+            builder.add_link_elastic(
+                xform=wp.transform(wp.vec3((k + 0.5) * length, 0.0, z), wp.quat_identity()), modal_basis=basis
+            )
+            for k in range(2)
+        ]
+        tip = builder.add_link(
+            xform=wp.transform(wp.vec3(2.5 * length, 0.0, z), wp.quat_identity()), mass=1.0, inertia=rigid_inertia
+        )
+        joints = [
+            builder.add_joint_revolute(
+                parent=-1,
+                child=base,
+                axis=axis,
+                parent_xform=wp.transform(wp.vec3(-length, 0.0, z), wp.quat_identity()),
+                child_xform=minus_half,
+            )
+        ]
+        for parent, child in ((base, links[0]), (links[0], links[1]), (links[1], tip)):
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent, child=child, axis=axis, parent_xform=half, child_xform=minus_half
+                )
+            )
+        builder.add_articulation(joints)
+    builder.color()
+    return builder.finalize()
+
+
+class FastVBDSparseElasticBackends:
+    """Compare the coupled and Schur block-sparse solves on mixed rigid-elastic articulations."""
+
+    params = (("coupled", "schur"), (1, 16))
+    param_names = ("backend", "articulation_count")
+    repeat = 3
+    number = 1
+
+    def setup(self, backend, articulation_count):
+        self.model = _make_mixed_elastic_articulations(articulation_count)
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.control = self.model.control()
+        self.solver = newton.solvers.SolverVBD(
+            self.model,
+            iterations=12,
+            rigid_articulation_solve="block_sparse_joints",
+            rigid_articulation_elastic_solve=backend,
+        )
+        for _ in range(WARMUP_FRAMES):
+            self._step()
+        wp.synchronize_device()
+
+    def _step(self):
+        self.solver.step(self.state_0, self.state_1, self.control, None, 1.0 / 240.0)
+        self.state_0, self.state_1 = self.state_1, self.state_0
+
+    @skip_benchmark_if(wp.get_cuda_device_count() == 0)
+    def time_step(self, backend, articulation_count):
+        del backend, articulation_count
+        for _ in range(60):
+            self._step()
+        wp.synchronize_device()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -119,6 +206,7 @@ if __name__ == "__main__":
     benchmark_list = {
         "FastReducedElasticRepresentativeExamples": FastReducedElasticRepresentativeExamples,
         "FastVBDRigidBaseline": FastVBDRigidBaseline,
+        "FastVBDSparseElasticBackends": FastVBDSparseElasticBackends,
     }
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
