@@ -171,6 +171,75 @@ def run_newton(a, mesh, model, out):
     (out / f"newton_{a.method}.log").write_text("\n".join(log_lines))
 
 
+def nr_static(model, K, M, C, deps, itf, active_idx, g, *, steps=(0.5, 1.0), tol=1e-7, max_iter=12, log=print, nthreads=16):
+    """Full-order nonlinear static equilibrium (Newton-Raphson, load steps) of the constrained thin-solid model.
+
+    CalculiX supplies the NLGEOM element internal force and tangent at a prescribed state (CcxModel.evaluate,
+    the same call re-ROM uses); the ties and RBE2 pads are eliminated exactly through SolidCB's S (active pad
+    frames held, released pads free and rigid); the state is evaluated with the released pads rigidified to
+    finite rotation (as re-ROM and CalculiX's *RIGID BODY do). Load = M g, the convention of the Newton models.
+    Returns (u (6N), history)."""
+    import scipy.sparse as sp
+
+    from rerom.panel import SolidCB, _factorize, rigidify_pads
+
+    scb = SolidCB(model.solid_points, C, itf, weld_dependents=deps)
+    keep = np.ones(scb.S.shape[1], bool)
+    for k in active_idx:
+        keep[scb.ni + 6 * k : scb.ni + 6 * k + 6] = False
+    S = scb.S[:, keep].tocsc()
+    f_g = model.gravity_load(M, np.asarray(g, float))
+    pads = [it["nodes"] for k, it in enumerate(itf) if k not in set(active_idx)]
+    z = np.zeros(S.shape[1])
+    hist = []
+    for lam in steps:
+        for it in range(max_iter):
+            u = S @ z
+            ue = rigidify_pads(model.solid_points, u, pads) if pads else u
+            t0 = time.perf_counter()
+            r = model.evaluate(ue, tangent=True, strains=False)
+            t_ccx = time.perf_counter() - t0
+            res = S.T @ (lam * f_g - r["f_int"])
+            Kz = (S.T @ (sp.csr_matrix(r["K_T"]) @ S)).tocsc()
+            dz = _factorize(Kz).solve(res)
+            z = z + dz
+            du = S @ dz
+            rel = float(np.abs(du).max() / max(np.abs(S @ z).max(), 1e-300))
+            rn = float(np.linalg.norm(res) / max(np.linalg.norm(S.T @ (lam * f_g)), 1e-300))
+            sag = -1e3 * float(model.mid_and_director(S @ z)[0][: model.mesh.orig_count, 2].min())
+            hist.append({"load": lam, "iter": it, "rel_du": rel, "rel_residual": rn, "sag_mm": sag, "wall_ccx_s": t_ccx})
+            log(f"  NR load {lam:.3f} iter {it}: sag {sag:.6f} mm, |du|/|u| {rel:.3e}, |r|/|f| {rn:.3e}, ccx {t_ccx:.1f}s")
+            if rel < tol:
+                break
+        else:
+            raise RuntimeError(f"Newton-Raphson did not converge at load {lam} in {max_iter} iterations")
+    u = S @ z
+    return (rigidify_pads(model.solid_points, u, pads) if pads else u), hist
+
+
+def run_fe_nr(a, mesh, model, out):
+    ids, cfg = configs(mesh)
+    t0 = time.perf_counter()
+    K, M = model.rest_matrices()
+    C = model.weld_rows()
+    deps = getattr(model, "weld_dependents", None)
+    itf = interface_list(model)
+    t_m = time.perf_counter() - t0
+    g = np.array([0.0, 0.0, -9.81]) * a.gravity_factor
+    res = {}
+    for name in a.configs:
+        t0 = time.perf_counter()
+        u, hist = nr_static(model, K, M, C, deps, itf, cfg[name], g, steps=tuple(a.steps), tol=a.tol, max_iter=a.max_iter)
+        tag = f"{name}_nr"
+        s = summary(model, u, tag)
+        s.update(wall_s=time.perf_counter() - t0, wall_matrices_s=t_m, history=hist, steps=list(a.steps), tol=a.tol,
+                 active=[ids[k] for k in cfg[name]])
+        res[tag] = s
+        save_field(out / f"fe_{tag}.npz", model, u)
+        print(json.dumps({k: v for k, v in s.items() if k != "history"}), flush=True)
+    (out / "fe_nr_summary.json").write_text(json.dumps(res, indent=1))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--package", required=True)
@@ -189,6 +258,11 @@ def main():
                     help="NLGEOM with CalculiX's default convergence criteria instead of the tight 1e-6 residual")
     fe.add_argument("--mg-load", action="store_true",
                     help="also a linear static with gravity as M g on the nodes (the load Newton's ROM sees)")
+    fr = sub.add_parser("fe-nr", help="full-order Newton-Raphson NLGEOM equilibrium (CalculiX element forces)")
+    fr.add_argument("--configs", nargs="+", default=["full", "reduced"])
+    fr.add_argument("--steps", type=float, nargs="+", default=[0.5, 1.0])
+    fr.add_argument("--tol", type=float, default=1e-7)
+    fr.add_argument("--max-iter", type=int, default=12)
     nw = sub.add_parser("newton")
     nw.add_argument("--method", choices=["fixed", "rerom"], required=True)
     nw.add_argument("--modes", type=int, default=64)
@@ -214,7 +288,7 @@ def main():
     if a.dry_run:
         (out / f"dry_run_{a.cmd}.json").write_text(json.dumps(info, indent=1))
         return
-    (run_fe if a.cmd == "fe" else run_newton)(a, mesh, model, out)
+    {"fe": run_fe, "fe-nr": run_fe_nr, "newton": run_newton}[a.cmd](a, mesh, model, out)
 
 
 def model_info(mesh, model):
