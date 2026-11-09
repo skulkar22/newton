@@ -359,6 +359,32 @@ class TestShellPackageCcx(unittest.TestCase):
         np.testing.assert_allclose(stiff[lam > 0], lam[lam > 0], rtol=1e-6)  # stored as float32
         np.testing.assert_allclose(stiff[lam <= 0], floor, rtol=1e-6)
 
+    def test_settle_force_guard(self):
+        """settle_force_tol: once the re-ROM run has settled, a projected force mismatch above the threshold triggers a
+        'settled_unbalanced' update; with a near-zero threshold it fires, and the settled sag still matches CalculiX
+        NLGEOM with stiff pads within 0.1 %."""
+        model, K, M = self.model, self.K, self.M
+        ref = self._references()
+        itf = interface_list(model)
+        full = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["full"] == 1]
+        red = [k for k, c in enumerate(self.mesh.clamps) if c["active"]["reduced"] == 1]
+        run = PanelReROM(
+            model, M, K, model.weld_rows(), itf, n_modes=24, gravity=self.G10, shift=model.mesh.points.mean(0),
+            iterations=10, tol=0.01, check_every=10, min_interval=10, log=lambda s: None,
+            weld_dependents=model.weld_dependents, settle_force_tol=1e-9,
+        )
+        step = 0
+        for act in (full, red):
+            run.set_active(act, step=step)
+            for _ in range(1500):
+                run.scene.step(1e-3)
+                step += 1
+                run.maybe_update(step, step * 1e-3)
+        reasons = [e["reason"] for e in run.events]
+        self.assertIn("settled_unbalanced", reasons)
+        s = self._sag(run.eval_state(run.total_displacement()))
+        self.assertLess(abs(s / self._sag(ref["nl"]) - 1.0), 1e-3, f"re-ROM {s:.6g} vs NLGEOM {self._sag(ref['nl']):.6g}")
+
     def test_tangent_matches_finite_difference(self):
         """K_T from ccx at a deformed state matches central differences of f_int (NLGEOM)."""
         model, K = self.model, self.K
