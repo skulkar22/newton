@@ -247,14 +247,20 @@ def test_articulation_determinism(test, device, solver_name):
     _run_isolated(test, "_check_articulation_determinism", str(device), solver_name)
 
 
-def _run_elastic_contact_rollout(device, deterministic, ground, contact_buffer_size=128, steps=ELASTIC_ROLLOUT_STEPS):
+def _run_elastic_contact_rollout(
+    device, deterministic, ground, contact_buffer_size=128, steps=ELASTIC_ROLLOUT_STEPS, **solver_kwargs
+):
     # 81 grid vertices on one elastic body: more contacts than modal-assembly threads, so each
     # thread scatters several contacts x modes^2 records. The 1 mm drop impacts after 9 steps.
     model, body = elastic_plank_on_ground(device, ground=ground, count_x=9, count_y=9, height=0.001)
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     solver = newton.solvers.SolverVBD(
-        model, iterations=4, rigid_body_contact_buffer_size=contact_buffer_size, deterministic=deterministic
+        model,
+        iterations=4,
+        rigid_body_contact_buffer_size=contact_buffer_size,
+        deterministic=deterministic,
+        **solver_kwargs,
     )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -303,6 +309,20 @@ def _check_elastic_contact_default_mode(device, ground):
 def test_elastic_contact_default_mode(test, device, ground):
     """Run the elastic drop onto the ground without a deterministic mode."""
     _run_isolated(test, "_check_elastic_contact_default_mode", str(device), ground)
+
+
+def _check_iteration_metrics_keep_deterministic_solve(device):
+    with wp.ScopedDevice(device):
+        plain = _run_elastic_contact_rollout(device, DETERMINISTIC_MODE, "mesh")
+        recorded = _run_elastic_contact_rollout(
+            device, DETERMINISTIC_MODE, "mesh", solver_iteration_metrics=True, elastic_solver_metrics=True
+        )
+    _assert_snapshots_equal(plain, recorded)
+
+
+def test_iteration_metrics_keep_deterministic_solve(test, device):
+    """Produce bit-identical deterministic rollouts with and without recording iteration metrics."""
+    _run_isolated(test, "_check_iteration_metrics_keep_deterministic_solve", str(device))
 
 
 def _check_elastic_contact_list_overflow_error(device):
@@ -699,6 +719,14 @@ add_function_test(
     TestSolverDeterminism,
     "test_elastic_sparse_schur_records",
     test_elastic_sparse_schur_records,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_iteration_metrics_keep_deterministic_solve",
+    test_iteration_metrics_keep_deterministic_solve,
     devices=devices,
     check_output=False,
 )

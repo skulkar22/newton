@@ -145,6 +145,7 @@ from .rigid_vbd_kernels import (
     compute_body_particle_contact_forces,
     compute_rigid_contact_forces,
     compute_rod_dahl_parameters,
+    create_solver_iteration_metric_kernels,
     forward_step_rigid_bodies,
     init_body_body_contact_materials,
     init_body_body_contacts_alm,
@@ -547,6 +548,25 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         Soft self-contact forces are not reported. See :ref:`vbd_contact_forces` for the wrench
         convention and a usage guide.
 
+    Convergence metrics:
+        Construct the solver with ``solver_iteration_metrics=True`` to record, for every
+        iteration of the most recent :meth:`step`, how far the body solve moved and how far the
+        body-body contacts are from satisfied. :meth:`solve_iteration_metrics` returns plain
+        arrays with the iteration index along the first axis; with ``elastic_solver_metrics=True``
+        as well, it also holds the reduced elastic block metrics of every iteration. Recording
+        only reads solver state, so the solve result is unchanged. The buffers and kernels are
+        created at construction, so recording works inside CUDA graph capture as long as
+        ``iterations`` and the contact capacity do not change during capture.
+
+        .. code-block:: python
+
+            solver = newton.solvers.SolverVBD(model, iterations=16, solver_iteration_metrics=True)
+            solver.step(state_in, state_out, control, contacts, dt)
+            metrics = solver.solve_iteration_metrics()
+            # Largest body translation per iteration [m] and contact penetration [m].
+            print(metrics["body_translation_update_norm"].max(axis=1))
+            print(metrics["contact_max_penetration"])
+
     References:
         - Anka He Chen, Ziheng Liu, Yin Yang, and Cem Yuksel. 2024. Vertex Block Descent. ACM Trans. Graph. 43, 4, Article 116 (July 2024), 16 pages.
           https://doi.org/10.1145/3658179
@@ -683,6 +703,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
+        solver_iteration_metrics: bool = False,
         elastic_block_solver: str = "auto",
         deterministic: wp.DeterministicMode | None = None,
         collision_pipeline: CollisionPipeline | None = None,
@@ -991,6 +1012,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             elastic_solver_metrics: Whether to compute reduced elastic block residual and update metrics. Disabled by
                 default to avoid extra dense matrix-vector products in every block solve. Elastic bodies solved inside
                 a ``"block_sparse_joints"`` articulation report zero metrics.
+            solver_iteration_metrics: Whether to record per-iteration convergence metrics of the body solve
+                for :meth:`solve_iteration_metrics`. Disabled by default; when enabled, every iteration
+                launches extra read-only kernels. The reduced elastic block metrics of each iteration are
+                included only when ``elastic_solver_metrics`` is enabled as well.
             elastic_block_solver: Solve method for the coupled frame-and-mode block of each reduced elastic body.
                 ``"tiled"`` factorizes each block in shared memory and raises :class:`ValueError` at construction
                 when a block does not fit the device's per-block shared memory (about 151 modes on a device with
@@ -1383,6 +1408,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
         self.elastic_body_relaxation = float(elastic_body_relaxation)
         self.elastic_solver_metrics = bool(elastic_solver_metrics)
+        self.solver_iteration_metrics = bool(solver_iteration_metrics)
         if elastic_block_solver not in ("auto", "tiled", "dense"):
             raise ValueError(f"elastic_block_solver must be 'auto', 'tiled', or 'dense', got {elastic_block_solver!r}")
         self.elastic_block_solver = elastic_block_solver
@@ -1658,6 +1684,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.elastic_body_block_update_max = wp.zeros(metric_count, dtype=float, device=self.device)
         if elastic_body_count > 0 and effective_deterministic != wp.DeterministicMode.NOT_GUARANTEED:
             self._set_elastic_deterministic_records(model, effective_deterministic)
+        self._iteration_metric_arrays: dict[str, wp.array] = {}
+        self._iteration_metric_body_q: wp.array | None = None
+        self._iteration_metric_contact_lambda: wp.array | None = None
+        self._iteration_metric_kernels = None
+        if self.solver_iteration_metrics:
+            self._iteration_metric_kernels = create_solver_iteration_metric_kernels()
+            for kernel in self._iteration_metric_kernels:
+                kernel.module.load(self.device)
+            self._allocate_solve_iteration_metrics()
 
         # Controls whether the next step() refreshes contact state derived from
         # the Contacts buffer or reuses the current rigid/body-particle contact state.
@@ -3892,13 +3927,175 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             Metrics are empty unless the solver was constructed with
             ``elastic_solver_metrics=True``.
         """
+        return {name: array.numpy().copy() for name, array in self._elastic_metric_arrays().items()}
+
+    def _elastic_metric_arrays(self) -> dict[str, wp.array]:
+        """Map the reduced elastic block metric names to their per-body arrays."""
         return {
-            "initial_residual_norm": self.elastic_body_block_initial_residual_norm.numpy().copy(),
-            "solve_residual_norm": self.elastic_body_block_solve_residual_norm.numpy().copy(),
-            "applied_residual_norm": self.elastic_body_block_applied_residual_norm.numpy().copy(),
-            "update_norm": self.elastic_body_block_update_norm.numpy().copy(),
-            "update_max": self.elastic_body_block_update_max.numpy().copy(),
+            "initial_residual_norm": self.elastic_body_block_initial_residual_norm,
+            "solve_residual_norm": self.elastic_body_block_solve_residual_norm,
+            "applied_residual_norm": self.elastic_body_block_applied_residual_norm,
+            "update_norm": self.elastic_body_block_update_norm,
+            "update_max": self.elastic_body_block_update_max,
         }
+
+    def solve_iteration_metrics(self) -> dict[str, np.ndarray]:
+        """Return per-iteration convergence metrics of the most recent :meth:`step`.
+
+        Each array has the iteration index along its first axis, with one row per iteration of
+        that step:
+
+        - ``body_translation_update_norm``: center-of-mass displacement of each body during the
+          iteration [m], shape ``[iterations, body_count]``.
+        - ``body_rotation_update_norm``: rotation angle of each body during the iteration [rad],
+          shape ``[iterations, body_count]``.
+        - ``contact_max_penetration``: largest body-body contact penetration at the iterate that
+          the iteration's dual update used [m], shape ``[iterations]``. Zero when no contact
+          penetrates.
+        - ``contact_normal_multiplier_change``: largest change of a body-body contact normal
+          multiplier in the iteration's dual update [N], shape ``[iterations]``.
+        - ``contact_tangent_multiplier_change``: largest change of a body-body contact tangential
+          (friction) multiplier in that update [N], shape ``[iterations]``.
+        - ``elastic_initial_residual_norm``, ``elastic_solve_residual_norm``,
+          ``elastic_applied_residual_norm``, ``elastic_update_norm``, ``elastic_update_max``: the
+          reduced elastic block metrics of :meth:`elastic_mode_solve_metrics` for each iteration,
+          shape ``[iterations, elastic_body_count]`` when the solver was also constructed with
+          ``elastic_solver_metrics=True``, else ``[iterations, 0]``.
+
+        A multiplier change that falls toward zero while the penetration stays within the contact
+        compliance indicates converged contacts; a body update that falls toward zero indicates a
+        converged body solve.
+
+        Note:
+            The multipliers are the compliant-ALM contact multipliers. On the deprecated legacy
+            path, hard contacts report the change of their AVBD multiplier, and soft contacts keep
+            no multiplier, so their changes are zero. Body updates are measured on the iterate,
+            including the reduced elastic frames; bodies not integrated by this solver report zero.
+            Elastic block metrics are zero for elastic bodies solved inside a
+            ``"block_sparse_joints"`` articulation.
+
+            Metrics have zero iterations unless the solver was constructed with
+            ``solver_iteration_metrics=True``, and are zero before the first step.
+        """
+        if not self.solver_iteration_metrics:
+            return {
+                name: np.zeros((0, *shape[1:]), dtype=np.float32)
+                for name, shape in self._solve_iteration_metric_shapes().items()
+            }
+        return {name: array.numpy().copy() for name, array in self._iteration_metric_arrays.items()}
+
+    def _solve_iteration_metric_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return the history shape of every per-iteration metric for the current iteration count."""
+        model = self.model
+        iterations = int(self.iterations)
+        body_count = int(model.body_count)
+        elastic_body_count = int(model.elastic_body_count) if self.elastic_solver_metrics else 0
+        shapes = {
+            "body_translation_update_norm": (iterations, body_count),
+            "body_rotation_update_norm": (iterations, body_count),
+            "contact_max_penetration": (iterations,),
+            "contact_normal_multiplier_change": (iterations,),
+            "contact_tangent_multiplier_change": (iterations,),
+        }
+        for name in self._elastic_metric_arrays():
+            shapes[f"elastic_{name}"] = (iterations, elastic_body_count)
+        return shapes
+
+    def _contact_lambda_count(self) -> int:
+        return int(self.body_body_contact_lambda.shape[0]) if self._integrates_rigid_bodies else 0
+
+    def _allocate_solve_iteration_metrics(self) -> None:
+        """Allocate the per-iteration metric history and the snapshots of the body iterate and multipliers."""
+        device = self.device
+        self._iteration_metric_arrays = {
+            name: wp.zeros(shape, dtype=float, device=device)
+            for name, shape in self._solve_iteration_metric_shapes().items()
+        }
+        self._iteration_metric_body_q = wp.zeros(int(self.model.body_count), dtype=wp.transform, device=device)
+        self._iteration_metric_contact_lambda = wp.zeros(self._contact_lambda_count(), dtype=wp.vec3, device=device)
+
+    def _begin_solve_iteration_metrics(self) -> None:
+        """Clear the per-iteration metric history for this step, resizing it when the solver changed."""
+        iterations = int(self.iterations)
+        lambda_count = self._contact_lambda_count()
+        history_iterations = self._iteration_metric_arrays["contact_max_penetration"].shape[0]
+        snapshot_count = self._iteration_metric_contact_lambda.shape[0]
+        if history_iterations != iterations or snapshot_count != lambda_count:
+            if snapshot_count != lambda_count:
+                self._raise_if_capturing_resize("iteration metric contact", snapshot_count, lambda_count)
+            else:
+                self._raise_if_capturing_resize("iteration metric history", history_iterations, iterations)
+            self._allocate_solve_iteration_metrics()
+            return
+        for array in self._iteration_metric_arrays.values():
+            array.zero_()
+
+    def _snapshot_iteration_state(self, state_in: State) -> None:
+        """Copy the body iterate and the contact multipliers before an iteration."""
+        if not self._integrates_rigid_bodies:
+            return
+        wp.copy(self._iteration_metric_body_q, state_in.body_q)
+        if self._iteration_metric_contact_lambda.shape[0] > 0:
+            wp.copy(self._iteration_metric_contact_lambda, self.body_body_contact_lambda)
+
+    def _record_iteration_metrics(
+        self, state_in: State, state_out: State, contacts: Contacts | None, iteration: int
+    ) -> None:
+        """Record the metrics of one iteration into row ``iteration`` of the history."""
+        if not self._integrates_rigid_bodies:
+            return
+        model = self.model
+        arrays = self._iteration_metric_arrays
+        record_body_update, record_contacts = self._iteration_metric_kernels
+        wp.launch(
+            kernel=record_body_update,
+            dim=model.body_count,
+            inputs=[iteration, self._iteration_metric_body_q, state_in.body_q, model.body_com],
+            outputs=[arrays["body_translation_update_norm"], arrays["body_rotation_update_norm"]],
+            device=self.device,
+        )
+        lambda_count = self._iteration_metric_contact_lambda.shape[0]
+        if contacts is not None and contacts.rigid_contact_max > 0 and lambda_count > 0:
+            wp.launch(
+                kernel=record_contacts,
+                dim=min(contacts.rigid_contact_max, lambda_count),
+                inputs=[
+                    iteration,
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_margin0,
+                    contacts.rigid_contact_margin1,
+                    contacts.rigid_contact_elastic_sample0,
+                    contacts.rigid_contact_elastic_sample1,
+                    model.shape_body,
+                    state_in.body_q,
+                    self.body_q_prev,
+                    model.body_elastic_index,
+                    model.elastic_joint,
+                    model.elastic_mode_count,
+                    state_out.joint_q,
+                    state_in.joint_q,
+                    model.joint_q_start,
+                    model.elastic_shape_vertex_local,
+                    model.elastic_shape_vertex_phi,
+                    model.elastic_max_mode_count,
+                    self._iteration_metric_contact_lambda,
+                    self.body_body_contact_lambda,
+                ],
+                outputs=[
+                    arrays["contact_max_penetration"],
+                    arrays["contact_normal_multiplier_change"],
+                    arrays["contact_tangent_multiplier_change"],
+                ],
+                device=self.device,
+            )
+        if self.elastic_solver_metrics and model.elastic_body_count > 0:
+            for name, source in self._elastic_metric_arrays().items():
+                wp.copy(arrays[f"elastic_{name}"][iteration], source)
 
     @override
     def step(
@@ -4009,15 +4206,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             preserve_history=self.rigid_contact_history,
         )
 
+        if self.solver_iteration_metrics:
+            self._begin_solve_iteration_metrics()
         for iter_num in range(self.iterations):
             rigid_due = self.collision_pipeline is not None and self._rigid_collision_is_due(iter_num)
             soft_due = self.particle_enable_self_contact and self._self_contact_is_due(iter_num)
             self._mid_step_detection(
                 state_in, state_out, contacts, dt, rigid_due=rigid_due, soft_due=soft_due, preserve_history=True
             )
+            if self.solver_iteration_metrics:
+                self._snapshot_iteration_state(state_in)
             self._solve_rigid_body_iteration(
                 state_in, state_out, control, contacts, dt, report_unsupported_wrap=False, iteration=iter_num
             )
+            if self.solver_iteration_metrics:
+                self._record_iteration_metrics(state_in, state_out, contacts, iter_num)
             self._solve_particle_iteration(state_in, state_out, contacts, dt)
 
         # Opt-in contact force export: evaluate at the final iterate while the pose history the

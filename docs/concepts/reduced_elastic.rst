@@ -413,6 +413,12 @@ Relevant options:
 - ``elastic_body_relaxation`` under-relaxes the block update, and
   ``elastic_solver_metrics`` enables
   :meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics`.
+- ``solver_iteration_metrics`` records, for every iteration of the last step,
+  the body updates, the largest body-body contact penetration and multiplier
+  changes, and, together with ``elastic_solver_metrics``, the elastic block
+  residuals; read them with
+  :meth:`~newton.solvers.SolverVBD.solve_iteration_metrics` to check whether a
+  step converged.
 
 Deterministic mode: ``SolverVBD(deterministic=wp.DeterministicMode.RUN_TO_RUN)``
 makes the elastic contact assembly repeat bit for bit. Pair it with

@@ -2584,6 +2584,110 @@ def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
             _check_vbd_elastic_contact_overflow_assembles_consistent_block(test, device, compliant)
 
 
+def _settle_elastic_plank(
+    device, iterations: int, steps: int = 240, ramp_steps: int = 60, **solver_kwargs
+) -> tuple[newton.Model, int, newton.State, newton.Contacts, newton.solvers.SolverVBD, object]:
+    """Lower a reduced elastic plank onto a static mesh by ramping gravity, then hold it.
+
+    The plank starts touching the ground (15 grid-vertex contacts) and gravity rises linearly over
+    ``ramp_steps`` steps of 1/240 s, so the plank settles without an impact. Returns the model, the
+    plank body, the final state, the contacts, the solver, and the contact-force observables of the
+    last step.
+    """
+    model, body = elastic_plank_on_ground(device)
+    gravity = model.gravity.numpy().copy()
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_body_contact_buffer_size=64, **solver_kwargs)
+    observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for step in range(steps):
+        if step < ramp_steps:
+            model.gravity.assign(gravity * ((step + 1) / ramp_steps))
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0, observables=observables)
+        state_0, state_1 = state_1, state_0
+    return model, body, state_0, contacts, solver, observables
+
+
+def test_vbd_solve_iteration_metrics_are_empty_by_default(test, device):
+    """Return zero-iteration metric arrays when the solver records no metrics."""
+    model, _body, _state, _contacts, solver, _observables = _settle_elastic_plank(device, iterations=4, steps=2)
+    metrics = solver.solve_iteration_metrics()
+    test.assertEqual(metrics["body_translation_update_norm"].shape, (0, model.body_count))
+    test.assertEqual(metrics["contact_max_penetration"].shape, (0,))
+    test.assertEqual(metrics["elastic_initial_residual_norm"].shape, (0, 0))
+    for values in metrics.values():
+        test.assertEqual(values.shape[0], 0)
+
+
+def test_vbd_solve_iteration_metrics_need_elastic_metrics_for_elastic_rows(test, device):
+    """Leave the elastic block history and the last-iteration elastic metrics empty without elastic metrics."""
+    iterations = 4
+    model, _body, _state, _contacts, solver, _observables = _settle_elastic_plank(
+        device, iterations=iterations, steps=2, solver_iteration_metrics=True
+    )
+    metrics = solver.solve_iteration_metrics()
+    test.assertEqual(metrics["body_translation_update_norm"].shape, (iterations, model.body_count))
+    test.assertEqual(metrics["elastic_initial_residual_norm"].shape, (iterations, 0))
+    for values in solver.elastic_mode_solve_metrics().values():
+        test.assertEqual(values.shape, (0,))
+
+
+def test_vbd_solve_iteration_metrics_record_every_iteration(test, device):
+    """Record one row of finite metrics per iteration, with residuals that fall over the iterations.
+
+    The plank rests on the mesh, so within a step the reduced elastic block residual and the
+    contact multiplier change shrink as the compliant-ALM iterations converge. Measured on CPU and
+    CUDA: the last iteration's block residual is 2.4e-4 of the first's and the last normal
+    multiplier change 1.3e-2 of the first's (tolerance 0.1 for both).
+    """
+    iterations = 16
+    model, _body, _state, _contacts, solver, _observables = _settle_elastic_plank(
+        device, iterations=iterations, solver_iteration_metrics=True, elastic_solver_metrics=True
+    )
+    metrics = solver.solve_iteration_metrics()
+    test.assertEqual(metrics["body_translation_update_norm"].shape, (iterations, model.body_count))
+    test.assertEqual(metrics["body_rotation_update_norm"].shape, (iterations, model.body_count))
+    for name in ("contact_max_penetration", "contact_normal_multiplier_change", "contact_tangent_multiplier_change"):
+        test.assertEqual(metrics[name].shape, (iterations,))
+    for name in ("initial_residual_norm", "solve_residual_norm", "applied_residual_norm", "update_norm", "update_max"):
+        test.assertEqual(metrics[f"elastic_{name}"].shape, (iterations, model.elastic_body_count))
+    for name, values in metrics.items():
+        test.assertTrue(bool(np.isfinite(values).all()), name)
+        test.assertTrue(bool((values >= 0.0).all()), name)
+
+    residual = metrics["elastic_initial_residual_norm"][:, 0]
+    test.assertGreater(float(residual[0]), 0.0)
+    test.assertLess(float(residual[-1]), 0.1 * float(residual[0]))
+    multiplier_change = metrics["contact_normal_multiplier_change"]
+    test.assertLess(float(multiplier_change[-1]), 0.1 * float(multiplier_change[0]))
+    test.assertGreater(float(metrics["contact_max_penetration"][-1]), 0.0)
+    # The last iteration matches the existing last-iteration accessor.
+    last = solver.elastic_mode_solve_metrics()
+    test.assertEqual(float(last["initial_residual_norm"][0]), float(residual[-1]))
+
+
+def test_vbd_solve_iteration_metrics_do_not_change_the_solve(test, device):
+    """Produce bit-identical states with and without recording metrics.
+
+    CPU only: the CUDA contact assembly sums with unordered atomics, so repeated CUDA runs already
+    differ in the last bits. The determinism tests repeat this check on CUDA in deterministic mode.
+    """
+    rest_states = []
+    for record in (False, True):
+        _model, _body, state, _contacts, _solver, _observables = _settle_elastic_plank(
+            device, iterations=8, steps=60, solver_iteration_metrics=record, elastic_solver_metrics=record
+        )
+        rest_states.append(
+            {name: getattr(state, name).numpy() for name in ("body_q", "body_qd", "joint_q", "joint_qd")}
+        )
+    for name in rest_states[0]:
+        np.testing.assert_array_equal(rest_states[0][name], rest_states[1][name], err_msg=name)
+
+
 def test_elastic_contact_local_mat33_projection_matches_world(test, device):
     """Check that projecting a contact force and Hessian onto modes in the body frame matches the world frame."""
     del device
@@ -7581,6 +7685,31 @@ for device in devices:
         test_elastic_surface_contact_deterministic_sort_orders_samples,
         devices=[device],
     )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_solve_iteration_metrics_are_empty_by_default",
+        test_vbd_solve_iteration_metrics_are_empty_by_default,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_solve_iteration_metrics_need_elastic_metrics_for_elastic_rows",
+        test_vbd_solve_iteration_metrics_need_elastic_metrics_for_elastic_rows,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_solve_iteration_metrics_record_every_iteration",
+        test_vbd_solve_iteration_metrics_record_every_iteration,
+        devices=[device],
+    )
+    if device.is_cpu:
+        add_function_test(
+            TestReducedElasticBody,
+            "test_vbd_solve_iteration_metrics_do_not_change_the_solve",
+            test_vbd_solve_iteration_metrics_do_not_change_the_solve,
+            devices=[device],
+        )
     add_function_test(
         TestReducedElasticBody,
         "test_elastic_contact_local_mat33_projection_matches_world",
