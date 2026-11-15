@@ -2612,6 +2612,55 @@ def _settle_elastic_plank(
     return model, body, state_0, contacts, solver, observables
 
 
+def _elastic_plank_vertex_positions(model, body, state) -> np.ndarray:
+    """Return the world positions [m] of the plank's deformed collision-mesh vertices."""
+    q_start, _qd_start = elastic_free_joint_starts(model, body)
+    mode_count = int(model.elastic_mode_count.numpy()[0])
+    local = model.elastic_shape_vertex_local.numpy()
+    phi = model.elastic_shape_vertex_phi.numpy().reshape(local.shape[0], int(model.elastic_max_mode_count), 3)
+    modal_q = state.joint_q.numpy()[q_start + 7 : q_start + 7 + mode_count]
+    deformed = local + np.einsum("vmk,m->vk", phi[:, :mode_count], modal_q)
+    body_q = state.body_q.numpy()[body]
+    return body_q[:3] + quat_rotate(body_q[3:7], deformed)
+
+
+def test_vbd_elastic_plank_rests_on_mesh_with_its_weight(test, device):
+    """Carry a resting reduced elastic plank's weight with its reported mesh contact forces.
+
+    Compliant ALM, 32 iterations. Measured on CPU and CUDA: the normal forces match the weight within
+    1.1e-4 relative (tolerance 1.0e-3), the frame speed is at most 9.1e-7 m/s (tolerance 1.0e-5 m/s),
+    and the angular speed at most 3.5e-6 rad/s (tolerance 1.0e-4 rad/s).
+    """
+    model, body, state, contacts, _solver, observables = _settle_elastic_plank(device, iterations=32)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertEqual(count, 15)
+    force = observables.contact_f.numpy()[:count, :3]
+    shape_body = model.shape_body.numpy()
+    # Rows hold the force on the contact's body 0, which is the ground or the plank.
+    on_plank = np.where(shape_body[contacts.rigid_contact_shape0.numpy()[:count]] == body, 1.0, -1.0)
+    weight = float(model.body_mass.numpy()[body]) * float(-model.gravity.numpy()[0][2])
+    normal_force = float(np.sum(force[:, 2] * on_plank))
+    test.assertAlmostEqual(normal_force / weight, 1.0, delta=1.0e-3)
+    body_qd = state.body_qd.numpy()[body]
+    test.assertLess(float(np.linalg.norm(body_qd[:3])), 1.0e-5)
+    test.assertLess(float(np.linalg.norm(body_qd[3:])), 1.0e-4)
+
+
+def test_vbd_elastic_plank_rest_state_is_iteration_independent(test, device):
+    """Reach the same resting state of a reduced elastic plank with N and 2N iterations.
+
+    Compliant ALM with N = 16. The deformed collision-mesh vertices are compared, so the frame
+    pose and the modal coordinates enter in meters. Measured: the vertices differ by at most
+    2.5e-7 m on CPU and 2.7e-7 m on CUDA between 16 and 32 iterations. The tolerance of 1.0e-6 m
+    is a fifth of the 5.2e-6 m static contact deflection (weight over 15 contacts of 1e5 N/m).
+    """
+    rest_states = []
+    for iterations in (16, 32):
+        model, body, state, _contacts, _solver, _observables = _settle_elastic_plank(device, iterations=iterations)
+        rest_states.append(_elastic_plank_vertex_positions(model, body, state))
+    np.testing.assert_allclose(rest_states[0], rest_states[1], rtol=0.0, atol=1.0e-6)
+
+
 def test_vbd_solve_iteration_metrics_are_empty_by_default(test, device):
     """Return zero-iteration metric arrays when the solver records no metrics."""
     model, _body, _state, _contacts, solver, _observables = _settle_elastic_plank(device, iterations=4, steps=2)
@@ -7683,6 +7732,18 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_surface_contact_deterministic_sort_orders_samples",
         test_elastic_surface_contact_deterministic_sort_orders_samples,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_plank_rests_on_mesh_with_its_weight",
+        test_vbd_elastic_plank_rests_on_mesh_with_its_weight,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_plank_rest_state_is_iteration_independent",
+        test_vbd_elastic_plank_rest_state_is_iteration_independent,
         devices=[device],
     )
     add_function_test(
