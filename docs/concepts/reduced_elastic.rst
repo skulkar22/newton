@@ -414,6 +414,22 @@ Relevant options:
   ``elastic_solver_metrics`` enables
   :meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics`.
 
+Deterministic mode: ``SolverVBD(deterministic=wp.DeterministicMode.RUN_TO_RUN)``
+makes the elastic contact assembly repeat bit for bit. Pair it with
+``CollisionPipeline(deterministic=True)``, which fixes the contact order. Warp
+then records every atomic update and reduces it in a fixed order, so the
+solver sizes the record buffers of the modal contact assembly from the largest
+mode count and ``rigid_body_contact_buffer_size``: about
+``ceil(rigid_body_contact_buffer_size / 32) * (6 n + n (n + 1) / 2)`` records
+per thread, or 36 MiB per launch for one body with 48 modes and a 1024-entry
+list. Construction raises :class:`ValueError` when one launch would need more
+than 1 GiB. Every elastic body's contacts should fit its per-body list; a step
+whose list overflows can exceed the buffers and then raises a
+:class:`ValueError` naming the ``rigid_body_contact_buffer_size`` needed.
+Deterministic mode is much slower: a 240-step drop of a three-mode plank with
+about 100 contacts took 26 to 35 times longer than in the default mode on a
+shared RTX PRO 6000 Blackwell GPU (Warp 1.18).
+
 With ``rigid_articulation_solve="block_sparse_joints"``, elastic links inside
 an articulation are solved in the articulation's direct factorization: their
 modes are eliminated exactly onto the frame blocks of the link and its joint

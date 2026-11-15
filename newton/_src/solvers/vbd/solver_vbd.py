@@ -92,6 +92,7 @@ from .reduced_elastic_kernels import (
     create_solve_elastic_body_tiled,
     elastic_block_dense_width,
     elastic_block_solve_tiled_block_dim,
+    elastic_contact_deterministic_max_records,
     evaluate_elastic_endpoint_joints,
     integrate_elastic_modes_implicit,
     launch_solve_elastic_body_dense,
@@ -188,6 +189,9 @@ _WARP_CPU_TILE_SHARED_MEMORY_BYTES = 256 * 1024
 
 _ELASTIC_BLOCK_MIN_BUCKET_MODES = 8
 """Smallest modal row count of a reduced elastic block-solve bucket."""
+
+_ELASTIC_DETERMINISTIC_SCATTER_BYTES_MAX = 1 << 30
+"""Largest deterministic scatter allocation [bytes] that one reduced elastic contact launch may need."""
 
 
 def _elastic_block_solve_shared_memory_estimate(block_width: int) -> int:
@@ -1004,7 +1008,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 ``wp.config.deterministic`` mode. Body-particle contact forces
                 are accumulated per contact record with atomics in
                 ``NOT_GUARANTEED`` mode and gathered per particle without
-                atomics in every other mode.
+                atomics in every other mode. With reduced elastic bodies,
+                a deterministic mode sizes the scatter buffers that Warp
+                pools per launch of the modal contact assembly from the
+                largest mode count and ``rigid_body_contact_buffer_size``,
+                and raises :class:`ValueError` at construction when one
+                launch would need more than 1 GiB; reduce the buffer size or
+                the mode count in that case. Every elastic body's contacts
+                should fit its per-body list: an overflowing list can exceed
+                those buffers, and the step then raises a
+                :class:`ValueError` that names the
+                ``rigid_body_contact_buffer_size`` needed. Deterministic
+                mode is much slower than the default mode. Collision
+                detection is not covered by this option; use
+                ``CollisionPipeline(deterministic=True)`` for a
+                deterministic contact order.
 
             collision_pipeline: Optional :class:`~newton.CollisionPipeline`
                 owned by this solver. When given, the solver allocates its own
@@ -1638,6 +1656,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.elastic_body_block_applied_residual_norm = wp.zeros(metric_count, dtype=float, device=self.device)
         self.elastic_body_block_update_norm = wp.zeros(metric_count, dtype=float, device=self.device)
         self.elastic_body_block_update_max = wp.zeros(metric_count, dtype=float, device=self.device)
+        if elastic_body_count > 0 and effective_deterministic != wp.DeterministicMode.NOT_GUARANTEED:
+            self._set_elastic_deterministic_records(model, effective_deterministic)
 
         # Controls whether the next step() refreshes contact state derived from
         # the Contacts buffer or reuses the current rigid/body-particle contact state.
@@ -1663,6 +1683,58 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+    def _set_elastic_deterministic_records(self, model: Model, deterministic: wp.DeterministicMode) -> None:
+        """Size the deterministic scatter buffers of the reduced elastic kernel modules.
+
+        The modal contact assembly and the sparse Schur columns emit a number of atomic records per
+        thread that grows with the contact list capacity and the mode count (see
+        :func:`elastic_contact_deterministic_max_records`), beyond the call-site count Warp derives.
+        Warp pools ``launch_dim * deterministic_max_records`` records per atomic target on every
+        launch of a module's kernels, so the bound is set on these modules only; the same value on
+        every solver module would allocate far more.
+
+        Raises:
+            ValueError: If one assembly launch would need more scatter memory than
+                ``_ELASTIC_DETERMINISTIC_SCATTER_BYTES_MAX``.
+        """
+        max_modes = int(model.elastic_max_mode_count)
+        layout = self.rigid_articulation_sparse_layout
+        if layout is not None and int(layout.elastic_body_count) > 0:
+            # build_elastic_sparse_schur_columns: a thread of a joint group between two elastic
+            # bodies adds one record per mode of the body.
+            self._set_module_options(
+                {"deterministic": deterministic, "deterministic_max_records": max_modes},
+                module=reduced_elastic_sparse_kernels,
+            )
+        contact_buffer_size = int(self.body_body_contact_buffer_pre_alloc)
+        max_records = elastic_contact_deterministic_max_records(max_modes, contact_buffer_size)
+        if max_records == 0:
+            return
+        # The assembly launches one thread group per elastic body of a color group, or of the
+        # sparse articulation layout; the frame coupling launches one thread per elastic body.
+        launch_bodies = max(
+            [int(bodies.shape[0]) for _group, bodies in self._elastic_color_bodies.values()]
+            + [0 if layout is None else int(layout.elastic_body_count)]
+        )
+        key_bytes = 8
+        # assemble_elastic_contacts scatters floats to the block gradient and matrix;
+        # accumulate_elastic_frame_coupling scatters vec3 forces and torques.
+        scatter_bytes = 2 * launch_bodies * _NUM_ELASTIC_CONTACT_THREADS_PER_BODY * max_records * (key_bytes + 4)
+        scatter_bytes += 2 * int(model.elastic_body_count) * max_records * (key_bytes + 12)
+        if scatter_bytes > _ELASTIC_DETERMINISTIC_SCATTER_BYTES_MAX:
+            raise ValueError(
+                f"Deterministic reduced elastic contact assembly would need {scatter_bytes / 2**20:.0f} MiB of "
+                f"scatter buffers per launch ({max_records} records per thread for {max_modes} modes and "
+                f"rigid_body_contact_buffer_size={contact_buffer_size}, {launch_bodies} elastic bodies per launch), "
+                f"above the {_ELASTIC_DETERMINISTIC_SCATTER_BYTES_MAX // 2**20} MiB limit. Reduce "
+                "rigid_body_contact_buffer_size, the elastic mode count, or the number of elastic bodies "
+                "per color group, or run without a deterministic mode."
+            )
+        self._set_module_options(
+            {"deterministic": deterministic, "deterministic_max_records": max_records},
+            module=reduced_elastic_kernels,
+        )
 
     def _init_elastic_assembly_scratch(self, model: Model) -> None:
         """Allocate the intermediates of the parallel reduced elastic block assembly.
@@ -7118,62 +7190,89 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
 
         if rigid_contact_max > 0:
-            wp.launch(
-                kernel=assemble_elastic_contacts,
-                dim=body_ids.size * _NUM_ELASTIC_CONTACT_THREADS_PER_BODY,
-                inputs=[
-                    dt,
-                    True,
-                    body_ids,
-                    model.elastic_joint,
-                    model.elastic_mode_count,
-                    model.elastic_max_mode_count,
-                    model.body_elastic_index,
-                    self.body_inv_mass_effective,
-                    state_in.body_q,
-                    self.body_q_prev,
-                    model.body_com,
-                    model.shape_body,
-                    rigid_contact_max,
-                    rigid_contact_count,
-                    contacts.rigid_contact_shape0,
-                    contacts.rigid_contact_shape1,
-                    contacts.rigid_contact_point0,
-                    contacts.rigid_contact_point1,
-                    contacts.rigid_contact_offset0,
-                    contacts.rigid_contact_offset1,
-                    contacts.rigid_contact_normal,
-                    contacts.rigid_contact_margin0,
-                    contacts.rigid_contact_margin1,
-                    contacts.rigid_contact_elastic_sample0,
-                    contacts.rigid_contact_elastic_sample1,
-                    self.body_body_contact_penalty_k,
-                    self.body_body_contact_normal_rho,
-                    self.body_body_contact_material_ke,
-                    self.body_body_contact_material_kd,
-                    self.body_body_contact_material_mu,
-                    self.body_body_contact_tangent_rho,
-                    self.body_body_contact_lambda,
-                    self.body_body_contact_C0,
-                    self.rigid_contact_alpha,
-                    self.rigid_contact_hard,
-                    self.rigid_compliant_alm,
-                    self.friction_epsilon,
-                    self.body_body_contact_buffer_pre_alloc,
-                    self.body_body_contact_counts,
-                    self.body_body_contact_indices,
-                    model.joint_q_start,
-                    model.elastic_shape_vertex_local,
-                    model.elastic_shape_vertex_phi,
-                    state_in.joint_q,
-                    state_out.joint_q,
-                ],
-                outputs=[
-                    self.elastic_body_block_grad,
-                    self.elastic_body_block_matrix,
-                ],
-                device=self.device,
-            )
+            try:
+                wp.launch(
+                    kernel=assemble_elastic_contacts,
+                    dim=body_ids.size * _NUM_ELASTIC_CONTACT_THREADS_PER_BODY,
+                    inputs=[
+                        dt,
+                        True,
+                        body_ids,
+                        model.elastic_joint,
+                        model.elastic_mode_count,
+                        model.elastic_max_mode_count,
+                        model.body_elastic_index,
+                        self.body_inv_mass_effective,
+                        state_in.body_q,
+                        self.body_q_prev,
+                        model.body_com,
+                        model.shape_body,
+                        rigid_contact_max,
+                        rigid_contact_count,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        contacts.rigid_contact_point0,
+                        contacts.rigid_contact_point1,
+                        contacts.rigid_contact_offset0,
+                        contacts.rigid_contact_offset1,
+                        contacts.rigid_contact_normal,
+                        contacts.rigid_contact_margin0,
+                        contacts.rigid_contact_margin1,
+                        contacts.rigid_contact_elastic_sample0,
+                        contacts.rigid_contact_elastic_sample1,
+                        self.body_body_contact_penalty_k,
+                        self.body_body_contact_normal_rho,
+                        self.body_body_contact_material_ke,
+                        self.body_body_contact_material_kd,
+                        self.body_body_contact_material_mu,
+                        self.body_body_contact_tangent_rho,
+                        self.body_body_contact_lambda,
+                        self.body_body_contact_C0,
+                        self.rigid_contact_alpha,
+                        self.rigid_contact_hard,
+                        self.rigid_compliant_alm,
+                        self.friction_epsilon,
+                        self.body_body_contact_buffer_pre_alloc,
+                        self.body_body_contact_counts,
+                        self.body_body_contact_indices,
+                        model.joint_q_start,
+                        model.elastic_shape_vertex_local,
+                        model.elastic_shape_vertex_phi,
+                        state_in.joint_q,
+                        state_out.joint_q,
+                    ],
+                    outputs=[
+                        self.elastic_body_block_grad,
+                        self.elastic_body_block_matrix,
+                    ],
+                    device=self.device,
+                )
+            except RuntimeError as exc:
+                if "scatter buffer overflow" not in str(exc):
+                    raise
+                error = self._elastic_contact_list_overflow_error(body_ids)
+                if error is None:
+                    raise
+                raise error from exc
+
+    def _elastic_contact_list_overflow_error(self, body_ids: wp.array[wp.int32]) -> ValueError | None:
+        """Explain a deterministic scatter overflow caused by an overflowing elastic contact list.
+
+        An elastic body with more contacts than its per-body list strides over the whole contact
+        range, beyond the records sized from ``rigid_body_contact_buffer_size``. Warp pools the
+        records of one launch, so such an overflow raises only when the other bodies of the launch
+        leave too little room. Returns ``None`` when no elastic body in ``body_ids`` overflowed.
+        """
+        capacity = int(self.body_body_contact_buffer_pre_alloc)
+        counts = self.body_body_contact_counts.numpy()[body_ids.numpy()]
+        needed = int(counts.max()) if counts.size > 0 else 0
+        if needed <= capacity:
+            return None
+        return ValueError(
+            f"Deterministic mode needs every reduced elastic body's contacts to fit its per-body contact "
+            f"list, but an elastic body has {needed} contacts and rigid_body_contact_buffer_size={capacity}. "
+            f"Construct SolverVBD with rigid_body_contact_buffer_size >= {needed}."
+        )
 
     def _accumulate_elastic_frame_coupling(self, state_in: State, state_out: State, dt: float) -> None:
         """Add the reduced elastic frame-coupling wrench of every elastic body to the body forces.
