@@ -2295,6 +2295,21 @@ class CollisionPipeline:
         self._contact_sort_sub_key_bits = getattr(
             self.narrow_phase, "_contact_sort_sub_key_bits", CONTACT_SORT_SUB_KEY_BITS
         )
+        # Elastic contacts use their global vertex sample as the sub-key. A narrower field would tie
+        # the samples of one shape pair and leave their order to the atomic output slots. At the
+        # 23-bit limit the masked samples of one shape stay distinct while the shape has at most
+        # 2**23 vertices; beyond that they tie.
+        elastic_vertex_count = int(model.elastic_shape_vertex_total_count)
+        if elastic_vertex_count > 0:
+            elastic_sub_key_bits = min((elastic_vertex_count - 1).bit_length(), CONTACT_SORT_SUB_KEY_BITS)
+            self._contact_sort_sub_key_bits = max(self._contact_sort_sub_key_bits, elastic_sub_key_bits)
+            if int(np.max(model.elastic_shape_vertex_count.numpy())) > 1 << CONTACT_SORT_SUB_KEY_BITS:
+                warnings.warn(
+                    f"An elastic shape has more than {1 << CONTACT_SORT_SUB_KEY_BITS} vertices; its contacts "
+                    "can tie in the deterministic contact sort, so their order is not deterministic.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         self._hydro_shape_sdf_data_prepared = self.hydroelastic_sdf is not None
         if self.hydroelastic_sdf is not None:

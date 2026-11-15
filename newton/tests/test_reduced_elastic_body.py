@@ -62,6 +62,7 @@ from newton.examples.basic.example_basic_reduced_elastic_wall_contact import Exa
 from newton.tests import _reduced_elastic_reference as elastic_reference
 from newton.tests._reduced_elastic_fixtures import (
     elastic_free_joint_starts,
+    elastic_plank_on_ground,
     rod_joint_state,
     rod_model,
     rod_physical,
@@ -2338,6 +2339,24 @@ def test_elastic_surface_contact_deterministic_sort_preserves_samples(test, devi
     elastic_rows = samples >= 0
     test.assertTrue(bool(np.any(elastic_rows)))
     np.testing.assert_allclose(points[elastic_rows], rest_points[samples[elastic_rows]], atol=0.0)
+
+
+def test_elastic_surface_contact_deterministic_sort_orders_samples(test, device):
+    """Order deterministic elastic contacts by vertex sample against a mesh, a plane, and a box.
+
+    The samples of one shape pair are the sort sub-key, so they must not tie in the sort even
+    when no other contact in the model needs a wide sub-key.
+    """
+    for ground in ("mesh", "plane", "box"):
+        with test.subTest(ground=ground):
+            model, _body = elastic_plank_on_ground(device, ground=ground, count_x=17, count_y=9, height=0.002)
+            pipeline = newton.CollisionPipeline(model, deterministic=True)
+            contacts = pipeline.contacts()
+            pipeline.collide(model.state(), contacts)
+            count = min(int(contacts.rigid_contact_count.numpy()[0]), contacts.rigid_contact_max)
+            test.assertGreater(count, 64)
+            samples = contacts.rigid_contact_elastic_sample1.numpy()[:count]
+            test.assertTrue(bool(np.all(np.diff(samples) > 0)), f"unsorted samples {samples.tolist()}")
 
 
 def test_elastic_surface_contact_reduction_preserves_modal_samples(test, device):
@@ -7555,6 +7574,12 @@ for device in devices:
         test_vbd_elastic_contact_overflow_assembles_consistent_block,
         devices=[device],
         check_output=False,
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_deterministic_sort_orders_samples",
+        test_elastic_surface_contact_deterministic_sort_orders_samples,
+        devices=[device],
     )
     add_function_test(
         TestReducedElasticBody,
