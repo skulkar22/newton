@@ -1008,6 +1008,28 @@ def mesh_query_point_sign(mesh: wp.uint64, point: wp.vec3, max_dist: float, sign
 
 
 @wp.func
+def elastic_mesh_query_point_sign(mesh: wp.uint64, point: wp.vec3, max_dist: float, sign_method: int):
+    """Closest-point query of a reduced elastic contact sample against a mesh.
+
+    The pseudo-normal of the closest feature decides the sign, as in :func:`mesh_query_point_sign`
+    with ``MeshSignMethod.NORMAL``. With ``MeshSignMethod.NORMAL_AND_PARITY``, a point it reports
+    inside is tested again by ray parity with three rays close to the (1, 1, 1) direction (inside
+    when at least two of them cross the mesh an odd number of times). When parity says outside,
+    the parity query is returned, so a point is inside only if both tests say inside. Other values
+    of *sign_method* use the pseudo-normal alone.
+    """
+    query = wp.mesh_query_point_sign_normal(mesh, point, max_dist)
+    if sign_method == MeshSignMethod.NORMAL_AND_PARITY and query.result and query.sign < 0.0:
+        # Both queries search the same triangles within max_dist and find the same closest
+        # distance up to round-off. Between equally close faces they can pick different ones,
+        # which changes the row normal but not its separation.
+        parity = wp.mesh_query_point_sign_parity(mesh, point, max_dist, 3)
+        if parity.result and parity.sign > 0.0:
+            return parity
+    return query
+
+
+@wp.func
 def mesh_sdf(mesh: wp.uint64, point: wp.vec3, max_dist: float):
     res = wp.mesh_query_point_sign_parity(mesh, point, max_dist)
 
@@ -1335,6 +1357,7 @@ def create_elastic_shape_contacts(
     rigid_contact_max: int,
     contact_sort_shape_index_bits: int,
     contact_sort_sub_key_bits: int,
+    mesh_sign_method: int,
     # outputs
     rigid_contact_count: wp.array[int],
     rigid_contact_shape0: wp.array[wp.int32],
@@ -1459,24 +1482,22 @@ def create_elastic_shape_contacts(
     if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
         mesh = shape_source_ptr[rigid_shape]
 
-        face_index = int(0)
-        face_u = float(0.0)
-        face_v = float(0.0)
-        sign = float(0.0)
-
         min_scale = wp.max(wp.min(geo_scale), 1.0e-8)
         query_radius = (
             shape_margin[elastic_shape] + shape_margin[rigid_shape] + shape_gap[elastic_shape] + shape_gap[rigid_shape]
         )
-        if wp.mesh_query_point_sign_normal(
-            mesh, wp.cw_div(x_shape, geo_scale), query_radius / min_scale, sign, face_index, face_u, face_v
-        ):
-            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
+        # A sample reported inside becomes a row as deep as its distance to the mesh, so the sign
+        # test decides between no force and a deep row that pulls the sample into the mesh.
+        query = elastic_mesh_query_point_sign(
+            mesh, wp.cw_div(x_shape, geo_scale), query_radius / min_scale, mesh_sign_method
+        )
+        if query.result:
+            shape_p = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
             shape_p = wp.cw_mul(shape_p, geo_scale)
 
             delta = x_shape - shape_p
-            d = wp.length(delta) * sign
-            n = wp.normalize(delta) * sign
+            d = wp.length(delta) * query.sign
+            n = wp.normalize(delta) * query.sign
 
     if geo_type == GeoType.PLANE:
         d = sdf_plane(x_shape, geo_scale[0] * 0.5, geo_scale[1] * 0.5)

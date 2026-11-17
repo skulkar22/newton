@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
+import os
 import warnings
 from typing import Literal
 
@@ -30,7 +32,7 @@ from ..geometry.contact_reduction_global import (
 )
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
-from ..geometry.flags import MeshProperties, ShapeFlags
+from ..geometry.flags import MeshProperties, MeshSignMethod, ShapeFlags
 from ..geometry.kernels import create_elastic_shape_contacts, create_soft_contacts
 from ..geometry.narrow_phase import NarrowPhase
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
@@ -41,7 +43,7 @@ from ..geometry.support_function import (
     pack_mesh_ptr,
 )
 from ..geometry.tri_mesh_collision import TriMeshCollisionDetector
-from ..geometry.types import GeoType
+from ..geometry.types import GeoType, Mesh
 from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.model import Model
 from ..sim.state import State
@@ -1629,6 +1631,127 @@ def _warn_full_surface_fallbacks(model: Model, capable: np.ndarray) -> None:
     )
 
 
+_NEWTON_SRC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir)) + os.sep
+
+
+def _external_stacklevel() -> int:
+    """Return a ``stacklevel`` that points past all ``newton._src`` frames."""
+    frame = inspect.currentframe()
+    if frame is None:
+        return 2
+    frame = frame.f_back
+    stacklevel = 1
+    try:
+        while frame is not None and os.path.normpath(frame.f_code.co_filename).startswith(_NEWTON_SRC_DIR):
+            frame = frame.f_back
+            stacklevel += 1
+        return stacklevel
+    finally:
+        del frame
+
+
+def _mesh_signed_volume(mesh: Mesh) -> tuple[float, float]:
+    """Return the signed enclosed volume [m^3] of *mesh* in mesh space and a round-off tolerance for it."""
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    triangles = np.asarray(mesh.indices, dtype=np.int64).reshape(-1, 3)
+    if len(triangles) == 0 or len(vertices) == 0:
+        return 0.0, 0.0
+    # Center the vertices to limit cancellation; the volume of a closed mesh does not depend on the origin.
+    vertices = vertices - 0.5 * (vertices.min(axis=0) + vertices.max(axis=0))
+    v0, v1, v2 = vertices[triangles[:, 0]], vertices[triangles[:, 1]], vertices[triangles[:, 2]]
+    volume = float(np.einsum("ij,ij->i", v0, np.cross(v1, v2)).sum() / 6.0)
+    diagonal = max(float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0))), 1.0)
+    return volume, np.finfo(np.float64).eps * diagonal**3 * len(triangles)
+
+
+_ELASTIC_MESH_WARNING_PREFIX = "Collision meshes unsuitable for reduced elastic contacts"
+
+
+def _warn_on_unsuitable_meshes_in_elastic_pairs(
+    model: Model,
+    elastic_shape_pairs: np.ndarray,
+    shape_is_elastic: np.ndarray,
+    sign_method: str,
+) -> None:
+    """Warn once about collision meshes on which the inside/outside test of elastic contacts fails.
+
+    Checks each unique mesh that can collide with a reduced elastic shape for edges not shared by
+    exactly two triangles (:attr:`Mesh.is_watertight`) and, if it is closed, for a negative enclosed
+    volume (inside-out winding).
+    """
+    shape_type = model.shape_type.numpy()
+    shape_flags = model.shape_flags.numpy()
+    partners = np.unique(
+        np.where(shape_is_elastic[elastic_shape_pairs[:, 0]], elastic_shape_pairs[:, 1], elastic_shape_pairs[:, 0])
+    )
+    open_labels: dict[int, str] = {}
+    inside_out_labels: dict[int, str] = {}
+    checked: set[int] = set()
+    for shape in partners.tolist():
+        if shape_type[shape] not in (int(GeoType.MESH), int(GeoType.CONVEX_MESH)):
+            continue
+        if (shape_flags[shape] & int(ShapeFlags.COLLIDE_SHAPES)) == 0:
+            continue
+        mesh = model.shape_source[shape]
+        if not isinstance(mesh, Mesh):
+            continue
+        key = hash(mesh)
+        if key in checked:
+            continue
+        checked.add(key)
+        if not mesh.is_watertight:
+            open_labels[key] = str(model.shape_label[shape])
+            continue
+        volume, tolerance = _mesh_signed_volume(mesh)
+        if volume < -tolerance:
+            inside_out_labels[key] = str(model.shape_label[shape])
+    if not open_labels and not inside_out_labels:
+        return
+
+    def describe(labels: dict[int, str], what: str) -> str:
+        names = ", ".join(repr(label) for label in list(labels.values())[:3])
+        more = ", ..." if len(labels) > 3 else ""
+        return f"{len(labels)} mesh(es) {what}, used by shapes such as {names}{more}"
+
+    problems = []
+    if open_labels:
+        problems.append(
+            describe(
+                open_labels,
+                "are open or have doubled or non-manifold faces (some edges are not shared by exactly two triangles)",
+            )
+        )
+    if inside_out_labels:
+        problems.append(describe(inside_out_labels, "are closed but inside-out (negative enclosed volume)"))
+    first = (
+        "First, give these shapes a closed convex or watertight collision mesh whose triangles face outward, "
+        "for example newton.utils.remesh_mesh(mesh, method='convex_hull')"
+    )
+    if inside_out_labels:
+        first += ", or reverse the triangle winding of an inside-out mesh"
+    sentences = [
+        f"{_ELASTIC_MESH_WARNING_PREFIX}: {'; '.join(problems)}.",
+        "Contacts of reduced elastic bodies against such meshes can be on the wrong side, which pulls the body "
+        "into the mesh, or can be missed.",
+        first + ", and keep the contact gaps of both shapes small.",
+    ]
+    if sign_method == "normal_and_parity":
+        sentences.append(
+            "With elastic_contact_mesh_sign_method='normal_and_parity', real contacts against these meshes can "
+            "be missed"
+            + (", all of them on an inside-out mesh" if inside_out_labels else "")
+            + (", and wrong-side contacts remain on single open sheets" if open_labels else "")
+            + "."
+        )
+    elif open_labels:
+        sentences.append(
+            "Second, for open or doubled faces that cannot be fixed, "
+            "CollisionPipeline(elastic_contact_mesh_sign_method='normal_and_parity') removes most wrong-side "
+            "contacts but misses a share of real ones; it does not help on single open sheets or inside-out meshes."
+        )
+    warnings.warn(" ".join(sentences), stacklevel=_external_stacklevel())
+
+
 class CollisionPipeline:
     """
     Full-featured collision pipeline with GJK/MPR narrow phase and pluggable broad phase.
@@ -1680,6 +1803,7 @@ class CollisionPipeline:
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_contact_gap_max: float | None = None,
+        elastic_contact_mesh_sign_method: Literal["normal", "normal_and_parity"] = "normal",
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1820,6 +1944,69 @@ class CollisionPipeline:
                 ``0.0`` enables them without enlarging authored gaps. Defaults to
                 ``None``. See
                 :ref:`Speculative contacts <speculative-contacts>`.
+            elastic_contact_mesh_sign_method: Inside/outside test of the
+                contacts between the samples of reduced elastic shapes and
+                mesh shapes. Fix the collision mesh first: use a closed
+                convex or watertight mesh whose triangles face outward, and
+                author small contact gaps on both shapes (see
+                :ref:`Reduced Elastic Links`). This option is a fallback for
+                meshes that cannot be fixed. It applies to every mesh shape
+                that can collide with a reduced elastic shape and does not
+                affect any other contacts.
+
+                - ``"normal"`` (default): the sign of the pseudo-normal of
+                  the closest mesh feature
+                  (``wp.mesh_query_point_sign_normal``). It gives an open
+                  surface a front and a back side, so a sample behind it is
+                  reported inside. Next to coincident back-to-back faces it
+                  reports samples on both sides inside, and on an inside-out
+                  mesh it reports every sample on the wrong side.
+                - ``"normal_and_parity"``: a sample that ``"normal"``
+                  reports inside is tested again with
+                  ``wp.mesh_query_point_sign_parity`` using three rays close
+                  to the (1, 1, 1) direction of the mesh frame; parity says
+                  inside when at least two rays cross the mesh an odd number
+                  of times. The sample is inside only if both tests say
+                  inside. Otherwise its row uses the closest point of the
+                  parity query and a positive separation equal to the
+                  distance, with the normal pointing from the mesh to the
+                  sample; it is kept only within the sum of margins and
+                  gaps. This removes the wrong-side rows next to open cups
+                  and duplicated faces, but it also drops real contacts:
+                  in a measured scaled, rotated box, 33 % of them on an open
+                  cup or with a duplicated face (of either winding), 69 % on
+                  two overlapping closed boxes, and 100 % on an inside-out
+                  box. Behind a single open sheet both tests can fail
+                  together, so wrong-side rows remain. It does not make a
+                  defective mesh safe. The parity rays run through the whole
+                  mesh. Only samples that ``"normal"`` reports inside pay
+                  for the second query; in a CPU measurement on an
+                  81,920-triangle mesh the sign queries took 3.7 times as
+                  long as with ``"normal"`` when half of the queried samples
+                  were inside, and 6.2 times as long when all were.
+
+                On one closed mesh component whose triangles face outward,
+                both values gave the same rows in every measured case. A
+                sample reported inside gives a row as deep as its distance
+                to the mesh. The query searches, in the unscaled mesh frame,
+                the sum of the margins and gaps of both shapes divided by the
+                smallest scale component of the mesh shape, so under
+                non-uniform scale a wrong-side row can be deeper than that
+                sum, up to that sum times the ratio of the largest to the
+                smallest scale component. This holds for positive scale
+                components; negative (mirroring) scale components are not
+                supported. A shape whose
+                ``ModelBuilder.ShapeConfig.gap`` is ``None`` uses
+                ``ModelBuilder.rigid_gap``, 0.1 m by default. The pipeline
+                warns once at construction about meshes that can collide
+                with a reduced elastic shape and are open or non-manifold,
+                or closed but inside-out. Silence the warning with
+                ``warnings.filterwarnings("ignore", message="Collision meshes
+                unsuitable for reduced elastic contacts")``.
+
+                .. experimental::
+
+                    This option may change without prior notice.
 
         .. experimental::
 
@@ -1843,6 +2030,13 @@ class CollisionPipeline:
         matching_sticky = contact_matching == "sticky"
         if contact_report and not matching_enabled:
             raise ValueError('contact_report=True requires contact_matching != "disabled"')
+        elastic_sign_methods = {"normal": MeshSignMethod.NORMAL, "normal_and_parity": MeshSignMethod.NORMAL_AND_PARITY}
+        if elastic_contact_mesh_sign_method not in elastic_sign_methods:
+            raise ValueError(
+                "elastic_contact_mesh_sign_method must be one of 'normal', 'normal_and_parity', "
+                f"got {elastic_contact_mesh_sign_method!r}"
+            )
+        self._elastic_contact_mesh_sign_method = int(elastic_sign_methods[elastic_contact_mesh_sign_method])
         if speculative_contact_gap_max is not None and (
             not np.isfinite(speculative_contact_gap_max) or speculative_contact_gap_max < 0.0
         ):
@@ -1933,6 +2127,11 @@ class CollisionPipeline:
             elastic_b = shape_is_elastic[candidate_pairs[:, 1]]
             elastic_shape_pairs = candidate_pairs[elastic_a ^ elastic_b].astype(np.int32, copy=False)
             narrow_phase_elastic_pairs = candidate_pairs[elastic_a | elastic_b].astype(np.int32, copy=False)
+
+        if len(elastic_shape_pairs) > 0:
+            _warn_on_unsuitable_meshes_in_elastic_pairs(
+                model, elastic_shape_pairs, shape_is_elastic, elastic_contact_mesh_sign_method
+            )
 
         def without_elastic_pairs(pairs: wp.array) -> wp.array:
             pairs_np = pairs.numpy().reshape((-1, 2))
@@ -3125,6 +3324,7 @@ class CollisionPipeline:
                     contacts.rigid_contact_max,
                     self._contact_sort_shape_index_bits,
                     self._contact_sort_sub_key_bits,
+                    self._elastic_contact_mesh_sign_method,
                 ],
                 outputs=[
                     contacts.rigid_contact_count,
