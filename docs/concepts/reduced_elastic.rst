@@ -381,6 +381,129 @@ elastic link and rigid shapes; shape pairs in which both shapes belong to
 elastic links produce no contacts. :class:`~newton.viewer.ViewerGL` renders the
 deformed shapes.
 
+Against a mesh shape, a vertex gives a contact row when the mesh has a point
+within the search radius. The radius is the sum of the margins and gaps of both
+shapes, divided by the smallest scale component of the mesh shape and applied in
+the unscaled mesh frame; this and the bound below hold for positive scale
+components, and negative (mirroring) scale components are not supported. The row's separation is the distance to the closest
+mesh point, negative when the vertex is reported inside the mesh, and a row
+whose separation exceeds the sum of margins and gaps is dropped. The
+inside/outside test is reliable on one closed mesh component whose triangles
+face outward. On other meshes (open parts, coincident back-to-back faces,
+inside-out or overlapping components) a vertex outside the mesh can be reported
+inside, which gives a row as deep as its distance to the mesh and pulls the
+vertex into the mesh, and a vertex inside can be missed. Under non-uniform scale
+such a row can be deeper than the sum of margins and gaps, up to that sum times
+the ratio of the largest to the smallest scale component.
+
+Prepare the collision meshes of parts that touch an elastic link first:
+
+1. Use a closed convex or watertight mesh with outward-facing triangles, for
+   example ``newton.utils.remesh_mesh(mesh, method="convex_hull")``.
+   :attr:`Mesh.is_watertight <newton.Mesh.is_watertight>` checks only that every
+   edge is shared by exactly two triangles; it does not check their
+   orientation.
+2. Author small gaps, a few millimeters, on both shapes. A shape whose
+   ``ModelBuilder.ShapeConfig.gap`` is ``None`` uses
+   ``ModelBuilder.rigid_gap``, which is 0.1 m by default.
+3. Exclude parts that never touch the elastic link from contact.
+
+:class:`~newton.CollisionPipeline` warns once per construction about the unique
+meshes that can collide with an elastic shape and are open or non-manifold
+(some edges are not shared by exactly two triangles), or closed with a negative
+enclosed volume (inside-out). On an 81,920-triangle mesh, measured on a CPU, the
+check took about 3 ms when the watertightness of the mesh was already cached
+(:meth:`ModelBuilder.finalize` computes it for mesh shapes) and about 40 ms when
+it was not. It does not detect overlapping closed components, a mesh in which
+only some components are inside-out while the total volume stays positive, a
+closed mesh in which only some triangles are flipped (its total signed volume
+can stay positive), an outward-facing shell nested inside another, or an
+isolated pair of coincident triangles. It also warns about
+meshes that work as intended, for example an open single-sided surface that
+the elastic link only touches from its front side, or a closed mesh with an
+extra zero-area triangle. Silence it with a standard warnings filter:
+
+.. code-block:: python
+
+    import warnings
+
+    warnings.filterwarnings("ignore", message="Collision meshes unsuitable for reduced elastic contacts")
+
+For meshes that cannot be fixed, ``CollisionPipeline(...,
+elastic_contact_mesh_sign_method="normal_and_parity")`` changes the test for
+every mesh shape that can collide with an elastic shape. A vertex that the
+pseudo-normal reports inside is tested again by ray parity with three rays
+close to one direction, which says inside when at least two rays cross the mesh
+an odd number of times. The vertex counts as inside only if both tests say
+inside; otherwise its row gets a positive separation equal to its distance. The
+table shows the effect on a unit box mesh scaled to 0.4 x 0.25 x 0.1 m and
+rotated, against the 5,500 surface vertices of 125 small elastic boxes placed
+around it (gap 20 mm on each shape, no margin).
+
+.. list-table::
+   :header-rows: 1
+
+   * - Mesh
+     - Wrong-side rows, ``"normal"``
+     - Wrong-side rows, ``"normal_and_parity"``
+     - Real contacts lost, ``"normal"``
+     - Real contacts lost, ``"normal_and_parity"``
+   * - Closed, outward-facing
+     - 0
+     - 0
+     - 0 %
+     - 0 %
+   * - Open cup (top face removed)
+     - 304
+     - 0
+     - 4 %
+     - 33 %
+   * - Closed with a back-to-back copy of the top face
+     - 342
+     - 0
+     - 3 %
+     - 33 %
+   * - Closed with a same-winding copy of the top face
+     - 0
+     - 0
+     - 0 %
+     - 33 %
+   * - Closed with an extra zero-area triangle
+     - 0
+     - 0
+     - 0 %
+     - 0 %
+   * - Closed, inside-out
+     - 4204
+     - 0
+     - 100 %
+     - 100 %
+   * - Single open sheet (no solid behind it)
+     - 1355
+     - 596
+     - n/a
+     - n/a
+   * - Two overlapping closed boxes
+     - 0
+     - 0
+     - 30 %
+     - 69 %
+
+So the option removes the wrong-side rows next to open cups and duplicated
+faces, but it drops a share of real contacts there; where the default was
+already right, as with a same-winding duplicate face, it only drops contacts.
+Behind a single open sheet both tests can fail together, so wrong-side rows
+remain. On an inside-out closed mesh every contact is lost, and on overlapping
+closed components contacts in the overlap are lost. A real contact that is
+dropped still gives a row while its distance to the mesh is within the sum of
+margins and gaps, with a positive separation and a normal pointing from the
+mesh into the solid, so any force that row produces pushes the vertex deeper.
+The option does not make a defective mesh safe. The extra query runs at every step for every vertex the pseudo-normal
+reports inside, and its rays run through the whole mesh. In a CPU measurement
+on an 81,920-triangle mesh, the sign queries took 3.7 times as long as with the
+default when half of the queried vertices were inside, and 6.2 times as long
+when all were.
+
 Solver
 ------
 
