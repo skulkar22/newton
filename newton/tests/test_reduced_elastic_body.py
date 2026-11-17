@@ -2359,6 +2359,403 @@ def test_elastic_surface_contact_deterministic_sort_orders_samples(test, device)
             test.assertTrue(bool(np.all(np.diff(samples) > 0)), f"unsorted samples {samples.tolist()}")
 
 
+def _quads_to_triangles(quads) -> np.ndarray:
+    return np.array([[q[0], q[i], q[i + 1]] for q in quads for i in (1, 2)], dtype=np.int32)
+
+
+_BOX_VERTICES = np.array([[x, y, z] for z in (-0.2, 0.0) for y in (-0.5, 0.5) for x in (-0.5, 0.5)], dtype=np.float32)
+"""Corners of a 1 m x 1 m x 0.2 m box whose top face is at z = 0."""
+
+_BOX_QUADS = {
+    "bottom": [0, 2, 3, 1],
+    "top": [4, 5, 7, 6],
+    "front": [0, 1, 5, 4],
+    "back": [2, 6, 7, 3],
+    "left": [0, 4, 6, 2],
+    "right": [1, 3, 7, 5],
+}
+"""Faces of ``_BOX_VERTICES`` with outward-facing winding."""
+
+
+def _box_mesh(faces=tuple(_BOX_QUADS), inside_out: bool = False) -> newton.Mesh:
+    """Return the box of ``_BOX_VERTICES`` with the given faces, optionally with every triangle reversed."""
+    triangles = _quads_to_triangles([_BOX_QUADS[face] for face in faces])
+    if inside_out:
+        triangles = triangles[:, [0, 2, 1]]
+    return newton.Mesh(_BOX_VERTICES, triangles.reshape(-1), compute_inertia=False)
+
+
+def _box_solid_contains(points: np.ndarray) -> np.ndarray:
+    """Return whether mesh-space points lie strictly inside the solid box of ``_BOX_VERTICES``."""
+    return np.all(np.abs(points[:, :2]) < 0.5, axis=1) & (points[:, 2] > -0.2) & (points[:, 2] < 0.0)
+
+
+def _back_to_back_square_mesh(flip_order: bool) -> newton.Mesh:
+    """Return a 1 m square in the z = 0 plane made of two coincident triangle layers with opposite winding."""
+    vertices = np.array(
+        [[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0]],
+        dtype=np.float32,
+    )
+    up_facing = _quads_to_triangles([[0, 1, 2, 3]])
+    down_facing = up_facing[:, [0, 2, 1]]
+    triangles = np.concatenate([down_facing, up_facing] if flip_order else [up_facing, down_facing])
+    return newton.Mesh(vertices, triangles.reshape(-1), compute_inertia=False)
+
+
+def _open_wall_mesh() -> newton.Mesh:
+    """Return a single-sided 1 m square wall in the x = 0 plane whose triangles face -x."""
+    vertices = np.array(
+        [[0.0, -0.5, -0.5], [0.0, 0.5, -0.5], [0.0, 0.5, 0.5], [0.0, -0.5, 0.5]],
+        dtype=np.float32,
+    )
+    return newton.Mesh(vertices, _quads_to_triangles([[0, 3, 2, 1]]).reshape(-1), compute_inertia=False)
+
+
+_TILTED_MESH_SCALE = (0.4, 0.25, 0.5)
+_TILTED_MESH_XFORM = wp.transform(
+    wp.vec3(0.1, -0.05, 0.3), wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 0.5)), 0.7)
+)
+
+
+def _build_elastic_box_near_mesh_model(
+    device, mesh: newton.Mesh, position, mesh_xform=None, mesh_scale=(1.0, 1.0, 1.0), mesh_copies: int = 1
+):
+    """Build a 0.1 m elastic box at world ``position`` next to a static mesh; the pair's contact gap is 20 mm."""
+
+    def downward_shape_fn(_x):
+        return np.array([[0.0, 0.0, -1.0]], dtype=np.float32)
+
+    cfg = newton.ModelBuilder.ShapeConfig()
+    cfg.ke = 1000.0
+    cfg.kd = 0.0
+    cfg.mu = 0.0
+    cfg.margin = 0.0
+    cfg.gap = 0.01
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis="Z")
+    for _ in range(mesh_copies):
+        builder.add_shape_mesh(-1, xform=mesh_xform, mesh=mesh, scale=mesh_scale, cfg=cfg)
+    body = builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(*position), wp.quat_identity()),
+        mass=1.0,
+        inertia=_identity_inertia(),
+        mode_count=1,
+        mode_mass=[1.0],
+        mode_stiffness=[100.0],
+        mode_damping=[0.0],
+        mode_q=[0.0],
+        mode_shape_fn=downward_shape_fn,
+    )
+    builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    builder.color()
+    return builder.finalize(device=device), body
+
+
+def _elastic_mesh_contact_rows(model, body, sign_method: str | None):
+    """Collide once and return the sample ids, normals and separations [m] of the elastic rows, sorted by sample."""
+    kwargs = {} if sign_method is None else {"elastic_contact_mesh_sign_method": sign_method}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit", reduce_contacts=False, **kwargs)
+    contacts = pipeline.contacts()
+    state = model.state()
+    pipeline.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    samples = contacts.rigid_contact_elastic_sample1.numpy()[:count]
+    order = np.argsort(samples, kind="stable")
+    normal = contacts.rigid_contact_normal.numpy()[:count][order]
+    point0 = contacts.rigid_contact_point0.numpy()[:count][order]
+    samples = samples[order]
+    body_q = state.body_q.numpy()[body]
+    world = body_q[:3] + quat_rotate(body_q[3:7], model.elastic_shape_vertex_local.numpy()[samples])
+    return samples, normal, np.einsum("ij,ij->i", normal, world - point0)
+
+
+def _elastic_box_sample_coordinate(model, body, axis: int) -> np.ndarray:
+    """Return one world coordinate [m] of the elastic box samples at the model's initial pose."""
+    body_q = model.state().body_q.numpy()[body]
+    return body_q[axis] + model.elastic_shape_vertex_local.numpy()[:, axis]
+
+
+def _elastic_box_samples_in_mesh_space(model, body, mesh_xform, mesh_scale) -> np.ndarray:
+    """Return the elastic box samples at the model's initial pose in the unscaled frame of the mesh [m]."""
+    body_q = model.state().body_q.numpy()[body]
+    world = body_q[:3] + quat_rotate(body_q[3:7], model.elastic_shape_vertex_local.numpy())
+    xform = np.array(mesh_xform, dtype=np.float64)
+    inverse_rotation = np.array([-xform[3], -xform[4], -xform[5], xform[6]])
+    return quat_rotate(inverse_rotation, world - xform[:3]) / np.asarray(mesh_scale)
+
+
+@wp.kernel
+def _pseudo_normal_reference_rows_kernel(
+    mesh: wp.uint64,
+    body_xform: wp.transform,
+    mesh_xform: wp.transform,
+    mesh_scale: wp.vec3,
+    max_dist: float,
+    sample_local: wp.array[wp.vec3],
+    found: wp.array[wp.int32],
+    separation: wp.array[float],
+    normal: wp.array[wp.vec3],
+):
+    i = wp.tid()
+    x = wp.transform_point(wp.transform_inverse(mesh_xform), wp.transform_point(body_xform, sample_local[i]))
+    query = wp.mesh_query_point_sign_normal(mesh, wp.cw_div(x, mesh_scale), max_dist)
+    if query.result:
+        delta = x - wp.cw_mul(wp.mesh_eval_position(mesh, query.face, query.u, query.v), mesh_scale)
+        found[i] = 1
+        separation[i] = wp.length(delta) * query.sign
+        normal[i] = wp.transform_vector(mesh_xform, wp.normalize(delta) * query.sign)
+
+
+def _pseudo_normal_reference_rows(model, body, mesh_xform, mesh_scale, contact_distance: float):
+    """Return the elastic rows of a static mesh shape computed directly from ``wp.mesh_query_point_sign_normal``.
+
+    Mirrors the definition of an elastic mesh row: the sample's closest mesh point within the
+    search radius, the pseudo-normal sign, and the row kept when its separation does not exceed
+    ``contact_distance`` (margins plus gaps of both shapes).
+    """
+    sample_local = model.elastic_shape_vertex_local
+    count = sample_local.shape[0]
+    found = wp.zeros(count, dtype=wp.int32, device=model.device)
+    separation = wp.zeros(count, dtype=float, device=model.device)
+    normal = wp.zeros(count, dtype=wp.vec3, device=model.device)
+    wp.launch(
+        _pseudo_normal_reference_rows_kernel,
+        dim=count,
+        inputs=[
+            wp.uint64(int(model.shape_source_ptr.numpy()[0])),
+            wp.transform(*model.state().body_q.numpy()[body]),
+            mesh_xform,
+            wp.vec3(*mesh_scale),
+            contact_distance / min(mesh_scale),
+            sample_local,
+        ],
+        outputs=[found, separation, normal],
+        device=model.device,
+    )
+    separation = separation.numpy()
+    keep = (found.numpy() == 1) & (separation <= contact_distance)
+    samples = np.flatnonzero(keep).astype(np.int32)
+    return samples, normal.numpy()[keep], separation[keep]
+
+
+def test_elastic_surface_contact_mesh_sign_default_matches_pseudo_normal(test, device):
+    """Keep the default elastic mesh rows equal to a direct pseudo-normal query.
+
+    The reference calls ``wp.mesh_query_point_sign_normal`` for every sample of an elastic box
+    next to a scaled and rotated mesh, a closed box and an open cup, and keeps the rows within
+    the 20 mm contact distance. The pipeline's default rows, and the rows with an explicit
+    ``"normal"``, must have the same samples, separations, and normals. The open cup gives rows
+    on which the sign tests disagree, so a change of the default sign test fails this check.
+    """
+    cases = {
+        "closed": (_box_mesh(), (0.1, 0.05, 0.0)),
+        "open_cup": (_box_mesh(faces=[f for f in _BOX_QUADS if f != "top"]), (-0.45, 0.05, 0.0)),
+    }
+    for name, (mesh, mesh_point) in cases.items():
+        with test.subTest(mesh=name):
+            scaled = np.asarray(mesh_point) * np.asarray(_TILTED_MESH_SCALE)
+            position = wp.transform_point(_TILTED_MESH_XFORM, wp.vec3(*scaled))
+            model, body = _build_elastic_box_near_mesh_model(
+                device, mesh, position, mesh_xform=_TILTED_MESH_XFORM, mesh_scale=_TILTED_MESH_SCALE
+            )
+            expected = _pseudo_normal_reference_rows(model, body, _TILTED_MESH_XFORM, _TILTED_MESH_SCALE, 0.02)
+            test.assertGreater(int(np.count_nonzero(expected[2] < 0.0)), 0)
+            test.assertGreater(int(np.count_nonzero(expected[2] > 0.0)), 0)
+            for sign_method in (None, "normal"):
+                samples, normal, separation = _elastic_mesh_contact_rows(model, body, sign_method)
+                np.testing.assert_array_equal(samples, expected[0])
+                np.testing.assert_allclose(separation, expected[2], rtol=0.0, atol=1.0e-6)
+                np.testing.assert_allclose(normal, expected[1], rtol=0.0, atol=1.0e-5)
+            if name == "open_cup":
+                # The other sign test changes these rows, so this check is sensitive to the sign test.
+                samples, _normal, separation = _elastic_mesh_contact_rows(model, body, "normal_and_parity")
+                test.assertFalse(
+                    np.array_equal(samples, expected[0]) and np.array_equal(np.sign(separation), np.sign(expected[2]))
+                )
+
+
+def test_elastic_surface_contact_mesh_sign_on_back_to_back_faces(test, device):
+    """Sign samples next to coincident back-to-back faces as separated with ``"normal_and_parity"``.
+
+    The static mesh is a square of two coincident triangle layers with opposite winding, so its
+    closest face has no defined side. An elastic box sits 5 mm above or below it. The pseudo-normal
+    test reports every sample within the 20 mm gap as penetrating by its distance, a known limit of
+    the default. ``"normal_and_parity"`` reports the distance as a positive separation with a
+    normal pointing from the square to the box, for both triangle orders.
+    """
+    for flip_order in (False, True):
+        for side in (1.0, -1.0):
+            with test.subTest(flip_order=flip_order, side=side):
+                mesh = _back_to_back_square_mesh(flip_order)
+                model, body = _build_elastic_box_near_mesh_model(device, mesh, (0.1, 0.03, side * 0.055))
+                distance = np.abs(_elastic_box_sample_coordinate(model, body, 2))
+                expected = np.sort(distance[distance <= 0.02])
+                test.assertGreater(expected.shape[0], 0)
+
+                _samples, _normal, separation = _elastic_mesh_contact_rows(model, body, "normal")
+                np.testing.assert_allclose(np.sort(-separation), expected, rtol=0.0, atol=1.0e-6)
+
+                _samples, normal, separation = _elastic_mesh_contact_rows(model, body, "normal_and_parity")
+                np.testing.assert_allclose(np.sort(separation), expected, rtol=0.0, atol=1.0e-6)
+                # Unit normals in single precision; their in-plane parts stay below 2e-5.
+                np.testing.assert_allclose(normal[:, 2], side, rtol=0.0, atol=1.0e-4)
+
+
+def test_elastic_surface_contact_mesh_sign_methods_agree_on_closed_mesh(test, device):
+    """Give the same rows with both sign tests on a closed mesh with outward-facing triangles.
+
+    The elastic box hovers 5 mm above the top face of a closed box mesh, or overlaps it by 6 mm.
+    Samples above the face are separated by their height; samples below it penetrate by their depth.
+    The same holds for the box mesh scaled non-uniformly and rotated, where the rows of both sign
+    tests must be identical.
+    """
+    for height in (0.055, 0.044):
+        with test.subTest(height=height):
+            model, body = _build_elastic_box_near_mesh_model(device, _box_mesh(), (0.1, 0.03, height))
+            z = _elastic_box_sample_coordinate(model, body, 2)
+            expected = np.sort(z[np.abs(z) <= 0.02])
+            samples, normal, separation = _elastic_mesh_contact_rows(model, body, "normal")
+            np.testing.assert_allclose(np.sort(separation), expected, rtol=0.0, atol=1.0e-6)
+            np.testing.assert_allclose(normal[:, 2], 1.0, rtol=0.0, atol=1.0e-4)
+            test.assertEqual(bool(np.any(separation < 0.0)), height < 0.05)
+            other_samples, other_normal, other_separation = _elastic_mesh_contact_rows(model, body, "normal_and_parity")
+            np.testing.assert_array_equal(other_samples, samples)
+            np.testing.assert_allclose(other_separation, separation, rtol=0.0, atol=1.0e-6)
+            np.testing.assert_allclose(other_normal, normal, rtol=0.0, atol=1.0e-4)
+
+    for offset in (0.006, -0.006):
+        with test.subTest(scaled_and_rotated=True, offset=offset):
+            mesh_point = np.array([0.1, 0.05, 0.0]) * np.asarray(_TILTED_MESH_SCALE) + np.array([0.0, 0.0, offset])
+            position = wp.transform_point(_TILTED_MESH_XFORM, wp.vec3(*mesh_point))
+            model, body = _build_elastic_box_near_mesh_model(
+                device, _box_mesh(), position, mesh_xform=_TILTED_MESH_XFORM, mesh_scale=_TILTED_MESH_SCALE
+            )
+            normal_rows = _elastic_mesh_contact_rows(model, body, "normal")
+            combined_rows = _elastic_mesh_contact_rows(model, body, "normal_and_parity")
+            test.assertGreater(int(np.count_nonzero(normal_rows[2] < 0.0)), 0)
+            for normal_array, combined_array in zip(normal_rows, combined_rows, strict=True):
+                np.testing.assert_array_equal(combined_array, normal_array)
+
+
+def test_elastic_surface_contact_mesh_sign_on_open_wall(test, device):
+    """Keep samples in front of an open wall separated with both sign tests.
+
+    The wall is a single-sided square facing the elastic box, which sits 5 mm in front of it. The
+    pseudo-normal gives the wall a side, so the samples are separated by their distance, and
+    ``"normal_and_parity"`` keeps that answer.
+    """
+    model, body = _build_elastic_box_near_mesh_model(device, _open_wall_mesh(), (-0.055, 0.03, 0.02))
+    distance = -_elastic_box_sample_coordinate(model, body, 0)
+    expected = np.sort(distance[distance <= 0.02])
+    test.assertGreater(expected.shape[0], 0)
+    for sign_method in ("normal", "normal_and_parity"):
+        _samples, normal, separation = _elastic_mesh_contact_rows(model, body, sign_method)
+        np.testing.assert_allclose(np.sort(separation), expected, rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(normal[:, 0], -1.0, rtol=0.0, atol=1.0e-4)
+
+
+def test_elastic_surface_contact_mesh_sign_trade_off_on_open_cup(test, device):
+    """Remove wrong-side rows but lose real contacts with ``"normal_and_parity"`` on an open cup.
+
+    The mesh is the box without its top face. The elastic box straddles the top edge of one wall.
+    Samples above the opening next to the edge are outside the solid, but the pseudo-normal of the
+    edge reports them inside. ``"normal_and_parity"`` reports none of them inside. Samples inside
+    the solid next to the wall are reported inside by the pseudo-normal, but the parity rays leave
+    through the opening, so ``"normal_and_parity"`` reports them separated: those contacts are lost.
+    Every row it reports inside is the same as with ``"normal"``, and every changed row keeps its
+    distance with a positive sign.
+    """
+    model, body = _build_elastic_box_near_mesh_model(
+        device, _box_mesh(faces=[f for f in _BOX_QUADS if f != "top"]), (-0.495, 0.03, 0.005)
+    )
+    inside = _box_solid_contains(_elastic_box_samples_in_mesh_space(model, body, wp.transform_identity(), (1, 1, 1)))
+    samples, _normal, separation = _elastic_mesh_contact_rows(model, body, "normal")
+    combined_samples, _combined_normal, combined_separation = _elastic_mesh_contact_rows(
+        model, body, "normal_and_parity"
+    )
+    np.testing.assert_array_equal(combined_samples, samples)
+
+    wrong_side = (separation < 0.0) & ~inside[samples]
+    test.assertGreater(int(np.count_nonzero(wrong_side)), 0)
+    test.assertFalse(bool(np.any((combined_separation < 0.0) & ~inside[samples])))
+
+    changed = combined_separation != separation
+    test.assertTrue(bool(np.all(separation[changed] < 0.0)))
+    np.testing.assert_allclose(combined_separation[changed], -separation[changed], rtol=0.0, atol=1.0e-6)
+    lost = changed & inside[samples]
+    test.assertGreater(int(np.count_nonzero(lost)), 0)
+
+
+def test_elastic_surface_contact_mesh_sign_on_inside_out_box(test, device):
+    """Pin both sign tests on a closed box whose triangles all face inward.
+
+    The elastic box hovers 5 mm above the top face or overlaps it by 6 mm. The pseudo-normal
+    reports every sample within the 20 mm gap with the wrong sign: samples above the face penetrate
+    by their height and samples inside are separated. ``"normal_and_parity"`` reports every sample
+    as separated by its distance, so it removes the wrong-side rows and loses every real contact.
+    """
+    for height in (0.055, 0.044):
+        with test.subTest(height=height):
+            model, body = _build_elastic_box_near_mesh_model(device, _box_mesh(inside_out=True), (0.1, 0.03, height))
+            z = _elastic_box_sample_coordinate(model, body, 2)
+            near = np.abs(z) <= 0.02
+            test.assertGreater(int(np.count_nonzero(near)), 0)
+            samples, _normal, separation = _elastic_mesh_contact_rows(model, body, "normal")
+            np.testing.assert_array_equal(samples, np.flatnonzero(near))
+            np.testing.assert_allclose(separation, -z[samples], rtol=0.0, atol=1.0e-6)
+            samples, _normal, separation = _elastic_mesh_contact_rows(model, body, "normal_and_parity")
+            np.testing.assert_array_equal(samples, np.flatnonzero(near))
+            np.testing.assert_allclose(separation, np.abs(z[samples]), rtol=0.0, atol=1.0e-6)
+
+
+def test_elastic_surface_contact_mesh_sign_method_validation(test, device):
+    """Reject sign tests other than ``"normal"`` and ``"normal_and_parity"``."""
+    model, _body = _build_elastic_box_near_mesh_model(device, _box_mesh(), (0.1, 0.03, 0.055))
+    for value in ("parity", "winding"):
+        with test.subTest(value=value):
+            with test.assertRaisesRegex(ValueError, "elastic_contact_mesh_sign_method"):
+                newton.CollisionPipeline(model, broad_phase="explicit", elastic_contact_mesh_sign_method=value)
+
+
+def _elastic_mesh_warnings(model, **kwargs) -> list[warnings.WarningMessage]:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        newton.CollisionPipeline(model, broad_phase="explicit", **kwargs)
+    return [w for w in caught if "unsuitable for reduced elastic contacts" in str(w.message)]
+
+
+def test_elastic_surface_contact_warns_about_unsuitable_mesh(test, device):
+    """Warn once about open and inside-out meshes that can contact an elastic shape, and only about those.
+
+    Two shapes share one open mesh, so the warning counts one mesh, names the problem, points at
+    the caller, and suggests ``"normal_and_parity"`` only while it is not selected. A closed box
+    with outward-facing triangles gives no warning.
+    """
+    model, _body = _build_elastic_box_near_mesh_model(device, _open_wall_mesh(), (-0.055, 0.03, 0.02), mesh_copies=2)
+    caught = _elastic_mesh_warnings(model)
+    test.assertEqual(len(caught), 1)
+    message = str(caught[0].message)
+    test.assertIn("1 mesh(es) are open", message)
+    test.assertIn("normal_and_parity", message)
+    test.assertEqual(os.path.normcase(caught[0].filename), os.path.normcase(__file__))
+
+    caught = _elastic_mesh_warnings(model, elastic_contact_mesh_sign_method="normal_and_parity")
+    test.assertEqual(len(caught), 1)
+    test.assertIn("can be missed", str(caught[0].message))
+    test.assertNotIn("Second,", str(caught[0].message))
+
+    model, _body = _build_elastic_box_near_mesh_model(device, _box_mesh(inside_out=True), (0.1, 0.03, 0.055))
+    caught = _elastic_mesh_warnings(model)
+    test.assertEqual(len(caught), 1)
+    test.assertIn("1 mesh(es) are closed but inside-out", str(caught[0].message))
+    test.assertNotIn("are open", str(caught[0].message))
+
+    model, _body = _build_elastic_box_near_mesh_model(device, _box_mesh(), (0.1, 0.03, 0.055))
+    test.assertEqual(_elastic_mesh_warnings(model), [])
+
+
 def test_elastic_surface_contact_reduction_preserves_modal_samples(test, device):
     """Check that contact reduction keeps valid elastic vertex samples."""
     model, _body = _build_elastic_ground_contact_model(device, z=0.04)
@@ -7732,6 +8129,54 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_surface_contact_deterministic_sort_orders_samples",
         test_elastic_surface_contact_deterministic_sort_orders_samples,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_default_matches_pseudo_normal",
+        test_elastic_surface_contact_mesh_sign_default_matches_pseudo_normal,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_on_back_to_back_faces",
+        test_elastic_surface_contact_mesh_sign_on_back_to_back_faces,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_methods_agree_on_closed_mesh",
+        test_elastic_surface_contact_mesh_sign_methods_agree_on_closed_mesh,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_on_open_wall",
+        test_elastic_surface_contact_mesh_sign_on_open_wall,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_trade_off_on_open_cup",
+        test_elastic_surface_contact_mesh_sign_trade_off_on_open_cup,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_on_inside_out_box",
+        test_elastic_surface_contact_mesh_sign_on_inside_out_box,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_mesh_sign_method_validation",
+        test_elastic_surface_contact_mesh_sign_method_validation,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_surface_contact_warns_about_unsuitable_mesh",
+        test_elastic_surface_contact_warns_about_unsuitable_mesh,
         devices=[device],
     )
     add_function_test(
