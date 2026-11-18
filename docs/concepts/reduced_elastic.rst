@@ -48,6 +48,26 @@ connected by ordinary joints, such as
 :meth:`~ModelBuilder.add_joint_revolute`, using their parent and child
 transforms on the elastic link as attachment points.
 
+To attach a compliant component after importing a robot, use the experimental
+:meth:`~ModelBuilder.extend_articulation` before creating joints for another
+articulation. The appended range must immediately follow the existing range and
+include the component's elastic owner joint as well as its physical attachment:
+
+.. code-block:: python
+
+   builder.add_urdf(robot_urdf, floating=False)
+   articulation = builder.articulation_count - 1
+   first_new_joint = builder.joint_count
+   tool = builder.add_link_elastic(modal_basis=tool_basis)
+   builder.add_joint_fixed(parent=wrist_body, child=tool)
+   builder.extend_articulation(
+       articulation, list(range(first_new_joint, builder.joint_count))
+   )
+
+The helper preserves the articulation's identity and metadata. Joints from
+another world or articulation cannot be absorbed. Physical loop-closing joints
+require ``allow_closed_loops=True`` and a compatible maximal-coordinate solver.
+
 Kinematics and state
 --------------------
 

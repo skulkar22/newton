@@ -4301,6 +4301,87 @@ class ModelBuilder:
                 expected_frequency=Model.AttributeFrequency.ARTICULATION,
             )
 
+    def extend_articulation(self, articulation: int, joints: list[int], *, allow_closed_loops: bool = False) -> None:
+        """Append unowned joints to an existing articulation's contiguous range.
+
+        .. experimental::
+
+        Use this after importing a robot, before creating joints for another articulation.
+        Articulation labels, indices and custom attributes are preserved. Validation completes
+        before ownership changes. The current world need not be the articulation's world, but
+        all appended joints must belong to that world.
+
+        Args:
+            articulation: Index of the articulation to extend.
+            joints: Contiguous, monotonically increasing joint indices starting at the
+                articulation's current end. Include any intervening elastic owner joints.
+            allow_closed_loops: Permit physical joints with repeated child bodies or cycles,
+                including loops already in the articulation. Use only with maximal-coordinate
+                solvers supporting loop closure, as described in :meth:`add_articulation`.
+                Elastic owner joints store state without imposing a physical constraint and
+                are excluded from this tree check.
+
+        Raises:
+            ValueError: If the articulation or joint indices are invalid, joints are not
+                contiguous with the existing range, are already owned, belong to a different
+                world, violate kinematic-root restrictions, connect separate articulations,
+                or form a loop without explicit opt-in.
+        """
+        if articulation < 0 or articulation >= self.articulation_count:
+            raise ValueError(f"Articulation index {articulation} is out of range [0, {self.articulation_count})")
+        if not joints:
+            raise ValueError("Cannot extend an articulation with no joints")
+
+        for joint in joints:
+            if joint < 0 or joint >= self.joint_count:
+                raise ValueError(f"Joint index {joint} is out of range [0, {self.joint_count})")
+            if self.joint_articulation[joint] >= 0:
+                raise ValueError(f"Joint {joint} already belongs to articulation {self.joint_articulation[joint]}")
+            if self.joint_world[joint] != self.articulation_world[articulation]:
+                raise ValueError(f"Joint {joint} belongs to a different world than articulation {articulation}")
+
+        current_end = self.articulation_end[articulation]
+        if joints != list(range(current_end, current_end + len(joints))):
+            raise ValueError(
+                f"Joints must be contiguous and monotonically increasing, starting at joint {current_end}. Got {joints}"
+            )
+
+        combined = range(self.articulation_start[articulation], joints[-1] + 1)
+        if not allow_closed_loops:
+            child_to_parent = {}
+            for joint in combined:
+                if self.joint_type[joint] == JointType.ELASTIC:
+                    continue
+                child, parent = self.joint_child[joint], self.joint_parent[joint]
+                if child in child_to_parent:
+                    raise ValueError(f"Body {child} has multiple joints as a child. Pass allow_closed_loops=True")
+                child_to_parent[child] = parent
+            visited = set()
+            for child in child_to_parent:
+                path = set()
+                ancestor = child
+                while ancestor in child_to_parent and ancestor not in visited:
+                    if ancestor in path:
+                        raise ValueError("Articulation contains a cycle. Pass allow_closed_loops=True")
+                    path.add(ancestor)
+                    ancestor = child_to_parent[ancestor]
+                visited.update(path)
+
+        self._validate_kinematic_articulation_joints(combined)
+        ownership = np.array(self.joint_articulation, dtype=np.int64)
+        ownership[joints] = articulation
+        self._validate_articulation_connections(
+            ownership,
+            np.asarray(self.joint_parent),
+            np.asarray(self.joint_child),
+            ownership >= 0,
+            self.body_count,
+        )
+
+        self.articulation_end[articulation] = joints[-1] + 1
+        for joint in joints:
+            self.joint_articulation[joint] = articulation
+
     def _record_curve_deformable_object(
         self,
         label: str | None,
