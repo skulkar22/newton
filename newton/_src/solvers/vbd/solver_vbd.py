@@ -967,7 +967,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 ``Control.joint_f`` wrench) in the translation of each dynamic body's starting
                 position guess. ``1`` (default) keeps the native prediction; ``0`` omits external
                 acceleration from the guess only; values in between keep a proportional part.
-                Inertial targets and predicted velocities stay unchanged, so the solved
+                Inertial targets and predicted velocities stay unchanged, so the converged
                 configuration is the same, but the iterations start elsewhere. This can help a
                 supported cable that barely drops; it may bias free motion at finite iterations.
                 Non-default values require rigid-only compliant ALM with rigid bodies integrated
