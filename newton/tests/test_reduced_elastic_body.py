@@ -2996,7 +2996,7 @@ def _settle_elastic_plank(
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_body_contact_buffer_size=64, **solver_kwargs)
-    observables = solver.observables({newton.solvers.SolverObservableFlags.CONTACT_F})
+    observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     for step in range(steps):
