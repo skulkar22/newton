@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 import math
 import unittest
 import warnings
@@ -916,6 +917,9 @@ class TestVBDSparseArticulation(unittest.TestCase):
             ("rigid_articulation_relaxation", math.nan),
             ("rigid_articulation_diagonal_regularization", math.nan),
             ("rigid_articulation_diagonal_regularization", math.inf),
+            ("rigid_articulation_angular_regularization", math.nan),
+            ("rigid_articulation_angular_regularization", math.inf),
+            ("rigid_articulation_angular_regularization", -1.0e-6),
         ):
             with self.subTest(name=name, value=value):
                 with self.assertRaisesRegex(ValueError, name):
@@ -2011,6 +2015,270 @@ def test_sparse_limit_and_force_options_default_off(test, device):
         test.assertFalse(np.array_equal(default_q, on_q), f"no effect of {options}")
 
 
+def _make_stiff_anchor_limit_model(device) -> tuple[newton.Model, list[int]]:
+    """Build a light four-link chain whose root hinge starts 0.071 rad inside its lower limit, held by ball anchors.
+
+    A world revolute joint (limit [-pi/2, 0.035] rad, ``limit_ke=1e4``, ``limit_kd=5``) carries the first link; three
+    ball joints carry the rest. Links are 2 cm long with mass 1 g and inertia 1e-7 kg*m^2.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    length = 0.02
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-7)
+    links = [builder.add_link(mass=1.0e-3, com=wp.vec3(0.5 * length, 0.0, 0.0), inertia=inertia) for _ in range(4)]
+    joints = [
+        builder.add_joint_revolute(
+            -1,
+            links[0],
+            axis=newton.Axis.Z,
+            limit_lower=-0.5 * math.pi,
+            limit_upper=0.035,
+            limit_ke=1.0e4,
+            limit_kd=5.0,
+        )
+    ]
+    for parent, child in itertools.pairwise(links):
+        joints.append(
+            builder.add_joint_ball(parent, child, parent_xform=wp.transform((length, 0.0, 0.0), wp.quat_identity()))
+        )
+    builder.add_articulation(joints)
+    builder.joint_q[builder.joint_q_start[joints[0]]] = -1.5
+    builder.color()
+    return builder.finalize(device=device), links
+
+
+def _stiff_anchor_limit_response(device, solve, **options) -> tuple[float, float, float, float]:
+    """Pull the chain into its hinge limit through K = 1e6 joints at 16 iterations.
+
+    Over 120 steps of 1/2400 s, returns the largest hinge overshoot past the lower limit [rad], and over the last 60
+    steps: the fraction of sign flips between consecutive hinge-angle increments larger than 1e-6 rad, the
+    peak-to-peak hinge angle [rad] and the final distance of the hinge angle from the lower limit [rad].
+    """
+    model, links = _make_stiff_anchor_limit_model(device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=16,
+        rigid_compliant_alm=True,
+        rigid_articulation_solve=solve,
+        rigid_joint_linear_ke=1.0e6,
+        rigid_joint_angular_ke=1.0e6,
+        rigid_joint_linear_kd=0.0,
+        rigid_joint_angular_kd=0.0,
+        **options,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    # 50 N on the last link, 0.5 rad past the limit direction, presses the hinge into its lower bound.
+    pull_angle = -0.5 * math.pi - 0.5
+    wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+    wrench[links[-1], 0:2] = (50.0 * math.cos(pull_angle), 50.0 * math.sin(pull_angle))
+    body_f = wp.array(wrench, dtype=wp.spatial_vector, device=device)
+    angles = []
+    for _ in range(120):
+        state_in.clear_forces()
+        wp.copy(state_in.body_f, body_f)
+        solver.step(state_in, state_out, None, None, 1.0 / 2400.0)
+        state_in, state_out = state_out, state_in
+        rotation = state_in.body_q.numpy()[links[0], 3:7].astype(np.float64)
+        angles.append(2.0 * math.atan2(rotation[2], rotation[3]))
+    angles = np.asarray(angles)
+    lower = -0.5 * math.pi
+    overshoot = lower - float(np.min(angles))
+    hold = angles[-60:]
+    increments = np.diff(hold)
+    increments = increments[np.abs(increments) > 1.0e-6]
+    alternation = float(np.mean(np.sign(increments[1:]) != np.sign(increments[:-1]))) if increments.size > 1 else 0.0
+    return overshoot, alternation, float(np.ptp(hold)), abs(float(hold[-1]) - lower)
+
+
+def test_sparse_stiff_joint_limit_rings_without_rho_floor(test, device):
+    """Hold a limit loaded through K = 1e6 joints at 16 iterations without chatter only with the limit rho floor."""
+    for solve in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(solve=solve):
+            # Control: without the floor this scene overshoots the limit and the hinge chatters during the hold.
+            overshoot, alternation, _, _ = _stiff_anchor_limit_response(device, solve, rigid_limit_rho_floor=False)
+            test.assertGreater(overshoot, 3.0e-3)
+            test.assertGreater(alternation, 0.03)
+            overshoot, alternation, swing, distance = _stiff_anchor_limit_response(
+                device, solve, rigid_limit_rho_floor=True
+            )
+            test.assertLess(overshoot, 1.0e-3)
+            test.assertLess(alternation, 0.01)
+            test.assertLess(swing, 1.0e-4)
+            # The hinge rests on the limit, not short of it.
+            test.assertLess(distance, 1.0e-3)
+
+
+def _make_tiny_inertia_rod_model(device) -> tuple[newton.Model, list[int], int]:
+    """32 x 2 mm rod at its authored segment inertia (~1e-14 kg*m^2), held by a ball joint to the world.
+
+    Material as in a thin cable model: radius 0.25 mm, stretch/shear stiffness 5e5 N/m, bend/twist stiffness
+    5e-6 N*m/rad, damping 10 N*s/m on the linear rows and 5e-6 N*m*s/rad on the angular rows. The last segment is
+    joined by a ball joint to a 10 g tip link (the tensioning end). ``finalize()`` raises the segment inertia to its
+    floor; the analytic thin-rod inertia is written back afterwards, as a model with authored inertia does.
+    """
+    segments, length, radius = 32, 2.0e-3, 0.25e-3
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    points = np.zeros((segments + 1, 3))
+    points[:, 0] = np.arange(segments + 1) * length
+    rod = newton.Rod(
+        points,
+        radius=radius,
+        stretch_rigidity=1.0e3,
+        shear_rigidity=1.0e3,
+        bend_rigidity=1.0e-8,
+        twist_rigidity=1.0e-8,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="add_rod: wrap_in_articulation=False", category=UserWarning)
+        bodies, joints = builder.add_rod(
+            rod=rod,
+            cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, has_shape_collision=False),
+            body_frame_origin="com",
+            wrap_in_articulation=False,
+            stretch_damping=0.0,
+            bend_damping=0.0,
+        )
+    for joint in joints:
+        dof = builder.joint_qd_start[joint]
+        builder.joint_target_kd[dof : dof + 6] = [0.02 / length] * 3 + [1.0e-8 / length] * 3
+    tip_offset, tip_mass = 5.0e-3, 0.01
+    tip = builder.add_link(
+        xform=wp.transform(wp.vec3(segments * length + tip_offset, 0.0, 0.0), wp.quat_identity()),
+        mass=tip_mass,
+        inertia=wp.mat33(np.eye(3) * tip_mass * 1.0e-4),
+    )
+    # Segment frames have local +z along the rod (+x in world).
+    joints.append(
+        builder.add_joint_ball(
+            -1, bodies[0], child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.5 * length), wp.quat_identity())
+        )
+    )
+    joints.append(
+        builder.add_joint_ball(
+            bodies[-1],
+            tip,
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5 * length), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-tip_offset, 0.0, 0.0), wp.quat_identity()),
+        )
+    )
+    builder.add_articulation(joints)
+    builder.color()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Inertia validation corrected")
+        model = builder.finalize(device=device)
+    inertia = model.body_inertia.numpy()
+    inv_inertia = model.body_inv_inertia.numpy()
+    for body in bodies:
+        authored = np.asarray(builder.body_inertia[body], dtype=np.float64).reshape(3, 3)
+        inertia[body] = authored
+        inv_inertia[body] = np.linalg.inv(authored)
+    model.body_inertia.assign(inertia)
+    model.body_inv_inertia.assign(inv_inertia)
+    return model, bodies, tip
+
+
+def _run_tiny_inertia_rod(device, mode: str, iterations: int, steps: int = 60, **options):
+    """Pull the tip link of the tiny-inertia rod with 10 N from slightly kinked segment orientations.
+
+    Returns ``(body_q per step [steps, bodies, 7], clamped pivots per step, rod bodies)``.
+    """
+    model, bodies, tip = _make_tiny_inertia_rod_model(device)
+    solver = newton.solvers.SolverVBD(
+        model, iterations=iterations, rigid_compliant_alm=True, rigid_articulation_solve=mode, **options
+    )
+    state_in, state_out = model.state(), model.state()
+    poses = state_in.body_q.numpy()
+    rng = np.random.default_rng(3)
+    for body in bodies:  # 0.1 rad about a random axis per segment
+        axis = rng.normal(size=3)
+        poses[body, 3:7] = _quat_mul(_quat_from_axis_angle(axis / np.linalg.norm(axis), 0.1), poses[body, 3:7])
+    state_in.body_q.assign(poses)
+    state_out.body_q.assign(poses)
+    wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+    wrench[tip, 0] = 10.0
+    body_f = wp.array(wrench, dtype=wp.spatial_vector, device=device)
+    trajectory, clamped = [], []
+    for _ in range(steps):
+        state_in.clear_forces()
+        wp.copy(state_in.body_f, body_f)
+        solver.step(state_in, state_out, None, None, 1.0 / 2400.0)
+        state_in, state_out = state_out, state_in
+        trajectory.append(state_in.body_q.numpy())
+        counter = solver.rigid_articulation_pivot_clamped
+        clamped.append(0 if counter is None else int(counter.numpy()[0]))
+    return np.array(trajectory), np.array(clamped), bodies
+
+
+def test_sparse_tiny_inertia_rod_needs_angular_regularization(test, device):
+    """Keep a tiny-inertia rod finite and close to the local solve with the angular regularization.
+
+    At ~1e-14 kg*m^2 the angular inertia term I/dt^2 of a 2 mm segment is ~1e-7 N*m/rad at dt = 1/2400 s, below
+    the default 1e-6 shift; after the stretch lever-arm terms cancel, the softest angular pivot of the coupled
+    system is the bend damping (~0.01 N*m/rad). A tensioned rod then takes rotation steps of radians: with the
+    default the rod folds (largest neighbour bend above 90 deg on CPU and above 140 deg on CUDA) and ends
+    centimetres from the local solve. 5.76 N*m/rad is the angular term a 1e-6 kg*m^2 inertia floor would add
+    (1e-6 kg*m^2 / (1/2400 s)^2), here as a Hessian-only shift that leaves the inertia authored: the rod stays
+    finite, no pivot is clamped, and it follows the local solve. Tolerances: 8 sparse iterations against a
+    32-iteration local reference; measured max deviation 0.04 mm (CPU) / 0.55 mm (CUDA) and max bend 0.4 / 10.6 deg
+    at 5.76; at the default 11-12 cm and 121-130 deg (CPU), 3.4-15 cm and 159-180 deg (CUDA, varies run to run).
+    """
+    local_q, _, bodies = _run_tiny_inertia_rod(device, "local", iterations=32)
+    test.assertTrue(np.isfinite(local_q).all())
+
+    def deviation(q: np.ndarray) -> float:
+        return float(np.max(np.abs(q[:, :, :3] - local_q[:, :, :3])))
+
+    def max_bend_deg(q: np.ndarray) -> float:
+        tangents = np.stack(
+            [[_quat_rotate(q[s, b, 3:7], np.array([0.0, 0.0, 1.0])) for b in bodies] for s in range(len(q))]
+        )
+        cosines = np.clip(np.sum(tangents[:, :-1] * tangents[:, 1:], axis=-1), -1.0, 1.0)
+        return float(np.degrees(np.arccos(cosines)).max())
+
+    folded_bend_deg = 140.0 if wp.get_device(device).is_cuda else 90.0
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(mode=mode, regularization="default"):
+            # Precondition, not a contract: the scenario must reproduce the large-rotation failure at the
+            # default, otherwise the 5.76 subtest below no longer guards anything. Update or remove this check
+            # if the default path improves.
+            q, _, _ = _run_tiny_inertia_rod(device, mode, iterations=8)
+            test.assertGreater(deviation(q), 1.0e-2, "the default no longer reproduces the authored-inertia failure")
+            test.assertGreater(max_bend_deg(q), folded_bend_deg, "the default no longer folds the rod")
+        with test.subTest(mode=mode, regularization=5.76):
+            q, clamped, _ = _run_tiny_inertia_rod(
+                device, mode, iterations=8, rigid_articulation_angular_regularization=5.76
+            )
+            test.assertTrue(np.isfinite(q).all())
+            test.assertEqual(int(clamped.sum()), 0)
+            test.assertLess(max_bend_deg(q), 30.0)
+            test.assertLess(deviation(q), 2.0e-3)
+
+
+def test_sparse_angular_regularization_reaches_solve(test, device):
+    """Change the sparse trajectory when ``rigid_articulation_angular_regularization`` changes.
+
+    The exact effect on the assembled system is checked in ``test_vbd_sparse_variable_assembly``; this end-to-end
+    check only shows that the solver passes the value to both sparse modes. CUDA only, like the other
+    ``_run_levels_variant`` tests: on CPU the deterministic build would be loaded for this test alone, and the
+    rod test above already shows the value reaching the serial CPU solve.
+    """
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(mode=mode):
+            reference = _run_levels_variant(
+                device, steps=20, graph=False, model_name="star", rigid_articulation_solve=mode
+            )
+            shifted = _run_levels_variant(
+                device,
+                steps=20,
+                graph=False,
+                model_name="star",
+                rigid_articulation_solve=mode,
+                rigid_articulation_angular_regularization=1.0,
+            )
+            test.assertFalse(np.array_equal(shifted, reference), "the option must reach the assembly")
+
+
 add_function_test(
     TestVBDSparseArticulationDevices,
     "test_sparse_falls_back_to_local_without_articulations",
@@ -2094,6 +2362,12 @@ add_function_test(
     TestVBDSparseArticulationDevices,
     "test_sparse_limit_and_force_options_reject_invalid_values",
     test_sparse_limit_and_force_options_reject_invalid_values,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_stiff_joint_limit_rings_without_rho_floor",
+    test_sparse_stiff_joint_limit_rings_without_rho_floor,
     devices=devices,
 )
 add_function_test(
@@ -2263,6 +2537,18 @@ add_function_test(
     "test_sparse_levels_launch_level_plan",
     test_sparse_levels_launch_level_plan,
     devices=devices,
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_tiny_inertia_rod_needs_angular_regularization",
+    test_sparse_tiny_inertia_rod_needs_angular_regularization,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_angular_regularization_reaches_solve",
+    test_sparse_angular_regularization_reaches_solve,
+    devices=[device for device in devices if device.is_cuda],
 )
 
 

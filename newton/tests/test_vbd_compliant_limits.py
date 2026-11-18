@@ -12,7 +12,7 @@ import newton
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
-def _impact(device, iterations, reverse, sign, ke, kd, enabled=True, graph=False):
+def _impact(device, iterations, reverse, sign, ke, kd, graph=False):
     inertia = np.array([1.0e-5, 1.0e-6])
     dt = 1.0 / 1200.0
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -35,10 +35,6 @@ def _impact(device, iterations, reverse, sign, ke, kd, enabled=True, graph=False
     solver = newton.solvers.SolverVBD(
         model,
         iterations=iterations,
-        rigid_avbd_beta=1.0e6,
-        rigid_joint_linear_k_start=1.0e7,
-        rigid_joint_angular_k_start=1.0e5,
-        rigid_joint_limit_alm=enabled,
     )
     state, out = model.state(), model.state()
     control = model.control()
@@ -52,10 +48,11 @@ def _impact(device, iterations, reverse, sign, ke, kd, enabled=True, graph=False
     for _ in range(14):
         predicted = angles + dt * omega
         g = sign * (predicted[1] - predicted[0]) - 0.05
-        g_prev = max(sign * (angles[1] - angles[0]) - 0.05, 0.0)
-        # Closed-form backward Euler for the unilateral Kelvin-Voigt stop.
-        stiffness = ke + 0.5 * kd / dt
-        traction = max((stiffness * g - 0.5 * kd / dt * g_prev) / (1 + stiffness * dt**2 * np.sum(1 / inertia)), 0)
+        g_prev = sign * (angles[1] - angles[0]) - 0.05
+        # Closed-form backward Euler for the unilateral Kelvin-Voigt stop: force ke * g + kd * dg/dt, kept while it
+        # pushes the joint back into its range.
+        stiffness = ke + kd / dt
+        traction = max((stiffness * g - kd / dt * g_prev) / (1 + stiffness * dt**2 * np.sum(1 / inertia)), 0)
         omega += sign * dt * traction * np.array([1 / inertia[0], -1 / inertia[1]])
         angles += dt * omega
         reference.append(omega.copy())

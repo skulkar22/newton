@@ -244,6 +244,7 @@ def assemble_articulation_body_diagonal_variable(
     body_disp: wp.array[wp.vec3],
     body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
+    angular_regularization: float,
     values: wp.array[float],
     rhs: wp.array[float],
 ):
@@ -252,8 +253,9 @@ def assemble_articulation_body_diagonal_variable(
     Launch with ``dim = articulation_body_count - rigid_body_row_count``; thread ``t`` handles row
     ``rigid_body_row_count + t`` and skips reduced elastic bodies (see
     :func:`scatter_elastic_body_block_variable`). The block is the one the 6 x 6 kernels assemble
-    (``_body_diagonal_contribution``: inertia, contact and external Hessians and forces, the small
-    angular regularization, ``1e30 I_6`` for static bodies), written at the variable offsets.
+    (``_body_diagonal_contribution``: inertia, contact and external Hessians and forces, the
+    ``angular_regularization`` [N m/rad] on the angular diagonal, ``1e30 I_6`` for static
+    bodies), written at the variable offsets.
     """
     row = rigid_body_row_count + wp.tid()
     body = articulation_bodies[row]
@@ -278,6 +280,7 @@ def assemble_articulation_body_diagonal_variable(
         body_disp,
         body_disp_ang,
         use_displacement,
+        angular_regularization,
     )
     slot = articulation_diag_slots[row]
     for i in range(6):
@@ -904,6 +907,7 @@ def assemble_articulation_variable_system(
     twists: wp.array,
     values: wp.array,
     rhs: wp.array,
+    angular_regularization: float,
     device: wp.context.Devicelike = None,
 ) -> tuple[wp.array, wp.array]:
     """Assemble the variable-size block system of every mixed articulation of ``layout``.
@@ -949,6 +953,9 @@ def assemble_articulation_variable_system(
         twists: Scratch, shape [twist_scratch_size(layout)], dtype ``vec6f``.
         values: Block values, shape [layout.articulation_value_count].
         rhs: Right-hand side, shape [layout.articulation_scalar_count].
+        angular_regularization: Stiffness added to the three angular diagonal entries of every
+            rigid body row [N m/rad]; Hessian only. The solver passes
+            ``SolverVBD.rigid_articulation_angular_regularization``.
         device: Launch device; defaults to the device of ``values``.
 
     Returns:
@@ -1007,6 +1014,7 @@ def assemble_articulation_variable_system(
             body_disp,
             body_disp_ang,
             use_displacement,
+            angular_regularization,
         ],
         outputs=[values, rhs],
         device=device,
