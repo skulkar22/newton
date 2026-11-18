@@ -185,7 +185,8 @@ def test_bdf2_reset_restarts_world_history(test, device):
 
 
 def test_bdf2_rejects_unsupported_models(test, device):
-    """Reject BDF2 with the local solve, joint mimics, particles, reduced elastic bodies or invalid option values."""
+    """Reject BDF2 with the local solve, joint mimics, particles, reduced elastic bodies, a rescaled position
+    guess or invalid option values."""
 
     def pendulum_model(add_mimic: bool = False, add_particle: bool = False) -> newton.Model:
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_GRAVITY))
@@ -232,6 +233,17 @@ def test_bdf2_rejects_unsupported_models(test, device):
         _make_solver(pendulum_model(), rigid_time_integration="bdf3")
     with test.assertRaisesRegex(ValueError, "rigid_bdf2_theta_policy"):
         _make_solver(pendulum_model(), rigid_time_integration="bdf2", rigid_bdf2_theta_policy="off")
+
+    with test.assertRaisesRegex(ValueError, "rigid_position_guess_acceleration_scale"):
+        _make_solver(pendulum_model(), rigid_time_integration="bdf2", rigid_position_guess_acceleration_scale=0.0)
+    with test.assertRaisesRegex(ValueError, "rigid_position_guess_acceleration_scale"):
+        _make_solver(
+            pendulum_model(),
+            rigid_time_integration="bdf2",
+            rigid_articulation_solve="block_sparse_levels",
+            rigid_position_guess_acceleration_scale=0.5,
+        )
+    _make_solver(pendulum_model(), rigid_time_integration="bdf2", rigid_position_guess_acceleration_scale=1.0)
 
     solver = _make_solver(pendulum_model(), rigid_time_integration="bdf2")
     test.assertTrue(solver.rigid_axis_support_armature)

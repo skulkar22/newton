@@ -972,6 +972,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 supported cable that barely drops; it may bias free motion at finite iterations.
                 Non-default values require rigid-only compliant ALM with rigid bodies integrated
                 by this solver. Ignored with zero iterations (the guess would be the result).
+                Supported with ``rigid_articulation_solve`` ``"local"``, ``"block_sparse_joints"``
+                and ``"block_sparse_levels"``; rejected with ``rigid_time_integration="bdf2"`` (its
+                warm start replaces the guess), with ``integrate_with_external_rigid_solver=True``,
+                with particles and with reduced elastic bodies. With
+                ``rigid_external_force_mode="solve"`` the forward step is force-free, so the scale
+                acts on gravity only.
 
                 .. experimental::
                     ``rigid_position_guess_acceleration_scale`` is experimental and may change or
@@ -1741,8 +1747,30 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
         self._integrates_rigid_bodies = integrates_rigid_bodies
-        if not 0.0 <= rigid_position_guess_acceleration_scale <= 1.0:
-            raise ValueError("rigid_position_guess_acceleration_scale must be in [0, 1]")
+        if isinstance(rigid_position_guess_acceleration_scale, bool) or not isinstance(
+            rigid_position_guess_acceleration_scale, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(
+                "rigid_position_guess_acceleration_scale must be a real number, "
+                f"got {type(rigid_position_guess_acceleration_scale).__name__}"
+            )
+        if not isfinite(rigid_position_guess_acceleration_scale) or not (
+            0.0 <= rigid_position_guess_acceleration_scale <= 1.0
+        ):
+            raise ValueError(
+                "rigid_position_guess_acceleration_scale must be finite and in [0, 1], "
+                f"got {rigid_position_guess_acceleration_scale}"
+            )
+        if rigid_position_guess_acceleration_scale != 1.0:
+            if integrate_with_external_rigid_solver:
+                raise ValueError(
+                    "rigid_position_guess_acceleration_scale != 1 is not supported with "
+                    "integrate_with_external_rigid_solver=True: SolverVBD does not predict the rigid poses."
+                )
+            if int(model.elastic_body_count) > 0:
+                raise ValueError(
+                    "rigid_position_guess_acceleration_scale != 1 is not supported with reduced elastic bodies."
+                )
         if rigid_position_guess_acceleration_scale != 1.0 and (
             not integrates_rigid_bodies or not rigid_compliant_alm or model.particle_count > 0
         ):
@@ -9071,6 +9099,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             raise ValueError("rigid_time_integration='bdf2' does not support particles")
         if self.model.tendon_count > 0:
             raise ValueError("rigid_time_integration='bdf2' does not support tendons")
+        if self.rigid_position_guess_acceleration_scale != 1.0:
+            # The BDF2 predictor writes its own guess and warm_start_body_displacement then replaces
+            # it with the previous step's converged displacement, so a rescaled guess has no effect.
+            raise ValueError(
+                "rigid_position_guess_acceleration_scale != 1 is not supported with "
+                "rigid_time_integration='bdf2': the BDF2 warm start replaces the starting guess."
+            )
 
     def _setup_time_integration(
         self,

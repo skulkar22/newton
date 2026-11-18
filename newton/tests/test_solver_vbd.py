@@ -10,6 +10,7 @@ import unittest
 import warnings
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -17,7 +18,7 @@ import warp as wp
 import newton
 from newton._src.geometry.soft_contacts_mesh import _SoftContactFilterData
 from newton._src.geometry.tri_mesh_collision import build_tri_mesh_collision_info
-from newton._src.solvers.vbd import particle_vbd_kernels, rigid_vbd_kernels
+from newton._src.solvers.vbd import particle_vbd_kernels, rigid_vbd_kernels, solver_vbd
 from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
@@ -38,6 +39,7 @@ from newton._src.solvers.vbd.particle_vbd_kernels import (
     make_solve_elasticity_tile,
     scatter_particle_body_contact_force_and_hessian,
 )
+from newton._src.solvers.vbd.rigid_position_guess_kernels import scale_rigid_position_guess_acceleration
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     ElasticReducedMobility,
     JointFrictionData,
@@ -9583,6 +9585,123 @@ for _test in (
     )
 
 
+def _position_guess_pendulum_model(device, add_particle: bool = False) -> newton.Model:
+    """Build a three-link pendulum chain and a free body, under gravity."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-2)
+    joints = []
+    parent = -1
+    for i in range(3):
+        link = builder.add_link(mass=1.0 + i, com=wp.vec3(0.0, 0.0, -0.25), inertia=inertia)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform((0.0, 0.0, 1.0 if parent < 0 else -0.5), wp.quat_identity()),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.joint_q[builder.joint_q_start[joints[0]]] = 0.4
+    builder.add_body(xform=wp.transform((1.0, 0.0, 2.0), wp.quat_identity()), mass=2.0, inertia=inertia)
+    if add_particle:
+        builder.add_particle((0.0, 0.0, 2.0), (0.0, 0.0, 0.0), 1.0)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def test_position_guess_scale_rejects_invalid_values_and_paths(test, device):
+    """Validate the scale's type and range and reject the solver paths it does not support."""
+    model = _position_guess_pendulum_model(device)
+
+    def make(scale, target_model=None, **options):
+        return newton.solvers.SolverVBD(
+            model if target_model is None else target_model,
+            iterations=4,
+            rigid_compliant_alm=options.pop("rigid_compliant_alm", True),
+            rigid_position_guess_acceleration_scale=scale,
+            **options,
+        )
+
+    for value in ("0.5", None, True, [0.5]):
+        with test.assertRaisesRegex(TypeError, "real number", msg=repr(value)):
+            make(value)
+    for value in (-0.1, 1.5, float("nan"), float("inf")):
+        with test.assertRaisesRegex(ValueError, r"finite and in \[0, 1\]", msg=repr(value)):
+            make(value)
+    for value, expected in ((0, 0.0), (0.5, 0.5), (np.float32(0.25), 0.25), (1, 1.0)):
+        solver = make(value)
+        test.assertIsInstance(solver.rigid_position_guess_acceleration_scale, float)
+        test.assertEqual(solver.rigid_position_guess_acceleration_scale, expected)
+
+    with test.assertRaisesRegex(ValueError, "integrate_with_external_rigid_solver"):
+        make(0.0, integrate_with_external_rigid_solver=True)
+    with test.assertRaisesRegex(ValueError, "rigid-only compliant ALM"):
+        make(0.0, target_model=_position_guess_pendulum_model(device, add_particle=True))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with test.assertRaisesRegex(ValueError, "rigid-only compliant ALM"):
+            make(0.0, rigid_compliant_alm=False)
+        # The default stays accepted on every path.
+        make(1.0, rigid_compliant_alm=False)
+        make(1.0, integrate_with_external_rigid_solver=True)
+
+    elastic_builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    elastic_builder.add_body_elastic(
+        mass=1.0,
+        inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-2),
+        mode_count=1,
+        mode_mass=[1.0],
+        mode_stiffness=[100.0],
+        mode_damping=[0.0],
+        mode_shape_fn=lambda _x: np.array([[0.0, 0.0, 0.1]], dtype=np.float32),
+    )
+    elastic_builder.color()
+    elastic_model = elastic_builder.finalize(device=device)
+    with test.assertRaisesRegex(ValueError, "reduced elastic bodies"):
+        make(0.0, target_model=elastic_model)
+
+
+def _run_position_guess_pendulum(device, iterations: int, steps: int = 30, **options):
+    """Step the pendulum scene; return final body_q, body_qd and the number of guess-scaling launches."""
+    model = _position_guess_pendulum_model(device)
+    solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_compliant_alm=True, **options)
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    with mock.patch.object(solver_vbd.wp, "launch", wraps=wp.launch) as launch:
+        for _ in range(steps):
+            solver.step(state_in, state_out, None, None, 4.0e-3)
+            state_in, state_out = state_out, state_in
+    scale_launches = sum(
+        1 for call in launch.call_args_list if call.kwargs.get("kernel") is scale_rigid_position_guess_acceleration
+    )
+    return state_in.body_q.numpy(), state_in.body_qd.numpy(), scale_launches
+
+
+def test_position_guess_scale_default_is_identity(test, device):
+    """Leave the default bitwise unchanged and never launch the guess-scaling kernel at scale 1."""
+    default_q, default_qd, default_launches = _run_position_guess_pendulum(device, 4)
+    one_q, one_qd, one_launches = _run_position_guess_pendulum(device, 4, rigid_position_guess_acceleration_scale=1.0)
+    np.testing.assert_array_equal(default_q, one_q)
+    np.testing.assert_array_equal(default_qd, one_qd)
+    test.assertEqual(default_launches, 0)
+    test.assertEqual(one_launches, 0)
+    scaled_q, _, scaled_launches = _run_position_guess_pendulum(device, 4, rigid_position_guess_acceleration_scale=0.0)
+    test.assertEqual(scaled_launches, 30)
+    test.assertFalse(np.array_equal(default_q, scaled_q))
+
+
+def test_position_guess_scale_is_ignored_without_iterations(test, device):
+    """With zero iterations the guess is the step result, so the scale is not applied."""
+    default_q, default_qd, _ = _run_position_guess_pendulum(device, 0)
+    scaled_q, scaled_qd, launches = _run_position_guess_pendulum(device, 0, rigid_position_guess_acceleration_scale=0.0)
+    test.assertEqual(launches, 0)
+    np.testing.assert_array_equal(default_q, scaled_q)
+    np.testing.assert_array_equal(default_qd, scaled_qd)
+
+
 class TestVBDRigidContactHistoryProvenance(unittest.TestCase):
     pass
 
@@ -9636,6 +9755,17 @@ add_function_test(
     devices=cuda_devices,
 )
 
+
+class TestVBDPositionGuessScale(unittest.TestCase):
+    pass
+
+
+for _test in (
+    test_position_guess_scale_rejects_invalid_values_and_paths,
+    test_position_guess_scale_default_is_identity,
+    test_position_guess_scale_is_ignored_without_iterations,
+):
+    add_function_test(TestVBDPositionGuessScale, _test.__name__, _test, devices=devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
