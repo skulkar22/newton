@@ -61,6 +61,7 @@ def _evaluate_normal_contact(
         1,
         1.0e-3,
         wp.vec3(0.0),
+        False,
         active_set_linear,
     )
     force_a[0] = f_a

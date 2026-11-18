@@ -865,6 +865,7 @@ def _eval_separating_contact_damping_kernel(
         dt,
         wp.vec3(0.0),
         bidirectional,
+        0,
     )
     (
         _force_a_undamped,
@@ -905,6 +906,7 @@ def _eval_separating_contact_damping_kernel(
         dt,
         wp.vec3(0.0),
         bidirectional,
+        0,
     )
     damping_forces[mode, 2] = force_b_damped - force_b_undamped
     damping_hessians[mode, 2] = h_ll_b_damped - h_ll_b_undamped
