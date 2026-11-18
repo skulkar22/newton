@@ -123,7 +123,7 @@ def _legacy_alm_allowed():
     """
     with warnings.catch_warnings():
         warnings.filterwarnings(
-            "ignore", message="rigid_compliant_alm=False is deprecated", category=DeprecationWarning
+            "ignore", message="VBD options rigid_compliant_alm=False", category=DeprecationWarning
         )
         yield
 

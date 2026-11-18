@@ -1009,6 +1009,8 @@ class TestRigidContact(unittest.TestCase):
         writer.body_q = wp.array(poses, dtype=wp.transform, device=device)
         writer.shape_body = wp.array(np.arange(len(poses)), dtype=int, device=device)
         writer.shape_gap = wp.full(len(poses), 0.001, dtype=float, device=device)
+        # The integration branch's writer skips reduced-elastic bodies; mark every body rigid.
+        writer.body_elastic_index = wp.full(len(poses), -1, dtype=wp.int32, device=device)
         writer.contact_count = contacts.rigid_contact_count
         for field in (
             "shape0",
@@ -1021,6 +1023,8 @@ class TestRigidContact(unittest.TestCase):
             "margin0",
             "margin1",
             "tids",
+            "elastic_sample0",
+            "elastic_sample1",
         ):
             setattr(writer, f"out_{field}", getattr(contacts, f"rigid_contact_{field}"))
         writer.shape_transform = writer.body_q

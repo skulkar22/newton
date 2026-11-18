@@ -110,8 +110,8 @@ from .graph_coloring import (
     combine_independent_coloring_plan,
     construct_particle_graph,
 )
-from .modal import ModalBasis
 from .joint_mimic import _SUPPORTED_JOINT_TYPES
+from .modal import ModalBasis
 from .model import Model, _pack_shape_pair_codes
 from .rod import Rod
 from .shape_contact_pairs import _ShapeContactPairs
