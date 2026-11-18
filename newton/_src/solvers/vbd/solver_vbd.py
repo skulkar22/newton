@@ -2167,7 +2167,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._setup_external_force_mode(rigid_external_force_mode)
         self._warn_position_guess_relaxation_bias()
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
-        self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
+        self._mimic_solver = self._create_mimic_solver()
 
         # Initialize rigid penetration-free (DAT) truncation state
         self._init_rigid_penetration_free(model, rigid_soft_dat_use_interval_arithmetic)
@@ -2703,12 +2703,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if elastic_body_array.shape[0] == 0:
             return
         model = self.model
-        if self._has_joint_mimics:
-            raise NotImplementedError(
-                f"SolverVBD with rigid_articulation_solve={self.rigid_articulation_solve!r} and "
-                f"rigid_articulation_elastic_solve={backend!r} does not support joint mimics together with "
-                "reduced elastic articulation bodies. Use rigid_articulation_solve='local'."
-            )
+        self._check_mimic_sparse_elastic()
         elastic_bodies = set(elastic_body_array.numpy().tolist())
         parent = model.joint_parent.numpy()
         child = model.joint_child.numpy()
@@ -3471,9 +3466,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.model, "SolverVBD"
             )
             self._check_bdf2_supported()
-            self._mimic_solver = (
-                JointMimicSolver(self.model, self._joint_coordinates.data) if self._has_joint_mimics else None
-            )
+            self._mimic_solver = self._create_mimic_solver()
             self._update_displacement_mode()
         # Armature, damping, and friction also arrive with the narrow DOF flags, which the broad
         # JOINT_DOF_PROPERTIES bit does not include.
@@ -7569,6 +7562,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.body_hessian_ll,
                 self.body_hessian_al,
                 self.body_hessian_aa,
+                self.rigid_articulation_sparse_values,
             )
         self._update_rigid_body_duals(state_in, state_out, control, contacts, dt)
 
@@ -10004,6 +9998,31 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             outputs=[self.body_forces, self.body_torques],
             device=self.device,
         )
+
+    def _check_mimic_sparse_elastic(self) -> None:
+        """Reject joint mimics when the block-sparse solve covers reduced elastic bodies.
+
+        The mimic solve reads the 6 x 6 block factors of rigid-only articulations; the Schur-reduced
+        and variable-size block systems of articulations with elastic bodies are not supported.
+        """
+        layout = self.rigid_articulation_sparse_layout
+        if layout is None or not self._has_joint_mimics:
+            return
+        backend = layout.elastic_solve
+        elastic_bodies = layout.mixed_elastic_bodies if backend == "coupled" else layout.elastic_bodies
+        if elastic_bodies.shape[0] > 0:
+            raise NotImplementedError(
+                f"SolverVBD with rigid_articulation_solve={self.rigid_articulation_solve!r} and "
+                f"rigid_articulation_elastic_solve={backend!r} does not support joint mimics together with "
+                "reduced elastic articulation bodies. Use rigid_articulation_solve='local'."
+            )
+
+    def _create_mimic_solver(self) -> JointMimicSolver | None:
+        """Build the mimic solve; in the block-sparse modes it uses the articulations' coupled factors."""
+        if not self._has_joint_mimics:
+            return None
+        self._check_mimic_sparse_elastic()
+        return JointMimicSolver(self.model, self._joint_coordinates.data, self.rigid_articulation_sparse_layout)
 
     def _update_displacement_mode(self):
         """Enable the displacement-form update unless another solver writes body poses.
