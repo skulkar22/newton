@@ -110,6 +110,7 @@ from .reduced_elastic_sparse_kernels import (
     scatter_elastic_sparse_schur,
     update_elastic_sparse_modes,
 )
+from .rigid_position_guess_kernels import scale_rigid_position_guess_acceleration
 from .rigid_sparse_articulation import ELASTIC_SOLVE_MODES, build_rigid_articulation_sparse_layout
 from .rigid_sparse_articulation_kernels import (
     SPARSE_ARTICULATION_CTA_THREADS,
@@ -767,6 +768,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_avbd_linear_beta: float | None = None,  # Legacy linear beta override
         rigid_avbd_angular_beta: float | None = None,  # Legacy angular beta override
         rigid_avbd_gamma: float = 0.999,  # Per-step decay for persisted lambda (and legacy penalty k)
+        rigid_position_guess_acceleration_scale: float = 1.0,  # Experimental starting-guess scale
         # Rigid body - contacts
         rigid_contact_hard: bool | None = None,  # Legacy body-body contact hard/soft mode
         rigid_contact_history: bool | None = None,  # Body-body contact numeric warm-start
@@ -960,6 +962,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 Compliant ALM joints, particle-body attachments, and validated contacts
                 retain lambda by ``gamma``; the legacy path retains joint and contact
                 lambda by ``alpha * gamma``. Lower values discard history faster.
+            rigid_position_guess_acceleration_scale: Experimental scale in ``[0, 1]`` of the
+                external acceleration (gravity and the integrated ``State.body_f`` /
+                ``Control.joint_f`` wrench) in the translation of each dynamic body's starting
+                position guess. ``1`` (default) keeps the native prediction; ``0`` omits external
+                acceleration from the guess only; values in between keep a proportional part.
+                Inertial targets and predicted velocities stay unchanged, so the solved
+                configuration is the same, but the iterations start elsewhere. This can help a
+                supported cable that barely drops; it may bias free motion at finite iterations.
+                Non-default values require rigid-only compliant ALM with rigid bodies integrated
+                by this solver. Ignored with zero iterations (the guess would be the result).
+
+                .. experimental::
+                    ``rigid_position_guess_acceleration_scale`` is experimental and may change or
+                    be removed.
             rigid_contact_hard: Legacy body-body contact hard/soft mode. With
                 ``rigid_compliant_alm=True``, contacts use the ALM path. With
                 ``rigid_compliant_alm=False``, ``True`` selects legacy hard AVBD contact
@@ -1725,6 +1741,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
         self._integrates_rigid_bodies = integrates_rigid_bodies
+        if not 0.0 <= rigid_position_guess_acceleration_scale <= 1.0:
+            raise ValueError("rigid_position_guess_acceleration_scale must be in [0, 1]")
+        if rigid_position_guess_acceleration_scale != 1.0 and (
+            not integrates_rigid_bodies or not rigid_compliant_alm or model.particle_count > 0
+        ):
+            raise ValueError("Nondefault position-guess scale requires internally integrated rigid-only compliant ALM")
+        self.rigid_position_guess_acceleration_scale = float(rigid_position_guess_acceleration_scale)
 
         # Initialize particle system
         self._init_particle_system(
@@ -6169,6 +6192,23 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     block_dim=self._rigid_body_block_dim,
                     device=self.device,
                 )
+                if self.rigid_position_guess_acceleration_scale != 1.0 and self.iterations > 0:
+                    # Rescale the external acceleration in the starting guess only; the inertial
+                    # target written above keeps the full prediction.
+                    wp.launch(
+                        kernel=scale_rigid_position_guess_acceleration,
+                        dim=model.body_count,
+                        inputs=[
+                            dt,
+                            self.rigid_position_guess_acceleration_scale,
+                            model.gravity,
+                            model.body_world,
+                            body_f_for_integration,
+                            self.body_inv_mass_effective,
+                        ],
+                        outputs=[state_in.body_q],
+                        device=self.device,
+                    )
 
             # Truncate the forward step against the division planes before any
             # solve iterations run on the predicted poses.
