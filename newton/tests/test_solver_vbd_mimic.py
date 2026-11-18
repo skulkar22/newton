@@ -354,6 +354,11 @@ def _build_jointed_mimic_mechanism(device, topology, copies=1):
             builder.add_articulation(joints)
             mimics.append((joints[2], reference, 0.1, 0.5))
             coordinates = [0.4, 0.2, 0.1]
+        elif topology == "chain":
+            # The serial chain without a mimic.
+            joints = chain(3, x)
+            builder.add_articulation(joints)
+            coordinates = [0.4, 0.2, 0.2]
         else:
             raise ValueError(topology)
         initial.extend(zip(joints, coordinates, strict=True))
@@ -394,7 +399,9 @@ def _run_jointed_mimic_mechanism(device, topology, iterations, copies=1, **solve
         state, next_state = next_state, state
         separation = max(separation, _hinge_separation(state.body_q.numpy(), hinges))
     coordinates = state.joint_q.numpy()
-    mimic_error = max(abs(coordinates[f] - offset - ratio * coordinates[r]) for f, r, offset, ratio in rows)
+    mimic_error = max(
+        (abs(coordinates[f] - offset - ratio * coordinates[r]) for f, r, offset, ratio in rows), default=0.0
+    )
     return coordinates, separation, mimic_error, observables.solver_residual_history.numpy()[:, -1], solver
 
 
@@ -497,6 +504,60 @@ def test_vbd_mimic_block_sparse_graph_replay(test, device):
             np.testing.assert_allclose(results[1], results[0], atol=1.0e-5)
 
 
+def _set_joint_mimic(model, follower, reference, coeffs=(0.1, 0.5)):
+    """Change a mimic in the model arrays, as a user does before ``notify_model_changed``."""
+    references = model.joint_mimic_joint.numpy()
+    references[follower] = reference
+    model.joint_mimic_joint.assign(references)
+    values = model.joint_mimic_coeffs.numpy()
+    values[follower] = coeffs
+    model.joint_mimic_coeffs.assign(values)
+
+
+def test_vbd_mimic_block_sparse_rejected_model_change(test, device):
+    """Reject a mimic across two articulations through ``notify_model_changed`` and refuse to step.
+
+    ``ModelBuilder`` rejects such a mimic, so the model arrays are changed directly. The rejected
+    change keeps the solver's previous mimic state, and ``step`` raises until a later
+    ``notify_model_changed`` accepts the model.
+    """
+    for solve in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(solve=solve):
+            model, _hinges, _rows = _build_jointed_mimic_mechanism(device, "chain", copies=2)
+            solver = newton.solvers.SolverVBD(
+                model, iterations=16, rigid_compliant_alm=True, rigid_articulation_solve=solve
+            )
+            state, next_state = model.state(), model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            solver.step(state, next_state, None, None, 4.0e-3)
+            test.assertIsNone(solver._mimic_solver)
+            test.assertEqual(solver._use_body_displacement, 1)
+
+            # Joints 0-2 form the first articulation, joints 3-5 the second.
+            _set_joint_mimic(model, 5, 1)
+            with test.assertRaisesRegex(ValueError, "two different articulations"):
+                solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            test.assertFalse(solver._has_joint_mimics)
+            test.assertIsNone(solver._mimic_solver)
+            test.assertEqual(solver._use_body_displacement, 1)
+            with test.assertRaisesRegex(RuntimeError, "rejected the model's joint mimics"):
+                solver.step(next_state, state, None, None, 4.0e-3)
+
+            # A mimic inside the second articulation is accepted and enforced.
+            _set_joint_mimic(model, 5, -1)
+            _set_joint_mimic(model, 5, 4)
+            solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            test.assertTrue(solver._has_joint_mimics)
+            test.assertIsNotNone(solver._mimic_solver)
+            test.assertEqual(solver._use_body_displacement, 0)
+            for _ in range(30):
+                solver.step(state, next_state, None, None, 4.0e-3)
+                state, next_state = next_state, state
+            coordinates = state.joint_q.numpy()
+            # Measured 2.2e-8 to 6.7e-8 rad on CPU and CUDA; without the mimic this error is 2.1e-2 rad.
+            test.assertLess(abs(coordinates[5] - 0.1 - 0.5 * coordinates[4]), 1.0e-6)
+
+
 class TestSolverVBDMimic(unittest.TestCase):
     pass
 
@@ -514,6 +575,7 @@ for test_function in (
     test_vbd_mimic_block_sparse_many_articulations,
     test_vbd_mimic_block_sparse_kinematic_reference,
     test_vbd_mimic_block_sparse_graph_replay,
+    test_vbd_mimic_block_sparse_rejected_model_change,
 ):
     add_function_test(TestSolverVBDMimic, test_function.__name__, test_function, devices=get_test_devices())
 
