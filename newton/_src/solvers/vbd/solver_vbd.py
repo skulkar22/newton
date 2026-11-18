@@ -5142,7 +5142,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 last iteration; ``SOLVER_RESIDUAL_HISTORY`` records one row per iteration. With
                 ``rigid_articulation_solve="block_sparse_joints"`` or ``"block_sparse_levels"``, each sparse
                 articulation is one block: it contributes the stationarity residual ``r^T A^-1 r`` of all its
-                bodies together, sampled after the iteration's sparse solve and before relaxation. With
+                bodies together, computed from the right-hand side and the unrelaxed step of the iteration's
+                sparse solve, i.e. at the iterate before the update. With
                 ``rigid_time_integration="bdf2"`` the residual is that of the BDF2 step equations. Reduced
                 elastic bodies on the local block solve record nothing. See :ref:`solver_residual_observable`
                 and :ref:`vbd_residual_history`.

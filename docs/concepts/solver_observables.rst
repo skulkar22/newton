@@ -294,9 +294,10 @@ articulation is the block. It contributes one stationarity residual
 residuals of its bodies (and, under ``rigid_articulation_elastic_solve="coupled"``,
 the modal residuals of its reduced elastic bodies) and :math:`A` is the
 articulation's sparse Hessian, including ``rigid_articulation_diagonal_regularization``
-and ``rigid_articulation_angular_regularization``. It is sampled after the
-iteration's sparse solve, from the unrelaxed step and before
-``rigid_articulation_relaxation`` is applied, so the world entry is the largest
+and ``rigid_articulation_angular_regularization``. It is computed from the
+right-hand side and the unrelaxed step of the iteration's sparse solve, i.e. at
+the iterate before the update, so it does not depend on
+``rigid_articulation_relaxation``. The world entry is the largest
 residual of any of its articulations, particles, and locally solved bodies; the
 history records it for every iteration. With ``rigid_time_integration="bdf2"``
 the residual is that of the BDF2 step equations, whose inertial term uses
