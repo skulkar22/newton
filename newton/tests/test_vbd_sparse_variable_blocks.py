@@ -1091,6 +1091,7 @@ def _launch_legacy_serial_solve(layout, values, rhs, delta, body_count, device):
             body_vec,
             body_vec,
             0,
+            wp.zeros(1, dtype=wp.int32, device=device),
             body_q_new,
         ],
         device=device,

@@ -31,10 +31,10 @@ def _load_block66_scalar(values: wp.array[float], slot: int) -> mat66f:
 
 
 @wp.func
-def _cholesky66_scalar(values: wp.array[float], slot: int):
+def _cholesky66_scalar(values: wp.array[float], slot: int, pivot_clamped: wp.array[wp.int32]):
     # Keep the dependent scalar operations in thread-local storage. Publishing
     # intermediate pivots to global memory adds latency without sharing work.
-    factor = _cholesky66_serial(_load_block66_scalar(values, slot))
+    factor = _cholesky66_serial(_load_block66_scalar(values, slot), pivot_clamped)
     for i in range(6):
         for j in range(6):
             _scalar_block_set(values, slot, i, j, factor[i, j])
@@ -75,6 +75,7 @@ def solve_articulation_sparse_levels(
     level_update_right_slots: wp.array[wp.int32],
     values: wp.array[float],
     rhs: wp.array[float],
+    pivot_clamped: wp.array[wp.int32],
     delta: wp.array[float],
 ):
     """Cooperative factor and triangular solves over independent pivot levels.
@@ -94,7 +95,7 @@ def solve_articulation_sparse_levels(
         begin = level_body_offsets[level]
         end = level_body_offsets[level + 1]
         for row in range(begin + lane, end, threads):
-            _cholesky66_scalar(values, diag_slots[row])
+            _cholesky66_scalar(values, diag_slots[row], pivot_clamped)
         _block_sync()
 
         column_begin = level_column_offsets[level]

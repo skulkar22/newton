@@ -467,6 +467,7 @@ def _eval_compliant_sliding_contact_metric_kernel(
             0.01,
             wp.vec3(0.0),
             False,
+            0,
         )
     )
     force_out[0] = force_a
@@ -1186,6 +1187,7 @@ def _eval_rigid_contact_rigid_motion_kernel(
         dt,
         wp.vec3(0.0),
         False,
+        0,
     )
     (
         force_a_undamped,
@@ -1226,6 +1228,7 @@ def _eval_rigid_contact_rigid_motion_kernel(
         dt,
         wp.vec3(0.0),
         False,
+        0,
     )
     rigid_delta = wp.max(wp.length(force_a_damped - force_a_undamped), wp.length(force_b_damped - force_b_undamped))
     rigid_delta = wp.max(rigid_delta, wp.length(torque_a_damped - torque_a_undamped))

@@ -622,6 +622,8 @@ def build_rigid_articulation_sparse_layout(
             body_articulation_local_host[body] = local_body
 
         for local_row, row_cols in enumerate(pattern):
+            # ``_find_block_slot`` binary-searches a row's columns.
+            assert all(a < b for a, b in itertools.pairwise(row_cols)), "block columns must be strictly increasing"
             row_start = len(block_cols_host)
             block_cols_host.extend(row_cols)
             diag_slots_host.append(row_start + row_cols.index(local_row))

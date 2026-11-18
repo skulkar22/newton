@@ -56,6 +56,8 @@ from . import (
     rigid_sparse_articulation_variable_assembly,
     rigid_sparse_articulation_variable_kernels,
     rigid_sparse_articulation_variable_metrics,
+    rigid_sparse_level_launch_kernels,
+    rigid_sparse_levels_kernels,
     rigid_vbd_kernels,
     vbd_coupling_kernels,
 )
@@ -132,6 +134,7 @@ from .rigid_sparse_articulation_kernels import (
     vec6f,
     warm_start_body_displacement,
 )
+from .rigid_sparse_level_launch_kernels import build_level_launch_plan, launch_level_scheduled_solve
 from .rigid_sparse_levels_kernels import solve_articulation_sparse_levels
 from .rigid_vbd_kernels import (
     _NUM_CONTACT_THREADS_PER_BODY,
@@ -791,6 +794,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_articulation_relaxation: float = 0.65,
         rigid_articulation_diagonal_regularization: float = 0.0,
         rigid_articulation_elastic_solve: str = "coupled",
+        rigid_articulation_levels_block_dim: int = 128,
+        rigid_articulation_levels_launch: str = "articulation",
+        rigid_articulation_contact_active_set: bool = False,
         rigid_joint_adaptive_stiffness: bool | None = None,
         elastic_body_relaxation: float = 1.0,
         elastic_solver_metrics: bool = False,
@@ -1145,6 +1151,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 sequential work for chains. On CPU it uses the serial solve with the level
                 ordering. Level ordering can increase fill; dense separators still serialize.
                 Neither sparse mode changes contact assembly or numerical precision.
+                ``rigid_articulation_levels_launch`` selects how the level-scheduled solve is launched.
             rigid_articulation_relaxation: Under-relaxation factor for the experimental coupled
                 articulation position update. A value of ``1`` applies the full Newton update.
                 The default damps sparse articulation updates so they do not overstep stale
@@ -1193,6 +1200,37 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     ``rigid_articulation_elastic_solve`` and both of its values are experimental and
                     may change or be removed without a deprecation period; ``"schur"`` is kept for
                     comparison only.
+            rigid_articulation_levels_block_dim: Threads per CUDA block of the cooperative
+                ``"block_sparse_levels"`` solve, in which one block factors one articulation, and of
+                the tail launch of ``rigid_articulation_levels_launch="level"``. A multiple of 32 in
+                ``[32, 512]``; the default 128 matches the joint assembly launch. More threads
+                shorten the per-thread rounds of a large elimination level of one long articulation at
+                the price of fewer resident blocks when there are many articulations. The block size
+                does not change the arithmetic. The upper bound is a conservative limit for this
+                kernel's register use under the current Warp version. Ignored by the ``"local"`` and
+                ``"block_sparse_joints"`` solves. Experimental.
+            rigid_articulation_levels_launch: How the ``"block_sparse_levels"`` solve is launched on
+                CUDA. ``"articulation"`` (default) runs one cooperative block per articulation through
+                all of its elimination levels, so one long articulation uses one multiprocessor.
+                ``"level"`` launches each phase of each level as one grid over that level's tasks of
+                every articulation, so the large early levels of a long articulation use the whole
+                GPU; the trailing levels, from the first one with fewer pivot rows (summed over
+                articulations) than a fixed threshold, are solved by one cooperative launch. It
+                targets models with few long articulations: many small articulations fill no such
+                tail and should keep ``"articulation"``. Both schedules perform the same operations
+                in the same fixed order; a substitution row or Schur destination with many entries is
+                summed in fixed chunks under ``"level"``, so models with a dense separator differ
+                from ``"articulation"`` at round-off. The CPU keeps the serial solve under both
+                values. Ignored by the ``"local"`` and ``"block_sparse_joints"`` solves. Experimental.
+            rigid_articulation_contact_active_set: Block-sparse articulation solves only. Linearize
+                body-body contacts on the multiplier's active set: while a contact's dual normal
+                force is compressive, its primal normal force follows ``k*C + lambda`` without the
+                per-iteration clamp at zero (bounded below by ``-lambda``), so a coupled step that
+                carries a body a little past separation is pulled back by the penalty instead of being
+                released and pushed back in by the load. The dual update still retires the contact
+                when ``lambda + rho*C`` turns non-positive; friction and damping use the compressive
+                part only. The ``local`` solve rejects the option. Experimental; default ``False`` keeps
+                the clamped force.
             rigid_joint_adaptive_stiffness: Legacy AVBD joint penalty ramping switch. ``False`` sets both the linear
                 and angular beta values to zero and, with ``rigid_compliant_alm=False``, skips the per-step joint
                 dual update, so legacy joints keep their authored stiffness. ``None`` and ``True`` leave the beta
@@ -1651,6 +1689,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
+                # The two level-scheduled solves emit no atomics; they are listed so that both
+                # launch schedules always receive the same module options.
+                rigid_sparse_levels_kernels,
+                rigid_sparse_level_launch_kernels,
                 rigid_sparse_articulation_variable_kernels,
                 rigid_sparse_articulation_variable_assembly,
                 reduced_elastic_kernels,
@@ -1658,6 +1700,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 accumulate_body_body_contacts_per_body.module,
                 compute_rigid_contact_forces.module,
                 update_duals_body_body_contacts.module,
+                # The BDF2 joint assembly compiles as its own module; its float atomics need the
+                # same deterministic option as the BDF1 assembly in rigid_sparse_articulation_kernels.
+                assemble_articulation_joints_scalar_bdf2.module,
             )
             for module in rigid_modules:
                 self._set_module_options(options, module=module)
@@ -1706,7 +1751,31 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 f"rigid_articulation_elastic_solve must be one of {ELASTIC_SOLVE_MODES}, "
                 f"got {rigid_articulation_elastic_solve!r}"
             )
+        if (
+            isinstance(rigid_articulation_levels_block_dim, bool)
+            or not isinstance(rigid_articulation_levels_block_dim, (int, np.integer))
+            or not 32 <= rigid_articulation_levels_block_dim <= 512
+            or rigid_articulation_levels_block_dim % 32 != 0
+        ):
+            raise ValueError(
+                "rigid_articulation_levels_block_dim must be a multiple of 32 in [32, 512], "
+                f"got {rigid_articulation_levels_block_dim!r}"
+            )
+        if rigid_articulation_levels_launch not in ("articulation", "level"):
+            raise ValueError(
+                "rigid_articulation_levels_launch must be 'articulation' or 'level', "
+                f"got {rigid_articulation_levels_launch!r}"
+            )
         self.rigid_articulation_solve = rigid_articulation_solve
+        self.rigid_articulation_levels_block_dim = int(rigid_articulation_levels_block_dim)
+        self.rigid_articulation_levels_launch = rigid_articulation_levels_launch
+        if not isinstance(rigid_articulation_contact_active_set, (bool, np.bool_)):
+            raise ValueError(
+                f"rigid_articulation_contact_active_set must be a bool, got {rigid_articulation_contact_active_set!r}"
+            )
+        if rigid_articulation_contact_active_set and rigid_articulation_solve == "local":
+            raise ValueError("rigid_articulation_contact_active_set requires a block-sparse rigid_articulation_solve")
+        self.rigid_articulation_contact_active_set = bool(rigid_articulation_contact_active_set)
         self.rigid_articulation_relaxation = rigid_articulation_relaxation
         self.rigid_articulation_diagonal_regularization = rigid_articulation_diagonal_regularization
         self.rigid_articulation_elastic_solve = rigid_articulation_elastic_solve
@@ -1881,7 +1950,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_sparse_delta_scalar = None
         self.rigid_articulation_sparse_joint_dof_dim = model.joint_dof_dim
         self._rigid_articulation_sparse_zero_views: tuple[wp.array, ...] = ()
+        self._rigid_articulation_level_launch_plan = None
+        self.rigid_articulation_pivot_clamped = None
         if self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels"):
+            # Block-Cholesky pivots clamped to the floor during the current step (device int32[1], reset at
+            # the start of every step). A non-zero count means the float32 factorization of that step was
+            # not trustworthy; see ``SPARSE_PIVOT_FLOOR_RELATIVE``.
+            self.rigid_articulation_pivot_clamped = wp.zeros(1, dtype=wp.int32, device=self.device)
             self.rigid_articulation_sparse_layout = build_rigid_articulation_sparse_layout(
                 model,
                 self.device,
@@ -1889,6 +1964,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 use_levels=self.rigid_articulation_solve == "block_sparse_levels",
             )
             layout = self.rigid_articulation_sparse_layout
+            if (
+                self.rigid_articulation_levels_launch == "level"
+                and self.device.is_cuda
+                and layout is not None
+                and layout.levels is not None
+                and layout.rigid_articulation_count > 0
+            ):
+                # Static per-level task lists (built once); the CPU keeps the serial solve.
+                self._rigid_articulation_level_launch_plan = build_level_launch_plan(
+                    layout, self.device, tail_block_dim=self.rigid_articulation_levels_block_dim
+                )
             if layout is not None:
                 self._rigid_articulation_armature_target = wp.zeros_like(model.joint_qd)
                 if layout.elastic_solve == "coupled":
@@ -4693,6 +4779,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             preserve_history=self.rigid_contact_history,
         )
 
+        if self.rigid_articulation_pivot_clamped is not None:
+            self.rigid_articulation_pivot_clamped.zero_()
         for iter_num in range(self.iterations):
             rigid_due = self.collision_pipeline is not None and self._rigid_collision_is_due(iter_num)
             soft_due = self.particle_enable_self_contact and self._self_contact_is_due(iter_num)
@@ -7037,11 +7125,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         state_out: State | None = None,
         body_contact_block_dim: int = 256,
         particle_contact_block_dim: int = 256,
+        contact_active_set: bool = False,
     ):
         """Accumulate contact and body-particle attachment terms for a body group.
 
         ``state_out.joint_q`` carries the current reduced elastic modal coordinates (the
         previous ones are in ``state_in.joint_q``); without it contacts use ``state_in``.
+        ``contact_active_set`` selects the active-set linearization of body-body contacts
+        (coupled sparse solve); the local sweep passes ``False``.
         """
         model = self.model
         joint_q = state_in.joint_q
@@ -7162,6 +7253,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_contact_alpha,
                     self.rigid_contact_hard,
                     self.rigid_compliant_alm,
+                    int(contact_active_set),
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_shape0,
                     contacts.rigid_contact_shape1,
@@ -7784,7 +7876,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
         if model.elastic_body_count > 0:
             self._accumulate_elastic_frame_coupling(state_in, state_out, dt)
-        self._accumulate_rigid_contact_forces(state_in, contacts, dt, layout.articulation_bodies, state_out)
+        self._accumulate_rigid_contact_forces(
+            state_in,
+            contacts,
+            dt,
+            layout.articulation_bodies,
+            state_out,
+            contact_active_set=self.rigid_articulation_contact_active_set,
+        )
         if self.rigid_articulation_diagonal_regularization > 0.0:
             # The coupled backend regularizes the frame rows of mixed articulations itself.
             wp.launch(
@@ -7947,6 +8046,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._body_disp,
                         self._body_disp_ang,
                         self._use_body_displacement,
+                        self.rigid_articulation_pivot_clamped,
                     ],
                     outputs=[state_in.body_q],
                     device=self.device,
@@ -7965,10 +8065,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         outputs=[self.body_hessian_ll, self.body_hessian_al, self.body_hessian_aa],
                         device=self.device,
                     )
-                if layout.levels is not None:
+                if self._rigid_articulation_level_launch_plan is not None:
+                    launch_level_scheduled_solve(
+                        self._rigid_articulation_level_launch_plan,
+                        layout,
+                        self._rigid_articulation_sparse_values_scalar,
+                        self._rigid_articulation_sparse_rhs_scalar,
+                        self._rigid_articulation_sparse_delta_scalar,
+                        self.device,
+                        self.rigid_articulation_pivot_clamped,
+                    )
+                elif layout.levels is not None:
                     wp.launch(
                         kernel=solve_articulation_sparse_levels,
-                        dim=layout.rigid_articulation_count * SPARSE_ARTICULATION_CTA_THREADS,
+                        dim=layout.rigid_articulation_count * self.rigid_articulation_levels_block_dim,
                         inputs=[
                             layout.articulation_body_offsets,
                             layout.articulation_block_row_offsets,
@@ -7989,10 +8099,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                             layout.levels.level_update_right_slots,
                             self._rigid_articulation_sparse_values_scalar,
                             self._rigid_articulation_sparse_rhs_scalar,
+                            self.rigid_articulation_pivot_clamped,
                         ],
                         outputs=[self._rigid_articulation_sparse_delta_scalar],
                         device=self.device,
-                        block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                        block_dim=self.rigid_articulation_levels_block_dim,
                     )
                 else:
                     wp.launch(
@@ -8012,6 +8123,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                             layout.articulation_diag_slots,
                             self._rigid_articulation_sparse_values_scalar,
                             self._rigid_articulation_sparse_rhs_scalar,
+                            self.rigid_articulation_pivot_clamped,
                         ],
                         outputs=[self._rigid_articulation_sparse_delta_scalar],
                         device=self.device,
@@ -8280,6 +8392,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_contact_alpha,
                     self.rigid_contact_hard,
                     self.rigid_compliant_alm,
+                    int(self.rigid_articulation_contact_active_set),
                     self.friction_epsilon,
                     self.rigid_contact_damping_bidirectional,
                     self.body_body_contact_buffer_pre_alloc,
