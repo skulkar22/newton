@@ -1,0 +1,1 @@
+Raise a `ValueError` at construction for `SolverVBD(deterministic=...)` with `rigid_articulation_elastic_solve="schur"` and Schur-eliminated reduced elastic bodies on Warp 1.19 or later, which refuses to compile the Schur column kernel in a deterministic mode; use the default `rigid_articulation_elastic_solve="coupled"`.

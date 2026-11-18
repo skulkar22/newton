@@ -20,7 +20,12 @@ from newton._src.solvers.vbd import (
     rigid_sparse_articulation_variable_kernels,
 )
 from newton.tests import _reduced_elastic_fixtures as elastic_fixtures
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_test_devices,
+    warp_version_at_least,
+)
 
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
@@ -997,12 +1002,23 @@ def test_elastic_articulation_honors_deterministic_option(test, device, backend)
             with test.subTest(mode=mode):
                 for module, options in zip(modules, original, strict=True):
                     wp.set_module_options(options, module=module)
-                _solver(
-                    _make_elastic_chain_model(device),
-                    mode,
-                    backend=backend,
-                    deterministic=wp.DeterministicMode.RUN_TO_RUN,
-                )
+                if backend == "schur" and mode == _SPARSE and warp_version_at_least("1.19.0.dev0"):
+                    # Warp >= 1.19 cannot compile the Schur column kernel deterministically; the
+                    # solver rejects the combination after forwarding the module options.
+                    with test.assertRaisesRegex(ValueError, "rigid_articulation_elastic_solve='coupled'"):
+                        _solver(
+                            _make_elastic_chain_model(device),
+                            mode,
+                            backend=backend,
+                            deterministic=wp.DeterministicMode.RUN_TO_RUN,
+                        )
+                else:
+                    _solver(
+                        _make_elastic_chain_model(device),
+                        mode,
+                        backend=backend,
+                        deterministic=wp.DeterministicMode.RUN_TO_RUN,
+                    )
                 for module in modules:
                     options = wp.get_module_options(module=module)
                     test.assertEqual(options["deterministic"], wp.DeterministicMode.RUN_TO_RUN)

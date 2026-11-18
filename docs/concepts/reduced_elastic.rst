@@ -559,6 +559,11 @@ list. Construction raises :class:`ValueError` when one launch would need more
 than 1 GiB. Every elastic body's contacts should fit its per-body list; a step
 whose list overflows can exceed the buffers and then raises a
 :class:`ValueError` naming the ``rigid_body_contact_buffer_size`` needed.
+With Warp 1.19 or later, a deterministic mode is not available together with
+``rigid_articulation_elastic_solve="schur"`` when the block-sparse solve
+eliminates reduced elastic bodies: construction raises :class:`ValueError`
+(Warp refuses to compile the Schur column kernel deterministically); the
+default ``"coupled"`` elastic solve is supported.
 Deterministic mode is much slower: a 240-step drop of a three-mode plank with
 about 100 contacts took 26 to 35 times longer than in the default mode on a
 shared RTX PRO 6000 Blackwell GPU (Warp 1.18).

@@ -38,6 +38,11 @@ ELASTIC_ROLLOUT_SPEED_MAX = 0.05
 _MUJOCO_WARP_DETERMINISM_UNSUPPORTED = warp_version_at_least("1.19.0.dev0")
 
 
+# Warp 1.19 rejects build_elastic_sparse_schur_columns, which reads and atomically updates
+# elastic_body_block_matrix, in deterministic mode; SolverVBD refuses the combination at construction.
+_SCHUR_DETERMINISM_UNSUPPORTED = warp_version_at_least("1.19.0.dev0")
+
+
 def _skip_unsupported_mujoco_determinism(test):
     if _MUJOCO_WARP_DETERMINISM_UNSUPPORTED:
         test.skipTest("MuJoCo Warp does not compile in Warp 1.19 deterministic mode")
@@ -408,6 +413,26 @@ def _check_elastic_sparse_schur_records(device):
         max_modes = int(model.elastic_max_mode_count)
         if max_modes != 48:
             raise AssertionError(f"expected 48 modes, got {max_modes}")
+        if _SCHUR_DETERMINISM_UNSUPPORTED:
+            # Warp >= 1.19 refuses the Schur column kernel in a deterministic mode (it reads and
+            # atomically updates elastic_body_block_matrix), so construction must reject it clearly.
+            try:
+                newton.solvers.SolverVBD(
+                    model,
+                    iterations=1,
+                    rigid_articulation_solve="block_sparse_joints",
+                    rigid_articulation_elastic_solve="schur",
+                    deterministic=DETERMINISTIC_MODE,
+                )
+            except ValueError as error:
+                message = str(error)
+                if "rigid_articulation_elastic_solve='schur'" not in message or (
+                    "rigid_articulation_elastic_solve='coupled'" not in message
+                ):
+                    raise AssertionError(f"unexpected message: {message}") from error
+            else:
+                raise AssertionError("deterministic Schur elimination was not rejected on Warp >= 1.19")
+            return
         solver = newton.solvers.SolverVBD(
             model,
             iterations=1,
@@ -455,7 +480,10 @@ def _check_elastic_sparse_schur_records(device):
 
 
 def test_elastic_sparse_schur_records(test, device):
-    """Scatter the modal coupling of two 48-mode elastic links joined to each other in deterministic mode."""
+    """Scatter the modal coupling of two 48-mode elastic links joined to each other in deterministic mode.
+
+    With Warp 1.19 or later, check instead that the solver rejects deterministic Schur elimination.
+    """
     _run_isolated(test, "_check_elastic_sparse_schur_records", str(device))
 
 

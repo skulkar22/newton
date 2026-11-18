@@ -275,6 +275,16 @@ def _is_deterministic_record_overflow(error: RuntimeError) -> bool:
     )
 
 
+def _warp_rejects_deterministic_read_of_atomic_target() -> bool:
+    """Return whether Warp refuses a deterministic kernel that reads an array it also updates atomically.
+
+    Warp 1.19 defers the float atomics of a deterministic kernel to records applied after the
+    kernel and rejects, at compile time, any kernel that also reads an atomic target directly.
+    """
+    major, minor = (int(part) for part in wp.__version__.split(".")[:2])
+    return (major, minor) >= (1, 19)
+
+
 def _elastic_block_solve_shared_memory_estimate(block_width: int) -> int:
     """Estimate the dynamic shared memory of the tiled block solve for ``block_width``, in bytes.
 
@@ -1296,7 +1306,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                   exactly onto its frame block and the frames of its joint neighbors, so every
                   articulation is solved with 6 x 6 blocks. Two elastic bodies joined directly
                   converge more slowly because their mode-mode coupling is replaced by a conservative
-                  per-body term.
+                  per-body term. Not available in a deterministic mode with Warp 1.19 or later (see
+                  ``deterministic``).
 
                 .. experimental::
                     ``rigid_articulation_elastic_solve`` and both of its values are experimental and
@@ -1434,7 +1445,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 should fit its per-body list: an overflowing list can exceed
                 those buffers, and the step then raises a
                 :class:`ValueError` that names the
-                ``rigid_body_contact_buffer_size`` needed. Deterministic
+                ``rigid_body_contact_buffer_size`` needed. With Warp 1.19
+                or later, a deterministic mode together with
+                ``rigid_articulation_elastic_solve="schur"`` raises
+                :class:`ValueError` at construction when the block-sparse
+                solve eliminates reduced elastic bodies; use the default
+                ``"coupled"`` elastic solve. Deterministic
                 mode is much slower than the default mode. Collision
                 detection is not covered by this option; use
                 ``CollisionPipeline(deterministic=True)`` for a
@@ -2244,6 +2260,21 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.elastic_body_block_update_max = wp.full(metric_count, nan, dtype=float, device=self.device)
         if elastic_body_count > 0 and effective_deterministic != wp.DeterministicMode.NOT_GUARANTEED:
             self._set_elastic_deterministic_records(model, effective_deterministic)
+            sparse_layout = self.rigid_articulation_sparse_layout
+            if (
+                sparse_layout is not None
+                and int(sparse_layout.elastic_body_count) > 0
+                and _warp_rejects_deterministic_read_of_atomic_target()
+            ):
+                # build_elastic_sparse_schur_columns reads elastic_body_block_matrix and adds to it
+                # with atomics in one kernel; Warp >= 1.19 refuses to compile it deterministically.
+                raise ValueError(
+                    f"SolverVBD(deterministic={effective_deterministic}) with "
+                    "rigid_articulation_elastic_solve='schur' and Schur-eliminated reduced elastic bodies "
+                    f"is not supported on Warp >= 1.19 (installed: {wp.__version__}): Warp refuses to compile "
+                    "the Schur column kernel in a deterministic mode. Use "
+                    "rigid_articulation_elastic_solve='coupled' (the default) or run without a deterministic mode."
+                )
         self._iteration_metric_arrays: dict[str, wp.array] = {}
         self._iteration_metric_body_q: wp.array | None = None
         self._iteration_metric_contact_lambda: wp.array | None = None
