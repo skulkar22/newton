@@ -272,32 +272,46 @@ def test_vbd_mimic_graph_replay(test, device):
             rig.check()
 
 
-def _build_jointed_mimic_mechanism(device, topology, copies=1):
+def _build_jointed_mimic_mechanism(device, topology, copies=1, extras=None):
     """Build hanging hinge mechanisms whose mimic rows act on bodies that joints couple to other bodies.
 
     Each of the ``copies`` is its own articulation. Returns the model, the hinges as
     ``(parent, child, parent anchor)`` and the mimic rows as
-    ``(follower coordinate, reference coordinate, offset, ratio)``.
+    ``(follower coordinate, reference coordinate, offset, ratio)``. If ``extras`` is a dict, it
+    receives ``"joint_f"`` (generalized forces by DOF), ``"contact"`` (whether the model has a
+    ground plane) and ``"control"`` (whether the run needs the model's control for its drives).
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     inertia = wp.mat33(np.eye(3) * 1.0e-2)
     hinges = []
     mimics = []
     initial = []
+    joint_f = {}
+    needs_control = False
+    contact = False
 
     def link(index, **kwargs):
-        return builder.add_link(mass=1.0 + index, com=wp.vec3(0.0, 0.0, -0.25), inertia=inertia, **kwargs)
+        kwargs.setdefault("mass", 1.0 + index)
+        kwargs.setdefault("com", wp.vec3(0.0, 0.0, -0.25))
+        kwargs.setdefault("inertia", inertia)
+        return builder.add_link(**kwargs)
 
-    def hinge(parent, child, anchor):
+    def hinge(parent, child, anchor, axis=newton.Axis.Y, **kwargs):
         hinges.append((parent, child, anchor))
         return builder.add_joint_revolute(
-            parent, child, axis=newton.Axis.Y, parent_xform=wp.transform(anchor, wp.quat_identity())
+            parent, child, axis=axis, parent_xform=wp.transform(anchor, wp.quat_identity()), **kwargs
         )
 
-    def chain(count, x):
+    def chain(count, x, z=1.0, joint_options=None):
+        joint_options = joint_options or {}
         links = [link(i) for i in range(count)]
         return [
-            hinge(-1 if i == 0 else links[i - 1], links[i], (x, 0.0, 1.0) if i == 0 else (0.0, 0.0, -0.5))
+            hinge(
+                -1 if i == 0 else links[i - 1],
+                links[i],
+                (x, 0.0, z) if i == 0 else (0.0, 0.0, -0.5),
+                **joint_options.get(i, {}),
+            )
             for i in range(count)
         ]
 
@@ -359,6 +373,62 @@ def _build_jointed_mimic_mechanism(device, topology, copies=1):
             joints = chain(3, x)
             builder.add_articulation(joints)
             coordinates = [0.4, 0.2, 0.2]
+        elif topology == "lead_screw":
+            # A lead screw on a swinging base: the screw turns on the base, the nut slides along the
+            # screw (prismatic follows revolute, 0.01 m/rad) and carries a hanging load. A torque
+            # drives the screw.
+            base = link(1)
+            screw = link(0, mass=0.5, com=wp.vec3(0.0), inertia=wp.mat33(np.eye(3) * 1.0e-3))
+            nut = link(0, mass=1.0, com=wp.vec3(0.02, 0.0, 0.0))
+            load = link(1)
+            joints = [
+                hinge(-1, base, (x, 0.0, 1.0)),
+                hinge(base, screw, (0.0, 0.0, -0.5), axis=newton.Axis.Z),
+                builder.add_joint_prismatic(
+                    screw, nut, axis=newton.Axis.Z, parent_xform=wp.transform((0.0, 0.0, -0.1), wp.quat_identity())
+                ),
+                hinge(nut, load, (0.0, 0.0, -0.1)),
+            ]
+            builder.add_articulation(joints)
+            mimics.append((joints[2], joints[1], 0.02, 0.01))
+            coordinates = [0.3, 0.0, 0.02, 0.2]
+            joint_f[builder.joint_qd_start[joints[1]]] = 0.2
+        elif topology in ("reference_limit", "follower_limit"):
+            # Without the limit the reference joint settles near 0.12 rad and the follower near 0.16 rad,
+            # so the reference limit [0.15, 0.25] or the follower limit [0.18, 0.22] is active.
+            limit = {"limit_ke": 1.0e4, "limit_kd": 1.0e1}
+            if topology == "reference_limit":
+                options = {1: {"limit_lower": 0.15, "limit_upper": 0.25, **limit}}
+            else:
+                options = {2: {"limit_lower": 0.18, "limit_upper": 0.22, **limit}}
+            joints = chain(3, x, joint_options=options)
+            builder.add_articulation(joints)
+            mimics.append((joints[2], joints[1], 0.1, 0.5))
+            coordinates = [0.4, 0.2, 0.2]
+        elif topology in ("reference_drive", "follower_drive"):
+            # A stiff position drive toward -0.3 rad on the reference joint, or on the follower where it
+            # fights the mimic.
+            drive = {
+                "target_ke": 1.0e4,
+                "target_kd": 1.0e2,
+                "target_pos": -0.3,
+                "actuator_mode": newton.JointTargetMode.POSITION,
+            }
+            joints = chain(3, x, joint_options={1 if topology == "reference_drive" else 2: drive})
+            builder.add_articulation(joints)
+            mimics.append((joints[2], joints[1], 0.1, 0.5))
+            coordinates = [0.4, 0.2, 0.2]
+            needs_control = True
+        elif topology == "follower_contact":
+            # The follower's link carries a sphere that lands on the ground and stays in contact.
+            joints = chain(3, x, z=1.45)
+            builder.add_shape_sphere(
+                builder.joint_child[joints[2]], xform=wp.transform((0.0, 0.0, -0.4), wp.quat_identity()), radius=0.1
+            )
+            builder.add_articulation(joints)
+            mimics.append((joints[2], joints[1], 0.1, 0.5))
+            coordinates = [0.4, 0.2, 0.2]
+            contact = True
         else:
             raise ValueError(topology)
         initial.extend(zip(joints, coordinates, strict=True))
@@ -366,8 +436,12 @@ def _build_jointed_mimic_mechanism(device, topology, copies=1):
         builder.set_joint_mimic(follower, reference, coeffs=(offset, ratio))
     for joint, coordinate in initial:
         builder.joint_q[builder.joint_q_start[joint]] = coordinate
+    if contact:
+        builder.add_ground_plane()
     builder.color()
     model = builder.finalize(device=device)
+    if extras is not None:
+        extras.update(joint_f=joint_f, contact=contact, control=needs_control)
     starts = model.joint_q_start.numpy()
     rows = [
         (int(starts[follower]), int(starts[reference]), offset, ratio) for follower, reference, offset, ratio in mimics
@@ -388,14 +462,29 @@ def _hinge_separation(body_q, hinges):
 
 def _run_jointed_mimic_mechanism(device, topology, iterations, copies=1, **solver_options):
     """Simulate 30 steps and return the coordinates, hinge separation, mimic error, residuals and solver."""
-    model, hinges, rows = _build_jointed_mimic_mechanism(device, topology, copies)
+    extras = {}
+    model, hinges, rows = _build_jointed_mimic_mechanism(device, topology, copies, extras)
     solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_compliant_alm=True, **solver_options)
     observables = solver.observables({solver.ObservableKind.SOLVER_RESIDUAL_HISTORY})
     state, next_state = model.state(), model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    control = None
+    if extras["joint_f"] or extras["control"]:
+        control = model.control()
+        if extras["joint_f"]:
+            joint_f = np.zeros(model.joint_dof_count, dtype=np.float32)
+            for dof, value in extras["joint_f"].items():
+                joint_f[dof] = value
+            control.joint_f.assign(joint_f)
+    pipeline = contacts = None
+    if extras["contact"]:
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = pipeline.contacts()
     separation = 0.0
     for _ in range(30):
-        solver.step(state, next_state, None, None, 4.0e-3, observables=observables)
+        if pipeline is not None:
+            pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, 4.0e-3, observables=observables)
         state, next_state = next_state, state
         separation = max(separation, _hinge_separation(state.body_q.numpy(), hinges))
     coordinates = state.joint_q.numpy()
@@ -504,6 +593,90 @@ def test_vbd_mimic_block_sparse_graph_replay(test, device):
             np.testing.assert_allclose(results[1], results[0], atol=1.0e-5)
 
 
+def _check_against_converged_reference(
+    test, device, topology, reference_iterations, coordinate_tolerance, extra_solves=(), iterations=(16, 64)
+):
+    """Compare the block-sparse solves with a converged local solve and return its coordinates.
+
+    ``coordinate_tolerance`` maps the iteration count to the bound on the joint coordinates [rad or m].
+    The mimic error must stay below 1e-6 [rad or m] (measured at most 7.5e-8 on these mechanisms), the
+    hinges may not open more than 1e-4 m beyond the reference (measured at most 4.7e-5 m, at 16
+    iterations with an active limit, where the local solve opens 5.0e-5 m), and every pose must stay
+    finite.
+    """
+    expected, expected_separation, _error, _residual, _solver = _run_jointed_mimic_mechanism(
+        device, topology, reference_iterations, rigid_articulation_solve="local"
+    )
+    for options in [*_sparse_solves(device), *extra_solves]:
+        for count in iterations:
+            with test.subTest(topology=topology, iterations=count, **options):
+                coordinates, separation, mimic_error, _residual, _solver = _run_jointed_mimic_mechanism(
+                    device, topology, count, **options
+                )
+                test.assertTrue(np.isfinite(coordinates).all())
+                test.assertLess(separation, expected_separation + 1.0e-4)
+                test.assertLess(mimic_error, 1.0e-6)
+                np.testing.assert_allclose(coordinates, expected, atol=coordinate_tolerance[count])
+    return expected
+
+
+def test_vbd_mimic_block_sparse_lead_screw(test, device):
+    """Drive a lead screw (prismatic nut following a revolute screw) on a swinging base.
+
+    The local solve converges slowly on this serial mechanism: after 30 steps of 4 ms its screw angle at
+    64 iterations is 0.44 rad from its value at 4096 iterations, and at 1024 iterations still 2.0e-4
+    (CPU and CUDA); 2048 and 4096 iterations agree within 1.2e-5 (CUDA). The reference is therefore the
+    local solve at 4096 iterations. Measured block-sparse difference from it at 16 and 64 iterations:
+    at most 5.7e-5 (CPU and CUDA, all backends).
+    """
+    _check_against_converged_reference(test, device, "lead_screw", 4096, {16: 2.0e-4, 64: 2.0e-4})
+
+
+def test_vbd_mimic_block_sparse_active_limits(test, device):
+    """Hold the reference joint, or the follower, at an active joint limit.
+
+    Reference: the local solve at 1024 iterations (within 3.1e-7 of 4096 iterations on CPU, 1.6e-6 on
+    CUDA). Limits converge slowly in both solves: at 16 iterations the local solve is 2.2e-3 from the
+    reference and the block-sparse solves 2.2e-3; at 64 iterations 2.1e-4 and 2.1e-4 (CPU and CUDA).
+    """
+    expected = _check_against_converged_reference(test, device, "reference_limit", 1024, {16: 6.0e-3, 64: 6.0e-4})
+    # Without the limit the reference joint ends near 0.12 rad; the limit holds it at 0.15 rad.
+    test.assertGreater(expected[1], 0.149)
+    expected = _check_against_converged_reference(test, device, "follower_limit", 1024, {16: 6.0e-3, 64: 6.0e-4})
+    # Without the limit the follower ends near 0.16 rad; its limit holds it at 0.18 rad and the mimic
+    # moves the reference with it.
+    test.assertGreater(expected[2], 0.179)
+
+
+def test_vbd_mimic_block_sparse_stiff_drive(test, device):
+    """Drive the reference joint, or the follower against the mimic, with a stiff position drive.
+
+    Reference: the local solve at 1024 iterations (within 4.3e-6 of 4096 iterations). Measured
+    block-sparse difference from it: at most 3.9e-6 (CPU and CUDA).
+    """
+    expected = _check_against_converged_reference(test, device, "reference_drive", 1024, {16: 5.0e-5, 64: 5.0e-5})
+    test.assertLess(expected[1], -0.25)
+    expected = _check_against_converged_reference(test, device, "follower_drive", 1024, {16: 5.0e-5, 64: 5.0e-5})
+    test.assertLess(expected[2], -0.25)
+
+
+def test_vbd_mimic_block_sparse_follower_contact(test, device):
+    """Land the follower's link on the ground, also with the contact active set.
+
+    Reference: the local solve at 1024 iterations (within 1.1e-5 of 4096 iterations). Measured
+    block-sparse difference from it: at most 1.4e-5 (CPU and CUDA, with and without the active set).
+    """
+    active_set = [{**options, "rigid_articulation_contact_active_set": True} for options in _sparse_solves(device)]
+    expected = _check_against_converged_reference(
+        test, device, "follower_contact", 1024, {16: 1.0e-4, 64: 1.0e-4}, extra_solves=active_set
+    )
+    # The ground stops the swing: the same chain without the ground ends 4e-2 rad elsewhere.
+    free, _separation, _error, _residual, _solver = _run_jointed_mimic_mechanism(
+        device, "serial", 64, rigid_articulation_solve="local"
+    )
+    test.assertGreater(np.abs(expected - free).max(), 1.0e-2)
+
+
 def _set_joint_mimic(model, follower, reference, coeffs=(0.1, 0.5)):
     """Change a mimic in the model arrays, as a user does before ``notify_model_changed``."""
     references = model.joint_mimic_joint.numpy()
@@ -576,6 +749,10 @@ for test_function in (
     test_vbd_mimic_block_sparse_kinematic_reference,
     test_vbd_mimic_block_sparse_graph_replay,
     test_vbd_mimic_block_sparse_rejected_model_change,
+    test_vbd_mimic_block_sparse_lead_screw,
+    test_vbd_mimic_block_sparse_active_limits,
+    test_vbd_mimic_block_sparse_stiff_drive,
+    test_vbd_mimic_block_sparse_follower_contact,
 ):
     add_function_test(TestSolverVBDMimic, test_function.__name__, test_function, devices=get_test_devices())
 
