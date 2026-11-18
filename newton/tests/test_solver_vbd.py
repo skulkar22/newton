@@ -9711,6 +9711,31 @@ def test_position_guess_scale_is_ignored_without_iterations(test, device):
     np.testing.assert_array_equal(default_qd, scaled_qd)
 
 
+def test_position_guess_scale_keeps_the_fixed_point(test, device):
+    """Scale 0 changes only where the iterations start: at 64 iterations it reaches the scale-1 result.
+
+    Pendulum scene, 30 steps of 4 ms. Measured max |body_q(scale 0) - body_q(scale 1)| at 64 iterations
+    (CPU / CUDA): local 4.2e-6 / 6.1e-6, ``block_sparse_joints`` 3.9e-7 / 4.5e-7, ``block_sparse_levels``
+    3.1e-7 / 2.4e-7 (each repeat bitwise equal). At 4 iterations the two differ by 4.6e-3 (local) and 1.1e-3
+    (sparse modes), so the comparison is not vacuous.
+    """
+    for mode, atol in (("local", 2.0e-5), ("block_sparse_joints", 2.0e-6), ("block_sparse_levels", 2.0e-6)):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # relaxation-bias warning of the sparse modes at 4 iterations
+            native_4, _, _ = _run_position_guess_pendulum(device, 4, rigid_articulation_solve=mode)
+            scaled_4, _, _ = _run_position_guess_pendulum(
+                device, 4, rigid_articulation_solve=mode, rigid_position_guess_acceleration_scale=0.0
+            )
+        test.assertGreater(float(np.max(np.abs(scaled_4 - native_4))), 1.0e-4, mode)
+        native, _, _ = _run_position_guess_pendulum(device, 64, rigid_articulation_solve=mode)
+        scaled, _, launches = _run_position_guess_pendulum(
+            device, 64, rigid_articulation_solve=mode, rigid_position_guess_acceleration_scale=0.0
+        )
+        test.assertEqual(launches, 30, mode)
+        test.assertTrue(np.isfinite(scaled).all(), mode)
+        np.testing.assert_allclose(scaled, native, rtol=0.0, atol=atol, err_msg=mode)
+
+
 class TestVBDRigidContactHistoryProvenance(unittest.TestCase):
     pass
 
@@ -9773,6 +9798,7 @@ for _test in (
     test_position_guess_scale_rejects_invalid_values_and_paths,
     test_position_guess_scale_default_is_identity,
     test_position_guess_scale_is_ignored_without_iterations,
+    test_position_guess_scale_keeps_the_fixed_point,
 ):
     add_function_test(TestVBDPositionGuessScale, _test.__name__, _test, devices=devices)
 
