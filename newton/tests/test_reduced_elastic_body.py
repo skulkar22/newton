@@ -125,9 +125,7 @@ def _legacy_alm_allowed():
     examples that stay on the legacy path.
     """
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", message="VBD options rigid_compliant_alm=False", category=DeprecationWarning
-        )
+        warnings.filterwarnings("ignore", message="VBD options rigid_compliant_alm=False", category=DeprecationWarning)
         yield
 
 
