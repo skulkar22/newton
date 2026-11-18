@@ -2206,8 +2206,14 @@ class CollisionPipeline:
         shape_is_elastic = np.zeros(shape_count, dtype=bool)
         elastic_shape_pairs = np.empty((0, 2), dtype=np.int32)
         narrow_phase_elastic_pairs = np.empty((0, 2), dtype=np.int32)
-        candidate_pair_array = shape_pairs_filtered if shape_pairs_filtered is not None else model.shape_contact_pairs
-        if getattr(model, "elastic_shape_count", 0) > 0 and candidate_pair_array is not None:
+        has_elastic_shapes = getattr(model, "elastic_shape_count", 0) > 0
+        # Model.shape_contact_pairs is built on first access; only elastic models read it here.
+        candidate_pair_array = None
+        if has_elastic_shapes:
+            candidate_pair_array = (
+                shape_pairs_filtered if shape_pairs_filtered is not None else model.shape_contact_pairs
+            )
+        if has_elastic_shapes and candidate_pair_array is not None:
             candidate_pairs = candidate_pair_array.numpy().reshape((-1, 2))
             shape_body_np = model.shape_body.numpy()
             body_elastic_index_np = model.body_elastic_index.numpy()
@@ -2219,6 +2225,8 @@ class CollisionPipeline:
             narrow_phase_elastic_pairs = candidate_pairs[elastic_a | elastic_b].astype(np.int32, copy=False)
 
         def without_elastic_pairs(pairs: wp.array) -> wp.array:
+            if not shape_is_elastic.any():
+                return pairs
             pairs_np = pairs.numpy().reshape((-1, 2))
             keep = ~(shape_is_elastic[pairs_np[:, 0]] | shape_is_elastic[pairs_np[:, 1]])
             return wp.array(pairs_np[keep], dtype=wp.vec2i, device=device)
