@@ -2216,12 +2216,13 @@ def test_sparse_tiny_inertia_rod_needs_angular_regularization(test, device):
     At ~1e-14 kg*m^2 the angular inertia term I/dt^2 of a 2 mm segment is ~1e-7 N*m/rad at dt = 1/2400 s, below
     the default 1e-6 shift; after the stretch lever-arm terms cancel, the softest angular pivot of the coupled
     system is the bend damping (~0.01 N*m/rad). A tensioned rod then takes rotation steps of radians: with the
-    default the rod folds (largest neighbour bend above 90 deg on CPU and above 140 deg on CUDA) and ends
-    centimetres from the local solve. 5.76 N*m/rad is the angular term a 1e-6 kg*m^2 inertia floor would add
+    default the rod folds (largest neighbour bend above 90 deg) and ends centimetres from the local solve, or
+    diverges. 5.76 N*m/rad is the angular term a 1e-6 kg*m^2 inertia floor would add
     (1e-6 kg*m^2 / (1/2400 s)^2), here as a Hessian-only shift that leaves the inertia authored: the rod stays
     finite, no pivot is clamped, and it follows the local solve. Tolerances: 8 sparse iterations against a
     32-iteration local reference; measured max deviation 0.04 mm (CPU) / 0.55 mm (CUDA) and max bend 0.4 / 10.6 deg
-    at 5.76; at the default 7.6-7.7 cm and 134-150 deg (CPU), 3.4-15 cm and 159-180 deg (CUDA, varies run to run).
+    at 5.76; at the default 7.6-7.7 cm and 134-150 deg (CPU), 8.3-14.6 cm and 163-179 deg (CUDA, 12 runs per
+    mode, varies run to run; one of the 12 ``block_sparse_joints`` runs became non-finite).
     """
     local_q, _, bodies = _run_tiny_inertia_rod(device, "local", iterations=32)
     test.assertTrue(np.isfinite(local_q).all())
@@ -2236,15 +2237,17 @@ def test_sparse_tiny_inertia_rod_needs_angular_regularization(test, device):
         cosines = np.clip(np.sum(tangents[:, :-1] * tangents[:, 1:], axis=-1), -1.0, 1.0)
         return float(np.degrees(np.arccos(cosines)).max())
 
-    folded_bend_deg = 140.0 if wp.get_device(device).is_cuda else 90.0
     for mode in ("block_sparse_joints", "block_sparse_levels"):
         with test.subTest(mode=mode, regularization="default"):
             # Precondition, not a contract: the scenario must reproduce the large-rotation failure at the
             # default, otherwise the 5.76 subtest below no longer guards anything. Update or remove this check
-            # if the default path improves.
+            # if the default path improves. A non-finite result also reproduces the failure.
             q, _, _ = _run_tiny_inertia_rod(device, mode, iterations=8)
-            test.assertGreater(deviation(q), 1.0e-2, "the default no longer reproduces the authored-inertia failure")
-            test.assertGreater(max_bend_deg(q), folded_bend_deg, "the default no longer folds the rod")
+            if np.isfinite(q).all():
+                test.assertGreater(
+                    deviation(q), 1.0e-2, "the default no longer reproduces the authored-inertia failure"
+                )
+                test.assertGreater(max_bend_deg(q), 90.0, "the default no longer folds the rod")
         with test.subTest(mode=mode, regularization=5.76):
             q, clamped, _ = _run_tiny_inertia_rod(
                 device, mode, iterations=8, rigid_articulation_angular_regularization=5.76
