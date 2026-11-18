@@ -8206,6 +8206,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_contact_hard,
                     self.rigid_compliant_alm,
                     self.friction_epsilon,
+                    self.rigid_contact_damping_bidirectional,
                     self.body_body_contact_buffer_pre_alloc,
                     self.body_body_contact_counts,
                     self.body_body_contact_indices,

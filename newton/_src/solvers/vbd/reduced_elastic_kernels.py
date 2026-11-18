@@ -243,6 +243,7 @@ def _accumulate_elastic_contact_modes(
     legacy_hard_contacts: int,
     contact_compliant_alm: int,
     friction_epsilon: float,
+    contact_damping_bidirectional: bool,
     joint_q_start: wp.array[wp.int32],
     elastic_shape_vertex_local: wp.array[wp.vec3],
     elastic_shape_vertex_phi: wp.array[wp.vec3],
@@ -377,6 +378,7 @@ def _accumulate_elastic_contact_modes(
         contact_compliant_alm,
         dt,
         friction_c0,
+        contact_damping_bidirectional,
     )
 
     elastic_force = force_1
@@ -1457,6 +1459,7 @@ def assemble_elastic_contacts(
     legacy_hard_contacts: int,
     contact_compliant_alm: int,
     friction_epsilon: float,
+    contact_damping_bidirectional: bool,
     body_contact_buffer_pre_alloc: int,
     body_contact_counts: wp.array[wp.int32],
     body_contact_indices: wp.array[wp.int32],
@@ -1538,6 +1541,7 @@ def assemble_elastic_contacts(
                     legacy_hard_contacts,
                     contact_compliant_alm,
                     friction_epsilon,
+                    contact_damping_bidirectional,
                     joint_q_start,
                     elastic_shape_vertex_local,
                     elastic_shape_vertex_phi,
@@ -1591,6 +1595,7 @@ def assemble_elastic_contacts(
                 legacy_hard_contacts,
                 contact_compliant_alm,
                 friction_epsilon,
+                contact_damping_bidirectional,
                 joint_q_start,
                 elastic_shape_vertex_local,
                 elastic_shape_vertex_phi,
