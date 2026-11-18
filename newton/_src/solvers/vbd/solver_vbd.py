@@ -613,8 +613,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
           :func:`~newton.eval_ik` overwrites the continuous output with wrapped
           angles, but does not change VBD's internal turn history.
         - Joint-owned mimic relationships are supported for PRISMATIC, REVOLUTE, and D6 joints.
-          VBD uses its assembled body Hessians and constraint reaction forces,
-          with one mimic solve per iteration. Changes to mimic references require
+          VBD uses constraint reaction forces and the system of its body update, with one
+          mimic solve per iteration: the assembled body Hessians under
+          ``rigid_articulation_solve="local"``, and the factored articulation systems in the
+          block-sparse modes, which covers mimics between bodies that joints connect to
+          other bodies. Changes to mimic references require
           :meth:`notify_model_changed` with :attr:`~newton.ModelFlags.JOINT_PROPERTIES`
           and recapturing any existing CUDA graph; turn history is preserved.
 
@@ -1215,8 +1218,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 articulation body. Cross-articulation joints and bodies shared by two articulations
                 are rejected at construction. Passive friction and damping use coupled coordinate
                 rows; angular drives and limits retain continuous turn counts. Mimic joints keep
-                one reaction-force projection per iteration using the assembled body-diagonal
-                blocks, rather than being added to the sparse factorization.
+                one reaction-force projection per iteration rather than being added to the sparse
+                factorization. A mimic row on articulation bodies takes its compliance and its pose
+                update from the articulation's block Cholesky factor of the same iteration (two block
+                triangular solves over the articulation per row and iteration, one thread per
+                articulation), because the coupled solve answers a mimic reaction with the whole
+                articulation; a row body outside the articulations uses its own block. A mimic whose
+                two joints lie in different articulations is rejected.
                 Reduced elastic bodies in an articulation are solved inside its factorization, with
                 their joints at the deformed attachments; ``rigid_articulation_elastic_solve`` selects
                 how. Joint mimics, and armature, passive damping, or friction on joints attached to
