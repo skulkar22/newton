@@ -28,6 +28,35 @@ _NUM_ELASTIC_CONTACT_THREADS_PER_BODY = 32
 """Threads per reduced elastic body for modal contact accumulation."""
 
 
+def elastic_contact_deterministic_max_records(max_mode_count: int, body_contact_buffer_size: int) -> int:
+    """Return the deterministic scatter records per thread that :func:`assemble_elastic_contacts` emits.
+
+    In a deterministic Warp mode each float ``atomic_add`` writes one record to a scatter buffer that
+    Warp pools per target array and launch, with ``launch_dim * max(call_site_count,
+    deterministic_max_records)`` entries (at least 1024), and the call-site count does not see loop
+    trips. Thread ``t`` of a body's group of ``_NUM_ELASTIC_CONTACT_THREADS_PER_BODY`` handles list
+    entries ``t, t + 32, ...`` of a per-body contact list holding at most ``body_contact_buffer_size``
+    entries, so it handles at most ``ceil(body_contact_buffer_size / 32)`` contacts. Each contact adds
+    ``m`` records to the block gradient and at most ``6 m + m (m + 1) / 2`` records to the block matrix
+    (frame-mode and upper mode-mode entries) for ``m`` modes, so the matrix count bounds both targets.
+    A per-body list that overflows makes the kernel stride over every contact instead, which this
+    bound does not cover; the pooled buffer then overflows unless other bodies of the launch leave
+    room.
+
+    Args:
+        max_mode_count: Largest mode count of any reduced elastic body.
+        body_contact_buffer_size: Per-body contact list capacity of the solver.
+
+    Returns:
+        Records per thread for the ``deterministic_max_records`` module option.
+    """
+    m = max(int(max_mode_count), 0)
+    contacts_per_thread = (
+        max(int(body_contact_buffer_size), 0) + _NUM_ELASTIC_CONTACT_THREADS_PER_BODY - 1
+    ) // _NUM_ELASTIC_CONTACT_THREADS_PER_BODY
+    return contacts_per_thread * (6 * m + m * (m + 1) // 2)
+
+
 @wp.kernel
 def copy_elastic_body_transforms_back(
     body_ids: wp.array[wp.int32],

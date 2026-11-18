@@ -1,0 +1,1 @@
+Add `ModalGeneratorCraigBamptonFEM` to build a Craig-Bampton modal basis directly from full sparse finite-element matrices with three or six DOFs per node, with `"node"`, `"rbe2"`, and `"rbe3"` interface frames, sparse constraint modes, ARPACK fixed-interface modes, and `save_npz()` export of the reduced model.

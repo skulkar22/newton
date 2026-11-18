@@ -1,0 +1,1 @@
+Add `ConstraintElimination` to remove linear multi-point constraints, such as node-to-node ties between meshes and rigid links, from finite-element matrices with a sparse coordinate transformation; `ModalGeneratorCraigBamptonFEM` applies it through its `constraints` and `transformation` arguments.

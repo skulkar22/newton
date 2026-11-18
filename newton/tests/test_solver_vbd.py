@@ -6846,6 +6846,40 @@ def _rigid_hinge_multiturn_limits(test, device):
             test.assertLess(np.max(np.abs(state_in.body_qd.numpy()[:, 5])), 1.0e-2)
 
 
+def _rigid_box_solve_iteration_metrics(test, device):
+    """Record body and contact metrics per iteration for a rigid box resting on the ground."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+    builder.color()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    iterations = 8
+    solver = newton.solvers.SolverVBD(model, iterations=iterations, solver_iteration_metrics=True)
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(30):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+
+    metrics = solver.solve_iteration_metrics()
+    test.assertEqual(metrics["body_translation_update_norm"].shape, (iterations, 1))
+    test.assertEqual(metrics["body_rotation_update_norm"].shape, (iterations, 1))
+    test.assertEqual(metrics["contact_max_penetration"].shape, (iterations,))
+    test.assertEqual(metrics["elastic_update_norm"].shape, (iterations, 0))
+    for name, values in metrics.items():
+        test.assertTrue(bool(np.isfinite(values).all()), name)
+        test.assertTrue(bool((values >= 0.0).all()), name)
+    translation = metrics["body_translation_update_norm"][:, box]
+    test.assertGreater(float(translation[0]), 0.0)
+    test.assertLess(float(translation[-1]), float(translation[0]))
+    test.assertGreater(float(metrics["contact_max_penetration"][-1]), 0.0)
+
+
 class TestSolverVBD(unittest.TestCase):
     def test_contact_kernel_modules_follow_deterministic_mode(self):
         """Apply VBD deterministic options to the separately compiled rigid kernels."""
@@ -6921,6 +6955,12 @@ class TestSolverVBD(unittest.TestCase):
 add_function_test(TestSolverVBD, "test_rigid_constraint_adjacency", _rigid_constraint_adjacency, devices=devices)
 
 add_function_test(TestSolverVBD, "test_rigid_hinge_multiturn_drive", _rigid_hinge_multiturn_drive, devices=devices)
+add_function_test(
+    TestSolverVBD,
+    "test_rigid_box_solve_iteration_metrics",
+    _rigid_box_solve_iteration_metrics,
+    devices=devices,
+)
 add_function_test(TestSolverVBD, "test_rigid_hinge_multiturn_limits", _rigid_hinge_multiturn_limits, devices=devices)
 add_function_test(
     TestSolverVBD,

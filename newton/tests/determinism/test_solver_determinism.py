@@ -17,11 +17,21 @@ import newton
 import newton.tests.unittest_utils
 from newton._src.solvers.semi_implicit import kernels_particle as semi_implicit_particle_kernels
 from newton._src.solvers.solver import _set_module_options_if_changed
-from newton._src.solvers.vbd import particle_vbd_kernels, vbd_coupling_kernels
+from newton._src.solvers.vbd import (
+    particle_vbd_kernels,
+    reduced_elastic_kernels,
+    reduced_elastic_sparse_kernels,
+    rigid_sparse_articulation_kernels,
+    rigid_vbd_kernels,
+    vbd_coupling_kernels,
+)
 from newton._src.solvers.xpbd import kernels as xpbd_kernels
+from newton.tests._reduced_elastic_fixtures import elastic_plank_on_ground
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, warp_version_at_least
 
 DETERMINISTIC_MODE = wp.DeterministicMode.RUN_TO_RUN
+ELASTIC_ROLLOUT_STEPS = 60
+ELASTIC_ROLLOUT_SPEED_MAX = 0.05
 
 # Warp 1.19 rejects MuJoCo Warp kernels that read and atomically update one array
 # (_accumulate_subtreemass, _qLD_acc) in deterministic mode.
@@ -262,6 +272,185 @@ def test_articulation_determinism(test, device, solver_name):
     _run_isolated(test, "_check_articulation_determinism", str(device), solver_name)
 
 
+def _run_elastic_contact_rollout(
+    device, deterministic, ground, contact_buffer_size=128, steps=ELASTIC_ROLLOUT_STEPS, **solver_kwargs
+):
+    # 81 grid vertices on one elastic body: more contacts than modal-assembly threads, so each
+    # thread scatters several contacts x modes^2 records. The 1 mm drop impacts after 9 steps.
+    model, body = elastic_plank_on_ground(device, ground=ground, count_x=9, count_y=9, height=0.001)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=4,
+        rigid_body_contact_buffer_size=contact_buffer_size,
+        deterministic=deterministic,
+        **solver_kwargs,
+    )
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    fields = ("body_q", "body_qd", "joint_q", "joint_qd")
+    history = {field: [] for field in fields}
+    max_contacts = 0
+    for _ in range(steps):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        max_contacts = max(max_contacts, int(contacts.rigid_contact_count.numpy()[0]))
+        solver.step(state_0, state_1, control, contacts, 1.0 / 600.0)
+        state_0, state_1 = state_1, state_0
+        for field, values in _snapshot(state_0, fields).items():
+            history[field].append(values)
+
+    if max_contacts <= 2 * reduced_elastic_kernels._NUM_ELASTIC_CONTACT_THREADS_PER_BODY:
+        raise AssertionError(f"elastic plank made only {max_contacts} contacts")
+    body_qd = history["body_qd"][-1][body]
+    if not np.isfinite(body_qd).all() or np.linalg.norm(body_qd[:3]) > ELASTIC_ROLLOUT_SPEED_MAX:
+        raise AssertionError(f"elastic plank did not settle after the impact: body_qd={body_qd}")
+    return {field: np.stack(values) for field, values in history.items()}
+
+
+def _check_elastic_contact_determinism(device, ground):
+    with wp.ScopedDevice(device):
+        first = _run_elastic_contact_rollout(device, DETERMINISTIC_MODE, ground)
+        second = _run_elastic_contact_rollout(device, DETERMINISTIC_MODE, ground)
+    _assert_snapshots_equal(first, second)
+
+
+def test_elastic_contact_determinism(test, device, ground):
+    """Repeat a reduced elastic body's drop onto the ground bit for bit in deterministic mode.
+
+    The plank falls onto a static triangle mesh or a ground plane, impacts, and settles. Every
+    step's body state and modal coordinates must match between two rollouts. The collision
+    pipeline's deterministic option fixes the contact order.
+    """
+    _run_isolated(test, "_check_elastic_contact_determinism", str(device), ground)
+
+
+def _check_elastic_contact_default_mode(device, ground):
+    with wp.ScopedDevice(device):
+        _run_elastic_contact_rollout(device, wp.DeterministicMode.NOT_GUARANTEED, ground)
+
+
+def test_elastic_contact_default_mode(test, device, ground):
+    """Run the elastic drop onto the ground without a deterministic mode."""
+    _run_isolated(test, "_check_elastic_contact_default_mode", str(device), ground)
+
+
+def _check_iteration_metrics_keep_deterministic_solve(device):
+    with wp.ScopedDevice(device):
+        plain = _run_elastic_contact_rollout(device, DETERMINISTIC_MODE, "mesh")
+        recorded = _run_elastic_contact_rollout(
+            device, DETERMINISTIC_MODE, "mesh", solver_iteration_metrics=True, elastic_solver_metrics=True
+        )
+    _assert_snapshots_equal(plain, recorded)
+
+
+def test_iteration_metrics_keep_deterministic_solve(test, device):
+    """Produce bit-identical deterministic rollouts with and without recording iteration metrics."""
+    _run_isolated(test, "_check_iteration_metrics_keep_deterministic_solve", str(device))
+
+
+def _check_elastic_contact_list_overflow_error(device):
+    with wp.ScopedDevice(device):
+        try:
+            _run_elastic_contact_rollout(device, DETERMINISTIC_MODE, "mesh", contact_buffer_size=16, steps=20)
+        except ValueError as error:
+            if "rigid_body_contact_buffer_size" not in str(error):
+                raise AssertionError(f"unexpected message: {error}") from error
+            return
+    raise AssertionError("an overflowing elastic contact list did not raise")
+
+
+def test_elastic_contact_list_overflow_error(test, device):
+    """Name the needed contact list size when an elastic body overflows it in deterministic mode."""
+    _run_isolated(test, "_check_elastic_contact_list_overflow_error", str(device))
+
+
+def _build_elastic_joined_pair(device, mode_order=12):
+    # Two beams with 4 * mode_order modes each, joined to each other: the sparse Schur columns of
+    # the joint scatter one record per mode of a body from each thread.
+    beam = newton.ModalGeneratorBeam
+    specs = []
+    for order in range(1, mode_order + 1):
+        specs += [
+            {"type": beam.Mode.BENDING_Y, "boundary": beam.Boundary.PINNED_PINNED, "order": order},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": order},
+            {"type": beam.Mode.TORSION, "boundary": beam.Boundary.FIXED_FREE, "order": order},
+            {"type": beam.Mode.AXIAL, "boundary": beam.Boundary.FIXED_FREE, "order": order},
+        ]
+    length = 0.6
+    basis = beam(length=length, half_width_y=0.03, half_width_z=0.02, young_modulus=2.0e6, mode_specs=specs).build()
+    builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    links = [
+        builder.add_link_elastic(
+            xform=wp.transform(wp.vec3((i + 0.5) * length, 0.0, 0.0), wp.quat_identity()), modal_basis=basis
+        )
+        for i in range(2)
+    ]
+    half = wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity())
+    minus_half = wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity())
+    root = builder.add_joint_revolute(parent=-1, child=links[0], axis=(0.0, 0.0, 1.0), child_xform=minus_half)
+    builder.add_joint_revolute(
+        parent=links[0], child=links[1], axis=(0.0, 0.0, 1.0), parent_xform=half, child_xform=minus_half
+    )
+    builder.add_articulation([root, root + 1])
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _check_elastic_sparse_schur_records(device):
+    with wp.ScopedDevice(device):
+        model = _build_elastic_joined_pair(device)
+        max_modes = int(model.elastic_max_mode_count)
+        if max_modes != 48:
+            raise AssertionError(f"expected 48 modes, got {max_modes}")
+        solver = newton.solvers.SolverVBD(
+            model, iterations=1, rigid_articulation_solve="block_sparse_joints", deterministic=DETERMINISTIC_MODE
+        )
+        if wp.get_module_options(module=reduced_elastic_sparse_kernels)["deterministic_max_records"] != max_modes:
+            raise AssertionError("the sparse elastic module records were not sized from the mode count")
+        # Launch only the Schur column kernel, with the solver's own buffers; a full deterministic
+        # step compiles the whole sparse articulation module, which takes many minutes on a cold cache.
+        layout = solver.rigid_articulation_sparse_layout
+        state = model.state()
+        wp.launch(
+            kernel=reduced_elastic_sparse_kernels.build_elastic_sparse_schur_columns,
+            dim=layout.elastic_group_count * max_modes,
+            inputs=[
+                layout.elastic_bodies,
+                layout.elastic_group_owner,
+                layout.elastic_group_joint,
+                layout.elastic_group_body,
+                layout.elastic_group_neighbor_elastic,
+                model.body_elastic_index,
+                state.body_q,
+                model.body_com,
+                model.elastic_joint,
+                model.elastic_mode_count,
+                max_modes,
+                model.joint_q_start,
+                model.joint_parent,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_parent_elastic_endpoint,
+                model.joint_child_elastic_endpoint,
+                model.elastic_endpoint_phi,
+                model.elastic_endpoint_psi,
+                layout.joint_cross_slot,
+                state.joint_q,
+                solver._rigid_articulation_sparse_values_scalar,
+            ],
+            outputs=[solver.elastic_body_block_matrix, solver._sparse_elastic_b],
+        )
+        if not np.isfinite(solver.elastic_body_block_matrix.numpy()).all():
+            raise AssertionError("non-finite elastic block entries")
+
+
+def test_elastic_sparse_schur_records(test, device):
+    """Scatter the modal coupling of two 48-mode elastic links joined to each other in deterministic mode."""
+    _run_isolated(test, "_check_elastic_sparse_schur_records", str(device))
+
+
 class TestSolverDeterminism(unittest.TestCase):
     pass
 
@@ -294,6 +483,13 @@ class TestSolverDeterminismOptions(unittest.TestCase):
             particle_vbd_kernels,
             semi_implicit_particle_kernels,
             vbd_coupling_kernels,
+            rigid_vbd_kernels,
+            rigid_sparse_articulation_kernels,
+            reduced_elastic_kernels,
+            reduced_elastic_sparse_kernels,
+            rigid_vbd_kernels.accumulate_body_body_contacts_per_body.module,
+            rigid_vbd_kernels.compute_rigid_contact_forces.module,
+            rigid_vbd_kernels.update_duals_body_body_contacts.module,
         )
         self._saved_config = wp.config.deterministic
         self._saved_options = {
@@ -400,6 +596,49 @@ class TestSolverDeterminismOptions(unittest.TestCase):
             self.assertEqual(options["deterministic"], wp.DeterministicMode.NOT_GUARANTEED)
             self.assertEqual(options["deterministic_max_records"], 0)
 
+    def test_vbd_sizes_elastic_contact_scatter_records(self):
+        """Size the elastic contact scatter records only in deterministic mode with an elastic body."""
+        with wp.ScopedDevice("cpu"):
+            model, _body = elastic_plank_on_ground("cpu")
+            newton.solvers.SolverVBD(model, rigid_body_contact_buffer_size=64, deterministic=DETERMINISTIC_MODE)
+            options = wp.get_module_options(module=reduced_elastic_kernels)
+            self.assertEqual(options["deterministic"], DETERMINISTIC_MODE)
+            # 64 list entries over 32 threads give 2 contacts per thread, each with 6 * 3 + 3 * 4 / 2 = 24
+            # block-matrix records for the plank's 3 modes.
+            self.assertEqual(options["deterministic_max_records"], 48)
+            for module in (rigid_vbd_kernels, reduced_elastic_sparse_kernels):
+                self.assertEqual(wp.get_module_options(module=module)["deterministic_max_records"], 0)
+
+            newton.solvers.SolverVBD(
+                model,
+                rigid_body_contact_buffer_size=64,
+                deterministic=wp.DeterministicMode.NOT_GUARANTEED,
+            )
+            options = wp.get_module_options(module=reduced_elastic_kernels)
+            self.assertEqual(options["deterministic"], wp.DeterministicMode.NOT_GUARANTEED)
+            self.assertEqual(options["deterministic_max_records"], 0)
+
+            builder = newton.ModelBuilder()
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            builder.add_ground_plane()
+            builder.color()
+            rigid_model = builder.finalize(device="cpu")
+            newton.solvers.SolverVBD(rigid_model, deterministic=DETERMINISTIC_MODE)
+            options = wp.get_module_options(module=reduced_elastic_kernels)
+            self.assertEqual(options["deterministic"], DETERMINISTIC_MODE)
+            self.assertEqual(options["deterministic_max_records"], 0)
+
+    def test_vbd_rejects_oversized_elastic_contact_scatter_buffers(self):
+        """Raise at construction when the elastic contact scatter buffers would exceed the memory limit."""
+        with wp.ScopedDevice("cpu"):
+            model, _body = elastic_plank_on_ground("cpu")
+            with self.assertRaisesRegex(ValueError, "rigid_body_contact_buffer_size"):
+                newton.solvers.SolverVBD(
+                    model, rigid_body_contact_buffer_size=1 << 21, deterministic=DETERMINISTIC_MODE
+                )
+            newton.solvers.SolverVBD(model, rigid_body_contact_buffer_size=1 << 21)
+
     def test_vbd_coupling_hook_reapplies_deterministic_options(self):
         with wp.ScopedDevice("cpu"):
             model = _build_soft_body("cpu")
@@ -451,6 +690,49 @@ for solver_name in ("featherstone", "mujoco"):
         solver_name=solver_name,
         check_output=False,
     )
+
+for ground in ("mesh", "plane"):
+    add_function_test(
+        TestSolverDeterminism,
+        f"test_elastic_contact_determinism_{ground}",
+        test_elastic_contact_determinism,
+        devices=devices,
+        ground=ground,
+        check_output=False,
+    )
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_elastic_contact_list_overflow_error",
+    test_elastic_contact_list_overflow_error,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_elastic_sparse_schur_records",
+    test_elastic_sparse_schur_records,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_iteration_metrics_keep_deterministic_solve",
+    test_iteration_metrics_keep_deterministic_solve,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_elastic_contact_default_mode_mesh",
+    test_elastic_contact_default_mode,
+    devices=devices,
+    ground="mesh",
+    check_output=False,
+)
 
 add_function_test(
     TestSolverDeterminism,

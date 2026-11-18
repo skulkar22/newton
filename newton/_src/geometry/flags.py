@@ -52,6 +52,13 @@ class MeshSignMethod(IntEnum):
     """Angle-weighted closest-face pseudo-normal; robust for open surfaces."""
     PARITY = 1
     """Ray-crossing parity; correct and cheap for watertight (closed) meshes."""
+    NORMAL_AND_PARITY = 2
+    """Inside only where the pseudo-normal and a three-ray parity test both report inside.
+
+    Supported only by the contacts of reduced elastic bodies against mesh shapes. The three rays
+    are close to one direction. It removes most false insides of the pseudo-normal next to open
+    or doubled faces, but misses a point inside whenever either test misses it, for example
+    every point inside an inside-out mesh."""
 
 
 class MeshProperties(IntFlag):

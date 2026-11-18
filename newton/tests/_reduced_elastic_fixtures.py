@@ -125,3 +125,66 @@ def rod_physical(state, data):
     """Return the rod's sampled COM, linear momentum, and angular momentum about the COM."""
     joint_q, joint_qd = rod_joint_state(state, data)
     return elastic_reference.physical_state(data["points"], data["mass"], data["phi"], data["com"], joint_q, joint_qd)
+
+
+def grid_surface_mesh(half_x: float, half_y: float, count_x: int, count_y: int) -> newton.Mesh:
+    """Return a flat triangle grid of ``count_x x count_y`` vertices in the local ``z = 0`` plane."""
+    xs = np.linspace(-half_x, half_x, count_x, dtype=np.float32)
+    ys = np.linspace(-half_y, half_y, count_y, dtype=np.float32)
+    vertices = np.array([[x, y, 0.0] for y in ys for x in xs], dtype=np.float32)
+    indices = []
+    for j in range(count_y - 1):
+        for i in range(count_x - 1):
+            a = j * count_x + i
+            c = a + count_x
+            indices += [a, a + 1, c + 1, a, c + 1, c]
+    return newton.Mesh(vertices, np.asarray(indices, dtype=np.int32), compute_inertia=False)
+
+
+def elastic_plank_on_ground(device, *, ground: str = "mesh", count_x: int = 5, count_y: int = 3, height: float = 0.0):
+    """Build a reduced elastic plank above a static ground.
+
+    The plank is a 0.4 m x 0.2 m x 0.01 m beam basis from :class:`newton.ModalGeneratorBeam` with
+    two vertical bending modes and one torsion mode (0.8 kg). Its collision mesh is a flat grid of
+    ``count_x x count_y`` vertices on its mid plane, ``height`` [m] above a ground surface at
+    ``z = 0``, so each grid vertex makes one elastic contact. ``ground`` selects a two-triangle
+    static mesh (``"mesh"``), a ground plane (``"plane"``), or a static box (``"box"``).
+
+    Returns:
+        The finalized model and the plank body index.
+    """
+    cfg = newton.ModelBuilder.ShapeConfig()
+    cfg.ke = 1.0e5
+    cfg.kd = 0.0
+    cfg.mu = 0.5
+    cfg.gap = 0.01
+    builder = newton.ModelBuilder()
+    if ground == "mesh":
+        builder.add_shape_mesh(-1, mesh=grid_surface_mesh(1.0, 1.0, 2, 2), cfg=cfg)
+    elif ground == "plane":
+        builder.add_ground_plane(cfg=cfg)
+    elif ground == "box":
+        builder.add_shape_box(
+            -1, xform=wp.transform(wp.vec3(0.0, 0.0, -0.05), wp.quat_identity()), hx=1.0, hy=1.0, hz=0.05, cfg=cfg
+        )
+    else:
+        raise ValueError(f"unknown ground {ground!r}")
+    beam = newton.ModalGeneratorBeam
+    basis = beam(
+        length=0.4,
+        half_width_y=0.1,
+        half_width_z=0.005,
+        mode_specs=[
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 2},
+            {"type": beam.Mode.TORSION, "boundary": beam.Boundary.LINEAR},
+        ],
+        young_modulus=1.0e7,
+        damping_ratio=0.05,
+    ).build()
+    body = builder.add_body_elastic(
+        xform=wp.transform(wp.vec3(0.0, 0.0, height), wp.quat_identity()), modal_basis=basis
+    )
+    builder.add_shape_mesh(body, mesh=grid_surface_mesh(0.2, 0.1, count_x, count_y), cfg=cfg)
+    builder.color()
+    return builder.finalize(device=device), body

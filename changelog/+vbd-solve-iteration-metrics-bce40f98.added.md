@@ -1,0 +1,1 @@
+Add `SolverVBD(solver_iteration_metrics=True)` and `SolverVBD.solve_iteration_metrics()`, which report for every iteration of the latest step the body position and rotation updates, the largest body-body contact penetration and contact multiplier changes, and, with `elastic_solver_metrics=True`, the reduced elastic block residual and update norms.

@@ -257,7 +257,8 @@ integrals they can compute exactly:
      - All exact from the consistent nodal mass matrix.
      - Estimated with ``derive_psi``.
      - :meth:`ModalBasis.add_frame`
-   * - :class:`ModalGeneratorCraigBampton`
+   * - :class:`ModalGeneratorCraigBampton`,
+       :class:`ModalGeneratorCraigBamptonFEM`
      - ``Mf``, ``S``, ``G``, and rigid properties exact from the reduced
        matrices; ``B``, ``C``, and ``P`` only with ``sample_mass``, lumped
        over the recovery samples.
@@ -284,6 +285,79 @@ motion. The FEM generator does not: the rigid-body part of, for example,
 mass-proportional damping of a free-free model is dropped, so the floating
 frame is undamped.
 
+:class:`ModalGeneratorFEM` accepts dense arrays or SciPy sparse matrices.
+``eigensolver="dense"`` solves the full spectrum with LAPACK, densifying
+sparse input, and suits models up to a few thousand DOFs.
+``eigensolver="arpack"`` keeps the matrices sparse and computes only the
+lowest modes with ARPACK shift-invert Lanczos on a sparse LU factorization of
+:math:`\mathbf{K} - \sigma\mathbf{M}`; it requires ``mode_count``. The
+rigid-body modes of a free-free model are deflated analytically, and a Sturm
+sequence count from a second factorization verifies that no mode below the
+retained ones was missed; when no gap in the spectrum allows that check, a
+warning says so. The residual of every returned eigenpair is checked as
+well. The default ``"auto"`` uses ARPACK when any input matrix is sparse, or
+when the free DOF count exceeds ``dense_dof_limit`` and ``mode_count`` is
+set. Both paths orient each mode so that its largest-magnitude entry is
+positive; within a repeated eigenvalue the basis can differ between them. The
+default shift :math:`\sigma = -10^{-6}\,\|\mathbf{K}\|_1 /
+\|\mathbf{M}\|_1` keeps the shifted matrix definite for free-free models,
+which require a negative shift because their rigid-body eigenvalues are zero;
+for constrained meshes whose stiffest and softest modes differ by many
+decades, an ``arpack_shift`` just below the lowest wanted eigenvalue
+converges faster. A shift at an eigenvalue raises. On this path the
+zero-energy threshold is relative to a scale of the largest eigenvalue: the
+smaller of the Gershgorin-type bound
+:math:`\max_i \sum_j |K_{ij}| / M_{ii}` and twice the Rayleigh quotient
+after 30 power iterations on :math:`\mathbf{M}^{-1}\mathbf{K}`. The bound
+alone is close for three-DOF meshes but exceeds the largest eigenvalue 41
+times on a consistent-mass shell panel and about 1200 times on a welded
+two-panel shell with small (drilling-ratio) rotary inertia, which would put
+the threshold above genuine elastic modes. Fixed-interface eigenvalues of
+:class:`ModalGeneratorCraigBamptonFEM` at or below ``eigenvalue_tolerance``
+times this scale are reported as mechanisms, and the reduction report
+records the scale and its source. The
+factorization dominates time and memory: its fill grows much faster for
+volume meshes than for shell meshes of the same size. For large models, also
+pass ``sample_node_indices`` (sample points that coincide with nodes are
+otherwise detected automatically, but all others are interpolated from every
+node).
+
+:class:`ModalGeneratorCraigBamptonFEM` performs the fixed-interface
+Craig-Bampton reduction itself, from full nodal mass, stiffness, and optional
+damping matrices with three (``[ux, uy, uz]``) or six
+(``[ux, uy, uz, rx, ry, rz]``) DOFs per node, and passes the reduced
+matrices and the translational recovery of the sample nodes to
+:class:`ModalGeneratorCraigBampton`. Each interface is a six-DOF frame
+defined by a list of nodes: ``"node"`` uses one six-DOF node directly,
+``"rbe2"`` ties the nodes rigidly to the frame, and ``"rbe3"`` defines the
+frame as the least-squares rigid fit of the node translations without
+stiffening them. The static constraint modes and the lowest fixed-interface
+modes reuse one sparse factorization of the interior stiffness, with every
+frame fixed; a mechanism that remains, such as a part that is not tied to the
+rest, raises. The generator exposes the intermediate matrices and a report of
+residuals and timings, and :meth:`~ModalGeneratorCraigBamptonFEM.save_npz`
+writes the reduced model as arrays named like the generator arguments.
+
+Assemblies of separately meshed parts are joined with linear multi-point
+constraints :math:`\mathbf{C}\mathbf{u} = 0`, which
+:class:`ConstraintElimination` removes with a coordinate transformation
+:math:`\mathbf{u} = \mathbf{T}\mathbf{q}`; the Craig-Bampton generator
+applies it first when given ``constraints`` or a ready ``transformation``.
+Node-to-node ties keep :math:`\mathbf{T}` Boolean, so the tied matrices are
+as sparse as the mesh; other rows, such as rigid links or averaging elements,
+are eliminated by pivoting on one dependent DOF per row. Constraints between
+coincident nodes and rigid links preserve rigid-body motion, which
+:meth:`~ConstraintElimination.rigid_motion_residual` checks; constraints
+between nodes at different positions preserve it only when they include the
+lever arm. :meth:`ModalGeneratorCraigBamptonFEM.reduce` rejects constraints
+that ground the body or resist rigid motion, because the reduced model would
+lack its six rigid-body modes. :func:`newton.utils.load_sparse_matrix` reads matrices exported as
+Matrix Market or SciPy ``.npz`` files. All generators require symmetric
+matrices in full storage and reject a relative asymmetry above
+:math:`10^{-8}`: a matrix exported as one triangle must be expanded first,
+which :func:`~newton.utils.load_sparse_matrix` does for Matrix Market files
+declared ``symmetric`` and checks with ``symmetric=True``.
+
 Joints, attachments, and contacts
 ---------------------------------
 
@@ -306,6 +380,129 @@ Contacts are generated between the deformed vertices of the shapes on an
 elastic link and rigid shapes; shape pairs in which both shapes belong to
 elastic links produce no contacts. :class:`~newton.viewer.ViewerGL` renders the
 deformed shapes.
+
+Against a mesh shape, a vertex gives a contact row when the mesh has a point
+within the search radius. The radius is the sum of the margins and gaps of both
+shapes, divided by the smallest scale component of the mesh shape and applied in
+the unscaled mesh frame; this and the bound below hold for positive scale
+components, and negative (mirroring) scale components are not supported. The row's separation is the distance to the closest
+mesh point, negative when the vertex is reported inside the mesh, and a row
+whose separation exceeds the sum of margins and gaps is dropped. The
+inside/outside test is reliable on one closed mesh component whose triangles
+face outward. On other meshes (open parts, coincident back-to-back faces,
+inside-out or overlapping components) a vertex outside the mesh can be reported
+inside, which gives a row as deep as its distance to the mesh and pulls the
+vertex into the mesh, and a vertex inside can be missed. Under non-uniform scale
+such a row can be deeper than the sum of margins and gaps, up to that sum times
+the ratio of the largest to the smallest scale component.
+
+Prepare the collision meshes of parts that touch an elastic link first:
+
+1. Use a closed convex or watertight mesh with outward-facing triangles, for
+   example ``newton.utils.remesh_mesh(mesh, method="convex_hull")``.
+   :attr:`Mesh.is_watertight <newton.Mesh.is_watertight>` checks only that every
+   edge is shared by exactly two triangles; it does not check their
+   orientation.
+2. Author small gaps, a few millimeters, on both shapes. A shape whose
+   ``ModelBuilder.ShapeConfig.gap`` is ``None`` uses
+   ``ModelBuilder.rigid_gap``, which is 0.1 m by default.
+3. Exclude parts that never touch the elastic link from contact.
+
+:class:`~newton.CollisionPipeline` warns once per construction about the unique
+meshes that can collide with an elastic shape and are open or non-manifold
+(some edges are not shared by exactly two triangles), or closed with a negative
+enclosed volume (inside-out). On an 81,920-triangle mesh, measured on a CPU, the
+check took about 3 ms when the watertightness of the mesh was already cached
+(:meth:`ModelBuilder.finalize` computes it for mesh shapes) and about 40 ms when
+it was not. It does not detect overlapping closed components, a mesh in which
+only some components are inside-out while the total volume stays positive, a
+closed mesh in which only some triangles are flipped (its total signed volume
+can stay positive), an outward-facing shell nested inside another, or an
+isolated pair of coincident triangles. It also warns about
+meshes that work as intended, for example an open single-sided surface that
+the elastic link only touches from its front side, or a closed mesh with an
+extra zero-area triangle. Silence it with a standard warnings filter:
+
+.. code-block:: python
+
+    import warnings
+
+    warnings.filterwarnings("ignore", message="Collision meshes unsuitable for reduced elastic contacts")
+
+For meshes that cannot be fixed, ``CollisionPipeline(...,
+elastic_contact_mesh_sign_method="normal_and_parity")`` changes the test for
+every mesh shape that can collide with an elastic shape. A vertex that the
+pseudo-normal reports inside is tested again by ray parity with three rays
+close to one direction, which says inside when at least two rays cross the mesh
+an odd number of times. The vertex counts as inside only if both tests say
+inside; otherwise its row gets a positive separation equal to its distance. The
+table shows the effect on a unit box mesh scaled to 0.4 x 0.25 x 0.1 m and
+rotated, against the 5,500 surface vertices of 125 small elastic boxes placed
+around it (gap 20 mm on each shape, no margin).
+
+.. list-table::
+   :header-rows: 1
+
+   * - Mesh
+     - Wrong-side rows, ``"normal"``
+     - Wrong-side rows, ``"normal_and_parity"``
+     - Real contacts lost, ``"normal"``
+     - Real contacts lost, ``"normal_and_parity"``
+   * - Closed, outward-facing
+     - 0
+     - 0
+     - 0 %
+     - 0 %
+   * - Open cup (top face removed)
+     - 304
+     - 0
+     - 4 %
+     - 33 %
+   * - Closed with a back-to-back copy of the top face
+     - 342
+     - 0
+     - 3 %
+     - 33 %
+   * - Closed with a same-winding copy of the top face
+     - 0
+     - 0
+     - 0 %
+     - 33 %
+   * - Closed with an extra zero-area triangle
+     - 0
+     - 0
+     - 0 %
+     - 0 %
+   * - Closed, inside-out
+     - 4204
+     - 0
+     - 100 %
+     - 100 %
+   * - Single open sheet (no solid behind it)
+     - 1355
+     - 596
+     - n/a
+     - n/a
+   * - Two overlapping closed boxes
+     - 0
+     - 0
+     - 30 %
+     - 69 %
+
+So the option removes the wrong-side rows next to open cups and duplicated
+faces, but it drops a share of real contacts there; where the default was
+already right, as with a same-winding duplicate face, it only drops contacts.
+Behind a single open sheet both tests can fail together, so wrong-side rows
+remain. On an inside-out closed mesh every contact is lost, and on overlapping
+closed components contacts in the overlap are lost. A real contact that is
+dropped still gives a row while its distance to the mesh is within the sum of
+margins and gaps, with a positive separation and a normal pointing from the
+mesh into the solid, so any force that row produces pushes the vertex deeper.
+The option does not make a defective mesh safe. The extra query runs at every step for every vertex the pseudo-normal
+reports inside, and its rays run through the whole mesh. In a CPU measurement
+on an 81,920-triangle mesh, the sign queries took 3.7 times as long as with the
+default when half of the queried vertices were inside, and 6.2 times as long
+when all were.
 
 Solver
 ------
@@ -339,6 +536,28 @@ Relevant options:
 - ``elastic_body_relaxation`` under-relaxes the block update, and
   ``elastic_solver_metrics`` enables
   :meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics`.
+- ``solver_iteration_metrics`` records, for every iteration of the last step,
+  the body updates, the largest body-body contact penetration and multiplier
+  changes, and, together with ``elastic_solver_metrics``, the elastic block
+  residuals; read them with
+  :meth:`~newton.solvers.SolverVBD.solve_iteration_metrics` to check whether a
+  step converged.
+
+Deterministic mode: ``SolverVBD(deterministic=wp.DeterministicMode.RUN_TO_RUN)``
+makes the elastic contact assembly repeat bit for bit. Pair it with
+``CollisionPipeline(deterministic=True)``, which fixes the contact order. Warp
+then records every atomic update and reduces it in a fixed order, so the
+solver sizes the record buffers of the modal contact assembly from the largest
+mode count and ``rigid_body_contact_buffer_size``: about
+``ceil(rigid_body_contact_buffer_size / 32) * (6 n + n (n + 1) / 2)`` records
+per thread, or 36 MiB per launch for one body with 48 modes and a 1024-entry
+list. Construction raises :class:`ValueError` when one launch would need more
+than 1 GiB. Every elastic body's contacts should fit its per-body list; a step
+whose list overflows can exceed the buffers and then raises a
+:class:`ValueError` naming the ``rigid_body_contact_buffer_size`` needed.
+Deterministic mode is much slower: a 240-step drop of a three-mode plank with
+about 100 contacts took 26 to 35 times longer than in the default mode on a
+shared RTX PRO 6000 Blackwell GPU (Warp 1.18).
 
 With ``rigid_articulation_solve="block_sparse_joints"``, elastic links in an
 articulation with at least one other body are solved in the articulation's

@@ -1,0 +1,1 @@
+Solve dense `ModalGeneratorFEM` input with more than `dense_dof_limit` (default 2000) free DOFs and a `mode_count` with ARPACK under the default `eigensolver="auto"`, instead of LAPACK. Eigenvalues agree to roundoff, but the basis within repeated eigenvalues and the zero-energy threshold can differ; pass `eigensolver="dense"` to keep the previous behavior.

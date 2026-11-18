@@ -9172,6 +9172,133 @@ def create_update_duals_body_body_contacts():
 update_duals_body_body_contacts = create_update_duals_body_body_contacts()
 
 
+@functools.cache
+def create_solver_iteration_metric_kernels():
+    """Create the kernels that record per-iteration convergence metrics of the body solve.
+
+    ``SolverVBD`` creates them only with ``solver_iteration_metrics=True``. They only read solver
+    state, so default runs neither compile nor launch them.
+    """
+
+    @wp.kernel(module="unique")
+    def record_body_iteration_update(
+        iteration: int,
+        body_q_before: wp.array[wp.transform],
+        body_q: wp.array[wp.transform],
+        body_com: wp.array[wp.vec3],
+        # outputs
+        translation_update_norm: wp.array2d[float],
+        rotation_update_norm: wp.array2d[float],
+    ):
+        """Record the center-of-mass translation and the rotation angle of one iteration's body update."""
+        body = wp.tid()
+        q_before = body_q_before[body]
+        q_after = body_q[body]
+        com = body_com[body]
+        translation = wp.transform_point(q_after, com) - wp.transform_point(q_before, com)
+        dq = wp.transform_get_rotation(q_after) * wp.quat_inverse(wp.transform_get_rotation(q_before))
+        vector_length = wp.length(wp.vec3(dq[0], dq[1], dq[2]))
+        translation_update_norm[iteration, body] = wp.length(translation)
+        rotation_update_norm[iteration, body] = 2.0 * wp.atan2(vector_length, wp.abs(dq[3]))
+
+    @wp.kernel(module="unique")
+    def record_body_body_contact_iteration_metrics(
+        iteration: int,
+        rigid_contact_count: wp.array[int],
+        rigid_contact_shape0: wp.array[int],
+        rigid_contact_shape1: wp.array[int],
+        rigid_contact_point0: wp.array[wp.vec3],
+        rigid_contact_point1: wp.array[wp.vec3],
+        rigid_contact_normal: wp.array[wp.vec3],
+        rigid_contact_margin0: wp.array[float],
+        rigid_contact_margin1: wp.array[float],
+        rigid_contact_elastic_sample0: wp.array[wp.int32],
+        rigid_contact_elastic_sample1: wp.array[wp.int32],
+        shape_body: wp.array[int],
+        body_q: wp.array[wp.transform],
+        body_q_prev: wp.array[wp.transform],
+        body_elastic_index: wp.array[wp.int32],
+        elastic_joint: wp.array[wp.int32],
+        elastic_mode_count: wp.array[wp.int32],
+        joint_q: wp.array[float],
+        joint_q_prev: wp.array[float],
+        joint_q_start: wp.array[wp.int32],
+        elastic_shape_vertex_local: wp.array[wp.vec3],
+        elastic_shape_vertex_phi: wp.array[wp.vec3],
+        elastic_max_mode_count: int,
+        contact_lambda_before: wp.array[wp.vec3],
+        contact_lambda: wp.array[wp.vec3],
+        # outputs
+        max_penetration: wp.array[float],
+        max_normal_multiplier_change: wp.array[float],
+        max_tangent_multiplier_change: wp.array[float],
+    ):
+        """Reduce one iteration's body-body penetration and multiplier changes to their maxima.
+
+        The penetration is measured at the iterate that the iteration's dual update used, with the
+        same deformed points as :func:`update_duals_body_body_contacts`. The maxima use float ``atomic_max``,
+        whose result does not depend on the order of the updates.
+        """
+        idx = wp.tid()
+        if idx >= rigid_contact_count[0]:
+            return
+        shape_id_0 = rigid_contact_shape0[idx]
+        shape_id_1 = rigid_contact_shape1[idx]
+        if shape_id_0 < 0 or shape_id_1 < 0:
+            return
+        body_id_0 = shape_body[shape_id_0]
+        body_id_1 = shape_body[shape_id_1]
+        if body_id_0 < 0 and body_id_1 < 0:
+            return
+
+        p0_world, _p0_prev = evaluate_contact_point_world(
+            body_id_0,
+            rigid_contact_point0[idx],
+            rigid_contact_elastic_sample0[idx],
+            body_q,
+            body_q_prev,
+            body_elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            joint_q,
+            joint_q_prev,
+            joint_q_start,
+            elastic_shape_vertex_local,
+            elastic_shape_vertex_phi,
+            elastic_max_mode_count,
+        )
+        p1_world, _p1_prev = evaluate_contact_point_world(
+            body_id_1,
+            rigid_contact_point1[idx],
+            rigid_contact_elastic_sample1[idx],
+            body_q,
+            body_q_prev,
+            body_elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            joint_q,
+            joint_q_prev,
+            joint_q_start,
+            elastic_shape_vertex_local,
+            elastic_shape_vertex_phi,
+            elastic_max_mode_count,
+        )
+        n = rigid_contact_normal[idx]
+        penetration = -contact_surface_separation(
+            p0_world, p1_world, n, rigid_contact_margin0[idx], rigid_contact_margin1[idx]
+        )
+        change = contact_lambda[idx] - contact_lambda_before[idx]
+        normal_change = wp.dot(change, n)
+        tangent_change = change - n * normal_change
+        wp.atomic_max(max_penetration, iteration, wp.max(penetration, 0.0))
+        wp.atomic_max(max_normal_multiplier_change, iteration, wp.abs(normal_change))
+        wp.atomic_max(max_tangent_multiplier_change, iteration, wp.length(tangent_change))
+
+    for kernel in (record_body_iteration_update, record_body_body_contact_iteration_metrics):
+        wp.set_module_options({"enable_backward": False}, module=kernel.module)
+    return record_body_iteration_update, record_body_body_contact_iteration_metrics
+
+
 @wp.kernel
 def update_duals_body_particle_contacts(
     body_particle_contact_count: wp.array[int],

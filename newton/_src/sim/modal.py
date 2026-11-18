@@ -20,9 +20,14 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
-from typing import Any, ClassVar, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 
 import numpy as np
+
+from . import modal_sparse
+
+if TYPE_CHECKING:
+    from scipy.sparse import sparray, spmatrix
 
 _PAIR_CHUNK_BYTES = 256 * 1024 * 1024
 """Upper bound [bytes] for each float64 GEMM operand chunk in :func:`_reduced_inertia_from_pairs`."""
@@ -1062,6 +1067,71 @@ class ModalBasis:
         )
 
 
+_NEIGHBOR_CANDIDATE_EXTRA = 8
+"""Extra k-d tree candidates per point beyond ``k + 1``, so that distance ties at the ``k``-th neighbor are seen."""
+
+_NEIGHBOR_BRUTE_FORCE_LIMIT = 2048
+"""Largest point count whose neighbors :func:`_nearest_neighbors` finds by brute force."""
+
+
+def _nearest_neighbors(points: np.ndarray, k: int) -> np.ndarray:
+    """Return the ``k`` nearest other points of every point, shape ``[point_count, k]``.
+
+    Up to :data:`_NEIGHBOR_BRUTE_FORCE_LIMIT` points, or without SciPy, a
+    brute-force ``O(N^2 log N)`` search sorts all squared distances, which
+    keeps the historical results, including how ties at the ``k``-th
+    neighbor of regular grids are broken. Larger point sets use a k-d tree
+    (:class:`scipy.spatial.cKDTree`) in ``O(N log N)`` and order neighbors by
+    squared distance, then by index, so ties are broken deterministically.
+
+    Args:
+        points: Point positions [m], shape ``[point_count, 3]``, float64.
+        k: Neighbor count, at most ``point_count - 1``.
+
+    Returns:
+        Neighbor indices, nearest first, excluding the point itself.
+    """
+    count = points.shape[0]
+    neighbors = np.empty((count, k), dtype=np.int64)
+    tree = None
+    if count > _NEIGHBOR_BRUTE_FORCE_LIMIT:
+        try:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(points)
+        except ImportError:
+            tree = None
+    if tree is None:
+        for point in range(count):
+            delta = points - points[point]
+            neighbors[point] = np.argsort(np.sum(delta * delta, axis=1))[1 : k + 1]
+        return neighbors
+
+    def ordered(point: int, candidates: np.ndarray) -> np.ndarray:
+        candidates = candidates[candidates != point]
+        delta = points[candidates] - points[point]
+        dist2 = np.sum(delta * delta, axis=1)
+        return candidates[np.lexsort((candidates, dist2))[:k]]
+
+    query_count = min(count, k + 1 + _NEIGHBOR_CANDIDATE_EXTRA)
+    _, candidates = tree.query(points, k=query_count)
+    candidates = np.asarray(candidates, dtype=np.int64).reshape((count, query_count))
+    for point in range(count):
+        row = candidates[point]
+        chosen = ordered(point, row)
+        if query_count < count and k > 0:
+            # Every point outside the candidates is at least as far as the farthest candidate; when that
+            # candidate ties with the k-th neighbor, gather all tied points with a radius query.
+            delta = points[row] - points[point]
+            kth_delta = points[chosen[-1]] - points[point]
+            kth = float(kth_delta @ kth_delta)
+            if float(np.max(np.sum(delta * delta, axis=1))) <= kth * (1.0 + 1.0e-9):
+                radius = math.sqrt(kth) * (1.0 + 1.0e-6) + np.finfo(np.float64).tiny
+                chosen = ordered(point, np.asarray(tree.query_ball_point(points[point], radius), dtype=np.int64))
+        neighbors[point] = chosen
+    return neighbors
+
+
 def _estimate_sample_psi(
     sample_points: Sequence[Sequence[float]] | np.ndarray,
     sample_phi: Sequence[Sequence[Sequence[float]]] | np.ndarray,
@@ -1108,11 +1178,11 @@ def _estimate_sample_psi(
         return psi
 
     k = min(int(neighbor_count), sample_count - 1)
+    neighbors = _nearest_neighbors(points, k)
     degenerate = 0
     for s in range(sample_count):
-        delta = points - points[s]
-        order = np.argsort(np.sum(delta * delta, axis=1))[1 : k + 1]
-        dx = delta[order]  # [k, 3]
+        order = neighbors[s]
+        dx = points[order] - points[s]  # [k, 3]
         gram = dx.T @ dx  # [3, 3]
         scale = np.trace(gram) / 3.0
         if scale <= 0.0:
@@ -1258,6 +1328,27 @@ def _project_modal_damping(generator: Any, modal_damping: np.ndarray, source: st
     return _clamp_modal_diagonal(diagonal, tolerance * diagonal_scale, f"{source} damping", stacklevel=4)
 
 
+_MODE_SIGN_TIE_TOLERANCE = 1.0e-6
+"""Relative magnitude within which mode entries tie for the largest one in :func:`_orient_modes` [dimensionless]."""
+
+
+def _orient_modes(modes: np.ndarray) -> np.ndarray:
+    """Return ``modes`` with each column's sign chosen so that its largest-magnitude entry is positive.
+
+    Entries within :data:`_MODE_SIGN_TIE_TOLERANCE` of the largest magnitude
+    tie, and the first of them decides, so that eigensolvers whose results
+    differ by roundoff choose the same sign, also for symmetric modes whose
+    largest entries have equal magnitude and opposite signs.
+    """
+    if modes.shape[1] == 0:
+        return modes
+    magnitude = np.abs(modes)
+    peak = np.max(magnitude, axis=0)
+    pivot = np.argmax(magnitude >= (1.0 - _MODE_SIGN_TIE_TOLERANCE) * peak, axis=0)
+    sign = np.where(modes[pivot, np.arange(modes.shape[1])] < 0.0, -1.0, 1.0)
+    return modes * sign
+
+
 def _clamp_modal_diagonal(values: np.ndarray, tolerance: float, name: str, stacklevel: int = 3) -> np.ndarray:
     """Clamp negative projected modal values to zero, warning beyond the roundoff ``tolerance``."""
     values = np.asarray(values, dtype=np.float64)
@@ -1332,6 +1423,7 @@ class ModalGeneratorCraigBampton:
         mass_matrix: Craig-Bampton reduced mass matrix, shape
             ``[reduced_dof_count, reduced_dof_count]``. The first
             ``6 * interface_count`` rows and columns are the interface block.
+            Dense or SciPy sparse; the reduced matrices are always densified.
         stiffness_matrix: Craig-Bampton reduced stiffness matrix, with the same
             shape and coordinate order as ``mass_matrix``.
         sample_points: Body-local recovery sample points [m], shape
@@ -1363,6 +1455,12 @@ class ModalGeneratorCraigBampton:
             interface translation rows and the recovered translation of a
             coincident sample for which the interface is treated as direct
             (RBE2-style) rather than distributing.
+        rigid_recovery_tolerance: Largest error of ``recovery_matrix`` applied
+            to the rigid-body motion of the interfaces, relative to the
+            sample rigid motion (``max(1, max |x_sample|)``), above which
+            :meth:`build` raises. A recovery that does not reproduce rigid
+            motion means the model resists rigid-body motion; see
+            ``rigid_consistency`` of :class:`ModalGeneratorCraigBamptonFEM`.
     """
 
     def __init__(
@@ -1382,6 +1480,7 @@ class ModalGeneratorCraigBampton:
         damping_projection: Literal["diagonal", "error"] = "diagonal",
         interface_match_tolerance: float = 1.0e-7,
         interface_recovery_tolerance: float = 1.0e-6,
+        rigid_recovery_tolerance: float = 1.0e-6,
     ):
         self.interface_positions = np.asarray(interface_positions, dtype=np.float64)
         if self.interface_positions.ndim != 2 or self.interface_positions.shape[1] != 3:
@@ -1458,6 +1557,9 @@ class ModalGeneratorCraigBampton:
             raise ValueError(
                 f"interface_recovery_tolerance must be non-negative, got {self.interface_recovery_tolerance}"
             )
+        self.rigid_recovery_tolerance = float(rigid_recovery_tolerance)
+        if not self.rigid_recovery_tolerance >= 0.0:
+            raise ValueError(f"rigid_recovery_tolerance must be non-negative, got {self.rigid_recovery_tolerance}")
         self.label = label
 
         self.fixed_interface_mode_count = self.reduced_dof_count - self.interface_dof_count
@@ -1477,14 +1579,12 @@ class ModalGeneratorCraigBampton:
 
     @staticmethod
     def _coerce_square_matrix(
-        matrix: Sequence[Sequence[float]] | np.ndarray,
+        matrix: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray,
         size: int,
         name: str,
     ) -> np.ndarray:
-        array = np.asarray(matrix, dtype=np.float64)
-        if array.shape != (size, size):
-            raise ValueError(f"{name} must have shape ({size}, {size}), got {array.shape}")
-        return 0.5 * (array + array.T)
+        """Return the dense symmetric part of a square matrix; reduced sparse matrices are densified."""
+        return modal_sparse.coerce_symmetric_matrix(matrix, size, name, keep_sparse=False)
 
     @staticmethod
     def _skew(value: np.ndarray) -> np.ndarray:
@@ -1596,10 +1696,11 @@ class ModalGeneratorCraigBampton:
         )
         recovery_scale = max(float(np.max(np.abs(sample_rigid))), 1.0)
         recovery_rigid_error = float(np.max(np.abs(self.recovery_matrix @ rigid - sample_rigid)))
-        if recovery_rigid_error > 1.0e-6 * recovery_scale:
+        if recovery_rigid_error > self.rigid_recovery_tolerance * recovery_scale:
             raise ValueError(
                 "recovery_matrix is inconsistent with rigid motion of sample_points "
-                f"(maximum error {recovery_rigid_error:.3g})"
+                f"(maximum error {recovery_rigid_error:.3g}, relative {recovery_rigid_error / recovery_scale:.3g} > "
+                f"rigid_recovery_tolerance {self.rigid_recovery_tolerance:.3g})"
             )
 
         recovered_modes = self.recovery_matrix @ modal_matrix
@@ -1880,6 +1981,10 @@ class ModalGeneratorFEM:
     rigid-body motion only when it overlaps a rigid motion that the fixed DOFs
     admit.
 
+    The sign of each mode is chosen so that its largest-magnitude nodal
+    entry is positive, on both eigensolver paths. Within a repeated
+    eigenvalue the basis remains arbitrary and can differ between the paths.
+
     Damping is not part of the eigenproblem. ``damping_matrix`` is projected onto
     the selected modes and only its diagonal is stored; see
     ``damping_projection``. Unlike :class:`ModalGeneratorCraigBampton`, the
@@ -1893,20 +1998,47 @@ class ModalGeneratorFEM:
     subspace, and ``damping_off_diagonal_ratio`` records the discarded damping
     coupling.
 
+    The matrices may be dense arrays or SciPy sparse matrices. The eigenproblem
+    is solved either densely (Cholesky reduction and a full symmetric
+    eigensolve over all free DOFs) or, for large models, with ARPACK
+    shift-invert Lanczos (:func:`scipy.sparse.linalg.eigsh`) on a sparse LU
+    factorization of ``K - sigma M``, which computes only the
+    ``discard_mode_count + mode_count`` lowest non-rigid modes plus a small
+    margin. On that path the rigid-body motions of a free-free model, which
+    the stiffness check proves to be zero-energy eigenvectors, are deflated
+    from the Lanczos operator rather than sought as a six-fold repeated
+    eigenvalue, and a Sturm sequence count (the inertia of a second
+    factorization of ``K - tau M`` above the retained modes) verifies that
+    no eigenvalue was missed; missed ones are sought again with the found
+    modes locked, and a remaining mismatch raises. The zero-energy threshold
+    is relative to the bound ``max_i sum_j |K_ij| / M_ii`` on the largest
+    eigenvalue instead of the computed spectrum, and its floor is
+    ``8 * max_row_nonzeros * eps`` instead of ``8 * free_dof_count * eps``.
+    Mass positive definiteness is certified there by the inertia of the
+    factorization of ``K - sigma M`` (for ``sigma <= 0``), the mass diagonal,
+    and the modal masses of the computed modes, which detects an indefinite
+    mass matrix except in directions that the stiffness dominates. For large
+    models, pass ``sample_node_indices``: otherwise every sample point that
+    does not coincide with a node is interpolated from all nodes.
+
     Args:
         node_positions: Rest node positions [m], shape ``[node_count, 3]``.
         mass_matrix: Nodal mass matrix [kg], shape
-            ``[3 * node_count, 3 * node_count]``.
+            ``[3 * node_count, 3 * node_count]``; dense or SciPy sparse.
         stiffness_matrix: Nodal stiffness matrix [N/m], shape
-            ``[3 * node_count, 3 * node_count]``.
+            ``[3 * node_count, 3 * node_count]``; dense or SciPy sparse.
         damping_matrix: Optional nodal damping matrix [N s/m], shape
-            ``[3 * node_count, 3 * node_count]``.
+            ``[3 * node_count, 3 * node_count]``; dense or SciPy sparse.
         sample_points: Body-local points [m] where the returned basis is
             sampled. Defaults to ``node_positions``.
         sample_node_indices: Optional node index for each sample point. When
             provided, sample values are copied exactly from those FEM nodes.
-            Otherwise values are interpolated from nodal modes.
-        mode_count: Number of elastic modes to retain.
+            Otherwise sample points that coincide exactly with distinct nodes
+            copy those nodes (detected with a k-d tree when SciPy is
+            available), and other points are interpolated from nodal modes,
+            which costs ``O(sample_count * node_count)``.
+        mode_count: Number of elastic modes to retain. Required when the
+            ARPACK eigensolver is used.
         fixed_node_indices: Nodes whose translational DOFs are fixed during the
             eigen solve. Their modal displacement is zero in the returned basis.
         fixed_dof_indices: Individual nodal DOF indices fixed during the solve.
@@ -1934,14 +2066,41 @@ class ModalGeneratorFEM:
             exceeds ``damping_coupling_tolerance``; ``"error"`` raises instead.
         damping_coupling_tolerance: Relative off-diagonal damping magnitude
             allowed before ``damping_projection`` warns or raises.
+        eigensolver: Generalized eigensolver. ``"dense"`` solves the full
+            spectrum with LAPACK, densifying sparse input. ``"arpack"`` uses
+            sparse ARPACK shift-invert and requires ``mode_count`` and SciPy.
+            ``"auto"`` selects ``"arpack"`` when any input matrix is sparse, or
+            when the free DOF count exceeds ``dense_dof_limit``, ``mode_count``
+            is set, and SciPy is installed; otherwise ``"dense"``, which does
+            not need SciPy.
+        arpack_shift: ARPACK shift ``sigma`` [1/s^2]. ``None`` uses a small
+            negative shift, ``-1e-6 * ||K||_1 / ||M||_1``, which keeps
+            ``K - sigma M`` positive definite for free-free models. A
+            free-free model requires a negative shift, because its rigid-body
+            eigenvalues are zero. For a constrained model, a shift just below
+            the lowest wanted eigenvalue speeds up convergence for very wide
+            spectra; modes skipped by a higher shift are detected by the Sturm
+            sequence count. A shift at an eigenvalue, which makes
+            ``K - sigma M`` numerically singular, raises.
+        arpack_tol: ARPACK relative eigenvalue accuracy; ``0`` requests
+            machine precision.
+        arpack_maxiter: Maximum ARPACK restart iterations; ``None`` uses
+            SciPy's default.
+        arpack_ncv: Number of ARPACK Lanczos vectors; ``None`` uses SciPy's
+            default.
+        dense_dof_limit: Largest free DOF count that ``eigensolver="auto"``
+            solves densely for dense input.
     """
+
+    _ARPACK_MARGIN: ClassVar[int] = 2
+    """Extra eigenpairs computed beyond the retained ones so the last retained mode is converged."""
 
     def __init__(
         self,
         node_positions: Sequence[Sequence[float]] | np.ndarray,
-        mass_matrix: Sequence[Sequence[float]] | np.ndarray,
-        stiffness_matrix: Sequence[Sequence[float]] | np.ndarray,
-        damping_matrix: Sequence[Sequence[float]] | np.ndarray | None = None,
+        mass_matrix: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray,
+        stiffness_matrix: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray,
+        damping_matrix: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray | None = None,
         sample_points: Sequence[Sequence[float]] | np.ndarray | None = None,
         sample_node_indices: Sequence[int] | np.ndarray | None = None,
         mode_count: int | None = None,
@@ -1956,7 +2115,23 @@ class ModalGeneratorFEM:
         free_free: bool | None = None,
         damping_projection: Literal["diagonal", "error"] = "diagonal",
         damping_coupling_tolerance: float = 1.0e-5,
+        eigensolver: Literal["auto", "dense", "arpack"] = "auto",
+        arpack_shift: float | None = None,
+        arpack_tol: float = 0.0,
+        arpack_maxiter: int | None = None,
+        arpack_ncv: int | None = None,
+        dense_dof_limit: int = 2000,
     ):
+        if eigensolver not in ("auto", "dense", "arpack"):
+            raise ValueError(f"eigensolver must be 'auto', 'dense', or 'arpack', got '{eigensolver}'")
+        self.eigensolver = eigensolver
+        self.arpack_shift = None if arpack_shift is None else float(arpack_shift)
+        self.arpack_tol = float(arpack_tol)
+        if self.arpack_tol < 0.0:
+            raise ValueError(f"arpack_tol must be non-negative, got {self.arpack_tol}")
+        self.arpack_maxiter = None if arpack_maxiter is None else int(arpack_maxiter)
+        self.arpack_ncv = None if arpack_ncv is None else int(arpack_ncv)
+        self.dense_dof_limit = int(dense_dof_limit)
         self._node_positions64 = np.asarray(node_positions, dtype=np.float64)
         self.node_positions = np.asarray(node_positions, dtype=np.float32)
         if self.node_positions.ndim != 2 or self.node_positions.shape[1] != 3:
@@ -2035,13 +2210,13 @@ class ModalGeneratorFEM:
         self.damping_off_diagonal_ratio = 0.0
 
     @staticmethod
-    def _coerce_square_matrix(matrix: Sequence[Sequence[float]] | np.ndarray, size: int, name: str) -> np.ndarray:
-        array = np.asarray(matrix, dtype=np.float64)
-        if array.shape != (size, size):
-            raise ValueError(f"{name} must have shape ({size}, {size}), got {array.shape}")
-        return 0.5 * (array + array.T)
+    def _coerce_square_matrix(
+        matrix: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray, size: int, name: str
+    ) -> np.ndarray | spmatrix:
+        """Return the symmetric part of a square matrix; sparse input stays sparse (CSC)."""
+        return modal_sparse.coerce_symmetric_matrix(matrix, size, name)
 
-    def _admissible_rigid_vectors(self) -> np.ndarray:
+    def _admissible_rigid_vectors(self, mass: np.ndarray | spmatrix) -> np.ndarray:
         """Return the rigid motions that leave every fixed DOF at rest, shape ``[dof_count, k]``.
 
         For a free model these are all rigid translations and rotations. For a
@@ -2049,22 +2224,25 @@ class ModalGeneratorFEM:
         restricted to the fixed DOFs, which is empty when the constraints
         remove all rigid-body motion.
         """
-        rigid = self._rigid_vectors()
+        rigid = self._rigid_vectors(mass)
         if self.fixed_dof_indices.shape[0] == 0:
             return rigid
         # Normalize the columns so the rank test does not depend on the body size.
         rigid = rigid / np.maximum(np.linalg.norm(rigid, axis=0), np.finfo(np.float64).tiny)
-        _, singular_values, right = np.linalg.svd(rigid[self.fixed_dof_indices], full_matrices=True)
+        # Only the 6x6 right singular vectors are needed; skip the [fixed, fixed] left ones when the
+        # thin factorization already yields all of them.
+        fixed_rigid = rigid[self.fixed_dof_indices]
+        _, singular_values, right = np.linalg.svd(fixed_rigid, full_matrices=fixed_rigid.shape[0] < 6)
         rank = int(np.count_nonzero(singular_values > 1.0e-10))
         return rigid @ right[rank:].T
 
-    def _rigid_vectors(self) -> np.ndarray:
+    def _rigid_vectors(self, mass: np.ndarray | spmatrix) -> np.ndarray:
         """Return nodal rigid translations and rotations about the mass center, shape ``[dof_count, 6]``."""
         positions = self._node_positions64
         translation = np.tile(np.eye(3, dtype=np.float64), (self.node_count, 1))
-        total_mass = float(np.trace(translation.T @ self.mass_matrix @ translation)) / 3.0
+        total_mass = float(np.trace(modal_sparse.bilinear(translation, mass, translation))) / 3.0
         if total_mass > 0.0:
-            center = (translation.T @ self.mass_matrix @ positions.reshape(-1)) / total_mass
+            center = modal_sparse.bilinear(translation, mass, positions.reshape(-1)) / total_mass
         else:
             center = np.mean(positions, axis=0)
         rigid = np.zeros((self.dof_count, 6), dtype=np.float64)
@@ -2076,37 +2254,34 @@ class ModalGeneratorFEM:
         return rigid
 
     @staticmethod
-    def _mass_orthonormal_columns(vectors: np.ndarray, mass: np.ndarray) -> np.ndarray:
+    def _mass_orthonormal_columns(vectors: np.ndarray, mass: np.ndarray | spmatrix) -> np.ndarray:
         """Return an ``M``-orthonormal basis of the column span of ``vectors``, dropping dependent directions."""
         if vectors.shape[1] == 0:
             return vectors
-        gram = vectors.T @ mass @ vectors
+        gram = modal_sparse.bilinear(vectors, mass, vectors)
         gram = 0.5 * (gram + gram.T)
         values, rotation = np.linalg.eigh(gram)
         scale = max(float(np.max(np.abs(values))), np.finfo(np.float64).tiny)
         keep = values > 1.0e-10 * scale
         return vectors @ (rotation[:, keep] / np.sqrt(values[keep]))
 
-    def build(self) -> ModalBasis:
-        """Build a sampled modal basis.
+    def _uses_arpack(self, free_count: int) -> bool:
+        """Return whether :meth:`build` solves the eigenproblem with ARPACK for ``free_count`` free DOFs."""
+        if self.eigensolver == "auto":
+            matrices = (self.mass_matrix, self.stiffness_matrix, self.damping_matrix)
+            if any(modal_sparse.is_sparse(matrix) for matrix in matrices):
+                return True
+            # Dense input stays dense without mode_count (ARPACK needs it) or SciPy, as before.
+            return free_count > self.dense_dof_limit and self.mode_count is not None and modal_sparse.has_scipy()
+        return self.eigensolver == "arpack"
+
+    def _solve_dense(self, mass: np.ndarray, stiffness: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Solve the full generalized eigenproblem on the free DOFs with LAPACK.
 
         Returns:
-            The sampled modal basis of the selected elastic modes.
-
-        Raises:
-            ValueError: If the mass matrix is not positive definite on the free
-                DOFs, a free-free stiffness matrix does not preserve rigid-body
-                motion, the rigid-body mode count is inconsistent, zero-energy
-                mechanisms remain, or projected damping coupling is rejected.
+            Ascending eigenvalues [1/s^2], ``M``-orthonormal eigenvectors, the
+            zero-energy threshold [1/s^2], and its relative tolerance.
         """
-        free_dofs = np.ones(self.dof_count, dtype=bool)
-        free_dofs[self.fixed_dof_indices] = False
-        free = np.nonzero(free_dofs)[0]
-        if free.shape[0] == 0:
-            raise ValueError("At least one free DOF is required to build FEM modes")
-
-        mass = self.mass_matrix[np.ix_(free, free)]
-        stiffness = self.stiffness_matrix[np.ix_(free, free)]
         try:
             chol = np.linalg.cholesky(mass)
         except np.linalg.LinAlgError as exc:
@@ -2123,34 +2298,199 @@ class ModalGeneratorFEM:
         # Relative to the largest eigenvalue: a genuine elastic mode far below a stiff one stays
         # elastic, while eigenvalues within the eigensolver's roundoff of zero are zero energy.
         eigenvalue_scale = float(np.max(np.abs(eigenvalues)))
-        relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * free.shape[0] * np.finfo(np.float64).eps)
+        relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * mass.shape[0] * np.finfo(np.float64).eps)
+        return eigenvalues, eigen_modes, relative_tolerance * eigenvalue_scale, relative_tolerance
+
+    def _solve_arpack(
+        self, mass: spmatrix, stiffness: spmatrix, rigid_basis: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Solve for the lowest generalized eigenpairs on the free DOFs with ARPACK shift-invert.
+
+        The rigid-body motions ``rigid_basis`` of a free-free model are exact
+        zero-energy eigenvectors once the stiffness check has passed, so they
+        are deflated from the Lanczos operator and prepended to the result
+        instead of being sought as a six-fold repeated eigenvalue.
+        ``discard_mode_count + mode_count`` further eigenpairs, plus a small
+        margin, are computed and verified with a Sturm sequence count; see
+        :func:`~newton._src.sim.modal_sparse.lowest_generalized_eigenpairs`.
+
+        Returns:
+            Ascending eigenvalues [1/s^2], ``M``-orthonormal eigenvectors, the
+            zero-energy threshold [1/s^2], and its relative tolerance.
+        """
+        if self.mode_count is None:
+            raise ValueError(
+                "mode_count is required by the ARPACK eigensolver, which computes only the lowest modes; "
+                "set mode_count, or use eigensolver='dense' for the full spectrum of a small model"
+            )
+        mass_diagonal = np.asarray(mass.diagonal(), dtype=np.float64)
+        if not np.all(mass_diagonal > 0.0):
+            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs")
+        sigma = modal_sparse.default_shift(stiffness, mass) if self.arpack_shift is None else self.arpack_shift
+        rigid_count = 0 if rigid_basis is None else int(rigid_basis.shape[1])
+        if rigid_count > 0 and sigma >= 0.0:
+            # The rigid-body eigenvalues are zero: sigma = 0 makes K - sigma M singular, and solves near it
+            # amplify roundoff in the deflated rigid directions into spurious eigenpairs.
+            raise ValueError(
+                f"arpack_shift must be negative for a free-free model, got {sigma:.6g}: its {rigid_count} rigid-body "
+                "modes have eigenvalue 0, so stiffness_matrix - arpack_shift * mass_matrix is singular or "
+                "indefinite. Omit arpack_shift to use the default negative shift"
+            )
+        factorization = modal_sparse.ShiftedFactorization(stiffness, mass, sigma)
+        if factorization.numerically_singular:
+            raise ValueError(
+                f"stiffness_matrix - sigma * mass_matrix is numerically singular for sigma = {sigma:.6g} (smallest "
+                f"pivot {factorization.pivot_ratio:.3g} of the largest): sigma lies at an eigenvalue, or the "
+                "stiffness matrix has a mechanism that the shift does not separate. Choose a different arpack_shift"
+            )
+        if sigma <= 0.0 and factorization.negative_pivot_count > 0:
+            # K - sigma M with sigma <= 0 is indefinite only if M or K is; factor M to tell which.
+            mass_pivots = modal_sparse.nonpositive_pivot_count(mass)
+            if mass_pivots == 0:
+                raise ValueError(
+                    "stiffness_matrix must be positive semi-definite on free DOFs: stiffness_matrix - sigma * "
+                    f"mass_matrix has {factorization.negative_pivot_count} non-positive pivots for "
+                    f"sigma = {sigma:.6g} although mass_matrix is positive definite"
+                )
+            cause = (
+                f"mass_matrix has {mass_pivots}"
+                if mass_pivots > 0
+                else "also check that stiffness_matrix is positive semi-definite"
+            )
+            raise ValueError(
+                "mass_matrix must be symmetric positive definite on free DOFs: stiffness_matrix - sigma * "
+                f"mass_matrix has {factorization.negative_pivot_count} non-positive pivots for "
+                f"sigma = {sigma:.6g}; {cause}"
+            )
+
+        # Scale of the largest eigenvalue: only its order of magnitude sets the relative threshold, so a few
+        # power iterations tighten the Gershgorin bound, which is loose for six-DOF shells (see
+        # generalized_eigenvalue_scale). The floor is the roundoff of a sparse Rayleigh quotient, which
+        # grows with the nonzeros per row rather than with the DOF count.
+        eigenvalue_scale, _ = modal_sparse.generalized_eigenvalue_scale(stiffness, mass)
+        row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness), 1)
+        relative_tolerance = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
         zero_threshold = relative_tolerance * eigenvalue_scale
 
-        rigid_free = self._admissible_rigid_vectors()[free]
+        try:
+            eigenvalues, eigen_modes = modal_sparse.lowest_generalized_eigenpairs(
+                stiffness,
+                mass,
+                self.discard_mode_count + self.mode_count,
+                sigma=sigma,
+                zero_threshold=zero_threshold,
+                margin=self._ARPACK_MARGIN,
+                deflation=rigid_basis,
+                tol=self.arpack_tol,
+                maxiter=self.arpack_maxiter,
+                ncv=self.arpack_ncv,
+                factorization=factorization,
+            )
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs") from exc
+        modal_mass = modal_sparse.quadratic_form_diag(eigen_modes, mass)
+        if not np.all(modal_mass > 0.0):
+            raise ValueError("mass_matrix must be symmetric positive definite on free DOFs")
+        if rigid_basis is not None and rigid_basis.shape[1] > 0:
+            eigenvalues = np.concatenate((modal_sparse.quadratic_form_diag(rigid_basis, stiffness), eigenvalues))
+            eigen_modes = np.hstack((rigid_basis, eigen_modes))
+            order = np.argsort(eigenvalues, kind="stable")
+            eigenvalues = eigenvalues[order]
+            eigen_modes = eigen_modes[:, order]
+        return eigenvalues, eigen_modes, zero_threshold, relative_tolerance
+
+    @staticmethod
+    def _check_rigid_motion_preserved(stiffness: np.ndarray | spmatrix, rigid_free: np.ndarray) -> None:
+        """Raise if a free-free ``stiffness`` does not annihilate the rigid-body motions ``rigid_free``."""
+        stiffness_scale = max(modal_sparse.matrix_inf_norm(stiffness), 1.0)
+        rigid_scale = max(float(np.linalg.norm(rigid_free, ord=np.inf)), 1.0)
+        rigid_stiffness_ratio = float(np.linalg.norm(modal_sparse.matmul(stiffness, rigid_free), ord=np.inf)) / (
+            stiffness_scale * rigid_scale
+        )
+        if rigid_stiffness_ratio > 1.0e-7:
+            raise ValueError(
+                "The free-free stiffness_matrix does not preserve rigid-body motion "
+                f"(relative residual {rigid_stiffness_ratio:.3g}); fix the stiffness model or "
+                "constrain the model with fixed_node_indices or fixed_dof_indices"
+            )
+
+    def _coincident_sample_nodes(self) -> np.ndarray:
+        """Return the node index of each sample point that coincides with exactly one node, else ``-1``.
+
+        Uses a k-d tree when SciPy is available; otherwise every entry is ``-1``.
+        """
+        coincident = np.full(self.sample_points.shape[0], -1, dtype=np.int64)
+        if self.sample_points.shape[0] == 0 or self.node_count == 0:
+            return coincident
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            return coincident
+        neighbors = min(2, self.node_count)
+        distance, index = cKDTree(self.node_positions.astype(np.float64)).query(
+            self.sample_points.astype(np.float64), k=neighbors
+        )
+        distance = np.asarray(distance, dtype=np.float64).reshape((self.sample_points.shape[0], neighbors))
+        index = np.asarray(index, dtype=np.int64).reshape((self.sample_points.shape[0], neighbors))
+        exact = distance[:, 0] == 0.0
+        if neighbors > 1:
+            exact &= distance[:, 1] > 0.0
+        coincident[exact] = index[exact, 0]
+        return coincident
+
+    def build(self) -> ModalBasis:
+        """Build a sampled modal basis.
+
+        Returns:
+            The sampled modal basis of the selected elastic modes.
+
+        Raises:
+            ValueError: If the mass matrix is not positive definite on the free
+                DOFs, a free-free stiffness matrix does not preserve rigid-body
+                motion, the rigid-body mode count is inconsistent, zero-energy
+                mechanisms remain, projected damping coupling is rejected,
+                ``mode_count`` is missing on the ARPACK path, or ARPACK does
+                not converge.
+        """
+        free_dofs = np.ones(self.dof_count, dtype=bool)
+        free_dofs[self.fixed_dof_indices] = False
+        free = np.nonzero(free_dofs)[0]
+        if free.shape[0] == 0:
+            raise ValueError("At least one free DOF is required to build FEM modes")
+
+        use_arpack = self._uses_arpack(int(free.shape[0]))
+        convert = modal_sparse.to_csc if use_arpack else modal_sparse.to_dense
+        mass_matrix = convert(self.mass_matrix)
+        stiffness_matrix = convert(self.stiffness_matrix)
+        damping_matrix = None if self.damping_matrix is None else convert(self.damping_matrix)
+
+        mass = modal_sparse.submatrix(mass_matrix, free, free)
+        stiffness = modal_sparse.submatrix(stiffness_matrix, free, free)
+        rigid_free = self._admissible_rigid_vectors(mass_matrix)[free]
         rigid_basis = self._mass_orthonormal_columns(rigid_free, mass)
+        if use_arpack:
+            if self.free_free:
+                self._check_rigid_motion_preserved(stiffness, rigid_free)
+            eigenvalues, eigen_modes, zero_threshold, relative_tolerance = self._solve_arpack(
+                mass, stiffness, rigid_basis if self.free_free else None
+            )
+        else:
+            eigenvalues, eigen_modes, zero_threshold, relative_tolerance = self._solve_dense(mass, stiffness)
+
         zero_indices = np.nonzero(eigenvalues <= zero_threshold)[0]
         if zero_indices.shape[0] > 1 and rigid_basis.shape[1] > 0:
             # Rigid modes and mechanisms share one degenerate zero-energy eigenspace, in which the
             # eigensolver returns arbitrary mixtures. Rotate that subspace so leading vectors align
             # with rigid-body motion before the per-mode overlap test.
             zero_modes = eigen_modes[:, zero_indices]
-            _, _, alignment = np.linalg.svd(rigid_basis.T @ mass @ zero_modes)
+            _, _, alignment = np.linalg.svd(modal_sparse.bilinear(rigid_basis, mass, zero_modes))
             zero_modes = zero_modes @ alignment.T
             eigen_modes[:, zero_indices] = zero_modes
-            eigenvalues[zero_indices] = np.einsum("di,de,ei->i", zero_modes, stiffness, zero_modes)
-        rigid_overlap = np.sum((rigid_basis.T @ (mass @ eigen_modes)) ** 2, axis=0)
+            eigenvalues[zero_indices] = modal_sparse.quadratic_form_diag(zero_modes, stiffness)
+        rigid_overlap = np.sum((rigid_basis.T @ modal_sparse.matmul(mass, eigen_modes)) ** 2, axis=0)
         if self.free_free:
-            stiffness_scale = max(float(np.linalg.norm(stiffness, ord=np.inf)), 1.0)
-            rigid_scale = max(float(np.linalg.norm(rigid_free, ord=np.inf)), 1.0)
-            rigid_stiffness_ratio = float(np.linalg.norm(stiffness @ rigid_free, ord=np.inf)) / (
-                stiffness_scale * rigid_scale
-            )
-            if rigid_stiffness_ratio > 1.0e-7:
-                raise ValueError(
-                    "The free-free stiffness_matrix does not preserve rigid-body motion "
-                    f"(relative residual {rigid_stiffness_ratio:.3g}); fix the stiffness model or "
-                    "constrain the model with fixed_node_indices or fixed_dof_indices"
-                )
+            if not use_arpack:
+                self._check_rigid_motion_preserved(stiffness, rigid_free)
             rigid_mask = rigid_overlap > 0.5
             expected_rigid_count = int(rigid_basis.shape[1])
             if int(np.count_nonzero(rigid_mask)) != expected_rigid_count:
@@ -2184,26 +2524,29 @@ class ModalGeneratorFEM:
         if valid_indices.shape[0] == 0:
             raise ValueError("No eigenmodes remain after filtering")
 
-        free_modes = eigen_modes[:, valid_indices]
+        # LAPACK and ARPACK return arbitrary signs; a fixed convention makes both paths reproducible.
+        free_modes = _orient_modes(eigen_modes[:, valid_indices])
         full_modes = np.zeros((self.dof_count, valid_indices.shape[0]), dtype=np.float64)
         full_modes[free, :] = free_modes
 
         mode_mass = np.zeros(valid_indices.shape[0], dtype=np.float64)
         for i in range(valid_indices.shape[0]):
             phi = full_modes[:, i]
-            modal_mass = float(phi @ self.mass_matrix @ phi)
+            modal_mass = modal_sparse.quadratic_form(phi, mass_matrix)
             if modal_mass <= 0.0:
                 raise ValueError(f"Mode {i} has non-positive modal mass {modal_mass}")
             full_modes[:, i] *= 1.0 / math.sqrt(modal_mass)
             phi = full_modes[:, i]
-            mode_mass[i] = float(phi @ self.mass_matrix @ phi)
+            mode_mass[i] = modal_sparse.quadratic_form(phi, mass_matrix)
         mode_stiffness = _clamp_modal_diagonal(
-            np.einsum("di,de,ei->i", full_modes, self.stiffness_matrix, full_modes),
+            modal_sparse.quadratic_form_diag(full_modes, stiffness_matrix),
             zero_threshold,
             "FEM stiffness",
         )
-        if self.damping_matrix is not None:
-            mode_damping = _project_modal_damping(self, full_modes.T @ self.damping_matrix @ full_modes, "FEM")
+        if damping_matrix is not None:
+            mode_damping = _project_modal_damping(
+                self, modal_sparse.bilinear(full_modes, damping_matrix, full_modes), "FEM"
+            )
         else:
             self.damping_off_diagonal_ratio = 0.0
             mode_damping = np.zeros(valid_indices.shape[0], dtype=np.float64)
@@ -2219,18 +2562,31 @@ class ModalGeneratorFEM:
         nodal_phi = np.transpose(full_modes.reshape((self.node_count, 3, -1)), (0, 2, 1))
         nodal_psi = _estimate_sample_psi(self.node_positions, nodal_phi) if self.derive_psi else None
         if self.sample_node_indices is None:
-            nodal_basis = ModalBasis(
-                sample_points=self.node_positions,
-                sample_phi=nodal_phi,
-                sample_psi=nodal_psi,
-                mode_mass=mode_mass,
-                mode_stiffness=mode_stiffness,
-                mode_damping=mode_damping,
-                label=self.label,
-            )
-            evaluated = [nodal_basis.evaluate(point) for point in self.sample_points]
-            sample_phi = np.asarray([phi for phi, _ in evaluated], dtype=np.float32)
-            sample_psi = np.asarray([psi for _, psi in evaluated], dtype=np.float32) if self.derive_psi else None
+            # Sample points on a node copy it exactly, as evaluate() would; only the others are interpolated.
+            coincident = self._coincident_sample_nodes()
+            interpolated = np.nonzero(coincident < 0)[0]
+            sample_count = self.sample_points.shape[0]
+            sample_phi = np.zeros((sample_count, valid_indices.shape[0], 3), dtype=np.float32)
+            sample_psi = np.zeros_like(sample_phi) if self.derive_psi else None
+            matched = np.nonzero(coincident >= 0)[0]
+            sample_phi[matched] = nodal_phi[coincident[matched]]
+            if sample_psi is not None:
+                sample_psi[matched] = nodal_psi[coincident[matched]]
+            if interpolated.shape[0] > 0:
+                nodal_basis = ModalBasis(
+                    sample_points=self.node_positions,
+                    sample_phi=nodal_phi,
+                    sample_psi=nodal_psi,
+                    mode_mass=mode_mass,
+                    mode_stiffness=mode_stiffness,
+                    mode_damping=mode_damping,
+                    label=self.label,
+                )
+                for sample in interpolated:
+                    phi_value, psi_value = nodal_basis.evaluate(self.sample_points[sample])
+                    sample_phi[sample] = phi_value
+                    if sample_psi is not None:
+                        sample_psi[sample] = psi_value
         else:
             sample_phi = nodal_phi[self.sample_node_indices]
             sample_psi = None if nodal_psi is None else nodal_psi[self.sample_node_indices]
@@ -2241,10 +2597,10 @@ class ModalGeneratorFEM:
 
         # Exact inertia integrals from the consistent mass matrix: the
         # mass-weighted mode field (M Phi) replaces the lumped mass_s phi_s.
-        mass_modes = self.mass_matrix @ full_modes
+        mass_modes = modal_sparse.matmul(mass_matrix, full_modes)
         mass_phi = np.transpose(mass_modes.reshape((self.node_count, 3, -1)), (0, 2, 1))  # [node, mode, 3]
         integrals = _reduced_inertia_from_pairs(self.node_positions, nodal_phi, mass_phi)
-        rigid_mass, rigid_com, rigid_inertia = self._rigid_properties()
+        rigid_mass, rigid_com, rigid_inertia = self._rigid_properties(mass_matrix)
 
         return ModalBasis(
             sample_points=self.sample_points,
@@ -2265,7 +2621,9 @@ class ModalGeneratorFEM:
             rigid_inertia=rigid_inertia,
         )
 
-    def _rigid_properties(self) -> tuple[float | None, np.ndarray | None, np.ndarray | None]:
+    def _rigid_properties(
+        self, mass_matrix: np.ndarray | spmatrix
+    ) -> tuple[float | None, np.ndarray | None, np.ndarray | None]:
         """Return the rigid mass [kg], center of mass [m], and inertia about it [kg m^2].
 
         The spatial mass ``[T R]^T M [T R]`` is projected from the nodal mass
@@ -2279,7 +2637,7 @@ class ModalGeneratorFEM:
             unit = np.zeros(3, dtype=np.float64)
             unit[axis] = 1.0
             rigid[:, 3 + axis] = np.cross(unit, positions).reshape((-1,))
-        spatial_mass = rigid.T @ self.mass_matrix @ rigid
+        spatial_mass = modal_sparse.bilinear(rigid, mass_matrix, rigid)
         tolerance = 1.0e-7 * max(float(np.max(np.abs(spatial_mass))), 1.0)
         mass = float(np.trace(spatial_mass[:3, :3]) / 3.0)
         com_skew = -spatial_mass[:3, 3:] / mass if mass > 0.0 else np.zeros((3, 3))

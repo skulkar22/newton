@@ -32,6 +32,7 @@ newton
    BodyFlags
    CollisionPipeline
    CollisionSubstepScheduler
+   ConstraintElimination
    Contacts
    Control
    Gaussian
@@ -43,6 +44,7 @@ newton
    ModalBasis
    ModalGeneratorBeam
    ModalGeneratorCraigBampton
+   ModalGeneratorCraigBamptonFEM
    ModalGeneratorFEM
    ModalGeneratorPOD
    ModalGeneratorSampled
