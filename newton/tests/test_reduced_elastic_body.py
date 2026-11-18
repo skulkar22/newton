@@ -7,11 +7,13 @@ import os
 import tracemalloc
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sim import collide as collide_module
 from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pairs
 from newton._src.solvers.vbd.reduced_elastic_kernels import (
     accumulate_elastic_frame_coupling,
@@ -2739,6 +2741,7 @@ def test_elastic_surface_contact_warns_about_unsuitable_mesh(test, device):
     message = str(caught[0].message)
     test.assertIn("1 mesh(es) are open", message)
     test.assertIn("normal_and_parity", message)
+    test.assertTrue(issubclass(caught[0].category, newton.NewtonWarning))
     test.assertEqual(os.path.normcase(caught[0].filename), os.path.normcase(__file__))
 
     caught = _elastic_mesh_warnings(model, elastic_contact_mesh_sign_method="normal_and_parity")
@@ -2754,6 +2757,24 @@ def test_elastic_surface_contact_warns_about_unsuitable_mesh(test, device):
 
     model, _body = _build_elastic_box_near_mesh_model(device, _box_mesh(), (0.1, 0.03, 0.055))
     test.assertEqual(_elastic_mesh_warnings(model), [])
+
+
+def test_elastic_contact_sort_key_tie_warning(test, device):
+    """Warn with :class:`newton.NewtonWarning` at the caller when an elastic shape outgrows the sort sub-key.
+
+    The real limit is 2**23 vertices per shape; the test lowers it to 2 bits so the box's vertices
+    exceed it.
+    """
+    model, _body = _build_elastic_ground_contact_model(device, z=0.04)
+    test.assertGreater(int(np.max(model.elastic_shape_vertex_count.numpy())), 4)
+    with mock.patch.object(collide_module, "CONTACT_SORT_SUB_KEY_BITS", 2):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+    caught = [w for w in caught if "tie in the deterministic contact sort" in str(w.message)]
+    test.assertEqual(len(caught), 1)
+    test.assertTrue(issubclass(caught[0].category, newton.NewtonWarning))
+    test.assertEqual(os.path.normcase(caught[0].filename), os.path.normcase(__file__))
 
 
 def test_elastic_surface_contact_reduction_preserves_modal_samples(test, device):
@@ -8188,6 +8209,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_surface_contact_warns_about_unsuitable_mesh",
         test_elastic_surface_contact_warns_about_unsuitable_mesh,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_contact_sort_key_tie_warning",
+        test_elastic_contact_sort_key_tie_warning,
         devices=[device],
     )
     add_function_test(

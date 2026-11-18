@@ -1895,7 +1895,7 @@ def _warn_on_unsuitable_meshes_in_elastic_pairs(
             "CollisionPipeline(elastic_contact_mesh_sign_method='normal_and_parity') removes most wrong-side "
             "contacts but misses a share of real ones; it does not help on single open sheets or inside-out meshes."
         )
-    warnings.warn(" ".join(sentences), stacklevel=_external_warning_stacklevel())
+    warnings.warn(" ".join(sentences), NewtonWarning, stacklevel=_external_warning_stacklevel())
 
 
 class CollisionPipeline:
@@ -2859,8 +2859,8 @@ class CollisionPipeline:
                 warnings.warn(
                     f"An elastic shape has more than {1 << CONTACT_SORT_SUB_KEY_BITS} vertices; its contacts "
                     "can tie in the deterministic contact sort, so their order is not deterministic.",
-                    UserWarning,
-                    stacklevel=2,
+                    NewtonWarning,
+                    stacklevel=_external_warning_stacklevel(),
                 )
         # Sort keys are written only in deterministic mode, which contact matching implies.
         self._contact_sort_shape_index_bits = (
