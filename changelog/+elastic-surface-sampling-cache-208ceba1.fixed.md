@@ -1,0 +1,1 @@
+Reuse transformed geometry and modal surface samples for replicated elastic shapes during model construction. Keep the cache local to each construction pass and separate distinct bases, meshes, scales, and local transforms.

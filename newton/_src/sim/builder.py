@@ -14387,6 +14387,7 @@ class ModelBuilder:
         if self.elastic_max_mode_count == 0:
             return
 
+        sample_cache = {}
         for shape_index, body in enumerate(self.shape_body):
             if body < 0:
                 continue
@@ -14396,12 +14397,36 @@ class ModelBuilder:
             if not (self.shape_flags[shape_index] & (ShapeFlags.VISIBLE | ShapeFlags.COLLIDE_SHAPES)):
                 continue
 
-            mesh = self._elastic_shape_render_mesh(shape_index)
-            if mesh is None:
-                continue
-            vertices, indices = mesh
-            if vertices.size == 0 or indices.size == 0:
-                continue
+            basis_index = self.elastic_basis[elastic_index] if elastic_index < len(self.elastic_basis) else -1
+            cache_key = None
+            if basis_index >= 0:
+                cache_key = (
+                    basis_index,
+                    self.elastic_mode_count[elastic_index],
+                    self.shape_type[shape_index],
+                    id(self.shape_source[shape_index]),
+                    tuple(self.shape_scale[shape_index]),
+                    tuple(self.shape_transform[shape_index]),
+                )
+            sampled = sample_cache.get(cache_key)
+            if sampled is None:
+                mesh = self._elastic_shape_render_mesh(shape_index)
+                if mesh is None:
+                    continue
+                vertices, indices = mesh
+                if vertices.size == 0 or indices.size == 0:
+                    continue
+                shape_xform = self.shape_transform[shape_index]
+                local_positions = np.asarray(
+                    [self._transform_point_np(shape_xform, vertex) for vertex in vertices], dtype=np.float32
+                )
+                phi_values, _psi_values, sample_indices = self._add_elastic_modal_samples(
+                    elastic_index, local_positions
+                )
+                if cache_key is not None:
+                    sample_cache[cache_key] = vertices, indices, local_positions, phi_values, sample_indices
+            else:
+                vertices, indices, local_positions, phi_values, sample_indices = sampled
 
             vertex_start = len(self.elastic_shape_vertex_local)
             index_start = len(self.elastic_shape_indices)
@@ -14413,11 +14438,6 @@ class ModelBuilder:
             self.elastic_shape_index_count.append(int(indices.size))
             self.elastic_shape_indices.extend(int(i) for i in indices)
 
-            shape_xform = self.shape_transform[shape_index]
-            local_positions = np.asarray(
-                [self._transform_point_np(shape_xform, vertex) for vertex in vertices], dtype=np.float32
-            )
-            phi_values, _psi_values, sample_indices = self._add_elastic_modal_samples(elastic_index, local_positions)
             for local_pos, phi, sample_index in zip(local_positions, phi_values, sample_indices, strict=True):
                 self.elastic_shape_vertex_local.append(
                     wp.vec3(float(local_pos[0]), float(local_pos[1]), float(local_pos[2]))
