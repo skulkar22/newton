@@ -33,10 +33,23 @@ def _skip_unsupported_mujoco_determinism(test):
         test.skipTest("MuJoCo Warp does not compile in Warp 1.19 deterministic mode")
 
 
-def _run_isolated(test, function_name, *args):
+def _run_isolated(
+    test,
+    function_name,
+    *args,
+    module_name="newton.tests.determinism.test_solver_determinism",
+    deterministic_mode=None,
+):
     # Deterministic kernels and GPU runtime state persist for the life of the process.
     call_args = ", ".join(repr(arg) for arg in args)
-    code = f"from newton.tests.determinism.test_solver_determinism import {function_name}; {function_name}({call_args})"
+    code = f"from {module_name} import {function_name}; {function_name}({call_args})"
+    if deterministic_mode is not None:
+        # Dependency guards import backends while registering tests.
+        # Configure Warp before importing the test module in the fresh child.
+        code = (
+            "import sys; import warp as wp; assert 'mujoco_warp' not in sys.modules; "
+            f"wp.config.deterministic = wp.DeterministicMode.{deterministic_mode.name}; " + code
+        )
 
     env = os.environ.copy()
     env.pop("PYTHONWARNINGS", None)
@@ -318,37 +331,6 @@ class TestSolverDeterminismOptions(unittest.TestCase):
         with mock.patch.object(wp, "set_module_options") as set_module_options:
             _set_module_options_if_changed(options, module=xpbd_kernels)
         set_module_options.assert_not_called()
-
-    def test_mujoco_generated_kernel_cache_tracks_determinism(self):
-        from mujoco_warp._src import warp_util
-
-        solver = object.__new__(newton.solvers.SolverMuJoCo)
-        solver._deterministic = DETERMINISTIC_MODE
-        solver._deterministic_max_records = 17
-        cache = warp_util._KERNEL_CACHE
-        saved_cache = cache.copy()
-        saved_options = newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options
-        sentinel = object()
-
-        try:
-            cache.clear()
-            cache["sentinel"] = sentinel
-            newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options = None
-
-            solver._prepare_generated_kernels()
-            self.assertEqual(cache, {})
-
-            cache["sentinel"] = sentinel
-            solver._prepare_generated_kernels()
-            self.assertIs(cache["sentinel"], sentinel)
-
-            solver._deterministic_max_records += 1
-            solver._prepare_generated_kernels()
-            self.assertEqual(cache, {})
-        finally:
-            cache.clear()
-            cache.update(saved_cache)
-            newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options = saved_options
 
     def test_current_solver_skips_module_option_checks(self):
         model = newton.ModelBuilder().finalize(device="cpu")

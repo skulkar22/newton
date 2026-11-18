@@ -578,6 +578,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._ensure_restitution_module_options()
         self._apply_module_options()
         self.validate_observables(observables, contacts)
+        self._require_unreduced_contacts(contacts)
         requires_grad = state_in.requires_grad
         if self.tendon_material_direct != self._tendon_material_state.enabled:
             raise ValueError("Reconstruct SolverXPBD to change tendon_material_direct")
