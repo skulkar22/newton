@@ -1750,8 +1750,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
-                # The two level-scheduled solves emit no atomics; they are listed so that both
-                # launch schedules always receive the same module options.
+                # The two level-scheduled solves emit no float atomics (the pivot guard's clamp
+                # counter is an int32 atomic add); they are listed so that both launch schedules
+                # always receive the same module options.
                 rigid_sparse_levels_kernels,
                 rigid_sparse_level_launch_kernels,
                 rigid_sparse_articulation_variable_kernels,
