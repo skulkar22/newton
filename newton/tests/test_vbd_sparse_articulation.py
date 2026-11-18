@@ -2221,7 +2221,7 @@ def test_sparse_tiny_inertia_rod_needs_angular_regularization(test, device):
     (1e-6 kg*m^2 / (1/2400 s)^2), here as a Hessian-only shift that leaves the inertia authored: the rod stays
     finite, no pivot is clamped, and it follows the local solve. Tolerances: 8 sparse iterations against a
     32-iteration local reference; measured max deviation 0.04 mm (CPU) / 0.55 mm (CUDA) and max bend 0.4 / 10.6 deg
-    at 5.76; at the default 11-12 cm and 121-130 deg (CPU), 3.4-15 cm and 159-180 deg (CUDA, varies run to run).
+    at 5.76; at the default 7.6-7.7 cm and 134-150 deg (CPU), 3.4-15 cm and 159-180 deg (CUDA, varies run to run).
     """
     local_q, _, bodies = _run_tiny_inertia_rod(device, "local", iterations=32)
     test.assertTrue(np.isfinite(local_q).all())
