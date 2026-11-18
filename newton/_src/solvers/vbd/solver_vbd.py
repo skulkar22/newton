@@ -1224,7 +1224,16 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 triangular solves over the articulation per row and iteration, one thread per
                 articulation), because the coupled solve answers a mimic reaction with the whole
                 articulation; a row body outside the articulations uses its own block. A mimic whose
-                two joints lie in different articulations is rejected.
+                two joints lie in different articulations is rejected. Two limits apply with mimics.
+                First, because the mimic solve moves body poses directly, any supported mimic in the
+                model switches every block-sparse articulation, including articulations without a
+                mimic, from the displacement-form update to the absolute-position update, which loses
+                float32 resolution far from the origin at small time steps (a three-link chain 30 m
+                from the origin at 0.5 ms steps ends about 5e-2 rad off after 240 steps, against
+                2e-4 rad without a mimic in the model; below 3e-4 rad at 4 ms steps). Second, the
+                rows of one articulation are solved one after another once per iteration, so several
+                rows in one articulation converge more slowly than in the local solve at large time
+                steps.
                 Reduced elastic bodies in an articulation are solved inside its factorization, with
                 their joints at the deformed attachments; ``rigid_articulation_elastic_solve`` selects
                 how. Joint mimics, and armature, passive damping, or friction on joints attached to
