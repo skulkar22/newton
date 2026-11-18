@@ -4962,9 +4962,16 @@ def refresh_joint_material_params(
 # Pre-iteration kernels (once per step)
 # -----------------------------
 @wp.kernel
+def copy_explicit_body_torques(body_f: wp.array[wp.spatial_vector], torques: wp.array[wp.vec3]):
+    body = wp.tid()
+    torques[body] = wp.spatial_bottom(body_f[body])
+
+
+@wp.kernel
 def forward_step_rigid_bodies(
     # Inputs
     dt: float,
+    explicit_torque_in_solve: bool,
     gravity: wp.array[wp.vec3],
     body_world: wp.array[wp.int32],
     pose_rebaseline_mask: wp.array[wp.bool],
@@ -4983,6 +4990,7 @@ def forward_step_rigid_bodies(
 
     Args:
         dt: Time step [s].
+        explicit_torque_in_solve: Whether the iterative solve applies external torques instead of this predictor.
         gravity: Gravity vector array (world frame).
         body_world: World index for each body.
         pose_rebaseline_mask: Per-world flags for the ``body_q_prev`` rebaseline below.
@@ -5015,6 +5023,8 @@ def forward_step_rigid_bodies(
     # Read body state (only for dynamic bodies)
     qd_current = body_qd[tid]
     f_current = body_f[tid]
+    if explicit_torque_in_solve:
+        f_current = wp.spatial_vector(wp.spatial_top(f_current), wp.vec3(0.0))
     com_local = body_com[tid]
     I_local = body_inertia[tid]
     inv_I = body_inv_inertia[tid]

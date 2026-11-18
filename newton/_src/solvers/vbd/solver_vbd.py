@@ -148,6 +148,7 @@ from .rigid_vbd_kernels import (
     compute_body_particle_contact_forces,
     compute_rigid_contact_forces,
     compute_rod_dahl_parameters,
+    copy_explicit_body_torques,
     forward_step_rigid_bodies,
     init_body_body_contact_materials,
     init_body_body_contacts_alm,
@@ -674,6 +675,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         rigid_joint_angular_k_start: float | None = None,  # Legacy AVBD angular joint penalty ramp seed
         rigid_joint_linear_kd: float = 0.0,  # Absolute damping for non-rod linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-rod angular joint constraints
+        rigid_explicit_torque_in_solve: bool = False,
         # Rigid body - penetration-free DAT truncation
         rigid_soft_enable_dat: bool = False,  # Truncate rigid pose updates against per-contact division planes
         rigid_soft_dat_use_interval_arithmetic: bool = False,  # Experimental interval verification of rigid trajectories
@@ -910,6 +912,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 Negative values are clamped to 0.
             rigid_joint_angular_kd: Damping coefficient for non-rod angular joint constraints [N·m·s/rad].
                 Negative values are clamped to 0.
+            rigid_explicit_torque_in_solve: Experimental. Apply external and explicit actuator torques
+                during the iterative solve. The rotational predictor excludes these torques. This can
+                improve accuracy when constraints prevent light bodies from making the large rotations
+                produced by an unconstrained predictor. Disabled by default.
             rigid_soft_enable_dat: Whether to apply Divide-and-Truncate (DAT) penetration-free
                 truncation to rigid-soft contacts, symmetric to particle self-contact truncation.
                 Each rigid-soft contact reported by the owned collision pipeline defines a division
@@ -1290,6 +1296,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # resolution) reads them as soon as the base class is constructed.
         self.particle_enable_self_contact = particle_enable_self_contact
         self.rigid_soft_enable_dat = rigid_soft_enable_dat
+        self.rigid_explicit_torque_in_solve = bool(rigid_explicit_torque_in_solve)
 
         # With an owned pipeline, seed its self-contact configuration from the solver's
         # parameters before the base class allocates the owned Contacts buffer.
@@ -2650,7 +2657,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
             # Persistent scratch for joint_f accumulation
             self._body_f_for_integration = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.device)
-            # Body wrenches the current step's rigid predictor applied (``state.body_f`` or the scratch above).
+            # External and actuator body wrenches used by this step (state.body_f or the scratch above).
             self._body_f_integrated = self._body_f_for_integration
 
             # Hessian blocks (6x6 block structure: angular-angular, angular-linear, linear-linear)
@@ -5559,6 +5566,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 kernel=forward_step_rigid_bodies,
                 inputs=[
                     dt,
+                    self.rigid_explicit_torque_in_solve,
                     model.gravity,
                     model.body_world,
                     self._rigid_pose_rebaseline_mask,
@@ -6278,6 +6286,22 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             device=self.device,
         )
 
+    def _clear_rigid_force_buffers(self) -> None:
+        if self.rigid_explicit_torque_in_solve:
+            wp.launch(
+                copy_explicit_body_torques,
+                dim=self.model.body_count,
+                inputs=[self._body_f_integrated],
+                outputs=[self.body_torques],
+                device=self.device,
+            )
+        else:
+            self.body_torques.zero_()
+        self.body_forces.zero_()
+        self.body_hessian_aa.zero_()
+        self.body_hessian_al.zero_()
+        self.body_hessian_ll.zero_()
+
     def _solve_rigid_body_iteration(
         self,
         state_in: State,
@@ -6483,11 +6507,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
 
         if body_color_groups is None:
-            self.body_torques.zero_()
-            self.body_forces.zero_()
-            self.body_hessian_aa.zero_()
-            self.body_hessian_al.zero_()
-            self.body_hessian_ll.zero_()
+            self._clear_rigid_force_buffers()
             if self._mimic_solver is not None:
                 self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)
             if model.elastic_body_count > 0:
@@ -7000,11 +7020,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         assert self._rigid_articulation_sparse_rhs_scalar is not None
         assert self._rigid_articulation_sparse_delta_scalar is not None
 
-        self.body_torques.zero_()
-        self.body_forces.zero_()
-        self.body_hessian_aa.zero_()
-        self.body_hessian_al.zero_()
-        self.body_hessian_ll.zero_()
+        self._clear_rigid_force_buffers()
 
         if self._mimic_solver is not None:
             self._mimic_solver.accumulate_reactions(state_in.body_q, self.body_forces, self.body_torques)

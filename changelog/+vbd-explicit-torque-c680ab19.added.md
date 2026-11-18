@@ -1,0 +1,1 @@
+Add the experimental, opt-in `SolverVBD` parameter `rigid_explicit_torque_in_solve` to apply explicit torques during the solve with a torque-free rotational predictor. This avoids inaccurate rotational targets for constrained bodies with very small inertia; the default predictor remains enabled unless the option is selected.
