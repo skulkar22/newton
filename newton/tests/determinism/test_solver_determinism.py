@@ -26,7 +26,7 @@ from newton._src.solvers.vbd import (
     vbd_coupling_kernels,
 )
 from newton._src.solvers.xpbd import kernels as xpbd_kernels
-from newton.tests._reduced_elastic_fixtures import elastic_plank_on_ground
+from newton.tests._reduced_elastic_fixtures import elastic_plank_on_ground, grid_surface_mesh
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, warp_version_at_least
 
 DETERMINISTIC_MODE = wp.DeterministicMode.RUN_TO_RUN
@@ -49,6 +49,7 @@ def _run_isolated(
     *args,
     module_name="newton.tests.determinism.test_solver_determinism",
     deterministic_mode=None,
+    timeout=600,
 ):
     # Deterministic kernels and GPU runtime state persist for the life of the process.
     call_args = ", ".join(repr(arg) for arg in args)
@@ -77,7 +78,7 @@ def _run_isolated(
         capture_output=True,
         env=env,
         text=True,
-        timeout=600,
+        timeout=timeout,
         check=False,
     )
     test.assertEqual(
@@ -476,7 +477,10 @@ def _check_elastic_sparse_coupled_records(device):
         expected = reduced_elastic_kernels.elastic_contact_deterministic_max_records(
             max_modes, int(solver.body_body_contact_buffer_pre_alloc)
         )
-        if expected == 0 or wp.get_module_options(module=reduced_elastic_kernels)["deterministic_max_records"] != expected:
+        if (
+            expected == 0
+            or wp.get_module_options(module=reduced_elastic_kernels)["deterministic_max_records"] != expected
+        ):
             raise AssertionError("the elastic contact assembly records were not sized for the coupled solve")
         # The two links sit in different colors, so only the coupled launch holds both: the
         # scatter guard must count that launch. The local solve launches one link per color.
@@ -508,6 +512,108 @@ def _check_elastic_sparse_coupled_records(device):
 def test_elastic_sparse_coupled_records(test, device):
     """Size the deterministic elastic contact records and bound their memory for the coupled solve."""
     _run_isolated(test, "_check_elastic_sparse_coupled_records", str(device))
+
+
+def _elastic_plank_with_rigid_tip(device):
+    """Return the elastic plank of :func:`elastic_plank_on_ground` hinged to a rigid tip in one articulation.
+
+    The plank (9 x 9 grid contact samples, 1 mm above a ground plane) and the tip form a mixed
+    rigid/elastic articulation, which the default ``rigid_articulation_elastic_solve="coupled"``
+    solves in one variable-block system.
+    """
+    cfg = newton.ModelBuilder.ShapeConfig()
+    cfg.ke = 1.0e5
+    cfg.kd = 0.0
+    cfg.mu = 0.5
+    cfg.gap = 0.01
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane(cfg=cfg)
+    beam = newton.ModalGeneratorBeam
+    basis = beam(
+        length=0.4,
+        half_width_y=0.1,
+        half_width_z=0.005,
+        mode_specs=[
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 2},
+            {"type": beam.Mode.TORSION, "boundary": beam.Boundary.LINEAR},
+        ],
+        young_modulus=1.0e7,
+        damping_ratio=0.05,
+    ).build()
+    plank = builder.add_link_elastic(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.001), wp.quat_identity()), modal_basis=basis
+    )
+    builder.add_shape_mesh(plank, mesh=grid_surface_mesh(0.2, 0.1, 9, 9), cfg=cfg)
+    tip = builder.add_link(
+        xform=wp.transform(wp.vec3(0.25, 0.0, 0.03), wp.quat_identity()),
+        mass=0.1,
+        inertia=wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-4),
+    )
+    root = builder.add_joint_free(plank)
+    builder.add_joint_revolute(
+        parent=plank,
+        child=tip,
+        axis=(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.05, 0.0, -0.03), wp.quat_identity()),
+    )
+    builder.add_articulation([root, root + 1])
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _run_coupled_elastic_contact_rollout(device, steps=30):
+    model = _elastic_plank_with_rigid_tip(device)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=4,
+        rigid_body_contact_buffer_size=128,
+        rigid_articulation_solve="block_sparse_joints",
+        deterministic=DETERMINISTIC_MODE,
+    )
+    layout = solver.rigid_articulation_sparse_layout
+    if layout.elastic_solve != "coupled" or layout.mixed_elastic_body_count != 1:
+        raise AssertionError("the plank must be solved in a coupled mixed articulation")
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    fields = ("body_q", "body_qd", "joint_q", "joint_qd")
+    history = {field: [] for field in fields}
+    max_contacts = 0
+    for _ in range(steps):
+        state_0.clear_forces()
+        pipeline.collide(state_0, contacts)
+        max_contacts = max(max_contacts, int(contacts.rigid_contact_count.numpy()[0]))
+        solver.step(state_0, state_1, control, contacts, 1.0 / 600.0)
+        state_0, state_1 = state_1, state_0
+        for field, values in _snapshot(state_0, fields).items():
+            history[field].append(values)
+    if max_contacts <= 2 * reduced_elastic_kernels._NUM_ELASTIC_CONTACT_THREADS_PER_BODY:
+        raise AssertionError(f"elastic plank made only {max_contacts} contacts")
+    if not all(np.isfinite(values[-1]).all() for values in history.values()):
+        raise AssertionError("non-finite coupled rollout")
+    return {field: np.stack(values) for field, values in history.items()}
+
+
+def _check_coupled_elastic_contact_determinism(device):
+    with wp.ScopedDevice(device):
+        first = _run_coupled_elastic_contact_rollout(device)
+        second = _run_coupled_elastic_contact_rollout(device)
+    _assert_snapshots_equal(first, second)
+
+
+def test_coupled_elastic_contact_determinism(test, device):
+    """Repeat the contacts of an elastic link in a coupled articulation bit for bit in deterministic mode.
+
+    The coupled solve assembles the contacts of all mixed elastic bodies in one launch, with the
+    deterministic records sized from the mode count and the contact list size. A cold kernel cache
+    compiles the deterministic sparse articulation modules, which takes several minutes.
+    """
+    # A cold kernel cache compiles the deterministic sparse articulation modules first (450 s
+    # measured on a shared RTX PRO 6000 Blackwell GPU).
+    _run_isolated(test, "_check_coupled_elastic_contact_determinism", str(device), timeout=1800)
 
 
 class TestSolverDeterminism(unittest.TestCase):
@@ -780,6 +886,14 @@ add_function_test(
     TestSolverDeterminism,
     "test_elastic_sparse_coupled_records",
     test_elastic_sparse_coupled_records,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_coupled_elastic_contact_determinism",
+    test_coupled_elastic_contact_determinism,
     devices=devices,
     check_output=False,
 )
