@@ -5097,13 +5097,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 wp.copy(arrays[f"elastic_{name}"][iteration], source)
 
     @override
-    @override
     def _observable_shape(self, kind: str, rows: int) -> tuple[int, ...]:
         """Give the residual history one row per iteration."""
         if kind == self.ObservableKind.SOLVER_RESIDUAL_HISTORY:
             return (self.iterations, rows)
         return super()._observable_shape(kind, rows)
 
+    @override
     def step(
         self,
         state_in: State,
