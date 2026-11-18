@@ -766,7 +766,7 @@ def _elastic_frame_accel_rel(
     com_v = (
         wp.transform_point(body_q[body], body_com_local) - wp.transform_point(body_q_prev[body], body_com_local)
     ) * inv_dt
-    return (com_v - com_v_prev) * inv_dt - gravity[wp.max(body_world[body], 0)]
+    return (com_v - com_v_prev) * inv_dt - gravity[body_world[body]]
 
 
 @wp.func
