@@ -630,12 +630,13 @@ Approximations and limits
   Under compliant ALM, contacts and joint drives or limits whose only mobility
   comes from massless modes have no support and are dropped.
 - **Joint terms on elastic attachments.** For a joint attached to an elastic
-  link, joint friction and passive joint damping are not assembled into the
-  elastic block, so they act on the other (rigid) body only, and mimic
-  reactions reach the elastic frame but not its modes. The block-sparse
-  articulation solve rejects joint friction, passive joint damping, and joint
-  armature on joints attached to elastic links, and rejects joint mimics
-  anywhere in a model whose articulations contain elastic links.
+  link, passive damping and friction on REVOLUTE, PRISMATIC, and D6 joints
+  contribute to the elastic frame and modes in local, Schur, and coupled solves.
+  Other joint-coordinate types retain their existing restrictions. Mimic
+  reactions reach the elastic frame but not its modes in the local solve.
+  The block-sparse articulation solve rejects joint armature on joints attached
+  to elastic links and rejects joint mimics anywhere in a model whose
+  articulations contain elastic links.
 - **Precision.** States are ``float32``. With the displacement-form frame
   update, an elastic link far from the origin is as accurate as a rigid body
   there; with the absolute-pose update (joint mimics or

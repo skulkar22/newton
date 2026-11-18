@@ -1,0 +1,1 @@
+Apply passive damping and friction to reduced-elastic joint attachments in VBD, including modal and frame reactions and their cross terms. Support REVOLUTE, PRISMATIC, and D6 joints in both sparse elastic backends while retaining the elastic-side armature restriction.

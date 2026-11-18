@@ -9,15 +9,12 @@ from ...sim import JointType
 from ...sim.articulation import transform_2d_rotational_axes, transform_3d_rotational_axes
 from .joint_coordinates import JointCoordinateData, evaluate_coordinate, evaluate_coordinate_prev
 from .rigid_vbd_kernels import (
-    _DRIVE_LIMIT_MODE_DRIVE,
     JointFrictionData,
     _drive_row_applies_force,
     _evaluate_drive_axis,
-    _evaluate_drive_limit_axis,
     _evaluate_joint_dissipation,
-    _limit_row_exists,
+    _evaluate_legacy_drive_axis,
     _load_joint_axis_drive_limit,
-    _resolve_active_drive_row,
     evaluate_joint_force_hessian,
 )
 
@@ -33,6 +30,7 @@ class JointForceData:
     joint_target_q_start: wp.array[int]
     joint_target_ke: wp.array[float]
     joint_target_kd: wp.array[float]
+    joint_effort_limit: wp.array[float]
     joint_limit_lower: wp.array[float]
     joint_limit_upper: wp.array[float]
     joint_limit_ke: wp.array[float]
@@ -145,6 +143,7 @@ def _drive_effort(
         data.joint_constraint_start[joint] + 2 + component,
         data.joint_target_ke,
         data.joint_target_kd,
+        data.joint_effort_limit,
         target_q,
         target_qd,
         data.joint_limit_lower,
@@ -175,41 +174,32 @@ def _drive_effort(
         separation_prev = wp.transform_get_translation(child_prev) - wp.transform_get_translation(parent_prev)
         q = wp.dot(separation, axis_world)
         rate = wp.dot(separation - separation_prev, axis_world) / dt
-    mode, error = _resolve_active_drive_row(
-        q,
-        axis.target_pos,
-        axis.lower,
-        axis.upper,
-        _drive_row_applies_force(axis.material_drive_ke, axis.drive_kd),
-        _limit_row_exists(axis.material_limit_ke, axis.lower, axis.upper),
-        data.compliant_alm,
-    )
-    force = float(0.0)
-    if mode == _DRIVE_LIMIT_MODE_DRIVE:
-        if data.compliant_alm == 1:
-            force, _h = _evaluate_drive_axis(
-                error,
-                rate,
-                axis.target_vel,
-                mode,
-                axis.drive_ke,
-                axis.drive_kd,
-                data.joint_drive_limit_support[dof],
-                data.joint_drive_lambda[dof],
-                1.0 / dt,
-            )
-        else:
-            force, _h = _evaluate_drive_limit_axis(
-                error,
-                rate,
-                axis.target_vel,
-                mode,
-                axis.drive_ke,
-                axis.drive_kd,
-                0.0,
-                0.0,
-                1.0 / dt,
-            )
+    has_drive = _drive_row_applies_force(axis.material_drive_ke, axis.drive_kd)
+    error = q - axis.target_pos
+    if data.compliant_alm == 1:
+        force, _h = _evaluate_drive_axis(
+            error,
+            rate,
+            axis.target_vel,
+            has_drive,
+            axis.drive_ke,
+            axis.drive_kd,
+            axis.effort_limit,
+            data.joint_drive_limit_support[dof],
+            data.joint_drive_lambda[dof],
+            1.0 / dt,
+        )
+    else:
+        force, _h = _evaluate_legacy_drive_axis(
+            error,
+            rate,
+            axis.target_vel,
+            has_drive,
+            axis.drive_ke,
+            axis.drive_kd,
+            axis.effort_limit,
+            1.0 / dt,
+        )
     return -force
 
 
@@ -279,6 +269,7 @@ def evaluate_joint_forces(
         data.joint_C_fric,
         data.joint_target_ke,
         data.joint_target_kd,
+        data.joint_effort_limit,
         joint_target_q,
         joint_target_qd,
         data.joint_limit_lower,
@@ -314,13 +305,18 @@ def evaluate_joint_forces(
             recipient = reference
             ratio = coeffs[joint][1]
         armature_simulated = False
-        if data.body_articulation_local and jt == JointType.REVOLUTE:
-            armature_simulated = data.body_articulation_local[child] >= 0
+        if jt == JointType.REVOLUTE:
+            parent = c.parent[joint]
+            armature_simulated = True
+            if data.body_elastic_index:
+                armature_simulated = data.body_elastic_index[child] < 0
+                if parent >= 0:
+                    armature_simulated = armature_simulated and data.body_elastic_index[parent] < 0
         for component in range(c.dof_dim[joint, 0] + c.dof_dim[joint, 1]):
             dof = c.qd_start[joint] + component
             effort = _actuation_effort(c, joint, component, body_q, actuation)
             effort += _drive_effort(data, joint, component, body_q, body_q_prev, joint_target_q, joint_target_qd, dt)
-            # Sparse revolute inertia already contributes to the solved drive
+            # Simulated revolute inertia already contributes to the solved drive
             # effort. Only estimate armature that the selected path ignores.
             if not armature_simulated:
                 effort += joint_armature[dof] * (joint_qd[dof] - joint_qd_prev[dof]) / dt

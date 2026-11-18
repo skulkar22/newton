@@ -942,23 +942,21 @@ def test_sparse_elastic_leaf_link_graph_capture(test, device, backend):
 
 
 def test_sparse_elastic_rejects_unsupported_joint_terms(test, device, backend):
-    """Reject elastic-attached joint armature, damping, and friction in the sparse solve.
+    """Reject elastic-attached joint armature in the sparse solve.
 
-    The message names the joint, the attribute and the backend. The local solve keeps each of them.
+    The message names the joint, the attribute and the backend. Local construction still accepts it.
     """
-    for attribute in ("joint_armature", "joint_damping", "joint_friction"):
-        with test.subTest(attribute=attribute):
-            model, _state, hinge = _make_leaf_link_model(device)
-            values = getattr(model, attribute).numpy()
-            values[model.joint_qd_start.numpy()[hinge]] = 0.01
-            getattr(model, attribute).assign(values)
-            with test.assertRaisesRegex(
-                ValueError,
-                rf"Joint {hinge} .* nonzero {attribute}\. rigid_articulation_elastic_solve='{backend}' does not "
-                r"support joint_armature, joint_damping, or joint_friction",
-            ):
-                _solver(model, _SPARSE, backend=backend)
-            _solver(model, "local", backend=backend)
+    model, _state, hinge = _make_leaf_link_model(device)
+    values = model.joint_armature.numpy()
+    values[model.joint_qd_start.numpy()[hinge]] = 0.01
+    model.joint_armature.assign(values)
+    with test.assertRaisesRegex(
+        ValueError,
+        rf"Joint {hinge} .* nonzero joint_armature\. rigid_articulation_elastic_solve='{backend}' does not "
+        r"support these coordinate terms on this joint",
+    ):
+        _solver(model, _SPARSE, backend=backend)
+    _solver(model, "local", backend=backend)
 
 
 def test_sparse_elastic_rejects_joint_mimics(test, device, backend):

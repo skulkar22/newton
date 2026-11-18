@@ -1,0 +1,1 @@
+Preserve requested VBD motor targets beyond joint limits and apply motor and stop forces simultaneously in compliant ALM and legacy AVBD. Clamp `Control.joint_target_q` explicitly to retain the previous bounded-target behavior. Drives pushing against stops remain bounded by `Model.joint_effort_limit`.

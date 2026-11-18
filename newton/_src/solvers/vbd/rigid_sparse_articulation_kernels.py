@@ -1340,6 +1340,7 @@ def _evaluate_sparse_drive_limit(
     rate: float,
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -1359,6 +1360,7 @@ def _evaluate_sparse_drive_limit(
         penalty_slot,
         joint_target_ke,
         joint_target_kd,
+        joint_effort_limit,
         joint_target_q,
         joint_target_vel,
         joint_limit_lower,
@@ -1675,6 +1677,7 @@ def _sparse_angular_drive_limit_row(
     body_q_prev: wp.array[wp.transform],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -1706,6 +1709,7 @@ def _sparse_angular_drive_limit_row(
             dtheta_dt,
             joint_target_ke,
             joint_target_kd,
+            joint_effort_limit,
             joint_target_q,
             joint_target_vel,
             joint_limit_lower,
@@ -1734,6 +1738,7 @@ def _sparse_linear_drive_limit_row(
     joint_axis: wp.array[wp.vec3],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_target_q: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -1766,6 +1771,7 @@ def _sparse_linear_drive_limit_row(
             dd_dt,
             joint_target_ke,
             joint_target_kd,
+            joint_effort_limit,
             joint_target_q,
             joint_target_vel,
             joint_limit_lower,
@@ -1821,6 +1827,7 @@ def _assemble_articulation_joint_scalar(
     joint_damping: wp.array[float],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
     joint_target_q: wp.array[float],
@@ -2149,6 +2156,7 @@ def _assemble_articulation_joint_scalar(
             body_q_prev,
             joint_target_ke,
             joint_target_kd,
+            joint_effort_limit,
             joint_target_q,
             joint_target_vel,
             joint_limit_lower,
@@ -2162,7 +2170,7 @@ def _assemble_articulation_joint_scalar(
             joint_compliant_alm,
             dt,
         )
-        if hessian_scalar > 0.0:
+        if hessian_scalar > 0.0 or force_scalar != 0.0:
             _assemble_angular_axis_row_scalar(
                 values_scalar,
                 rhs_scalar,
@@ -2194,6 +2202,7 @@ def _assemble_articulation_joint_scalar(
                     joint_axis,
                     joint_target_ke,
                     joint_target_kd,
+                    joint_effort_limit,
                     joint_target_q,
                     joint_target_vel,
                     joint_limit_lower,
@@ -2207,7 +2216,7 @@ def _assemble_articulation_joint_scalar(
                     joint_compliant_alm,
                     dt,
                 )
-                if hessian_scalar > 0.0:
+                if hessian_scalar > 0.0 or force_scalar != 0.0:
                     _assemble_linear_axis_row_scalar(
                         values_scalar,
                         rhs_scalar,
@@ -2243,6 +2252,7 @@ def _assemble_articulation_joint_scalar(
                     body_q_prev,
                     joint_target_ke,
                     joint_target_kd,
+                    joint_effort_limit,
                     joint_target_q,
                     joint_target_vel,
                     joint_limit_lower,
@@ -2256,7 +2266,7 @@ def _assemble_articulation_joint_scalar(
                     joint_compliant_alm,
                     dt,
                 )
-                if hessian_scalar > 0.0:
+                if hessian_scalar > 0.0 or force_scalar != 0.0:
                     _assemble_angular_axis_row_scalar(
                         values_scalar,
                         rhs_scalar,
@@ -2310,6 +2320,7 @@ def assemble_articulation_joints_scalar(
     joint_damping: wp.array[float],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
     joint_target_q: wp.array[float],
@@ -2369,6 +2380,7 @@ def assemble_articulation_joints_scalar(
         joint_damping,
         joint_target_ke,
         joint_target_kd,
+        joint_effort_limit,
         joint_armature,
         joint_armature_target,
         joint_target_q,
@@ -2593,6 +2605,7 @@ def _evaluate_articulation_joint_terms(
     joint_damping: wp.array[float],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
     joint_target_q: wp.array[float],
@@ -2865,6 +2878,7 @@ def _evaluate_articulation_joint_terms(
             body_q_prev,
             joint_target_ke,
             joint_target_kd,
+            joint_effort_limit,
             joint_target_q,
             joint_target_vel,
             joint_limit_lower,
@@ -2878,7 +2892,7 @@ def _evaluate_articulation_joint_terms(
             joint_compliant_alm,
             dt,
         )
-        if hessian_scalar > 0.0:
+        if hessian_scalar > 0.0 or force_scalar != 0.0:
             terms = _endpoint_terms_add_angular(
                 terms,
                 parent_active,
@@ -2902,6 +2916,7 @@ def _evaluate_articulation_joint_terms(
                     joint_axis,
                     joint_target_ke,
                     joint_target_kd,
+                    joint_effort_limit,
                     joint_target_q,
                     joint_target_vel,
                     joint_limit_lower,
@@ -2915,7 +2930,7 @@ def _evaluate_articulation_joint_terms(
                     joint_compliant_alm,
                     dt,
                 )
-                if hessian_scalar > 0.0:
+                if hessian_scalar > 0.0 or force_scalar != 0.0:
                     terms = _endpoint_terms_add_constraint(
                         terms,
                         parent_active,
@@ -2942,6 +2957,7 @@ def _evaluate_articulation_joint_terms(
                     body_q_prev,
                     joint_target_ke,
                     joint_target_kd,
+                    joint_effort_limit,
                     joint_target_q,
                     joint_target_vel,
                     joint_limit_lower,
@@ -2955,7 +2971,7 @@ def _evaluate_articulation_joint_terms(
                     joint_compliant_alm,
                     dt,
                 )
-                if hessian_scalar > 0.0:
+                if hessian_scalar > 0.0 or force_scalar != 0.0:
                     terms = _endpoint_terms_add_angular(
                         terms,
                         parent_active,
@@ -2999,6 +3015,7 @@ def evaluate_articulation_joint_terms(
     joint_damping: wp.array[float],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
     joint_target_q: wp.array[float],
@@ -3058,6 +3075,7 @@ def evaluate_articulation_joint_terms(
         joint_damping,
         joint_target_ke,
         joint_target_kd,
+        joint_effort_limit,
         joint_armature,
         joint_armature_target,
         joint_target_q,
@@ -3374,6 +3392,7 @@ def solve_articulation_sparse_serial_scalar(
     joint_damping: wp.array[float],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_armature: wp.array[float],
     joint_armature_target: wp.array[float],
     joint_target_q: wp.array[float],
@@ -3487,6 +3506,7 @@ def solve_articulation_sparse_serial_scalar(
                 joint_damping,
                 joint_target_ke,
                 joint_target_kd,
+                joint_effort_limit,
                 joint_armature,
                 joint_armature_target,
                 joint_target_q,

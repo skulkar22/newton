@@ -1,0 +1,1 @@
+Enforce `Model.joint_effort_limit` for implicit VBD motor drives in local, block-sparse, and reduced-elastic solves, including compliant-ALM multipliers and reported motor efforts. Keep passive joint forces and explicit feedforward actuation outside this bound.

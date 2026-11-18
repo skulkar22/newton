@@ -456,11 +456,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         - :attr:`~newton.Model.joint_limit_lower`/:attr:`~newton.Model.joint_limit_upper` and
           :attr:`~newton.Model.joint_limit_ke`/:attr:`~newton.Model.joint_limit_kd` are supported
           for REVOLUTE, PRISMATIC, and D6 joints.
+          Motor targets are not clamped to these bounds. Drives and stop reactions
+          act simultaneously, including on the legacy AVBD path. Clamp control targets
+          explicitly if that behavior is required.
         - Angular winding is retained for REVOLUTE joints and D6 joints with
           exactly one angular DOF. Tracking requires less than ``pi`` radians
           of relative rotation per solver step, including prediction and
           solver corrections.
         - :attr:`~newton.Control.joint_f` (feedforward forces) is supported.
+        - :attr:`~newton.Model.joint_effort_limit` bounds implicit motor effort, including
+          drive damping. Passive damping, friction, joint-limit reactions, armature,
+          and feedforward forces are not capped. Limits are read live.
         - :attr:`~newton.Model.joint_damping` is supported for REVOLUTE, PRISMATIC, and D6
           joints as a per-DOF passive viscous damper: ``force = -joint_damping * qd``
           [N or N·m]. Unlike drive damping (``joint_target_kd``), it always opposes
@@ -468,6 +474,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
           implicitly alongside Coulomb friction, including on mimic followers.
           Coefficients are read live; changing array values needs no notification
           or CUDA graph recapture. Other joint types do not use this property.
+          Scalar-coordinate damping and friction also act on reduced-elastic attachment
+          frames and modes in the local, Schur, and coupled articulation solves.
         - :attr:`~newton.Model.joint_friction` bounds dry-friction force or torque per DOF
           [N or N·m]. With ``rigid_compliant_alm=True`` and ``rigid_articulation_solve="local"``,
           REVOLUTE, PRISMATIC, D6, and BALL joints use projected reactions that support
@@ -477,9 +485,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
           requires local compliant ALM. Friction values are read live, including during
           CUDA graph replay. BALL bounds apply in the parent-anchor frame; D6 uses
           independent coordinate bounds with orthonormal axes in each axis group.
-        - Revolute :attr:`~newton.Model.joint_armature` is supported by the experimental
-          block-sparse articulation solve.
-        - Not supported: :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
+        - Revolute :attr:`~newton.Model.joint_armature` is supported for rigid endpoints
+          in local and block-sparse articulation solves. Local sweeps resolve the
+          relative-coordinate coupling iteratively. Values are read live.
+        - Not supported: :attr:`~newton.Model.joint_velocity_limit`,
           :attr:`~newton.Model.joint_target_mode`, equality constraints, and the deprecated sparse mimic constraints.
         - REVOLUTE and D6 angular coordinates retain their turn counts, with or
           without mimic relationships. Drives, limits, friction, damping, and
@@ -966,8 +975,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 blocks, rather than being added to the sparse factorization.
                 Reduced elastic bodies in an articulation are solved inside its factorization, with
                 their joints at the deformed attachments; ``rigid_articulation_elastic_solve`` selects
-                how. Joint mimics, and armature, passive damping, or friction on joints attached to
-                elastic articulation bodies, are rejected in this mode. Elastic bodies outside every
+                how. Passive damping and friction at elastic attachments are supported for REVOLUTE,
+                PRISMATIC, and D6 joints. Elastic-side joint armature and joint mimics in models
+                containing elastic articulations remain unsupported. Elastic bodies outside every
                 articulation keep the local block solve.
                 The mode is intended for moderate-size articulations;
                 the local mode may be faster for very long chains because sparse factorization is
@@ -1567,6 +1577,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         )
         self.rigid_articulation_sparse_layout = None
         self._rigid_articulation_armature_target = None
+        self._rigid_armature_joints = None
+        if self._integrates_rigid_bodies and model.joint_count > 0:
+            revolute = np.flatnonzero(model.joint_type.numpy() == int(JointType.REVOLUTE))
+            if revolute.size > 0:
+                self._rigid_armature_joints = wp.array(revolute, dtype=wp.int32, device=self.device)
+                self._rigid_articulation_armature_target = wp.zeros_like(model.joint_qd)
         self.rigid_articulation_sparse_values = None
         self.rigid_articulation_sparse_rhs = None
         self.rigid_articulation_sparse_delta = None
@@ -1584,7 +1600,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
             layout = self.rigid_articulation_sparse_layout
             if layout is not None:
-                self._rigid_articulation_armature_target = wp.zeros_like(model.joint_qd)
                 if layout.elastic_solve == "coupled":
                     # One flat storage: the rigid prefix keeps the 6 x 6 ``36 * slot`` and ``6 * row``
                     # indexing, the mixed articulations follow at the layout's variable offsets. The
@@ -1754,6 +1769,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         terms.force = wp.zeros(entry_count, dtype=wp.vec3, device=device)
         terms.torque = wp.zeros(entry_count, dtype=wp.vec3, device=device)
         terms.endpoint_torque = wp.zeros(entry_count, dtype=wp.vec3, device=device)
+        terms.attachment_offset = wp.zeros(entry_count, dtype=wp.vec3, device=device)
         terms.hessian_ll = wp.zeros(entry_count, dtype=wp.mat33, device=device)
         terms.hessian_al = wp.zeros(entry_count, dtype=wp.mat33, device=device)
         terms.hessian_aa = wp.zeros(entry_count, dtype=wp.mat33, device=device)
@@ -2074,9 +2090,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         Raises:
             NotImplementedError: If joint mimics are combined with elastic articulation bodies.
-            ValueError: If a joint attached to an elastic articulation body uses armature,
-                passive damping, or Coulomb friction, whose elastic-side terms the reduced
-                elastic block does not model, or (``"coupled"``) if a joint attached to an elastic
+            ValueError: If a joint attached to an elastic articulation body uses armature
+                or passive terms on a joint type without scalar-coordinate support, or
+                (``"coupled"``) if a joint attached to an elastic
                 articulation body lies outside that body's articulation range.
         """
         layout = self.rigid_articulation_sparse_layout
@@ -2125,14 +2141,19 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     )
                 continue
             dofs = slice(int(qd_start[joint]), int(qd_start[joint + 1]))
-            names = [name for name, values in coordinate_terms if np.any(values[dofs] != 0.0)]
+            scalar_joint = joint_type[joint] in (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
+            names = [
+                name
+                for name, values in coordinate_terms
+                if (name == "joint_armature" or not scalar_joint) and np.any(values[dofs] != 0.0)
+            ]
             if names:
                 raise ValueError(
                     f"Joint {joint} attaches reduced elastic body {body} inside a block-sparse articulation and has "
                     f"nonzero {', '.join(names)}. rigid_articulation_elastic_solve={backend!r} does not support "
-                    "joint_armature, joint_damping, or joint_friction on such joints: these coordinate terms are not "
-                    "part of the reduced elastic block, so the block-sparse solve cannot apply them consistently. "
-                    "Set them to zero on this joint or use rigid_articulation_solve='local'."
+                    "these coordinate terms on this joint. Passive damping and friction require a REVOLUTE, "
+                    "PRISMATIC, or D6 joint; elastic-side joint_armature is not supported. "
+                    "Use supported joint coordinates and set unsupported terms to zero."
                 )
 
     def _select_elastic_block_solve_path(self, block_width: int) -> tuple[str, int]:
@@ -5536,13 +5557,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
             # Rotor inertia must not inherit feedforward/external torques from
             # the body's force-shifted inertial target.
-            if self.rigid_articulation_sparse_layout is not None:
+            if self._rigid_armature_joints is not None:
                 wp.launch(
                     predict_articulation_armature,
-                    dim=self.rigid_articulation_sparse_layout.articulation_joint_count,
+                    dim=self._rigid_armature_joints.shape[0],
                     inputs=[
                         self._joint_coordinates.data,
-                        self.rigid_articulation_sparse_layout.articulation_joints,
+                        self._rigid_armature_joints,
                         state_in.body_q,
                         state_in.body_qd,
                         dt,
@@ -6560,6 +6581,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.joint_C_fric,
                     model.joint_target_ke,
                     model.joint_target_kd,
+                    model.joint_effort_limit,
                     control.joint_target_q,
                     control.joint_target_qd,
                     model.joint_limit_lower,
@@ -6580,6 +6602,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self._joint_coordinates.data,
                     self._joint_friction,
                     model.joint_damping,
+                    model.joint_armature,
+                    self._rigid_articulation_armature_target,
                     self.body_forces,
                     self.body_torques,
                     self.body_hessian_ll,
@@ -6787,6 +6811,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_angular_beta,
                     model.joint_target_ke,
                     model.joint_target_kd,
+                    model.joint_effort_limit,
                     control.joint_target_q,
                     control.joint_target_qd,
                     model.joint_limit_lower,
@@ -7070,6 +7095,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             model.joint_damping,
             model.joint_target_ke,
             model.joint_target_kd,
+            model.joint_effort_limit,
             model.joint_armature,
             self._rigid_articulation_armature_target,
             control.joint_target_q,
@@ -7332,6 +7358,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.joint_C_fric,
                     model.joint_target_ke,
                     model.joint_target_kd,
+                    model.joint_effort_limit,
                     control.joint_target_q,
                     control.joint_target_qd,
                     model.joint_limit_lower,
@@ -7350,6 +7377,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.rigid_compliant_alm,
                     model.joint_dof_dim,
                     self._joint_coordinates.data,
+                    self._joint_friction,
+                    model.joint_damping,
                     model.joint_parent_elastic_endpoint,
                     model.joint_child_elastic_endpoint,
                     model.joint_q_start,
@@ -7847,13 +7876,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         This estimate is supported for REVOLUTE, PRISMATIC, and D6 DOFs;
         unsupported and disabled entries are zero. It uses joint-side reflected
-        armature, not raw motor-shaft inertia. The block-sparse solve simulates
-        revolute armature for joints inside its articulations; those entries
+        armature, not raw motor-shaft inertia. Local and block-sparse solves
+        simulate revolute armature between rigid endpoints; those entries
         receive no correction because their drive effort already includes it.
         Other entries estimate additional effort needed for the same observed
         trajectory, without changing the simulated wrench or motion. This
         correction does not predict a simulation with that inertia enabled.
-        VBD's unsupported velocity/effort clamps are not included.
+        Velocity limits are not applied.
 
         Call immediately after :meth:`step`, before reset, another step, or
         changes to controls, poses, or model properties. The solver updates
@@ -8005,6 +8034,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             "joint_target_q_start",
             "joint_target_ke",
             "joint_target_kd",
+            "joint_effort_limit",
             "joint_limit_lower",
             "joint_limit_upper",
             "joint_limit_ke",

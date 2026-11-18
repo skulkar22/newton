@@ -99,8 +99,8 @@ def test_vbd_multiturn_drive_limit(test, device, *, solve="local"):
                     for _ in range(480):
                         solver.step(state, next_state, control, None, 1.0 / 120.0)
                         state, next_state = next_state, state
-                    # VBD clamps position-drive targets to the authored joint limits.
-                    expected = upper if limited else target
+                    # The requested target remains active against the compliant stop.
+                    expected = (100.0 * target + 10000.0 * upper) / 10100.0 if limited else target
                     test.assertAlmostEqual(float(state.joint_q.numpy()[0]), expected, delta=0.02)
 
 

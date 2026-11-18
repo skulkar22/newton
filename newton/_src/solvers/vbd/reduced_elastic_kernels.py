@@ -10,7 +10,9 @@ from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _SMALL_ANGLE_EPS,
     _SMALL_LENGTH_EPS,
+    JointFrictionData,
     RigidForceElementAdjacencyInfo,
+    _evaluate_joint_dissipation,
     _load_solve_weight,
     contact_surface_separation,
     evaluate_contact_point_world,
@@ -442,6 +444,8 @@ class ElasticEndpointJointTerms:
     """Joint torque on the body about its rest center of mass [N m]."""
     endpoint_torque: wp.array[wp.vec3]
     """Joint torque on the body about the deformed attachment [N m]."""
+    attachment_offset: wp.array[wp.vec3]
+    """Body-local offset from the rest center of mass to the deformed attachment [m]."""
     hessian_ll: wp.array[wp.mat33]
     """Linear-linear joint Hessian block [N/m]."""
     hessian_al: wp.array[wp.mat33]
@@ -489,6 +493,7 @@ def evaluate_elastic_endpoint_joints(
     joint_C_fric: wp.array[wp.vec3],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
+    joint_effort_limit: wp.array[float],
     joint_target_q: wp.array[float],
     joint_target_qd: wp.array[float],
     joint_limit_lower: wp.array[float],
@@ -507,6 +512,8 @@ def evaluate_elastic_endpoint_joints(
     joint_compliant_alm: int,
     joint_dof_dim: wp.array2d[int],
     joint_coordinates: JointCoordinateData,
+    joint_friction: JointFrictionData,
+    joint_damping: wp.array[float],
     joint_parent_elastic_endpoint: wp.array[wp.int32],
     joint_child_elastic_endpoint: wp.array[wp.int32],
     joint_q_start: wp.array[wp.int32],
@@ -576,6 +583,7 @@ def evaluate_elastic_endpoint_joints(
             joint_C_fric,
             joint_target_ke,
             joint_target_kd,
+            joint_effort_limit,
             joint_target_q,
             joint_target_qd,
             joint_limit_lower,
@@ -596,6 +604,24 @@ def evaluate_elastic_endpoint_joints(
             joint_coordinates,
             dt,
         )
+
+        passive_force, passive_torque, passive_H_ll, passive_H_al, passive_H_aa = _evaluate_joint_dissipation(
+            body,
+            joint,
+            body_q,
+            body_q_prev,
+            joint_coordinates,
+            joint_enabled,
+            joint_friction,
+            joint_damping,
+            dt,
+            False,
+        )
+        joint_force += passive_force
+        joint_torque += passive_torque
+        joint_H_ll += passive_H_ll
+        joint_H_al += passive_H_al
+        joint_H_aa += passive_H_aa
 
         endpoint_xform = _elastic_endpoint_xform(
             joint,
@@ -619,9 +645,10 @@ def evaluate_elastic_endpoint_joints(
         r_world = endpoint_pos_world - com_world
         r_skew = wp.skew(r_world)
 
-        linear_H_aa = wp.transpose(r_skew) * joint_H_ll * r_skew
         angular_torque = joint_torque - wp.cross(r_world, joint_force)
-        angular_H_aa = joint_H_aa - linear_H_aa
+        angular_H_aa = (
+            joint_H_aa - r_skew * joint_H_ll * r_skew + joint_H_al * r_skew - r_skew * wp.transpose(joint_H_al)
+        )
 
         theta_local = wp.vec3(0.0)
         for mode in range(mode_count):
@@ -633,6 +660,7 @@ def evaluate_elastic_endpoint_joints(
         endpoint_terms.force[entry] = body_R_T * joint_force
         endpoint_terms.torque[entry] = body_R_T * joint_torque
         endpoint_terms.endpoint_torque[entry] = body_R_T * angular_torque
+        endpoint_terms.attachment_offset[entry] = body_R_T * r_world
         endpoint_terms.hessian_ll[entry] = body_R_T * (joint_H_ll * body_R)
         endpoint_terms.hessian_al[entry] = body_R_T * (joint_H_al * body_R)
         endpoint_terms.hessian_aa[entry] = body_R_T * (joint_H_aa * body_R)
@@ -1144,33 +1172,35 @@ def assemble_elastic_blocks(
             force_local = endpoint_terms.force[entry]
             angular_torque_local = endpoint_terms.endpoint_torque[entry]
             H_ll_local = endpoint_terms.hessian_ll[entry]
-            angular_H_aa_local = endpoint_terms.endpoint_hessian_aa[entry]
+            H_al_local = endpoint_terms.hessian_al[entry]
+            H_aa_local = endpoint_terms.hessian_aa[entry]
+            offset = endpoint_terms.attachment_offset[entry]
             endpoint_rotation_jacobian = endpoint_terms.rotation_jacobian[entry]
             endpoint_mode_start = endpoint * max_modes
             phi_j_local = elastic_endpoint_phi[endpoint_mode_start + mode]
             psi_j_local = endpoint_rotation_jacobian * elastic_endpoint_psi[endpoint_mode_start + mode]
             grad = grad - wp.dot(force_local, phi_j_local) - wp.dot(angular_torque_local, psi_j_local)
 
+            linear_j = phi_j_local + wp.cross(offset, psi_j_local)
+            H_linear_j = H_ll_local * linear_j + wp.transpose(H_al_local) * psi_j_local
+            H_angular_j = H_al_local * linear_j + H_aa_local * psi_j_local
             if frame_dynamic:
-                linear_cross = H_ll_local * phi_j_local
-                angular_cross = endpoint_terms.hessian_al[entry] * phi_j_local + angular_H_aa_local * psi_j_local
                 for axis in range(3):
                     elastic_body_block_matrix[elastic_index, axis, column] = (
-                        elastic_body_block_matrix[elastic_index, axis, column] + linear_cross[axis]
+                        elastic_body_block_matrix[elastic_index, axis, column] + H_linear_j[axis]
                     )
                     elastic_body_block_matrix[elastic_index, 3 + axis, column] = (
-                        elastic_body_block_matrix[elastic_index, 3 + axis, column] + angular_cross[axis]
+                        elastic_body_block_matrix[elastic_index, 3 + axis, column] + H_angular_j[axis]
                     )
 
-            linear_j = H_ll_local * phi_j_local
-            angular_j = angular_H_aa_local * psi_j_local
             for i in range(mode + 1):
                 phi_i_local = elastic_endpoint_phi[endpoint_mode_start + i]
                 psi_i_local = endpoint_rotation_jacobian * elastic_endpoint_psi[endpoint_mode_start + i]
+                linear_i = phi_i_local + wp.cross(offset, psi_i_local)
                 elastic_body_block_matrix[elastic_index, 6 + i, column] = (
                     elastic_body_block_matrix[elastic_index, 6 + i, column]
-                    + wp.dot(phi_i_local, linear_j)
-                    + wp.dot(psi_i_local, angular_j)
+                    + wp.dot(linear_i, H_linear_j)
+                    + wp.dot(psi_i_local, H_angular_j)
                 )
     else:
         elastic_body_block_matrix[elastic_index, column, column] = 1.0

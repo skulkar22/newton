@@ -1,0 +1,1 @@
+Simulate revolute joint armature between rigid bodies in local VBD using relative-coordinate inertia and the force-free rotor predictor. Keep reported motor efforts consistent with the simulated inertia and allow live armature updates.

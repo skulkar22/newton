@@ -448,7 +448,7 @@ def test_vbd_joint_effort_rotating_parent(test, device, *, solve="local"):
 
 
 def test_vbd_joint_effort_simulated_armature(test, device, *, solve="local"):
-    """Avoid adding an armature estimate when sparse dynamics already simulate it."""
+    """Avoid adding an armature estimate when the dynamics already simulate it."""
     model = _make_joint_model(device, newton.JointType.REVOLUTE, armature=2.0)
     solver, state, next_state, previous, wrench = _setup(model, solve=solve)
     previous_qd = wp.clone(state.joint_qd)
@@ -466,10 +466,9 @@ def test_vbd_joint_effort_simulated_armature(test, device, *, solve="local"):
         joint_qd_prev=previous_qd,
     )
     acceleration = float(next_state.joint_qd.numpy()[0]) / _DT
-    simulated = solve == "block_sparse_joints"
-    test.assertAlmostEqual(acceleration, 1.0 if simulated else 3.0, delta=0.005)
+    test.assertAlmostEqual(acceleration, 1.0, delta=0.005)
     test.assertAlmostEqual(float(wrench.numpy()[0, 5]), 3.0, delta=2.0e-4)
-    test.assertAlmostEqual(float(effort.numpy()[0]), 3.0 if simulated else 3.0 + 2.0 * acceleration, delta=0.005)
+    test.assertAlmostEqual(float(effort.numpy()[0]), 3.0, delta=0.005)
 
 
 class TestSolverVBDJointForces(unittest.TestCase):
