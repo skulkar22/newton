@@ -2554,6 +2554,8 @@ add_function_test(
 
 _GUESS_GRAVITY = 9.81
 _GUESS_MODES = ("local", "block_sparse_joints", "block_sparse_levels")
+# Float32 bound on the guess shift: positions reach 0.6 m (ulp 6e-8); measured max error 2.7e-8 on CPU and CUDA.
+_GUESS_SHIFT_ATOL = 1.0e-7
 
 
 def _position_guess_snapshot(device, mode: str, scale: float, iterations: int = 1, **options):
@@ -2613,7 +2615,6 @@ def _position_guess_snapshot(device, mode: str, scale: float, iterations: int = 
 
     solver._rigid_penetration_free_truncation = record_forward_step
     solver.step(state_in, state_out, None, None, 1.0e-2)
-    snapshot["final"] = state_out.body_q.numpy().copy()
     return snapshot, model.body_mass.numpy(), wrench, (root, tip), kinematic
 
 
@@ -2636,7 +2637,7 @@ def test_position_guess_scale_moves_only_the_guess(test, device):
                     scaled["guess"][body, 0:3] - native["guess"][body, 0:3],
                     (scale - 1.0) * dt * dt * acceleration,
                     rtol=0.0,
-                    atol=2.0e-6,
+                    atol=_GUESS_SHIFT_ATOL,
                     err_msg=msg,
                 )
             # The native guess is the inertial target itself.
@@ -2657,7 +2658,7 @@ def test_position_guess_scale_acts_on_gravity_only_in_solve_force_mode(test, dev
                 scaled["guess"][body, 0:3] - native["guess"][body, 0:3],
                 (0.0, 0.0, dt * dt * _GUESS_GRAVITY),
                 rtol=0.0,
-                atol=2.0e-6,
+                atol=_GUESS_SHIFT_ATOL,
                 err_msg=mode,
             )
 
@@ -2751,10 +2752,14 @@ def test_position_guess_scale_warns_about_relaxation_bias(test, device):
 
 
 def test_position_guess_scale_graph_capture(test, device):
-    """Replay steps with a rescaled guess from a CUDA graph exactly like eager steps, in every rigid solve."""
+    """Replay steps from a CUDA graph exactly like eager steps, with the scale active inside the graph.
+
+    Graph and eager agree bitwise at scale 0 and 1 (measured), while scale 0 and scale 1 differ under capture by
+    2.7e-4 (local) and 1.5e-2 (sparse modes) after 40 steps, so the captured graph applies the scale.
+    """
     for mode in _GUESS_MODES:
 
-        def run(use_graph: bool, mode: str = mode) -> np.ndarray:
+        def run(use_graph: bool, scale: float, mode: str = mode) -> np.ndarray:
             model, _ = _make_light_link_limit_model(device)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -2763,7 +2768,7 @@ def test_position_guess_scale_graph_capture(test, device):
                     iterations=4,
                     rigid_compliant_alm=True,
                     rigid_articulation_solve=mode,
-                    rigid_position_guess_acceleration_scale=0.25,
+                    rigid_position_guess_acceleration_scale=scale,
                 )
             state_0 = model.state()
             state_1 = model.state()
@@ -2785,10 +2790,14 @@ def test_position_guess_scale_graph_capture(test, device):
                     substeps()
             return np.concatenate([state_0.body_q.numpy().ravel(), state_0.body_qd.numpy().ravel()])
 
-        eager = run(False)
-        graph = run(True)
-        test.assertTrue(np.isfinite(graph).all(), mode)
-        np.testing.assert_allclose(graph, eager, atol=1.0e-6, err_msg=mode)
+        graphs = {}
+        for scale in (0.0, 1.0):
+            eager = run(False, scale)
+            graphs[scale] = run(True, scale)
+            msg = f"{mode}, scale {scale}"
+            test.assertTrue(np.isfinite(graphs[scale]).all(), msg)
+            np.testing.assert_allclose(graphs[scale], eager, rtol=0.0, atol=1.0e-6, err_msg=msg)
+        test.assertGreater(float(np.max(np.abs(graphs[0.0] - graphs[1.0]))), 1.0e-5, mode)
 
 
 for _test in (
