@@ -1008,7 +1008,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 position guess. ``1`` (default) keeps the native prediction; ``0`` omits external
                 acceleration from the guess only; values in between keep a proportional part.
                 Inertial targets and predicted velocities stay unchanged, so the converged
-                configuration is the same, but the iterations start elsewhere. This can help a
+                configuration is the same, but the iterations start elsewhere. Collision passes
+                after initialization (``PRE_POST_INIT`` or per-iteration rigid detection) run at
+                the iterates and so see the scaled guess; the contact set and contact ``C0`` they
+                find can then differ from those at scale ``1``. This can help a
                 supported cable that barely drops; it may bias free motion at finite iterations.
                 Non-default values require rigid-only compliant ALM with rigid bodies integrated
                 by this solver. Ignored with zero iterations (the guess would be the result).
