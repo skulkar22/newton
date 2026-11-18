@@ -61,7 +61,9 @@ def _factor(device, blocks_host):
     pivot_clamped = wp.zeros(1, dtype=wp.int32, device=device)
     guarded = wp.zeros(n, dtype=mat66f, device=device)
     unguarded = wp.zeros(n, dtype=mat66f, device=device)
-    wp.launch(_factor_blocks, dim=n, inputs=[blocks, pivot_clamped], outputs=[guarded, unguarded, scalar], device=device)
+    wp.launch(
+        _factor_blocks, dim=n, inputs=[blocks, pivot_clamped], outputs=[guarded, unguarded, scalar], device=device
+    )
     return guarded.numpy(), unguarded.numpy(), scalar.numpy().reshape(n, 6, 6), int(pivot_clamped.numpy()[0])
 
 
