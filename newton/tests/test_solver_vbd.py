@@ -10260,6 +10260,10 @@ def test_sparse_solver_residual_decreases_with_iterations(test, device):
             nan_residual, nan_history, _ = _sparse_world_residual(model, mode, 2, nan_body=nan_body, **options)
             test.assertEqual(nan_residual[1], np.inf)
             test.assertEqual(nan_history[0, 1], np.inf)
+            # World 0 shares no body with the NaN box and keeps a finite, positive residual.
+            test.assertTrue(np.isfinite(nan_residual[0]))
+            test.assertGreater(nan_residual[0], 0.0)
+            test.assertTrue(np.all(np.isfinite(nan_history[:, 0])))
 
 
 def test_sparse_solver_residual_graph_capture(test, device):
@@ -10549,6 +10553,103 @@ def test_coupled_elastic_solver_residual(test, device):
             test.assertTrue(np.all(schur_history[0, :2] <= coupled_history[0, :2] * (1.0 + 1.0e-5)))
 
 
+def test_sparse_solver_residual_bdf2(test, device):
+    """Report the residual of the BDF2 step equations in both block-sparse modes.
+
+    The residual is finite and positive, the history ends with it, it drops with more iterations, and the
+    trajectory differs from the BDF1 one, so the BDF2 step was taken.
+    """
+    model = _make_sparse_residual_model(device)
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(mode=mode):
+            few, few_history, _, _ = _rigid_world_residual(model, mode, 2, rigid_time_integration="bdf2")
+            many, many_history, body_q, _ = _rigid_world_residual(model, mode, 16, rigid_time_integration="bdf2")
+            _, _, body_q_bdf1, _ = _rigid_world_residual(model, mode, 16)
+            for residual, history in ((few, few_history), (many, many_history)):
+                test.assertTrue(np.all(np.isfinite(history)))
+                np.testing.assert_array_equal(history[-1], residual)
+                test.assertTrue(np.all(residual[:2] > 0.0))
+                test.assertEqual(residual[-1], 0.0)
+            test.assertLess(many[:2].max(), 0.1 * few[:2].min())
+            test.assertGreater(float(np.abs(body_q - body_q_bdf1).max()), 1.0e-6)
+
+
+def _make_sparse_and_local_residual_model(device) -> newton.Model:
+    """World 0: a five-link revolute articulation. World 1: two pendulums hinged to the world outside any articulation.
+
+    A block-sparse solve owns every body of world 0 and leaves both bodies of world 1 to its trailing
+    per-body solve, so each world's residual comes from one recorder only.
+    """
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-3)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+
+    def add_link(x: float):
+        link = builder.add_link(xform=wp.transform((x, 0.0, 1.0), wp.quat_identity()), mass=0.2, inertia=inertia)
+        builder.add_shape_box(link, hx=0.05, hy=0.02, hz=0.02)
+        return link
+
+    child_xform = wp.transform((-0.05, 0.0, 0.0), wp.quat_identity())
+    builder.begin_world()
+    parent = -1
+    joints = []
+    for i in range(5):
+        link = add_link(0.1 * i + 0.05)
+        parent_xform = wp.transform((0.0, 0.0, 1.0) if parent < 0 else (0.05, 0.0, 0.0), wp.quat_identity())
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent, child=link, axis=newton.Axis.Y, parent_xform=parent_xform, child_xform=child_xform
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.end_world()
+    builder.begin_world()
+    for i in range(2):
+        # Joints to the world may stay outside articulations; these bodies are left to the per-body solve.
+        link = add_link(0.5 * i + 0.05)
+        builder.add_joint_revolute(
+            parent=-1,
+            child=link,
+            axis=newton.Axis.Y,
+            parent_xform=wp.transform((0.5 * i, 0.0, 1.0), wp.quat_identity()),
+            child_xform=child_xform,
+        )
+    builder.end_world()
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def test_sparse_solver_residual_with_local_bodies(test, device):
+    """Record the residual of a block-sparse solve that also solves bodies outside articulations.
+
+    World 0 holds only articulated bodies and world 1 only bodies the sparse solve leaves to its per-body
+    solve, so both worlds report a positive residual only if both recorders run. Each body of world 1 is
+    solved once per iteration: its poses and residual history match those of the same world under the
+    local articulation solve.
+    """
+    model = _make_sparse_and_local_residual_model(device)
+    body_world = model.body_world.numpy()
+    local_bodies = body_world == 1
+    _, local_history, local_body_q, _ = _rigid_world_residual(model, "local", 8, contacts=False)
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(mode=mode):
+            few, _, _, solver = _rigid_world_residual(model, mode, 2, contacts=False)
+            layout = solver.rigid_articulation_sparse_layout
+            test.assertEqual(layout.articulation_body_count, 5)
+            test.assertEqual(layout.local_body_count, 2)
+            residual, history, body_q, _ = _rigid_world_residual(model, mode, 8, contacts=False)
+            test.assertTrue(np.all(np.isfinite(history)))
+            np.testing.assert_array_equal(history[-1], residual)
+            test.assertTrue(np.all(residual[:2] > 0.0))
+            test.assertEqual(residual[-1], 0.0)
+            test.assertTrue(np.all(few[:2] > 0.0))
+            test.assertLess(residual[0], 0.1 * few[0])
+            # The bodies of world 1 take the same per-body solve as under the local articulation solve.
+            np.testing.assert_allclose(body_q[local_bodies], local_body_q[local_bodies], rtol=0.0, atol=1.0e-6)
+            # Measured up to 2.4e-4 relative (CPU) once the residual is near 6e-11.
+            np.testing.assert_allclose(history[:, 1], local_history[:, 1], rtol=2.0e-3, atol=0.0)
+
+
 add_function_test(
     TestVBDSolverResidual,
     "test_sparse_solver_residual_decreases_with_iterations",
@@ -10579,7 +10680,18 @@ add_function_test(
     test_coupled_elastic_solver_residual,
     devices=devices,
 )
-
+add_function_test(
+    TestVBDSolverResidual,
+    "test_sparse_solver_residual_bdf2",
+    test_sparse_solver_residual_bdf2,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSolverResidual,
+    "test_sparse_solver_residual_with_local_bodies",
+    test_sparse_solver_residual_with_local_bodies,
+    devices=devices,
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
