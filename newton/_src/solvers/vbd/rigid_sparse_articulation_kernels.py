@@ -9,6 +9,7 @@ import warp as wp
 
 from newton._src.math import quat_velocity
 from newton._src.sim import JointType
+from newton._src.solvers.rod_kernels import measure_rod_bend_twist_z, rod_bend_twist_jacobian_z_from_measure
 from newton._src.solvers.vbd.joint_coordinates import (
     JointCoordinateData,
     eval_elastic_endpoint_xform,
@@ -26,8 +27,6 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _load_joint_axis_drive_limit,
     _load_solve_weight,
     _material_force_terms,
-    _measure_rod_bend_twist_z,
-    _rod_bend_twist_jacobian_z_from_measure,
     _structural_row_has_stiffness,
     _world_selected,
     compute_joint_kappa_and_jacobian,
@@ -1407,9 +1406,9 @@ def _rod_cross_hessian(
         h_twist = h_twist + friction[2]
 
     if h_bend_x > 0.0 or h_bend_y > 0.0 or h_twist > 0.0:
-        measure = _measure_rod_bend_twist_z(q_wp, q_wc)
-        J_parent_angular = _rod_bend_twist_jacobian_z_from_measure(measure, True)
-        J_child_angular = _rod_bend_twist_jacobian_z_from_measure(measure, False)
+        measure = measure_rod_bend_twist_z(q_wp, q_wc)
+        J_parent_angular = rod_bend_twist_jacobian_z_from_measure(measure, True)
+        J_child_angular = rod_bend_twist_jacobian_z_from_measure(measure, False)
         H_local_diag = wp.vec3(h_bend_x, h_bend_y, h_twist)
         for i in range(3):
             for j in range(3):

@@ -12478,7 +12478,7 @@ class ModelBuilder:
 
         The bodies are always placed on the posed spline (:attr:`Model.body_q` and the initial
         state). The rod's structural rest shape is stored separately in the rod joints' rest
-        targets (:attr:`Model.joint_target_q`), which solvers that measure cable stretch/bend
+        coordinates (:attr:`Model.joint_rest_q`), which solvers that measure cable stretch/bend
         relative to the rest configuration (e.g. :class:`newton.solvers.SolverVBD`) use as
         the equilibrium. By default the rest shape is the spline itself, so pre-shaped cables
         (coils, knots) hold their shape. With ``straight_rest_shape=True`` the rest shape is
