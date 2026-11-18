@@ -4896,8 +4896,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             path, hard contacts report the change of their AVBD multiplier, and soft contacts keep
             no multiplier, so their changes are zero. Body updates are measured on the iterate,
             including the reduced elastic frames; bodies not integrated by this solver report zero.
-            Elastic block metrics are zero for elastic bodies solved inside a
-            ``"block_sparse_joints"`` articulation.
+            Each row of an elastic block metric is a copy of :meth:`elastic_mode_solve_metrics`
+            after that iteration, so it follows the same NaN convention: NaN for elastic bodies
+            solved with ``rigid_articulation_elastic_solve="schur"`` and for bodies of a coupled
+            articulation whose factorization failed in that iteration.
+
+            The metrics are separate from the solver residual observables
+            (``SOLVER_RESIDUAL`` and ``SOLVER_RESIDUAL_HISTORY``, see :meth:`step`): they measure
+            update sizes, contact penetration, and multiplier changes, not the stationarity
+            residual. Both can be recorded in the same step, including under CUDA graph capture.
 
             Metrics have zero iterations unless the solver was constructed with
             ``solver_iteration_metrics=True``, and are zero before the first step.

@@ -541,7 +541,11 @@ Relevant options:
   changes, and, together with ``elastic_solver_metrics``, the elastic block
   residuals; read them with
   :meth:`~newton.solvers.SolverVBD.solve_iteration_metrics` to check whether a
-  step converged.
+  step converged. The elastic rows copy
+  :meth:`~newton.solvers.SolverVBD.elastic_mode_solve_metrics` after each
+  iteration and are NaN where it is NaN (see below). These metrics are
+  separate from the solver residual observables of
+  :meth:`~newton.solvers.SolverVBD.step`; both can be recorded together.
 
 Deterministic mode: ``SolverVBD(deterministic=wp.DeterministicMode.RUN_TO_RUN)``
 makes the elastic contact assembly repeat bit for bit. Pair it with

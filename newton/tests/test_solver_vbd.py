@@ -10077,6 +10077,122 @@ def test_sparse_solver_residual_graph_capture(test, device):
                 test.assertTrue(np.all(history[:, -1] == 0.0))
 
 
+def _residual_and_iteration_metrics(model, mode: str, residual: bool, metrics: bool, **options):
+    """Step ``model`` five times with contacts, optionally requesting the residual and the iteration metrics.
+
+    Returns the residual, its history, the iteration metrics (``None`` when not requested), and the final
+    body poses.
+    """
+    iterations = 8
+    solver = newton.solvers.SolverVBD(
+        model, iterations=iterations, rigid_articulation_solve=mode, solver_iteration_metrics=metrics, **options
+    )
+    observables = None
+    if residual:
+        observables = solver.observables(
+            {solver.ObservableKind.SOLVER_RESIDUAL, solver.ObservableKind.SOLVER_RESIDUAL_HISTORY}
+        )
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(5):
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0, observables=observables)
+        state_0, state_1 = state_1, state_0
+    recorded = solver.solve_iteration_metrics() if metrics else None
+    if observables is None:
+        return None, None, recorded, state_0.body_q.numpy()
+    return (
+        observables.solver_residual.numpy(),
+        observables.solver_residual_history.numpy(),
+        recorded,
+        state_0.body_q.numpy(),
+    )
+
+
+def test_solver_residual_with_iteration_metrics(test, device):
+    """Record the residual observable and the per-iteration solve metrics in the same steps.
+
+    Both are opt-in and only read solver state: requesting either or both leaves the trajectory
+    unchanged, the residual and its history are the same with and without the metrics, and the
+    metrics have one finite, non-negative row per iteration.
+    """
+    model = _make_sparse_residual_model(device)
+    variants = [("local", {}), ("block_sparse_joints", {}), ("block_sparse_levels", {})]
+    if device.is_cuda:
+        variants.append(("block_sparse_levels", {"rigid_articulation_levels_launch": "level"}))
+    for mode, options in variants:
+        with test.subTest(mode=mode, **options):
+            residual, history, metrics, body_q = _residual_and_iteration_metrics(model, mode, True, True, **options)
+            residual_only, history_only, _, body_q_residual = _residual_and_iteration_metrics(
+                model, mode, True, False, **options
+            )
+            _, _, metrics_only, body_q_metrics = _residual_and_iteration_metrics(model, mode, False, True, **options)
+            _, _, _, body_q_plain = _residual_and_iteration_metrics(model, mode, False, False, **options)
+            np.testing.assert_array_equal(body_q, body_q_plain)
+            np.testing.assert_array_equal(body_q_residual, body_q_plain)
+            np.testing.assert_array_equal(body_q_metrics, body_q_plain)
+            np.testing.assert_array_equal(residual, residual_only)
+            np.testing.assert_array_equal(history, history_only)
+            np.testing.assert_array_equal(history[-1], residual)
+            test.assertTrue(np.all(np.isfinite(history)))
+            test.assertTrue(np.all(history[:, :2] > 0.0))
+            for name, values in metrics.items():
+                np.testing.assert_array_equal(values, metrics_only[name], err_msg=name)
+                test.assertEqual(values.shape[0], 8, name)
+                test.assertTrue(bool(np.isfinite(values).all()), name)
+                test.assertTrue(bool((values >= 0.0).all()), name)
+            test.assertEqual(metrics["body_translation_update_norm"].shape, (8, model.body_count))
+            test.assertGreater(float(metrics["body_translation_update_norm"][0].max()), 0.0)
+
+
+def test_solver_residual_with_iteration_metrics_graph_capture(test, device):
+    """Record the residual, its history, and the iteration metrics during CUDA graph replay.
+
+    Each replay must overwrite every residual history row and every body metric row, so the
+    arrays are filled with a sentinel before a replay. Contacts are left out of the captured step.
+    """
+    model = _make_sparse_residual_model(device)
+    iterations = 4
+    variants = [
+        ("block_sparse_joints", {}),
+        ("block_sparse_levels", {}),
+        ("block_sparse_levels", {"rigid_articulation_levels_launch": "level"}),
+    ]
+    for mode, options in variants:
+        with test.subTest(mode=mode, **options):
+            solver = newton.solvers.SolverVBD(
+                model, iterations=iterations, rigid_articulation_solve=mode, solver_iteration_metrics=True, **options
+            )
+            observables = solver.observables(
+                {solver.ObservableKind.SOLVER_RESIDUAL, solver.ObservableKind.SOLVER_RESIDUAL_HISTORY}
+            )
+            state_0, state_1 = model.state(), model.state()
+            control = model.control()
+            # Compile outside the capture.
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0, observables=observables)
+            with wp.ScopedCapture(device=device) as capture:
+                solver.step(state_0, state_1, control, None, 1.0 / 240.0, observables=observables)
+            for _ in range(3):
+                observables.solver_residual.fill_(-1.0)
+                observables.solver_residual_history.fill_(-1.0)
+                for array in solver._iteration_metric_arrays.values():
+                    array.fill_(-1.0)
+                wp.capture_launch(capture.graph)
+                residual = observables.solver_residual.numpy()
+                history = observables.solver_residual_history.numpy()
+                np.testing.assert_array_equal(history[-1], residual)
+                test.assertTrue(np.all(np.isfinite(history)))
+                test.assertTrue(np.all(history[:, :2] > 0.0))
+                metrics = solver.solve_iteration_metrics()
+                for name, values in metrics.items():
+                    test.assertEqual(values.shape[0], iterations, name)
+                    test.assertTrue(bool(np.isfinite(values).all()), name)
+                    test.assertTrue(bool((values >= 0.0).all()), name)
+                test.assertTrue(np.all(metrics["body_translation_update_norm"].max(axis=1) > 0.0))
+
+
 add_function_test(
     TestVBDSolverResidual,
     "test_sparse_solver_residual_decreases_with_iterations",
@@ -10087,6 +10203,18 @@ add_function_test(
     TestVBDSolverResidual,
     "test_sparse_solver_residual_graph_capture",
     test_sparse_solver_residual_graph_capture,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestVBDSolverResidual,
+    "test_solver_residual_with_iteration_metrics",
+    test_solver_residual_with_iteration_metrics,
+    devices=devices,
+)
+add_function_test(
+    TestVBDSolverResidual,
+    "test_solver_residual_with_iteration_metrics_graph_capture",
+    test_solver_residual_with_iteration_metrics_graph_capture,
     devices=cuda_devices,
 )
 
