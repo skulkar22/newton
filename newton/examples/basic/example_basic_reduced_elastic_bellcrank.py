@@ -206,7 +206,7 @@ class Example:
             axis=(0.0, 0.0, 1.0),
             parent_xform=wp.transform(wp.vec3(*self.input_pivot), wp.quat_identity()),
             child_xform=wp.transform(wp.vec3(-0.5 * self.input_length, 0.0, 0.0), wp.quat_identity()),
-            target_pos=self.input_theta0,
+            target_q=self.input_theta0,
             target_ke=160.0,
             target_kd=0.5,
             label="ground_to_input_rocker",

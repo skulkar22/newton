@@ -300,11 +300,11 @@ def _chain_model(device, kind: str, *, drives: bool = False, extras: bool = Fals
             if extras:
                 drive["armature"] = 0.05
             joints.append(
-                builder.add_joint_revolute(axis=(0.0, 0.3, 1.0), target_pos=0.2 if drives else 0.0, **drive, **common)
+                builder.add_joint_revolute(axis=(0.0, 0.3, 1.0), target_q=0.2 if drives else 0.0, **drive, **common)
             )
         elif kind == "prismatic":
             joints.append(
-                builder.add_joint_prismatic(axis=(1.0, 0.2, 0.0), target_pos=0.01 if drives else 0.0, **drive, **common)
+                builder.add_joint_prismatic(axis=(1.0, 0.2, 0.0), target_q=0.01 if drives else 0.0, **drive, **common)
             )
         elif kind == "d6":
             joints.append(
@@ -380,7 +380,7 @@ def _elastic_chain_model(device):
             child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
             target_ke=30.0,
             target_kd=0.2,
-            target_pos=0.3,
+            target_q=0.3,
         ),
         builder.add_joint_revolute(
             parent=base,
@@ -399,7 +399,7 @@ def _elastic_chain_model(device):
             parent_xform=wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity()),
             child_xform=wp.transform(wp.vec3(-0.15, 0.0, 0.0), wp.quat_identity()),
             target_ke=5.0,
-            target_pos=-0.2,
+            target_q=-0.2,
         ),
     ]
     builder.add_articulation(joints)

@@ -5773,7 +5773,7 @@ def _build_revolute_elastic_mode_model(
         parent=-1,
         child=body,
         axis=(1.0, 0.0, 0.0),
-        target_pos=target_pos,
+        target_q=target_pos,
         target_ke=target_ke,
         target_kd=0.0,
         limit_lower=-1.0,
@@ -6049,7 +6049,7 @@ def _check_vbd_prismatic_rotates_elastic_child(test, device, compliant: bool):
         axis=(1.0, 0.0, 0.0),
         parent_xform=wp.transform(wp.vec3(0.4, 0.0, 0.0), wp.quat_identity()),
         child_xform=wp.transform_identity(),
-        target_pos=0.0,
+        target_q=0.0,
     )
     builder.color()
     model = builder.finalize(device=device)

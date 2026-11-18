@@ -167,7 +167,7 @@ class Example:
             axis=(0.0, 0.0, 1.0),
             parent_xform=wp.transform(wp.vec3(*A), wp.quat_identity()),
             child_xform=wp.transform(wp.vec3(-self.a / 2.0, 0.0, 0.0), wp.quat_identity()),
-            target_pos=self.theta2_0,
+            target_q=self.theta2_0,
             target_ke=40.0,
             target_kd=0.08,
             label="ground_crank",

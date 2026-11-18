@@ -312,7 +312,7 @@ def _make_elastic_fourbar_model(device):
         axis=axis,
         parent_xform=wp.transform(wp.vec3(*ground_a), wp.quat_identity()),
         child_xform=offset(-0.5 * a),
-        target_pos=theta2 + 0.3,
+        target_q=theta2 + 0.3,
         target_ke=40.0,
         target_kd=0.08,
     )

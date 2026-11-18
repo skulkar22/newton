@@ -157,7 +157,7 @@ class Example:
             axis=(0.0, 0.0, 1.0),
             parent_xform=wp.transform(wp.vec3(0.0, 0.0, self.z), wp.quat_identity()),
             child_xform=wp.transform(wp.vec3(-0.5 * self.crank_length, 0.0, 0.0), wp.quat_identity()),
-            target_pos=self.theta0,
+            target_q=self.theta0,
             target_ke=120.0,
             target_kd=0.6,
             label="ground_to_crank",

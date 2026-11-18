@@ -364,7 +364,7 @@ def _mixed_model(device, *, rigid_articulation: bool = True):
     axis = (0.0, 0.2, 1.0)
     joints = [
         builder.add_joint_revolute(
-            parent=-1, child=e1, axis=axis, child_xform=minus_half, target_ke=20.0, target_kd=0.1, target_pos=0.2
+            parent=-1, child=e1, axis=axis, child_xform=minus_half, target_ke=20.0, target_kd=0.1, target_q=0.2
         ),
         builder.add_joint_revolute(parent=e1, child=e2, axis=axis, parent_xform=half, child_xform=minus_half),
         builder.add_joint_revolute(

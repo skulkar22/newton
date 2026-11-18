@@ -298,7 +298,7 @@ class Example:
             axis=(1.0, 0.0, 0.0),
             parent_xform=wp.transform(wp.vec3(self.cylinder_length, 0.0, 0.0), wp.quat_identity()),
             child_xform=wp.transform_identity(),
-            target_pos=0.0,
+            target_q=0.0,
             target_ke=2.4e4,
             target_kd=280.0,
             limit_lower=-0.22,

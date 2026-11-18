@@ -1876,7 +1876,7 @@ def _run_multi_axis_d6_chain(device, mode: str, angular_count: int) -> np.ndarra
         angular_axes = [
             JointDofConfig(
                 axis=axis,
-                target_pos=targets[k],
+                target_q=targets[k],
                 target_ke=200.0,
                 target_kd=5.0,
                 limit_lower=limits[k][0],
