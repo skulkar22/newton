@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import dataclasses
-import inspect
-import os
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -13,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import warp as wp
 
+from ..core._warnings import _external_warning_stacklevel
 from ..core.reset import normalize_reset_world_mask
 from ..exceptions import NewtonDeprecationWarning, NewtonWarning
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
@@ -1797,25 +1796,6 @@ def _warn_full_surface_fallbacks(model: Model, capable: np.ndarray) -> None:
     )
 
 
-_NEWTON_SRC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir)) + os.sep
-
-
-def _external_stacklevel() -> int:
-    """Return a ``stacklevel`` that points past all ``newton._src`` frames."""
-    frame = inspect.currentframe()
-    if frame is None:
-        return 2
-    frame = frame.f_back
-    stacklevel = 1
-    try:
-        while frame is not None and os.path.normpath(frame.f_code.co_filename).startswith(_NEWTON_SRC_DIR):
-            frame = frame.f_back
-            stacklevel += 1
-        return stacklevel
-    finally:
-        del frame
-
-
 def _mesh_signed_volume(mesh: Mesh) -> tuple[float, float]:
     """Return the signed enclosed volume [m^3] of *mesh* in mesh space and a round-off tolerance for it."""
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
@@ -1915,7 +1895,7 @@ def _warn_on_unsuitable_meshes_in_elastic_pairs(
             "CollisionPipeline(elastic_contact_mesh_sign_method='normal_and_parity') removes most wrong-side "
             "contacts but misses a share of real ones; it does not help on single open sheets or inside-out meshes."
         )
-    warnings.warn(" ".join(sentences), stacklevel=_external_stacklevel())
+    warnings.warn(" ".join(sentences), stacklevel=_external_warning_stacklevel())
 
 
 class CollisionPipeline:
