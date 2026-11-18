@@ -1945,6 +1945,259 @@ add_function_test(
 )
 
 
+_GUESS_GRAVITY = 9.81
+_GUESS_MODES = ("local", "block_sparse_joints", "block_sparse_levels")
+
+
+def _position_guess_snapshot(device, mode: str, scale: float, iterations: int = 1, **options):
+    """Take one step of a moving two-link chain with a wrench and return the forward-step state and the wrench.
+
+    The snapshot is read on the first call of ``_rigid_penetration_free_truncation``, which runs right
+    after the forward step (and the optional guess rescaling) and is a no-op for this rigid-only scene.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_GUESS_GRAVITY))
+    inertia = wp.mat33(np.diag([0.01, 0.02, 0.03]).astype(np.float32))
+    root = builder.add_link(mass=1.0, inertia=inertia)
+    tip = builder.add_link(mass=2.0, inertia=inertia)
+    joints = [
+        builder.add_joint_free(root),
+        builder.add_joint_revolute(
+            root,
+            tip,
+            parent_xform=wp.transform((0.3, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform((-0.3, 0.0, 0.0), wp.quat_identity()),
+            axis=newton.Axis.Y,
+        ),
+    ]
+    builder.add_articulation(joints)
+    kinematic = builder.add_body(
+        xform=wp.transform((0.0, 1.0, 0.0), wp.quat_identity()), mass=1.0, inertia=inertia, is_kinematic=True
+    )
+    builder.joint_q[2] = 0.5
+    builder.joint_qd[0:6] = [0.3, -0.2, 0.5, 0.1, 0.2, -0.3]
+    builder.joint_qd[6] = 1.0
+    builder.color()
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=iterations,
+        rigid_compliant_alm=True,
+        rigid_articulation_solve=mode,
+        rigid_position_guess_acceleration_scale=scale,
+        **options,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+    wrench[tip] = (3.0, 1.0, -4.0, 0.1, 0.0, 0.0)
+    state_in.clear_forces()
+    state_in.body_f.assign(wrench)
+
+    snapshot = {}
+    truncate = solver._rigid_penetration_free_truncation
+
+    def record_forward_step(state, contacts):
+        if not snapshot:
+            snapshot["guess"] = state.body_q.numpy().copy()
+            snapshot["qd"] = state.body_qd.numpy().copy()
+            snapshot["target"] = solver.body_inertia_q.numpy().copy()
+        truncate(state, contacts)
+
+    solver._rigid_penetration_free_truncation = record_forward_step
+    solver.step(state_in, state_out, None, None, 1.0e-2)
+    snapshot["final"] = state_out.body_q.numpy().copy()
+    return snapshot, model.body_mass.numpy(), wrench, (root, tip), kinematic
+
+
+def test_position_guess_scale_moves_only_the_guess(test, device):
+    """Shift only the guess translation by (scale - 1) dt^2 a_ext; keep target, velocity and rotation bitwise."""
+    dt = 1.0e-2
+    gravity = np.array((0.0, 0.0, -_GUESS_GRAVITY))
+    for mode in _GUESS_MODES:
+        native, mass, wrench, dynamic, kinematic = _position_guess_snapshot(device, mode, 1.0)
+        for scale in (0.0, 0.5):
+            scaled, *_ = _position_guess_snapshot(device, mode, scale)
+            msg = f"{mode}, scale {scale}"
+            np.testing.assert_array_equal(scaled["target"], native["target"], err_msg=msg)
+            np.testing.assert_array_equal(scaled["qd"], native["qd"], err_msg=msg)
+            np.testing.assert_array_equal(scaled["guess"][:, 3:7], native["guess"][:, 3:7], err_msg=msg)
+            np.testing.assert_array_equal(scaled["guess"][kinematic], native["guess"][kinematic], err_msg=msg)
+            for body in dynamic:
+                acceleration = gravity + wrench[body, 0:3] / mass[body]
+                np.testing.assert_allclose(
+                    scaled["guess"][body, 0:3] - native["guess"][body, 0:3],
+                    (scale - 1.0) * dt * dt * acceleration,
+                    rtol=0.0,
+                    atol=2.0e-6,
+                    err_msg=msg,
+                )
+            # The native guess is the inertial target itself.
+            np.testing.assert_array_equal(native["guess"], native["target"], err_msg=mode)
+
+
+def test_position_guess_scale_acts_on_gravity_only_in_solve_force_mode(test, device):
+    """With the wrench applied inside the solve, the forward step is force-free, so only gravity is rescaled."""
+    dt = 1.0e-2
+    for mode in _GUESS_MODES:
+        native, _mass, _wrench, dynamic, _kinematic = _position_guess_snapshot(
+            device, mode, 1.0, rigid_external_force_mode="solve"
+        )
+        scaled, *_ = _position_guess_snapshot(device, mode, 0.0, rigid_external_force_mode="solve")
+        np.testing.assert_array_equal(scaled["target"], native["target"], err_msg=mode)
+        for body in dynamic:
+            np.testing.assert_allclose(
+                scaled["guess"][body, 0:3] - native["guess"][body, 0:3],
+                (0.0, 0.0, dt * dt * _GUESS_GRAVITY),
+                rtol=0.0,
+                atol=2.0e-6,
+                err_msg=mode,
+            )
+
+
+def _free_fall_velocity_fraction(device, mode: str, scale: float, iterations: int) -> float:
+    """Return the COM velocity after one step from rest of a free three-link chain, as a fraction of g dt."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_GUESS_GRAVITY))
+    joints = []
+    parent = -1
+    for i in range(3):
+        mass = 1.0 + 0.5 * i
+        body = builder.add_link(mass=mass, inertia=wp.mat33(np.eye(3, dtype=np.float32) * 0.05 * mass))
+        if parent < 0:
+            joints.append(builder.add_joint_free(child=body))
+        else:
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    parent_xform=wp.transform((0.25, 0.0, 0.0), wp.quat_identity()),
+                    child_xform=wp.transform((-0.25, 0.0, 0.0), wp.quat_identity()),
+                    axis=newton.Axis.Y,
+                )
+            )
+        parent = body
+    builder.add_articulation(joints)
+    builder.color()
+    model = builder.finalize(device=device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=iterations,
+            rigid_compliant_alm=True,
+            rigid_articulation_solve=mode,
+            rigid_position_guess_acceleration_scale=scale,
+        )
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    dt = 1.0 / 2400.0
+    solver.step(state_in, state_out, None, None, dt)
+    body_mass = model.body_mass.numpy().astype(np.float64)
+    velocity_z = (body_mass * state_out.body_qd.numpy()[:, 2].astype(np.float64)).sum() / body_mass.sum()
+    return float(velocity_z / (-_GUESS_GRAVITY * dt))
+
+
+def test_position_guess_scale_sparse_relaxation_bias(test, device):
+    """Sparse modes recover the omitted gravity displacement by the relaxation factor per iteration."""
+    relaxation = 0.65
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        for iterations in (1, 2, 4):
+            test.assertAlmostEqual(_free_fall_velocity_fraction(device, mode, 1.0, iterations), 1.0, delta=1.0e-5)
+            for scale in (0.0, 0.5):
+                predicted = 1.0 - (1.0 - scale) * (1.0 - relaxation) ** iterations
+                fraction = _free_fall_velocity_fraction(device, mode, scale, iterations)
+                test.assertAlmostEqual(fraction, predicted, delta=1.0e-4, msg=f"{mode}, {iterations} it, scale {scale}")
+    # The local block solve has no step relaxation: the chain recovers within two iterations.
+    test.assertAlmostEqual(_free_fall_velocity_fraction(device, "local", 0.0, 2), 1.0, delta=1.0e-4)
+
+
+def test_position_guess_scale_warns_about_relaxation_bias(test, device):
+    """Warn at construction when the predicted sparse free-motion shortfall exceeds the tolerance."""
+    model, _ = _make_light_link_limit_model(device)
+
+    def build(mode, iterations, scale=0.0, **options):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            newton.solvers.SolverVBD(
+                model,
+                iterations=iterations,
+                rigid_compliant_alm=True,
+                rigid_articulation_solve=mode,
+                rigid_position_guess_acceleration_scale=scale,
+                **options,
+            )
+        return [w for w in caught if "rigid_position_guess_acceleration_scale" in str(w.message)]
+
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        # 0.35^4 = 1.5 % and 0.35^6 = 0.18 % exceed the 0.1 % tolerance; 0.35^7 = 0.064 % does not.
+        for iterations in (2, 4, 6):
+            caught = build(mode, iterations)
+            test.assertEqual(len(caught), 1, f"{mode}, {iterations} iterations")
+            test.assertIs(caught[0].category, UserWarning)
+            test.assertIn("predicted to miss", str(caught[0].message))
+        test.assertEqual(build(mode, 7), [], mode)
+        test.assertEqual(build(mode, 16), [], mode)
+        test.assertEqual(build(mode, 2, scale=1.0), [], mode)
+        test.assertEqual(build(mode, 2, rigid_articulation_relaxation=1.0), [], mode)
+    test.assertEqual(build("local", 1), [])
+
+
+def test_position_guess_scale_graph_capture(test, device):
+    """Replay steps with a rescaled guess from a CUDA graph exactly like eager steps, in every rigid solve."""
+    for mode in _GUESS_MODES:
+
+        def run(use_graph: bool, mode: str = mode) -> np.ndarray:
+            model, _ = _make_light_link_limit_model(device)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                solver = newton.solvers.SolverVBD(
+                    model,
+                    iterations=4,
+                    rigid_compliant_alm=True,
+                    rigid_articulation_solve=mode,
+                    rigid_position_guess_acceleration_scale=0.25,
+                )
+            state_0 = model.state()
+            state_1 = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+
+            def substeps():
+                for state_in, state_out in ((state_0, state_1), (state_1, state_0)):
+                    solver.step(state_in, state_out, None, None, 2.0e-3)
+
+            graph = None
+            if use_graph:
+                with wp.ScopedCapture(device=device) as capture:
+                    substeps()
+                graph = capture.graph
+            for _ in range(20):
+                if graph is not None:
+                    wp.capture_launch(graph)
+                else:
+                    substeps()
+            return np.concatenate([state_0.body_q.numpy().ravel(), state_0.body_qd.numpy().ravel()])
+
+        eager = run(False)
+        graph = run(True)
+        test.assertTrue(np.isfinite(graph).all(), mode)
+        np.testing.assert_allclose(graph, eager, atol=1.0e-6, err_msg=mode)
+
+
+for _test in (
+    test_position_guess_scale_moves_only_the_guess,
+    test_position_guess_scale_acts_on_gravity_only_in_solve_force_mode,
+    test_position_guess_scale_sparse_relaxation_bias,
+    test_position_guess_scale_warns_about_relaxation_bias,
+):
+    add_function_test(TestVBDSparseArticulationDevices, _test.__name__, _test, devices=devices)
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_position_guess_scale_graph_capture",
+    test_position_guess_scale_graph_capture,
+    devices=[device for device in devices if device.is_cuda],
+)
+
 # Run the same physical contracts with the independent-level backend.
 for _test in (
     test_sparse_falls_back_to_local_without_articulations,

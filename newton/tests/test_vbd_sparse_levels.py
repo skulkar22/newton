@@ -5,11 +5,13 @@
 
 import itertools
 import unittest
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.vbd.rigid_sparse_articulation import build_rigid_articulation_sparse_layout
 from newton._src.solvers.vbd.rigid_sparse_levels_kernels import solve_articulation_sparse_levels
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -172,6 +174,54 @@ def test_levels_dense_oracle(test, device):
                 np.testing.assert_array_equal(solution.numpy(), actual)
 
 
+def _supported_cable_tip_drop(device, iterations: int, scale: float, steps: int = 120) -> np.ndarray:
+    """Return the tip drop [m] per step of a stiff cantilever cable, pinned inside its articulation, under gravity."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    rod = newton.Rod.create_straight(
+        start=wp.vec3(0.0, 0.0, 1.0), direction=wp.vec3(1.0, 0.0, 0.0), length=0.5, segment_count=10, radius=0.01
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bodies, _joints = builder.add_rod(rod=rod, stretch_stiffness=1.0e6, bend_stiffness=1.0e2)
+    anchor = bodies[0]
+    builder.body_mass[anchor] = 0.0
+    builder.body_inv_mass[anchor] = 0.0
+    builder.body_inertia[anchor] = wp.mat33(0.0)
+    builder.body_inv_inertia[anchor] = wp.mat33(0.0)
+    builder.color()
+    model = builder.finalize(device=device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=iterations,
+            rigid_compliant_alm=True,
+            rigid_articulation_solve="block_sparse_levels",
+            rigid_position_guess_acceleration_scale=scale,
+        )
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    tip0 = float(state_in.body_q.numpy()[bodies[-1], 2])
+    drop = np.empty(steps)
+    for step in range(steps):
+        solver.step(state_in, state_out, None, None, 1.0 / 2400.0)
+        state_in, state_out = state_out, state_in
+        drop[step] = float(state_in.body_q.numpy()[bodies[-1], 2]) - tip0
+    return drop
+
+
+def test_levels_supported_cable_position_guess_scale(test, device):
+    """A supported cable sags too far at 2-4 iterations from the native guess; starting without gravity helps."""
+    reference = _supported_cable_tip_drop(device, 64, 1.0)
+    for iterations in (2, 3, 4):
+        native = np.max(np.abs(_supported_cable_tip_drop(device, iterations, 1.0) - reference))
+        scaled = np.max(np.abs(_supported_cable_tip_drop(device, iterations, 0.0) - reference))
+        # Measured on CPU: 2 iterations 1.68e-3 / 1.06e-3 m, 4 iterations 1.84e-4 / 1.23e-4 m (240 steps).
+        test.assertGreater(native, 1.0e-5, f"{iterations} iterations: no sag error to reduce")
+        test.assertLess(scaled, 0.8 * native, f"{iterations} iterations")
+
+
 class TestVBDSparseLevels(unittest.TestCase):
     pass
 
@@ -182,6 +232,12 @@ add_function_test(
     "test_levels_dense_oracle",
     test_levels_dense_oracle,
     devices=[device for device in get_test_devices() if device.is_cuda],
+)
+add_function_test(
+    TestVBDSparseLevels,
+    "test_levels_supported_cable_position_guess_scale",
+    test_levels_supported_cable_position_guess_scale,
+    devices=get_test_devices(),
 )
 
 if __name__ == "__main__":

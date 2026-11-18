@@ -446,6 +446,20 @@ These three options are off by default with BDF1 and on by default with BDF2.
     ``rigid_time_integration="bdf2"``, ``rigid_bdf2_theta_policy``, ``rigid_axis_support_armature``,
     ``rigid_limit_rho_floor`` and ``rigid_external_force_mode`` may change or be removed without prior notice.
 
+``rigid_position_guess_acceleration_scale`` (default ``1``) scales the gravity and external-force
+part of each dynamic body's starting position guess without changing the inertial target, so the
+solved configuration is the same but the iterations start elsewhere. ``0`` starts from the
+force-free prediction, which can reduce the sag error of a supported cable at a small iteration
+budget. It requires rigid-only compliant ALM, works with the local and both block-sparse
+articulation solves, and is rejected with BDF2. In the block-sparse solves the
+``rigid_articulation_relaxation`` (default 0.65) under-relaxes the update, so a freely moving
+articulated body misses ``(1 - scale) * (1 - relaxation) ** k`` of each step's gravity displacement
+after ``k`` iterations (with scale ``0``: 12 % at 2 iterations, 1.5 % at 4, 0.02 % at 8); the solver
+warns at construction when this exceeds 0.1 %.
+
+.. experimental::
+    ``rigid_position_guess_acceleration_scale`` may change or be removed without prior notice.
+
 SemiImplicit angular springs use principal coordinates in [-pi, pi). Crossing
 that boundary produces a force jump of ``2*pi*stiffness`` and can destabilize
 motion near it. Use Featherstone or MuJoCo for boundary-crossing or multi-turn

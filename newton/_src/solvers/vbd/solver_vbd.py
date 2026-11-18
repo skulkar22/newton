@@ -977,7 +977,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 warm start replaces the guess), with ``integrate_with_external_rigid_solver=True``,
                 with particles and with reduced elastic bodies. With
                 ``rigid_external_force_mode="solve"`` the forward step is force-free, so the scale
-                acts on gravity only.
+                acts on gravity only. The block-sparse solves under-relax each update by
+                ``rigid_articulation_relaxation``, so a freely moving articulated body recovers the
+                omitted displacement only gradually: after ``k`` iterations it still misses
+                ``(1 - scale) * (1 - rigid_articulation_relaxation) ** k`` of each step's gravity
+                displacement (with the default relaxation 0.65 and scale 0: 35 % at 1 iteration,
+                12 % at 2, 1.5 % at 4, 0.02 % at 8). Construction warns when this exceeds 0.1 %.
+                The local solve has no such relaxation.
 
                 .. experimental::
                     ``rigid_position_guess_acceleration_scale`` is experimental and may change or
@@ -1944,6 +1950,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_time_integration, rigid_bdf2_theta_policy, rigid_axis_support_armature, rigid_limit_rho_floor
         )
         self._setup_external_force_mode(rigid_external_force_mode)
+        self._warn_position_guess_relaxation_bias()
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
         self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
 
@@ -9310,6 +9317,38 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             outputs=[self._step_size.bdf2, self._step_size.h, self._step_size.inv_h2],
             device=dev,
         )
+
+    # Largest predicted fraction of the external-acceleration displacement a free body may still miss
+    # after the step's iterations before construction warns (see _warn_position_guess_relaxation_bias).
+    _POSITION_GUESS_SHORTFALL_TOLERANCE = 1.0e-3
+
+    def _position_guess_predicted_shortfall(self) -> float:
+        """Predicted fraction of one step's external-acceleration displacement still missing after the iterations.
+
+        Applies to free motion of bodies in sparse articulations, whose position update is under-relaxed by
+        ``rigid_articulation_relaxation``: each iteration recovers that fraction of the displacement the guess
+        omitted, so ``(1 - scale) * (1 - relaxation) ** iterations`` remains.
+        """
+        scale = self.rigid_position_guess_acceleration_scale
+        if scale == 1.0 or self.iterations <= 0 or self.rigid_articulation_sparse_layout is None:
+            return 0.0
+        return (1.0 - scale) * (1.0 - self.rigid_articulation_relaxation) ** self.iterations
+
+    def _warn_position_guess_relaxation_bias(self):
+        """Warn when a rescaled starting guess will visibly slow free motion in a sparse articulation."""
+        shortfall = self._position_guess_predicted_shortfall()
+        if shortfall > self._POSITION_GUESS_SHORTFALL_TOLERANCE:
+            warnings.warn(
+                f"rigid_position_guess_acceleration_scale={self.rigid_position_guess_acceleration_scale} with "
+                f"rigid_articulation_solve={self.rigid_articulation_solve!r}, "
+                f"rigid_articulation_relaxation={self.rigid_articulation_relaxation} and "
+                f"iterations={self.iterations}: a freely moving articulated body is predicted to miss "
+                f"{100.0 * shortfall:.2g} % of each step's gravity and external-force displacement "
+                "(sparse updates recover the omitted part by the relaxation factor per iteration). "
+                "Use more iterations, a larger relaxation or a scale closer to 1.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     def _setup_external_force_mode(self, rigid_external_force_mode: str | None):
         """Select where external wrenches enter the rigid step and allocate the wrench snapshot."""
