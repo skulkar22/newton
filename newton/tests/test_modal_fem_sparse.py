@@ -7,7 +7,6 @@ These are setup-time NumPy/SciPy tests; they do not launch Warp kernels and
 are registered once, independent of the test device.
 """
 
-import importlib.util
 import itertools
 import math
 import sys
@@ -21,9 +20,9 @@ import numpy as np
 import newton
 from newton._src.sim import modal_sparse
 from newton._src.sim.modal import _estimate_sample_psi, _nearest_neighbors
-from newton.tests.unittest_utils import add_function_test
+from newton.tests.unittest_utils import add_function_test, has_module
 
-HAS_SCIPY = importlib.util.find_spec("scipy") is not None
+HAS_SCIPY = has_module("scipy")
 
 
 def _sparse_spring_lattice(shape, spacing, spring_stiffness, node_mass, braced=True, soft_split=None):

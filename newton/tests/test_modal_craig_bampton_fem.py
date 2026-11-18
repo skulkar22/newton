@@ -10,7 +10,6 @@ available (set ``NEWTON_CB_PANEL_DIR`` to the folder that contains
 ``model/panel`` and ``rom/panel``) and are skipped otherwise.
 """
 
-import importlib.util
 import inspect
 import json
 import math
@@ -29,9 +28,9 @@ import newton
 import newton.utils
 from newton._src.sim import modal_sparse
 from newton.tests.test_reduced_elastic_body import _lattice_craig_bampton, _spring_lattice
-from newton.tests.unittest_utils import add_function_test
+from newton.tests.unittest_utils import add_function_test, has_module
 
-HAS_SCIPY = importlib.util.find_spec("scipy") is not None
+HAS_SCIPY = has_module("scipy")
 
 REF_DIR = Path(os.environ.get("NEWTON_CB_PANEL_DIR", "")).expanduser()
 REF_FILES = (
