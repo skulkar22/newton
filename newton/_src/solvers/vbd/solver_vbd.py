@@ -257,6 +257,24 @@ _ELASTIC_DETERMINISTIC_SCATTER_BYTES_MAX = 1 << 30
 """Largest deterministic scatter allocation [bytes] that one reduced elastic contact launch may need."""
 
 
+def _is_deterministic_record_overflow(error: RuntimeError) -> bool:
+    """Return whether ``error`` reports that a deterministic launch ran out of atomic records.
+
+    Warp 1.18 raises a :class:`RuntimeError` naming a "scatter buffer overflow"; Warp 1.19 raises
+    ``wp.WarpDeterminismError`` (a :class:`RuntimeError`) that asks to raise
+    ``deterministic_max_records``.
+    """
+    message = str(error)
+    if "scatter buffer overflow" in message:
+        return True
+    determinism_error = getattr(wp, "WarpDeterminismError", None)
+    return (
+        determinism_error is not None
+        and isinstance(error, determinism_error)
+        and "deterministic_max_records" in message
+    )
+
+
 def _elastic_block_solve_shared_memory_estimate(block_width: int) -> int:
     """Estimate the dynamic shared memory of the tiled block solve for ``block_width``, in bytes.
 
@@ -8879,7 +8897,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     device=self.device,
                 )
             except RuntimeError as exc:
-                if "scatter buffer overflow" not in str(exc):
+                if not _is_deterministic_record_overflow(exc):
                     raise
                 error = self._elastic_contact_list_overflow_error(body_ids)
                 if error is None:
