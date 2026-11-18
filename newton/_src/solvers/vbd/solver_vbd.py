@@ -2266,10 +2266,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             return
         # The assembly launches one thread group per elastic body of a color group, or of the
         # sparse articulation layout; the frame coupling launches one thread per elastic body.
-        launch_bodies = max(
-            [int(bodies.shape[0]) for _group, bodies in self._elastic_color_bodies.values()]
-            + [0 if layout is None else int(layout.elastic_body_count)]
-        )
+        launch_bodies = max(self._elastic_assembly_launch_body_counts())
         key_bytes = 8
         # assemble_elastic_contacts scatters floats to the block gradient and matrix;
         # accumulate_elastic_frame_coupling scatters vec3 forces and torques.
@@ -2288,6 +2285,35 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             {"deterministic": deterministic, "deterministic_max_records": max_records},
             module=reduced_elastic_kernels,
         )
+
+    def _elastic_assembly_launch_body_counts(self) -> list[int]:
+        """Return the elastic body count of every modal assembly launch the configured rigid solve makes.
+
+        The local solve launches the elastic bodies of each color of ``Model.body_color_groups``.
+        A block-sparse solve with articulations launches the elastic bodies of each color of the
+        bodies it leaves to the local solve, the Schur-eliminated bodies
+        (``rigid_articulation_elastic_solve="schur"``) at once, and the elastic bodies of the mixed
+        articulations (``"coupled"``) at once; without articulations it falls back to the local
+        solve. Used to bound the deterministic scatter memory of one launch.
+        """
+        model = self.model
+        layout = self.rigid_articulation_sparse_layout
+        sparse = (
+            self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels")
+            and not self.integrate_with_external_rigid_solver
+            and model.body_count > 0
+            and layout is not None
+            and layout.articulation_count > 0
+        )
+        groups = layout.local_body_color_groups if sparse else model.body_color_groups
+        counts = [0]
+        for group in groups:
+            entry = self._elastic_color_bodies.get(id(group))
+            if entry is not None and entry[0] is group:
+                counts.append(int(entry[1].shape[0]))
+        if sparse:
+            counts += [int(layout.elastic_body_count), int(layout.mixed_elastic_body_count)]
+        return counts
 
     def _init_elastic_assembly_scratch(self, model: Model) -> None:
         """Allocate the intermediates of the parallel reduced elastic block assembly.

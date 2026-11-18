@@ -366,7 +366,7 @@ def test_elastic_contact_list_overflow_error(test, device):
     _run_isolated(test, "_check_elastic_contact_list_overflow_error", str(device))
 
 
-def _build_elastic_joined_pair(device, mode_order=12):
+def _build_elastic_joined_pair(device, mode_order=12, ground=False):
     # Two beams with 4 * mode_order modes each, joined to each other: the sparse Schur columns of
     # the joint scatter one record per mode of a body from each thread.
     beam = newton.ModalGeneratorBeam
@@ -381,6 +381,9 @@ def _build_elastic_joined_pair(device, mode_order=12):
     length = 0.6
     basis = beam(length=length, half_width_y=0.03, half_width_z=0.02, young_modulus=2.0e6, mode_specs=specs).build()
     builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    if ground:
+        # Any shape gives the solver per-body contact lists, which the contact records are sized from.
+        builder.add_ground_plane()
     links = [
         builder.add_link_elastic(
             xform=wp.transform(wp.vec3((i + 0.5) * length, 0.0, 0.0), wp.quat_identity()), modal_basis=basis
@@ -405,7 +408,11 @@ def _check_elastic_sparse_schur_records(device):
         if max_modes != 48:
             raise AssertionError(f"expected 48 modes, got {max_modes}")
         solver = newton.solvers.SolverVBD(
-            model, iterations=1, rigid_articulation_solve="block_sparse_joints", deterministic=DETERMINISTIC_MODE
+            model,
+            iterations=1,
+            rigid_articulation_solve="block_sparse_joints",
+            rigid_articulation_elastic_solve="schur",
+            deterministic=DETERMINISTIC_MODE,
         )
         if wp.get_module_options(module=reduced_elastic_sparse_kernels)["deterministic_max_records"] != max_modes:
             raise AssertionError("the sparse elastic module records were not sized from the mode count")
@@ -449,6 +456,58 @@ def _check_elastic_sparse_schur_records(device):
 def test_elastic_sparse_schur_records(test, device):
     """Scatter the modal coupling of two 48-mode elastic links joined to each other in deterministic mode."""
     _run_isolated(test, "_check_elastic_sparse_schur_records", str(device))
+
+
+# Contact list size that puts one 48-mode body's contact assembly launch under the deterministic
+# scatter limit and a launch of both joined links above it: 600 contacts per thread x 1464 records.
+_JOINED_PAIR_GUARD_BUFFER_SIZE = 19200
+
+
+def _check_elastic_sparse_coupled_records(device):
+    with wp.ScopedDevice(device):
+        model = _build_elastic_joined_pair(device, ground=True)
+        max_modes = int(model.elastic_max_mode_count)
+        solver = newton.solvers.SolverVBD(
+            model, iterations=1, rigid_articulation_solve="block_sparse_joints", deterministic=DETERMINISTIC_MODE
+        )
+        layout = solver.rigid_articulation_sparse_layout
+        if layout.elastic_solve != "coupled" or layout.elastic_body_count != 0 or layout.mixed_elastic_body_count != 2:
+            raise AssertionError("the default elastic solve must put both joined links in one coupled articulation")
+        expected = reduced_elastic_kernels.elastic_contact_deterministic_max_records(
+            max_modes, int(solver.body_body_contact_buffer_pre_alloc)
+        )
+        if expected == 0 or wp.get_module_options(module=reduced_elastic_kernels)["deterministic_max_records"] != expected:
+            raise AssertionError("the elastic contact assembly records were not sized for the coupled solve")
+        # The two links sit in different colors, so only the coupled launch holds both: the
+        # scatter guard must count that launch. The local solve launches one link per color.
+        for mode, backend, raises in (
+            ("block_sparse_joints", "coupled", True),
+            ("block_sparse_levels", "coupled", True),
+            ("block_sparse_joints", "schur", True),
+            ("local", "coupled", False),
+        ):
+            try:
+                newton.solvers.SolverVBD(
+                    model,
+                    iterations=1,
+                    rigid_articulation_solve=mode,
+                    rigid_articulation_elastic_solve=backend,
+                    rigid_body_contact_buffer_size=_JOINED_PAIR_GUARD_BUFFER_SIZE,
+                    deterministic=DETERMINISTIC_MODE,
+                )
+            except ValueError as error:
+                if not raises:
+                    raise AssertionError(f"{mode}/{backend}: unexpected scatter limit error: {error}") from error
+                if "2 elastic bodies per launch" not in str(error):
+                    raise AssertionError(f"{mode}/{backend}: unexpected message: {error}") from error
+                continue
+            if raises:
+                raise AssertionError(f"{mode}/{backend}: the scatter limit did not count the joint launch")
+
+
+def test_elastic_sparse_coupled_records(test, device):
+    """Size the deterministic elastic contact records and bound their memory for the coupled solve."""
+    _run_isolated(test, "_check_elastic_sparse_coupled_records", str(device))
 
 
 class TestSolverDeterminism(unittest.TestCase):
@@ -713,6 +772,14 @@ add_function_test(
     TestSolverDeterminism,
     "test_elastic_sparse_schur_records",
     test_elastic_sparse_schur_records,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_elastic_sparse_coupled_records",
+    test_elastic_sparse_coupled_records,
     devices=devices,
     check_output=False,
 )
