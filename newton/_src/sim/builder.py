@@ -6869,8 +6869,13 @@ class ModelBuilder:
             self.joint_friction.append(0.0)
             self.joint_limit_lower.append(-MAXVAL)
             self.joint_limit_upper.append(MAXVAL)
+            self.joint_stiffness.append(0.0)
 
         self.joint_target_q.extend([0.0] * (7 + mode_count))
+        # Frame coordinates follow the FREE joint rest layout; modal coordinates have no authored rest.
+        rest = [None, None, None, 0.0, 0.0, 0.0, 1.0, *([None] * mode_count)]
+        self._joint_rest_q_authored.extend(value is not None for value in rest)
+        self.joint_rest_q.extend(0.0 if value is None else value for value in rest)
 
         self.joint_f.extend([0.0] * dof_count)
         self.joint_act.extend([0.0] * dof_count)
