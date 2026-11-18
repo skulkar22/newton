@@ -10416,6 +10416,139 @@ def test_solver_residual_with_iteration_metrics_graph_capture(test, device):
                 test.assertTrue(np.all(metrics["body_translation_update_norm"].max(axis=1) > 0.0))
 
 
+def _rigid_world_residual(
+    model, mode: str, iterations: int, steps: int = 5, dt: float = 1.0 / 240.0, contacts: bool = True, **options
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, newton.solvers.SolverVBD]:
+    """Step ``model`` with the residual and its history requested.
+
+    Returns the final per-world residual, its history, the final body poses, and the solver.
+    """
+    solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_articulation_solve=mode, **options)
+    observables = solver.observables(
+        {solver.ObservableKind.SOLVER_RESIDUAL, solver.ObservableKind.SOLVER_RESIDUAL_HISTORY}
+    )
+    pipeline = newton.CollisionPipeline(model) if contacts else None
+    contact_buffer = pipeline.contacts() if contacts else None
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    for _ in range(steps):
+        if contacts:
+            pipeline.collide(state_0, contact_buffer)
+        solver.step(state_0, state_1, control, contact_buffer, dt, observables=observables)
+        state_0, state_1 = state_1, state_0
+    return (
+        observables.solver_residual.numpy(),
+        observables.solver_residual_history.numpy(),
+        state_0.body_q.numpy(),
+        solver,
+    )
+
+
+def _make_mixed_elastic_residual_model(device) -> newton.Model:
+    """Two worlds, each with a hinged chain of a one-mode elastic link, a rigid link and a three-mode elastic link.
+
+    Under ``rigid_articulation_elastic_solve="coupled"`` the articulation rows have 7, 6 and 9 scalars, so a
+    row offset taken as ``6 * row`` would misplace the rigid and the second elastic row. The two elastic links
+    are not jointed to each other, so the Schur backend eliminates their modes exactly.
+    """
+    length = 0.5
+    beam = newton.ModalGeneratorBeam
+
+    def basis(mode_specs):
+        return beam(
+            length=length,
+            half_width_y=0.03,
+            half_width_z=0.02,
+            young_modulus=2.0e6,
+            density=1000.0,
+            mode_specs=mode_specs,
+        ).build()
+
+    one_mode = basis([{"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1}])
+    three_modes = basis(
+        [
+            {"type": beam.Mode.AXIAL},
+            {"type": beam.Mode.BENDING_Y, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+            {"type": beam.Mode.BENDING_Z, "boundary": beam.Boundary.PINNED_PINNED, "order": 1},
+        ]
+    )
+    builder = newton.ModelBuilder(gravity=(0.0, -9.81, 0.0))
+    for _world in range(2):
+        builder.begin_world()
+        first = builder.add_link_elastic(
+            xform=wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity()), modal_basis=one_mode, mode_q=[0.01]
+        )
+        middle = builder.add_link(
+            xform=wp.transform(wp.vec3(length + 0.1, 0.0, 0.0), wp.quat_identity()),
+            mass=0.4,
+            inertia=wp.mat33(*np.diag([0.001, 0.004, 0.004]).ravel()),
+        )
+        last = builder.add_link_elastic(
+            xform=wp.transform(wp.vec3(1.5 * length + 0.2, 0.0, 0.0), wp.quat_identity()),
+            modal_basis=three_modes,
+            mode_q=[0.0, 0.0, -0.01],
+        )
+        half = wp.transform(wp.vec3(0.5 * length, 0.0, 0.0), wp.quat_identity())
+        minus_half = wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity())
+        axis = (0.0, 0.0, 1.0)
+        joints = [
+            builder.add_joint_revolute(parent=-1, child=first, axis=axis, child_xform=minus_half),
+            builder.add_joint_revolute(
+                parent=first,
+                child=middle,
+                axis=axis,
+                parent_xform=half,
+                child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+            ),
+            builder.add_joint_revolute(
+                parent=middle,
+                child=last,
+                axis=axis,
+                parent_xform=wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity()),
+                child_xform=minus_half,
+            ),
+        ]
+        builder.add_articulation(joints)
+        builder.end_world()
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def test_coupled_elastic_solver_residual(test, device):
+    """Report the residual of a mixed rigid/elastic articulation under the coupled elastic solve.
+
+    The residual includes the modal rows of the articulation's reduced elastic links. It is finite and
+    positive in both worlds, the history ends with it, and it drops with more iterations. From the same
+    state, the Schur backend's first-iteration value leaves out the eliminated modal part and so is not
+    above the coupled one.
+    """
+    model = _make_mixed_elastic_residual_model(device)
+    dt = 1.0 / 480.0
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(mode=mode):
+            few, few_history, _, solver = _rigid_world_residual(model, mode, 2, dt=dt, contacts=False)
+            layout = solver.rigid_articulation_sparse_layout
+            test.assertEqual(layout.elastic_solve, "coupled")
+            test.assertEqual(layout.mixed_elastic_body_count, 4)
+            test.assertEqual(layout.local_body_count, 0)
+            many, many_history, _, _ = _rigid_world_residual(model, mode, 16, dt=dt, contacts=False)
+            test.assertEqual(few.shape, (model.world_count + 1,))
+            for residual, history in ((few, few_history), (many, many_history)):
+                test.assertTrue(np.all(np.isfinite(history)))
+                np.testing.assert_array_equal(history[-1], residual)
+                test.assertTrue(np.all(residual[:2] > 0.0))
+                test.assertEqual(residual[-1], 0.0)
+            test.assertLess(many[:2].max(), 0.1 * few[:2].min())
+
+            _, coupled_history, _, _ = _rigid_world_residual(model, mode, 4, steps=1, dt=dt, contacts=False)
+            _, schur_history, _, schur_solver = _rigid_world_residual(
+                model, mode, 4, steps=1, dt=dt, contacts=False, rigid_articulation_elastic_solve="schur"
+            )
+            test.assertEqual(schur_solver.rigid_articulation_sparse_layout.elastic_body_count, 4)
+            test.assertTrue(np.all(schur_history[0, :2] > 0.0))
+            test.assertTrue(np.all(schur_history[0, :2] <= coupled_history[0, :2] * (1.0 + 1.0e-5)))
+
+
 add_function_test(
     TestVBDSolverResidual,
     "test_sparse_solver_residual_decreases_with_iterations",
@@ -10440,6 +10573,13 @@ add_function_test(
     test_solver_residual_with_iteration_metrics_graph_capture,
     devices=cuda_devices,
 )
+add_function_test(
+    TestVBDSolverResidual,
+    "test_coupled_elastic_solver_residual",
+    test_coupled_elastic_solver_residual,
+    devices=devices,
+)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
