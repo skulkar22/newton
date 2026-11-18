@@ -1152,7 +1152,7 @@ add_example_test(
     TestRobotExamples,
     name="robot.example_robot_ur10_elastic_panel",
     devices=cuda_test_devices,
-    test_options={"usd_required": True, "num-frames": 120, "carhoods_dir": "/tmp/newton_missing_carhoods"},
+    test_options={"requires": ("pxr.Usd",), "num-frames": 120, "carhoods_dir": "/tmp/newton_missing_carhoods"},
     use_viewer=True,
 )
 add_example_test(
