@@ -623,8 +623,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
           :func:`~newton.eval_ik` overwrites the continuous output with wrapped
           angles, but does not change VBD's internal turn history.
         - Joint-owned mimic relationships are supported for PRISMATIC, REVOLUTE, and D6 joints.
-          VBD uses its assembled body Hessians and constraint reaction forces,
-          with one mimic solve per iteration. Changes to mimic references require
+          VBD uses constraint reaction forces and the system of its body update, with one
+          mimic solve per iteration: the assembled body Hessians under
+          ``rigid_articulation_solve="local"``, and the factored articulation systems in the
+          block-sparse modes, which covers mimics between bodies that joints connect to
+          other bodies. Changes to mimic references require
           :meth:`notify_model_changed` with :attr:`~newton.ModelFlags.JOINT_PROPERTIES`
           and recapturing any existing CUDA graph; turn history is preserved.
 
@@ -1230,8 +1233,22 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 articulation body. Cross-articulation joints and bodies shared by two articulations
                 are rejected at construction. Passive friction and damping use coupled coordinate
                 rows; angular drives and limits retain continuous turn counts. Mimic joints keep
-                one reaction-force projection per iteration using the assembled body-diagonal
-                blocks, rather than being added to the sparse factorization.
+                one reaction-force projection per iteration rather than being added to the sparse
+                factorization. A mimic row on articulation bodies takes its compliance and its pose
+                update from the articulation's block Cholesky factor of the same iteration (two block
+                triangular solves over the articulation per row and iteration, one thread per
+                articulation), because the coupled solve answers a mimic reaction with the whole
+                articulation; a row body outside the articulations uses its own block. A mimic whose
+                two joints lie in different articulations is rejected. Two limits apply with mimics.
+                First, because the mimic solve moves body poses directly, any supported mimic in the
+                model switches every block-sparse articulation, including articulations without a
+                mimic, from the displacement-form update to the absolute-position update, which loses
+                float32 resolution far from the origin at small time steps (a three-link chain 30 m
+                from the origin at 0.5 ms steps ends about 5e-2 rad off after 240 steps, against
+                2e-4 rad without a mimic in the model; below 3e-4 rad at 4 ms steps). Second, the
+                rows of one articulation are solved one after another once per iteration, so several
+                rows in one articulation converge more slowly than in the local solve at large time
+                steps.
                 Reduced elastic bodies in an articulation are solved inside its factorization, with
                 their joints at the deformed attachments; ``rigid_articulation_elastic_solve`` selects
                 how. Joint mimics, and armature, passive damping, or friction on joints attached to
@@ -2194,6 +2211,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._attachment_particle_body_rho = wp.zeros(attachment_count, dtype=float, device=self.device)
 
         self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(model, "SolverVBD")
+        # Set when notify_model_changed rejects a mimic change; step() refuses to run until a later
+        # notify_model_changed accepts the model.
+        self._rejected_mimic_change: str | None = None
         self._update_displacement_mode()
         self._setup_time_integration(
             rigid_time_integration, rigid_bdf2_theta_policy, rigid_axis_support_armature, rigid_limit_rho_floor
@@ -2201,7 +2221,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._setup_external_force_mode(rigid_external_force_mode)
         self._warn_position_guess_relaxation_bias()
         self._joint_coordinates = JointCoordinates(model) if self._integrates_rigid_bodies else None
-        self._mimic_solver = JointMimicSolver(model, self._joint_coordinates.data) if self._has_joint_mimics else None
+        self._mimic_solver = self._create_mimic_solver()
 
         # Initialize rigid penetration-free (DAT) truncation state
         self._init_rigid_penetration_free(model, rigid_soft_dat_use_interval_arithmetic)
@@ -2752,12 +2772,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if elastic_body_array.shape[0] == 0:
             return
         model = self.model
-        if self._has_joint_mimics:
-            raise NotImplementedError(
-                f"SolverVBD with rigid_articulation_solve={self.rigid_articulation_solve!r} and "
-                f"rigid_articulation_elastic_solve={backend!r} does not support joint mimics together with "
-                "reduced elastic articulation bodies. Use rigid_articulation_solve='local'."
-            )
+        self._check_mimic_sparse_elastic()
         elastic_bodies = set(elastic_body_array.numpy().tolist())
         parent = model.joint_parent.numpy()
         child = model.joint_child.numpy()
@@ -3516,13 +3531,19 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._warn_coupled_articulation_failures()
         # Mimic relationships are notified with CONSTRAINT_PROPERTIES.
         if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.CONSTRAINT_PROPERTIES):
-            self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(
-                self.model, "SolverVBD"
-            )
-            self._check_bdf2_supported()
-            self._mimic_solver = (
-                JointMimicSolver(self.model, self._joint_coordinates.data) if self._has_joint_mimics else None
-            )
+            has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(self.model, "SolverVBD")
+            # Validate and build before assigning, so a rejected change leaves the mimic state, the
+            # mimic solve and the displacement mode consistent with each other. The model already
+            # holds the rejected mimics, so step() raises until a later call accepts the model.
+            try:
+                self._check_bdf2_supported(has_joint_mimics)
+                mimic_solver = self._create_mimic_solver(has_joint_mimics)
+            except (ValueError, NotImplementedError) as error:
+                self._rejected_mimic_change = f"{type(error).__name__}: {error}"
+                raise
+            self._has_joint_mimics = has_joint_mimics
+            self._mimic_solver = mimic_solver
+            self._rejected_mimic_change = None
             self._update_displacement_mode()
         # Armature, damping, and friction also arrive with the narrow DOF flags, which the broad
         # JOINT_DOF_PROPERTIES bit does not include.
@@ -5149,10 +5170,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 and :ref:`vbd_residual_history`.
 
         Raises:
-            RuntimeError: If required rigid contact-matching data is unavailable, or contact-history storage would
-                need to be allocated or grown during graph capture.
+            RuntimeError: If required rigid contact-matching data is unavailable, contact-history storage would
+                need to be allocated or grown during graph capture, or the last :meth:`notify_model_changed`
+                rejected the model's joint mimics.
             ValueError: If ``solver_residual_history`` was allocated for a different ``iterations`` count.
         """
+        if self._rejected_mimic_change is not None:
+            raise RuntimeError(
+                "SolverVBD.notify_model_changed rejected the model's joint mimics "
+                f"({self._rejected_mimic_change}); fix the model and call notify_model_changed again "
+                "before stepping."
+            )
         contacts = self._resolve_step_contacts(contacts)
         self.validate_observables(observables, contacts)
         if observables is not None and observables.is_requested(self.ObservableKind.SOLVER_RESIDUAL_HISTORY):
@@ -7619,6 +7647,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.body_hessian_ll,
                 self.body_hessian_al,
                 self.body_hessian_aa,
+                self.rigid_articulation_sparse_values,
             )
         self._update_rigid_body_duals(state_in, state_out, control, contacts, dt)
 
@@ -9753,8 +9782,14 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         """Pose that in-solve rates difference against: x_n (BDF1) or x_n + (x_n - x_{n-1}) / 3 (BDF2)."""
         return self._bdf2_rate_ref if self._bdf2_enabled else self.body_q_prev
 
-    def _check_bdf2_supported(self):
-        """Raise if the model or solve mode cannot use ``rigid_time_integration="bdf2"``."""
+    def _check_bdf2_supported(self, has_joint_mimics: bool | None = None):
+        """Raise if the model or solve mode cannot use ``rigid_time_integration="bdf2"``.
+
+        Args:
+            has_joint_mimics: Mimic state to check; ``None`` uses the solver's current state.
+        """
+        if has_joint_mimics is None:
+            has_joint_mimics = self._has_joint_mimics
         if not self._bdf2_enabled:
             return
         if not self._integrates_rigid_bodies or self.rigid_articulation_solve not in (
@@ -9765,7 +9800,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "rigid_time_integration='bdf2' requires rigid_articulation_solve='block_sparse_joints' "
                 "or 'block_sparse_levels' and rigid bodies integrated by this solver"
             )
-        if self._has_joint_mimics:
+        if has_joint_mimics:
             raise ValueError("rigid_time_integration='bdf2' does not support joint mimics")
         if int(self.model.elastic_body_count) > 0:
             # The reduced elastic frame and modal assembly (local block solve and both sparse elastic
@@ -10054,6 +10089,42 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             outputs=[self.body_forces, self.body_torques],
             device=self.device,
         )
+
+    def _check_mimic_sparse_elastic(self, has_joint_mimics: bool | None = None) -> None:
+        """Reject joint mimics when the block-sparse solve covers reduced elastic bodies.
+
+        The mimic solve reads the 6 x 6 block factors of rigid-only articulations; the Schur-reduced
+        and variable-size block systems of articulations with elastic bodies are not supported.
+
+        Args:
+            has_joint_mimics: Mimic state to check; ``None`` uses the solver's current state.
+        """
+        if has_joint_mimics is None:
+            has_joint_mimics = self._has_joint_mimics
+        layout = self.rigid_articulation_sparse_layout
+        if layout is None or not has_joint_mimics:
+            return
+        backend = layout.elastic_solve
+        elastic_bodies = layout.mixed_elastic_bodies if backend == "coupled" else layout.elastic_bodies
+        if elastic_bodies.shape[0] > 0:
+            raise NotImplementedError(
+                f"SolverVBD with rigid_articulation_solve={self.rigid_articulation_solve!r} and "
+                f"rigid_articulation_elastic_solve={backend!r} does not support joint mimics together with "
+                "reduced elastic articulation bodies. Use rigid_articulation_solve='local'."
+            )
+
+    def _create_mimic_solver(self, has_joint_mimics: bool | None = None) -> JointMimicSolver | None:
+        """Build the mimic solve; in the block-sparse modes it uses the articulations' coupled factors.
+
+        Args:
+            has_joint_mimics: Mimic state to build for; ``None`` uses the solver's current state.
+        """
+        if has_joint_mimics is None:
+            has_joint_mimics = self._has_joint_mimics
+        if not has_joint_mimics:
+            return None
+        self._check_mimic_sparse_elastic(has_joint_mimics)
+        return JointMimicSolver(self.model, self._joint_coordinates.data, self.rigid_articulation_sparse_layout)
 
     def _update_displacement_mode(self):
         """Enable the displacement-form update unless another solver writes body poses.

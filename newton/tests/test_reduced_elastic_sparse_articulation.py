@@ -967,20 +967,48 @@ def test_sparse_elastic_rejects_unsupported_joint_terms(test, device, backend):
 
 
 def test_sparse_elastic_rejects_joint_mimics(test, device, backend):
-    """Reject joint mimics together with elastic articulation bodies in the sparse solve only."""
-    basis = _beam_basis([{"type": newton.ModalGeneratorBeam.Mode.AXIAL}])
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    link = builder.add_link_elastic(modal_basis=basis)
-    followers = [builder.add_link(mass=1.0, inertia=wp.mat33(*np.eye(3).ravel())) for _ in range(2)]
-    joints = [builder.add_joint_revolute(parent=-1, child=link, axis=(0.0, 0.0, 1.0))]
-    joints += [builder.add_joint_revolute(parent=link, child=body, axis=(0.0, 0.0, 1.0)) for body in followers]
-    builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.0, 1.0))
-    builder.add_articulation(joints)
-    builder.color()
-    model = builder.finalize(device=device)
-    with test.assertRaisesRegex(NotImplementedError, rf"rigid_articulation_elastic_solve='{backend}' .*joint mimics"):
+    """Reject joint mimics together with elastic articulation bodies in the sparse solve only.
+
+    The rejection applies at construction and to a mimic added later through
+    ``notify_model_changed``; after a rejected change ``step`` raises until the model is accepted.
+    """
+
+    def build(mimic: bool):
+        basis = _beam_basis([{"type": newton.ModalGeneratorBeam.Mode.AXIAL}])
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        link = builder.add_link_elastic(modal_basis=basis)
+        followers = [builder.add_link(mass=1.0, inertia=wp.mat33(*np.eye(3).ravel())) for _ in range(2)]
+        joints = [builder.add_joint_revolute(parent=-1, child=link, axis=(0.0, 0.0, 1.0))]
+        joints += [builder.add_joint_revolute(parent=link, child=body, axis=(0.0, 0.0, 1.0)) for body in followers]
+        if mimic:
+            builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.0, 1.0))
+        builder.add_articulation(joints)
+        builder.color()
+        return builder.finalize(device=device), joints
+
+    message = rf"rigid_articulation_elastic_solve='{backend}' .*joint mimics"
+    model, _joints = build(mimic=True)
+    with test.assertRaisesRegex(NotImplementedError, message):
         _solver(model, _SPARSE, backend=backend)
     _solver(model, "local", backend=backend)
+
+    model, joints = build(mimic=False)
+    solver = _solver(model, _SPARSE, backend=backend)
+    state, next_state = model.state(), model.state()
+    solver.step(state, next_state, None, None, 1.0 / 480.0)
+    references = model.joint_mimic_joint.numpy()
+    references[joints[2]] = joints[1]
+    model.joint_mimic_joint.assign(references)
+    with test.assertRaisesRegex(NotImplementedError, message):
+        solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    test.assertIsNone(solver._mimic_solver)
+    with test.assertRaisesRegex(RuntimeError, "rejected the model's joint mimics"):
+        solver.step(next_state, state, None, None, 1.0 / 480.0)
+    # Removing the mimic again makes the solver usable.
+    references[joints[2]] = -1
+    model.joint_mimic_joint.assign(references)
+    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    solver.step(next_state, state, None, None, 1.0 / 480.0)
 
 
 def test_elastic_articulation_honors_deterministic_option(test, device, backend):
