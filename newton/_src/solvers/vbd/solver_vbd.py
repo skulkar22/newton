@@ -1260,6 +1260,20 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 ordering. Level ordering can increase fill; dense separators still serialize.
                 Neither sparse mode changes contact assembly or numerical precision.
                 ``rigid_articulation_levels_launch`` selects how the level-scheduled solve is launched.
+                In both sparse modes ``rigid_articulation_pivot_clamped`` is a device ``int32`` array
+                of length 1 counting the pivots of the 6 x 6 block Cholesky factorizations that
+                were not above a floor (``1e-6`` times the magnitude of the row's diagonal entry in
+                the block being factored, at least ``1e-30``; a NaN pivot counts too) and were
+                replaced by it, summed over
+                all articulations and iterations. It is zeroed once in every :meth:`step`, so when
+                several steps run between two reads, for example substeps in one captured CUDA graph,
+                only the last step's count remains. A non-zero count means rows of that step were
+                solved with a substituted pivot, a warning sign of poor conditioning; a zero count
+                does not prove the solve was accurate. The variable-size block solve of articulations
+                with reduced elastic bodies (``rigid_articulation_elastic_solve="coupled"``) is not
+                counted; its failed factorizations are reported by
+                :meth:`rigid_articulation_elastic_solve_status`. The attribute is ``None`` with
+                ``"local"``.
             rigid_articulation_relaxation: Under-relaxation factor for the experimental coupled
                 articulation position update. A value of ``1`` applies the full Newton update.
                 The default damps sparse articulation updates so they do not overstep stale
