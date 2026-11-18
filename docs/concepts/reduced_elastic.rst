@@ -557,8 +557,9 @@ mode count and ``rigid_body_contact_buffer_size``: about
 per thread, or 36 MiB per launch for one body with 48 modes and a 1024-entry
 list. Construction raises :class:`ValueError` when one launch would need more
 than 1 GiB. Every elastic body's contacts should fit its per-body list; a step
-whose list overflows can exceed the buffers and then raises a
-:class:`ValueError` naming the ``rigid_body_contact_buffer_size`` needed.
+whose list overflows can exceed the buffers and, outside CUDA graph capture,
+then raises a :class:`ValueError` naming the ``rigid_body_contact_buffer_size``
+needed.
 With Warp 1.19 or later, a deterministic mode is not available together with
 ``rigid_articulation_elastic_solve="schur"`` when the block-sparse solve
 eliminates reduced elastic bodies: construction raises :class:`ValueError`

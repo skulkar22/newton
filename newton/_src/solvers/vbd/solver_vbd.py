@@ -1443,8 +1443,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 launch would need more than 1 GiB; reduce the buffer size or
                 the mode count in that case. Every elastic body's contacts
                 should fit its per-body list: an overflowing list can exceed
-                those buffers, and the step then raises a
-                :class:`ValueError` that names the
+                those buffers, and a step outside CUDA graph capture then
+                raises a :class:`ValueError` that names the
                 ``rigid_body_contact_buffer_size`` needed. With Warp 1.19
                 or later, a deterministic mode together with
                 ``rigid_articulation_elastic_solve="schur"`` raises
