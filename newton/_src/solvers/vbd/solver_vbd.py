@@ -1018,7 +1018,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 Supported with ``rigid_articulation_solve`` ``"local"``, ``"block_sparse_joints"``
                 and ``"block_sparse_levels"``; rejected with ``rigid_time_integration="bdf2"`` (its
                 warm start replaces the guess), with ``integrate_with_external_rigid_solver=True``,
-                with particles and with reduced elastic bodies. With
+                with particles, with reduced elastic bodies, and with joint mimics in the block-sparse
+                modes. With
                 ``rigid_external_force_mode="solve"`` the forward step is force-free, so the scale
                 acts on gravity only. The block-sparse solves under-relax each update by
                 ``rigid_articulation_relaxation``, so a freely moving articulated body recovers the
@@ -1917,6 +1918,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if int(model.elastic_body_count) > 0:
                 raise ValueError(
                     "rigid_position_guess_acceleration_scale != 1 is not supported with reduced elastic bodies."
+                )
+            joint_mimic_joint = getattr(model, "joint_mimic_joint", None)
+            if (
+                rigid_articulation_solve != "local"
+                and joint_mimic_joint is not None
+                and bool((joint_mimic_joint.numpy() >= 0).any())
+            ):
+                # Not validated: in a three-link mimic chain under gravity the block-sparse solves let the
+                # joints separate already at the default scale, so the option cannot be checked there.
+                raise ValueError(
+                    "rigid_position_guess_acceleration_scale != 1 is not supported with joint mimics in "
+                    f"rigid_articulation_solve={rigid_articulation_solve!r}; use rigid_articulation_solve='local'."
                 )
         if rigid_position_guess_acceleration_scale != 1.0 and (
             not integrates_rigid_bodies or not rigid_compliant_alm or model.particle_count > 0
