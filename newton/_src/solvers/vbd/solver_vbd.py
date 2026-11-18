@@ -1051,14 +1051,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 position guess. ``1`` (default) keeps the native prediction; ``0`` omits external
                 acceleration from the guess only; values in between keep a proportional part.
                 Inertial targets and predicted velocities stay unchanged, so the converged
-                configuration is the same, but the iterations start elsewhere. This can help a
+                configuration is the same, but the iterations start elsewhere. Collision passes
+                after initialization (``PRE_POST_INIT`` or per-iteration rigid detection) run at
+                the iterates and so see the scaled guess; the contact set and contact ``C0`` they
+                find can then differ from those at scale ``1``. This can help a
                 supported cable that barely drops; it may bias free motion at finite iterations.
                 Non-default values require rigid-only compliant ALM with rigid bodies integrated
                 by this solver. Ignored with zero iterations (the guess would be the result).
                 Supported with ``rigid_articulation_solve`` ``"local"``, ``"block_sparse_joints"``
                 and ``"block_sparse_levels"``; rejected with ``rigid_time_integration="bdf2"`` (its
                 warm start replaces the guess), with ``integrate_with_external_rigid_solver=True``,
-                with particles and with reduced elastic bodies. With
+                with particles, with reduced elastic bodies, and with joint mimics in the block-sparse
+                modes. With
                 ``rigid_external_force_mode="solve"`` the forward step is force-free, so the scale
                 acts on gravity only. The block-sparse solves under-relax each update by
                 ``rigid_articulation_relaxation``, so a freely moving articulated body recovers the
@@ -1112,7 +1116,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_contact_damping_bidirectional: Whether body-body contact damping, whose coefficient is the
                 mean of the two shapes' ``kd``, also acts while the bodies separate. The default ``False``
                 keeps the closing-only damping of rigid contacts (while the row carries load). ``True`` also
-                damps the rebound, so rigid contacts return less of the approach speed.
+                damps the rebound, so rigid contacts return less of the approach speed. The flag also governs
+                contacts between rigid shapes and reduced elastic bodies.
             rigid_body_contact_buffer_size: Max body-body contacts per rigid body for per-body contact lists.
             rigid_body_particle_contact_buffer_size: Capacity of the per-body soft-contact adjacency
                 list, including currently ineligible mesh candidates. If a body's list overflows, force
@@ -1811,8 +1816,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             rigid_modules = (
                 rigid_vbd_kernels,
                 rigid_sparse_articulation_kernels,
-                # The two level-scheduled solves emit no atomics; they are listed so that both
-                # launch schedules always receive the same module options.
+                # The two level-scheduled solves emit no float atomics (the pivot guard's clamp
+                # counter is an int32 atomic add); they are listed so that both launch schedules
+                # always receive the same module options.
                 rigid_sparse_levels_kernels,
                 rigid_sparse_level_launch_kernels,
                 rigid_sparse_articulation_variable_kernels,
@@ -1974,6 +1980,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if int(model.elastic_body_count) > 0:
                 raise ValueError(
                     "rigid_position_guess_acceleration_scale != 1 is not supported with reduced elastic bodies."
+                )
+            joint_mimic_joint = getattr(model, "joint_mimic_joint", None)
+            if (
+                rigid_articulation_solve != "local"
+                and joint_mimic_joint is not None
+                and bool((joint_mimic_joint.numpy() >= 0).any())
+            ):
+                # Not validated: in a three-link mimic chain under gravity the block-sparse solves let the
+                # joints separate already at the default scale, so the option cannot be checked there.
+                raise ValueError(
+                    "rigid_position_guess_acceleration_scale != 1 is not supported with joint mimics in "
+                    f"rigid_articulation_solve={rigid_articulation_solve!r}; use rigid_articulation_solve='local'."
                 )
         if rigid_position_guess_acceleration_scale != 1.0 and (
             not integrates_rigid_bodies or not rigid_compliant_alm or model.particle_count > 0

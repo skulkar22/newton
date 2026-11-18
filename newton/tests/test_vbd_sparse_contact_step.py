@@ -203,7 +203,9 @@ class TestVBDSparseContactStep(unittest.TestCase):
                 model, rigid_articulation_solve="block_sparse_levels", rigid_articulation_contact_active_set=1
             )
         with self.assertRaises(ValueError):
-            newton.solvers.SolverVBD(model, rigid_articulation_solve="local", rigid_articulation_contact_active_set=True)
+            newton.solvers.SolverVBD(
+                model, rigid_articulation_solve="local", rigid_articulation_contact_active_set=True
+            )
 
     def test_default_keeps_previous_behaviour(self):
         builder = newton.ModelBuilder()
@@ -234,7 +236,12 @@ for _test in (
     for mode, launch in SPARSE_MODES:
         suffix = mode + ("_level_launch" if launch else "")
         add_function_test(
-            TestVBDSparseContactStepDevices, f"{_test.__name__}_{suffix}", _test, devices=devices, mode=mode, launch=launch
+            TestVBDSparseContactStepDevices,
+            f"{_test.__name__}_{suffix}",
+            _test,
+            devices=devices,
+            mode=mode,
+            launch=launch,
         )
 
 

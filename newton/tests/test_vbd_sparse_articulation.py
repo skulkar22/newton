@@ -2216,12 +2216,13 @@ def test_sparse_tiny_inertia_rod_needs_angular_regularization(test, device):
     At ~1e-14 kg*m^2 the angular inertia term I/dt^2 of a 2 mm segment is ~1e-7 N*m/rad at dt = 1/2400 s, below
     the default 1e-6 shift; after the stretch lever-arm terms cancel, the softest angular pivot of the coupled
     system is the bend damping (~0.01 N*m/rad). A tensioned rod then takes rotation steps of radians: with the
-    default the rod folds (largest neighbour bend above 90 deg on CPU and above 140 deg on CUDA) and ends
-    centimetres from the local solve. 5.76 N*m/rad is the angular term a 1e-6 kg*m^2 inertia floor would add
+    default the rod folds (largest neighbour bend above 90 deg) and ends centimetres from the local solve, or
+    diverges. 5.76 N*m/rad is the angular term a 1e-6 kg*m^2 inertia floor would add
     (1e-6 kg*m^2 / (1/2400 s)^2), here as a Hessian-only shift that leaves the inertia authored: the rod stays
     finite, no pivot is clamped, and it follows the local solve. Tolerances: 8 sparse iterations against a
     32-iteration local reference; measured max deviation 0.04 mm (CPU) / 0.55 mm (CUDA) and max bend 0.4 / 10.6 deg
-    at 5.76; at the default 7.6-7.7 cm and 134-150 deg (CPU), 3.4-15 cm and 159-180 deg (CUDA, varies run to run).
+    at 5.76; at the default 7.6-7.7 cm and 134-150 deg (CPU), 8.3-14.6 cm and 163-179 deg (CUDA, 12 runs per
+    mode, varies run to run; one of the 12 ``block_sparse_joints`` runs became non-finite).
     """
     local_q, _, bodies = _run_tiny_inertia_rod(device, "local", iterations=32)
     test.assertTrue(np.isfinite(local_q).all())
@@ -2236,15 +2237,17 @@ def test_sparse_tiny_inertia_rod_needs_angular_regularization(test, device):
         cosines = np.clip(np.sum(tangents[:, :-1] * tangents[:, 1:], axis=-1), -1.0, 1.0)
         return float(np.degrees(np.arccos(cosines)).max())
 
-    folded_bend_deg = 140.0 if wp.get_device(device).is_cuda else 90.0
     for mode in ("block_sparse_joints", "block_sparse_levels"):
         with test.subTest(mode=mode, regularization="default"):
             # Precondition, not a contract: the scenario must reproduce the large-rotation failure at the
             # default, otherwise the 5.76 subtest below no longer guards anything. Update or remove this check
-            # if the default path improves.
+            # if the default path improves. A non-finite result also reproduces the failure.
             q, _, _ = _run_tiny_inertia_rod(device, mode, iterations=8)
-            test.assertGreater(deviation(q), 1.0e-2, "the default no longer reproduces the authored-inertia failure")
-            test.assertGreater(max_bend_deg(q), folded_bend_deg, "the default no longer folds the rod")
+            if np.isfinite(q).all():
+                test.assertGreater(
+                    deviation(q), 1.0e-2, "the default no longer reproduces the authored-inertia failure"
+                )
+                test.assertGreater(max_bend_deg(q), 90.0, "the default no longer folds the rod")
         with test.subTest(mode=mode, regularization=5.76):
             q, clamped, _ = _run_tiny_inertia_rod(
                 device, mode, iterations=8, rigid_articulation_angular_regularization=5.76
@@ -2554,6 +2557,8 @@ add_function_test(
 
 _GUESS_GRAVITY = 9.81
 _GUESS_MODES = ("local", "block_sparse_joints", "block_sparse_levels")
+# Float32 bound on the guess shift: positions reach 0.6 m (ulp 6e-8); measured max error 2.7e-8 on CPU and CUDA.
+_GUESS_SHIFT_ATOL = 1.0e-7
 
 
 def _position_guess_snapshot(device, mode: str, scale: float, iterations: int = 1, **options):
@@ -2613,7 +2618,6 @@ def _position_guess_snapshot(device, mode: str, scale: float, iterations: int = 
 
     solver._rigid_penetration_free_truncation = record_forward_step
     solver.step(state_in, state_out, None, None, 1.0e-2)
-    snapshot["final"] = state_out.body_q.numpy().copy()
     return snapshot, model.body_mass.numpy(), wrench, (root, tip), kinematic
 
 
@@ -2636,7 +2640,7 @@ def test_position_guess_scale_moves_only_the_guess(test, device):
                     scaled["guess"][body, 0:3] - native["guess"][body, 0:3],
                     (scale - 1.0) * dt * dt * acceleration,
                     rtol=0.0,
-                    atol=2.0e-6,
+                    atol=_GUESS_SHIFT_ATOL,
                     err_msg=msg,
                 )
             # The native guess is the inertial target itself.
@@ -2657,7 +2661,7 @@ def test_position_guess_scale_acts_on_gravity_only_in_solve_force_mode(test, dev
                 scaled["guess"][body, 0:3] - native["guess"][body, 0:3],
                 (0.0, 0.0, dt * dt * _GUESS_GRAVITY),
                 rtol=0.0,
-                atol=2.0e-6,
+                atol=_GUESS_SHIFT_ATOL,
                 err_msg=mode,
             )
 
@@ -2751,10 +2755,14 @@ def test_position_guess_scale_warns_about_relaxation_bias(test, device):
 
 
 def test_position_guess_scale_graph_capture(test, device):
-    """Replay steps with a rescaled guess from a CUDA graph exactly like eager steps, in every rigid solve."""
+    """Replay steps from a CUDA graph exactly like eager steps, with the scale active inside the graph.
+
+    Graph and eager agree bitwise at scale 0 and 1 (measured), while scale 0 and scale 1 differ under capture by
+    2.7e-4 (local) and 1.5e-2 (sparse modes) after 40 steps, so the captured graph applies the scale.
+    """
     for mode in _GUESS_MODES:
 
-        def run(use_graph: bool, mode: str = mode) -> np.ndarray:
+        def run(use_graph: bool, scale: float, mode: str = mode) -> np.ndarray:
             model, _ = _make_light_link_limit_model(device)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -2763,7 +2771,7 @@ def test_position_guess_scale_graph_capture(test, device):
                     iterations=4,
                     rigid_compliant_alm=True,
                     rigid_articulation_solve=mode,
-                    rigid_position_guess_acceleration_scale=0.25,
+                    rigid_position_guess_acceleration_scale=scale,
                 )
             state_0 = model.state()
             state_1 = model.state()
@@ -2785,10 +2793,14 @@ def test_position_guess_scale_graph_capture(test, device):
                     substeps()
             return np.concatenate([state_0.body_q.numpy().ravel(), state_0.body_qd.numpy().ravel()])
 
-        eager = run(False)
-        graph = run(True)
-        test.assertTrue(np.isfinite(graph).all(), mode)
-        np.testing.assert_allclose(graph, eager, atol=1.0e-6, err_msg=mode)
+        graphs = {}
+        for scale in (0.0, 1.0):
+            eager = run(False, scale)
+            graphs[scale] = run(True, scale)
+            msg = f"{mode}, scale {scale}"
+            test.assertTrue(np.isfinite(graphs[scale]).all(), msg)
+            np.testing.assert_allclose(graphs[scale], eager, rtol=0.0, atol=1.0e-6, err_msg=msg)
+        test.assertGreater(float(np.max(np.abs(graphs[0.0] - graphs[1.0]))), 1.0e-5, mode)
 
 
 for _test in (

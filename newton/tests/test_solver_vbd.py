@@ -9751,6 +9751,225 @@ def test_position_guess_scale_is_ignored_without_iterations(test, device):
     np.testing.assert_array_equal(default_qd, scaled_qd)
 
 
+def test_position_guess_scale_keeps_the_fixed_point(test, device):
+    """Scale 0 changes only where the iterations start: at 64 iterations it reaches the scale-1 result.
+
+    Pendulum scene, 30 steps of 4 ms. Measured max |body_q(scale 0) - body_q(scale 1)| at 64 iterations
+    (CPU / CUDA): local 4.2e-6 / 6.1e-6, ``block_sparse_joints`` 3.9e-7 / 4.5e-7, ``block_sparse_levels``
+    3.1e-7 / 2.4e-7 (each repeat bitwise equal). At 4 iterations the two differ by 4.6e-3 (local) and 1.1e-3
+    (sparse modes), so the comparison is not vacuous.
+    """
+    for mode, atol in (("local", 2.0e-5), ("block_sparse_joints", 2.0e-6), ("block_sparse_levels", 2.0e-6)):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # relaxation-bias warning of the sparse modes at 4 iterations
+            native_4, _, _ = _run_position_guess_pendulum(device, 4, rigid_articulation_solve=mode)
+            scaled_4, _, _ = _run_position_guess_pendulum(
+                device, 4, rigid_articulation_solve=mode, rigid_position_guess_acceleration_scale=0.0
+            )
+        test.assertGreater(float(np.max(np.abs(scaled_4 - native_4))), 1.0e-4, mode)
+        native, _, _ = _run_position_guess_pendulum(device, 64, rigid_articulation_solve=mode)
+        scaled, _, launches = _run_position_guess_pendulum(
+            device, 64, rigid_articulation_solve=mode, rigid_position_guess_acceleration_scale=0.0
+        )
+        test.assertEqual(launches, 30, mode)
+        test.assertTrue(np.isfinite(scaled).all(), mode)
+        np.testing.assert_allclose(scaled, native, rtol=0.0, atol=atol, err_msg=mode)
+
+
+def _run_position_guess_model(model: newton.Model, iterations: int, steps: int, dt: float, **options):
+    """Step ``model`` without contacts; return final body_q and the number of guess-scaling launches."""
+    solver = newton.solvers.SolverVBD(model, iterations=iterations, rigid_compliant_alm=True, **options)
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    with mock.patch.object(solver_vbd.wp, "launch", wraps=wp.launch) as launch:
+        for _ in range(steps):
+            state_in.clear_forces()
+            solver.step(state_in, state_out, None, None, dt)
+            state_in, state_out = state_out, state_in
+    scale_launches = sum(
+        1 for call in launch.call_args_list if call.kwargs.get("kernel") is scale_rigid_position_guess_acceleration
+    )
+    return state_in.body_q.numpy(), scale_launches
+
+
+def test_position_guess_scale_with_tendon(test, device):
+    """A tendon model in the local solve reaches the scale-1 result at 64 iterations with the guess rescaled.
+
+    Pinhole Atwood machine (two boxes on planar joints over a frictionless pinhole), 40 steps of 1/600 s.
+    Measured max |body_q(scale 0) - body_q(scale 1)| at 64 iterations (CPU / CUDA): positions 6.7e-6 / 1.5e-5,
+    rotations 6.1e-5 / 7.7e-5. Scale 1 alone moves by up to 4.3e-5 in rotation between 64 and 128 iterations
+    (CUDA), so the rotation bound sits at the convergence floor of this scene.
+    """
+    from newton.tests.test_tendon_capstan import build_pinhole_atwood  # noqa: PLC0415
+
+    def make_model() -> newton.Model:
+        with wp.ScopedDevice(device):
+            model, _left, _right = build_pinhole_atwood(compliance=4.0e-7)
+        # Serial coloring separates the tendon-coupled bodies (as in test_tendon_vbd).
+        model.body_color_groups = [
+            wp.array([body], dtype=wp.int32, device=model.device) for body in range(model.body_count)
+        ]
+        return model
+
+    options = {"rigid_articulation_solve": "local", "tendon_max_sweeps": 32}
+    native, native_launches = _run_position_guess_model(make_model(), 64, 40, 1.0 / 600.0, **options)
+    scaled, scaled_launches = _run_position_guess_model(
+        make_model(), 64, 40, 1.0 / 600.0, rigid_position_guess_acceleration_scale=0.0, **options
+    )
+    test.assertEqual(native_launches, 0)
+    test.assertEqual(scaled_launches, 40)
+    test.assertTrue(np.isfinite(scaled).all())
+    np.testing.assert_allclose(scaled[:, :3], native[:, :3], rtol=0.0, atol=5.0e-5)
+    np.testing.assert_allclose(scaled[:, 3:], native[:, 3:], rtol=0.0, atol=3.0e-4)
+
+
+def _position_guess_mimic_model(device) -> newton.Model:
+    """Build the pendulum chain with its last revolute joint mimicking the middle one."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 1.0e-2)
+    joints = []
+    parent = -1
+    for i in range(3):
+        link = builder.add_link(mass=1.0 + i, com=wp.vec3(0.0, 0.0, -0.25), inertia=inertia)
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform((0.0, 0.0, 1.0 if parent < 0 else -0.5), wp.quat_identity()),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    builder.set_joint_mimic(joints[2], joints[1], coeffs=(0.1, 0.5))
+    for joint, angle in zip(joints, (0.4, 0.2, 0.2), strict=True):
+        builder.joint_q[builder.joint_q_start[joint]] = angle
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def test_position_guess_scale_with_joint_mimic(test, device):
+    """Keep the scale-1 result with a joint mimic in the local solve; reject the scale in the sparse modes.
+
+    Local solve, 30 steps of 4 ms: measured max |body_q(scale 0) - body_q(scale 1)| at 64 iterations
+    3.1e-6 (CPU) / 3.2e-6 (CUDA), 2.7e-3 at 4 iterations. In both block-sparse modes this mimic chain
+    separates at its joints already at the default scale (0.6 m after 30 steps at 4 iterations, on the
+    pre-round tree too), so a nondefault scale cannot be validated there and is rejected.
+    """
+    native, native_launches = _run_position_guess_model(
+        _position_guess_mimic_model(device), 64, 30, 4.0e-3, rigid_articulation_solve="local"
+    )
+    scaled, scaled_launches = _run_position_guess_model(
+        _position_guess_mimic_model(device),
+        64,
+        30,
+        4.0e-3,
+        rigid_articulation_solve="local",
+        rigid_position_guess_acceleration_scale=0.0,
+    )
+    test.assertEqual(native_launches, 0)
+    test.assertEqual(scaled_launches, 30)
+    test.assertTrue(np.isfinite(scaled).all())
+    np.testing.assert_allclose(scaled, native, rtol=0.0, atol=2.0e-5)
+
+    model = _position_guess_mimic_model(device)
+    for mode in ("block_sparse_joints", "block_sparse_levels"):
+        with test.assertRaisesRegex(ValueError, "joint mimics", msg=mode):
+            newton.solvers.SolverVBD(
+                model,
+                iterations=4,
+                rigid_compliant_alm=True,
+                rigid_articulation_solve=mode,
+                rigid_position_guess_acceleration_scale=0.5,
+            )
+        newton.solvers.SolverVBD(model, iterations=4, rigid_compliant_alm=True, rigid_articulation_solve=mode)
+    # Without a mimic the sparse modes accept the scale.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        newton.solvers.SolverVBD(
+            _position_guess_pendulum_model(device),
+            iterations=4,
+            rigid_compliant_alm=True,
+            rigid_articulation_solve="block_sparse_joints",
+            rigid_position_guess_acceleration_scale=0.5,
+        )
+
+
+def test_position_guess_scale_uses_each_body_world_gravity(test, device):
+    """Shift each body's guess by its own world's gravity, including a body in the global world -1.
+
+    Two worlds with gravity (0, 0, -9.81) and (0, 0, -3) and a global-world chain with gravity (1, 0, -5)
+    (``Model.set_gravity``), one 10 ms step at scale 0: shift = -dt^2 * gravity[body_world]. Measured max
+    error 1.7e-8 on CPU and CUDA in every rigid solve.
+    """
+    dt = 1.0e-2
+    gravity = np.array([[0.0, 0.0, -9.81], [0.0, 0.0, -3.0], [1.0, 0.0, -5.0]], dtype=np.float32)
+
+    def snapshot(mode: str, scale: float):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        inertia = wp.mat33(np.diag([0.01, 0.02, 0.03]).astype(np.float32))
+        for world in (0, 1, -1):
+            if world >= 0:
+                builder.begin_world()
+            root = builder.add_link(
+                xform=wp.transform((0.0, 2.0 * world, 0.0), wp.quat_identity()), mass=1.0, inertia=inertia
+            )
+            tip = builder.add_link(mass=2.0, inertia=inertia)
+            joints = [
+                builder.add_joint_free(root),
+                builder.add_joint_revolute(
+                    root,
+                    tip,
+                    parent_xform=wp.transform((0.3, 0.0, 0.0), wp.quat_identity()),
+                    child_xform=wp.transform((-0.3, 0.0, 0.0), wp.quat_identity()),
+                    axis=newton.Axis.Y,
+                ),
+            ]
+            builder.add_articulation(joints)
+            if world >= 0:
+                builder.end_world()
+        builder.color()
+        model = builder.finalize(device=device)
+        model.set_gravity(gravity)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            rigid_compliant_alm=True,
+            rigid_articulation_solve=mode,
+            rigid_position_guess_acceleration_scale=scale,
+        )
+        state_in = model.state()
+        state_out = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+        recorded = {}
+        truncate = solver._rigid_penetration_free_truncation
+
+        def record_forward_step(state, contacts):
+            # First call: right after the forward step and the optional guess rescaling.
+            if not recorded:
+                recorded["guess"] = state.body_q.numpy().copy()
+                recorded["target"] = solver.body_inertia_q.numpy().copy()
+            truncate(state, contacts)
+
+        solver._rigid_penetration_free_truncation = record_forward_step
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            solver.step(state_in, state_out, None, None, dt)
+        return recorded, model.body_world.numpy()
+
+    for mode in ("local", "block_sparse_joints", "block_sparse_levels"):
+        native, body_world = snapshot(mode, 1.0)
+        scaled, _ = snapshot(mode, 0.0)
+        test.assertEqual(body_world.tolist(), [0, 0, 1, 1, -1, -1])
+        np.testing.assert_array_equal(scaled["target"], native["target"], err_msg=mode)
+        np.testing.assert_array_equal(scaled["guess"][:, 3:], native["guess"][:, 3:], err_msg=mode)
+        expected = -dt * dt * gravity[body_world]
+        np.testing.assert_allclose(
+            scaled["guess"][:, :3] - native["guess"][:, :3], expected, rtol=0.0, atol=1.0e-7, err_msg=mode
+        )
+
+
 class TestVBDRigidContactHistoryProvenance(unittest.TestCase):
     pass
 
@@ -9813,6 +10032,10 @@ for _test in (
     test_position_guess_scale_rejects_invalid_values_and_paths,
     test_position_guess_scale_default_is_identity,
     test_position_guess_scale_is_ignored_without_iterations,
+    test_position_guess_scale_keeps_the_fixed_point,
+    test_position_guess_scale_with_tendon,
+    test_position_guess_scale_with_joint_mimic,
+    test_position_guess_scale_uses_each_body_world_gravity,
 ):
     add_function_test(TestVBDPositionGuessScale, _test.__name__, _test, devices=devices)
 
