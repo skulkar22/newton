@@ -9850,50 +9850,45 @@ def _position_guess_mimic_model(device) -> newton.Model:
 
 
 def test_position_guess_scale_with_joint_mimic(test, device):
-    """Keep the scale-1 result with a joint mimic in the local solve; reject the scale in the sparse modes.
+    """Keep the scale-1 result with a joint mimic in the local and the block-sparse solves.
 
-    Local solve, 30 steps of 4 ms: measured max |body_q(scale 0) - body_q(scale 1)| at 64 iterations
-    3.1e-6 (CPU) / 3.2e-6 (CUDA), 2.7e-3 at 4 iterations. In both block-sparse modes this mimic chain
-    separates at its joints already at the default scale (0.6 m after 30 steps at 4 iterations, on the
-    pre-round tree too), so a nondefault scale cannot be validated there and is rejected.
+    30 steps of 4 ms; measured max |body_q(scale 0) - body_q(scale 1)| at 64 iterations (CPU / CUDA): local
+    3.1e-6 / 3.2e-6, ``block_sparse_joints`` 4.2e-6 / 1.4e-6, ``block_sparse_levels`` 4.8e-6 / 1.4e-6; at 4
+    iterations 2.7e-3 (local) and 7.1e-4 (sparse modes), so the comparison is not vacuous. With a mimic the
+    difference stays at 3e-6 to 4e-6 up to 128 iterations in every solve (the model uses the
+    absolute-position update), so the bound is that of the local solve, 2e-5.
     """
-    native, native_launches = _run_position_guess_model(
-        _position_guess_mimic_model(device), 64, 30, 4.0e-3, rigid_articulation_solve="local"
-    )
-    scaled, scaled_launches = _run_position_guess_model(
-        _position_guess_mimic_model(device),
-        64,
-        30,
-        4.0e-3,
-        rigid_articulation_solve="local",
-        rigid_position_guess_acceleration_scale=0.0,
-    )
-    test.assertEqual(native_launches, 0)
-    test.assertEqual(scaled_launches, 30)
-    test.assertTrue(np.isfinite(scaled).all())
-    np.testing.assert_allclose(scaled, native, rtol=0.0, atol=2.0e-5)
-
-    model = _position_guess_mimic_model(device)
-    for mode in ("block_sparse_joints", "block_sparse_levels"):
-        with test.assertRaisesRegex(ValueError, "joint mimics", msg=mode):
-            newton.solvers.SolverVBD(
-                model,
-                iterations=4,
-                rigid_compliant_alm=True,
-                rigid_articulation_solve=mode,
-                rigid_position_guess_acceleration_scale=0.5,
+    for mode in ("local", "block_sparse_joints", "block_sparse_levels"):
+        with test.subTest(mode=mode):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)  # relaxation-bias warning of the sparse modes
+                native_4, _ = _run_position_guess_model(
+                    _position_guess_mimic_model(device), 4, 30, 4.0e-3, rigid_articulation_solve=mode
+                )
+                scaled_4, _ = _run_position_guess_model(
+                    _position_guess_mimic_model(device),
+                    4,
+                    30,
+                    4.0e-3,
+                    rigid_articulation_solve=mode,
+                    rigid_position_guess_acceleration_scale=0.0,
+                )
+            test.assertGreater(float(np.max(np.abs(scaled_4 - native_4))), 1.0e-4)
+            native, native_launches = _run_position_guess_model(
+                _position_guess_mimic_model(device), 64, 30, 4.0e-3, rigid_articulation_solve=mode
             )
-        newton.solvers.SolverVBD(model, iterations=4, rigid_compliant_alm=True, rigid_articulation_solve=mode)
-    # Without a mimic the sparse modes accept the scale.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        newton.solvers.SolverVBD(
-            _position_guess_pendulum_model(device),
-            iterations=4,
-            rigid_compliant_alm=True,
-            rigid_articulation_solve="block_sparse_joints",
-            rigid_position_guess_acceleration_scale=0.5,
-        )
+            scaled, scaled_launches = _run_position_guess_model(
+                _position_guess_mimic_model(device),
+                64,
+                30,
+                4.0e-3,
+                rigid_articulation_solve=mode,
+                rigid_position_guess_acceleration_scale=0.0,
+            )
+            test.assertEqual(native_launches, 0)
+            test.assertEqual(scaled_launches, 30)
+            test.assertTrue(np.isfinite(scaled).all())
+            np.testing.assert_allclose(scaled, native, rtol=0.0, atol=2.0e-5)
 
 
 def test_position_guess_scale_uses_each_body_world_gravity(test, device):
