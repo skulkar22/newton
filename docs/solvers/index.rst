@@ -448,7 +448,8 @@ These three options are off by default with BDF1 and on by default with BDF2.
 
 ``rigid_position_guess_acceleration_scale`` (default ``1``) scales the gravity and external-force
 part of each dynamic body's starting position guess without changing the inertial target, so the
-solved configuration is the same but the iterations start elsewhere. ``0`` starts from the
+converged configuration is the same but the iterations start elsewhere; at a finite iteration
+count the result differs. ``0`` starts from the
 force-free prediction, which can reduce the sag error of a supported cable at a small iteration
 budget. It requires rigid-only compliant ALM, works with the local and both block-sparse
 articulation solves, and is rejected with BDF2. In the block-sparse solves the

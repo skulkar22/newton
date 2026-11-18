@@ -247,7 +247,8 @@ def test_levels_supported_cable_position_guess_scale(test, device):
     for iterations in (2, 3, 4):
         native = np.max(np.abs(_supported_cable_tip_drop(device, iterations, 1.0) - reference))
         scaled = np.max(np.abs(_supported_cable_tip_drop(device, iterations, 0.0) - reference))
-        # Measured on CPU: 2 iterations 1.68e-3 / 1.06e-3 m, 4 iterations 1.84e-4 / 1.23e-4 m (240 steps).
+        # Measured with these settings on CPU (native / scaled): 2 iterations 9.24e-4 / 4.32e-4 m,
+        # 3 iterations 3.15e-4 / 1.45e-4 m, 4 iterations 1.09e-4 / 4.98e-5 m (CUDA within 0.5 %).
         test.assertGreater(native, 1.0e-5, f"{iterations} iterations: no sag error to reduce")
         test.assertLess(scaled, 0.8 * native, f"{iterations} iterations")
 
