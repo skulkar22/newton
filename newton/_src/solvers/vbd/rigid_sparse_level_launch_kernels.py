@@ -10,9 +10,10 @@ the same order as ordinary launches: one launch per (phase, level) over that lev
 every articulation, so the large early levels spread over the whole GPU. Kernel boundaries
 replace the block barriers.
 
-On CUDA, the default 128-thread launch uses warp-cooperative pivots, Schur updates and
-substitution. Its static schedule fuses adjacent phases and selects a tail kernel from the
-layout and split settings. Other block sizes retain the following per-phase decomposition:
+On CUDA, a split plan with the default 128-thread launch uses warp-cooperative pivots,
+Schur updates and substitution. Its static schedule fuses adjacent phases and selects a tail
+kernel from the layout and split settings. Unsplit plans preserve bitwise agreement with the
+cooperative solver by retaining its operation order. The per-phase decomposition is:
 
 - diagonal: one thread per pivot row, the same 6 x 6 Cholesky;
 - column: one thread per (column entry, block row), the same right solve;

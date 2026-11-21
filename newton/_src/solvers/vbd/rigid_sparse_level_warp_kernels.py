@@ -3412,7 +3412,13 @@ class WarpLevelSchedule:
 
 def build_warp_schedule(
     plan: "RigidArticulationLevelLaunchPlan", layout: "RigidArticulationSparseLayout", device: "wp.context.Devicelike"
-) -> WarpLevelSchedule:
+) -> WarpLevelSchedule | None:
+    """Build a fused schedule for plans that perform at least one split reduction."""
+    if plan.tail_split_entries == 0 and all(
+        phase.long.shape[0] == 0 for phase in (plan.update, plan.forward, plan.backward)
+    ):
+        # Unsplit plans guarantee bitwise parity with the cooperative kernel.
+        return None
     schedule = WarpLevelSchedule(layout, [])
     sparse = Sparse()
     sparse.base = layout.articulation_body_offsets
