@@ -8547,16 +8547,29 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     block_dim=32,
                 )
 
-                wp.launch(
-                    kernel=assemble_articulation_joints_scalar_bdf2
-                    if self._bdf2_enabled
-                    else assemble_articulation_joints_scalar,
-                    dim=layout.rigid_joint_count,
-                    inputs=joint_inputs,
-                    outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
-                    device=self.device,
-                    block_dim=SPARSE_ARTICULATION_CTA_THREADS,
-                )
+                if self.device.is_cuda and not self._bdf2_enabled and not has_sparse_elastic:
+                    from .native_bridge import generated_assembly
+
+                    generated_assembly(
+                        assemble_articulation_joints_scalar,
+                        joint_inputs,
+                        self._rigid_articulation_sparse_values_scalar,
+                        self._rigid_articulation_sparse_rhs_scalar,
+                        self.device,
+                        layout.rigid_joint_count,
+                        SPARSE_ARTICULATION_CTA_THREADS,
+                    )
+                else:
+                    wp.launch(
+                        kernel=assemble_articulation_joints_scalar_bdf2
+                        if self._bdf2_enabled
+                        else assemble_articulation_joints_scalar,
+                        dim=layout.rigid_joint_count,
+                        inputs=joint_inputs,
+                        outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
+                        device=self.device,
+                        block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                    )
                 if has_sparse_elastic:
                     self._assemble_sparse_elastic_bodies(state_in, state_out, control, contacts, dt)
 
