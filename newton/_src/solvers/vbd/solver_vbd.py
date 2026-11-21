@@ -124,6 +124,7 @@ from .rigid_sparse_articulation_kernels import (
     assemble_articulation_body_diagonal_scalar,
     assemble_articulation_joints_scalar,
     assemble_articulation_joints_scalar_bdf2,
+    create_assemble_articulation_joints_scalar,
     init_body_displacement,
     mat66f,
     predict_articulation_armature,
@@ -137,6 +138,7 @@ from .rigid_sparse_articulation_kernels import (
     vec6f,
     warm_start_body_displacement,
 )
+from .rigid_sparse_articulation_scatter import prepare_joint_scatter
 from .rigid_sparse_level_launch_kernels import build_level_launch_plan, launch_level_scheduled_solve
 from .rigid_sparse_levels_kernels import solve_articulation_sparse_levels
 from .rigid_vbd_kernels import (
@@ -2131,6 +2133,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_sparse_delta_scalar = None
         self.rigid_articulation_sparse_joint_dof_dim = model.joint_dof_dim
         self._rigid_articulation_sparse_zero_views: tuple[wp.array, ...] = ()
+        self._rigid_joint_scatter = None
         self._rigid_articulation_level_launch_plan = None
         self.rigid_articulation_pivot_clamped = None
         if self.rigid_articulation_solve in ("block_sparse_joints", "block_sparse_levels"):
@@ -2157,6 +2160,26 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     layout, self.device, tail_block_dim=self.rigid_articulation_levels_block_dim
                 )
             if layout is not None:
+                if (
+                    self.device.is_cuda
+                    and rigid_time_integration == "bdf1"
+                    and self.rigid_compliant_alm
+                    and model.elastic_body_count == 0
+                    and model.elastic_max_mode_count == 0
+                    and 0 < layout.rigid_joint_count < 2048
+                ):
+                    # Small layouts split each joint across lanes to fill the GPU.
+                    # The large-layout regime uses the original joint-per-thread kernel.
+                    count = layout.rigid_joint_count
+                    lanes = 1
+                    while lanes < 32 and count * lanes < 2560:
+                        lanes *= 2
+                    self._rigid_joint_scatter = (
+                        create_assemble_articulation_joints_scalar(False, striped=True),
+                        lanes,
+                        wp.empty(count, dtype=wp.vec4i, device=self.device),
+                        wp.empty(7 * count, dtype=wp.vec3, device=self.device),
+                    )
                 self._rigid_articulation_armature_target = wp.zeros_like(model.joint_qd)
                 if layout.elastic_solve == "coupled":
                     # One flat storage: the rigid prefix keeps the 6 x 6 ``36 * slot`` and ``6 * row``
@@ -8547,16 +8570,58 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     block_dim=32,
                 )
 
-                wp.launch(
-                    kernel=assemble_articulation_joints_scalar_bdf2
-                    if self._bdf2_enabled
-                    else assemble_articulation_joints_scalar,
-                    dim=layout.rigid_joint_count,
-                    inputs=joint_inputs,
-                    outputs=[self._rigid_articulation_sparse_values_scalar, self._rigid_articulation_sparse_rhs_scalar],
-                    device=self.device,
-                    block_dim=SPARSE_ARTICULATION_CTA_THREADS,
-                )
+                if self._rigid_joint_scatter is not None and self.rigid_compliant_alm:
+                    assemble, lanes, edges, geometry = self._rigid_joint_scatter
+                    wp.launch(
+                        prepare_joint_scatter,
+                        dim=(2, layout.rigid_joint_count),
+                        inputs=[
+                            layout.articulation_joints,
+                            layout.articulation_joint_body_start,
+                            layout.articulation_block_row_offsets,
+                            layout.articulation_block_cols,
+                            layout.body_articulation_local,
+                            model.joint_type,
+                            model.joint_enabled,
+                            model.joint_parent,
+                            model.joint_child,
+                            self.joint_constraint_start,
+                            self.joint_penalty_kd,
+                            state_in.body_q,
+                            model.joint_X_p,
+                            model.joint_X_c,
+                            self.joint_rod_rest_kb_local,
+                            self.joint_rod_rest_twist,
+                        ],
+                        outputs=[edges, geometry],
+                        device=self.device,
+                        block_dim=32,
+                    )
+                    wp.launch(
+                        assemble,
+                        dim=(2, layout.rigid_joint_count, lanes),
+                        inputs=[*joint_inputs, edges, geometry, lanes - 1],
+                        outputs=[
+                            self._rigid_articulation_sparse_values_scalar,
+                            self._rigid_articulation_sparse_rhs_scalar,
+                        ],
+                        device=self.device,
+                        block_dim=32,
+                    )
+                else:
+                    wp.launch(
+                        kernel=assemble_articulation_joints_scalar_bdf2
+                        if self._bdf2_enabled
+                        else assemble_articulation_joints_scalar,
+                        dim=layout.rigid_joint_count,
+                        inputs=joint_inputs,
+                        outputs=[
+                            self._rigid_articulation_sparse_values_scalar,
+                            self._rigid_articulation_sparse_rhs_scalar,
+                        ],
+                        device=self.device,
+                        block_dim=SPARSE_ARTICULATION_CTA_THREADS,
+                    )
                 if has_sparse_elastic:
                     self._assemble_sparse_elastic_bodies(state_in, state_out, control, contacts, dt)
 
