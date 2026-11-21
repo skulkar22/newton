@@ -1280,6 +1280,7 @@ def _rod_rate_free_arm_blocks(
     """Angular-linear and angular-angular tiles. For S=skew(arm), S.T*K = -(S*K)."""
     skew_arm = wp.skew(arm)
     if parent_side:
+        identity = wp.identity(3, float)
         anchor_al = iso * wp.skew(anchor)
         anchor_aa = iso * (wp.length_sq(anchor) * identity - wp.outer(anchor, anchor))
         if isotropic:
