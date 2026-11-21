@@ -8612,28 +8612,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         device=self.device,
                     )
                 if self._rigid_articulation_level_launch_plan is not None:
-                    if self.device.is_cuda:
-                        from .native_bridge import generated_levels
-
-                        generated_levels(
-                            self._rigid_articulation_level_launch_plan,
-                            layout,
-                            self._rigid_articulation_sparse_values_scalar,
-                            self._rigid_articulation_sparse_rhs_scalar,
-                            self._rigid_articulation_sparse_delta_scalar,
-                            self.device,
-                            self.rigid_articulation_pivot_clamped,
-                        )
-                    else:
-                        launch_level_scheduled_solve(
-                            self._rigid_articulation_level_launch_plan,
-                            layout,
-                            self._rigid_articulation_sparse_values_scalar,
-                            self._rigid_articulation_sparse_rhs_scalar,
-                            self._rigid_articulation_sparse_delta_scalar,
-                            self.device,
-                            self.rigid_articulation_pivot_clamped,
-                        )
+                    launch_level_scheduled_solve(
+                        self._rigid_articulation_level_launch_plan,
+                        layout,
+                        self._rigid_articulation_sparse_values_scalar,
+                        self._rigid_articulation_sparse_rhs_scalar,
+                        self._rigid_articulation_sparse_delta_scalar,
+                        self.device,
+                        self.rigid_articulation_pivot_clamped,
+                    )
                 elif layout.levels is not None:
                     wp.launch(
                         kernel=solve_articulation_sparse_levels,

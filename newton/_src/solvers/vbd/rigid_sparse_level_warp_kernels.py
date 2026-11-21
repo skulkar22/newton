@@ -1,28 +1,57 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import json
-import torch
+"""CUDA warp-cooperative front, Schur update and substitution kernels for rigid sparse levels.
+
+The static host schedule binds Newton's layout and allocates the selected algorithm's workspace
+when the level plan is built. Each solve runs its numeric and symbolic kernels on the caller's stream.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, NamedTuple
+
 import warp as wp
 
-wp.init()
-wp.set_module_options({'block_dim':128, 'enable_backward':False, 'fast_math':False, 'fuse_fp':True})
+if TYPE_CHECKING:
+    from .rigid_sparse_articulation import RigidArticulationSparseLayout
+    from .rigid_sparse_level_launch_kernels import LevelLaunchPhaseTasks, RigidArticulationLevelLaunchPlan
 
-ia = wp.array(dtype=wp.int32)
-fa = wp.array(dtype=wp.float32)
-eight = wp.types.vector(length=8,dtype=wp.float32)
+wp.set_module_options({"block_dim": 128, "enable_backward": False, "fast_math": False, "fuse_fp": True})
 
-@wp.func_native('return __shfl_sync(0xffffffffu, value, src);')
-def shfl(value:float, src:int)->float:
+ia = wp.array[wp.int32]
+fa = wp.array[wp.float32]
+eight = wp.types.vector(length=8, dtype=wp.float32)
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return __shfl_sync(0xffffffffu, value, src);
+#else
+    return value;
+#endif
+""")
+def shfl(value: float, src: int) -> float:
     pass
 
-@wp.func_native('__syncthreads();')
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    __syncthreads();
+#endif
+""")
 def sync_block():
     pass
 
-@wp.func_native('__syncwarp();')
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    __syncwarp();
+#endif
+""")
 def sync_warp():
     pass
+
 
 @wp.struct
 class Sparse:
@@ -43,6 +72,7 @@ class Sparse:
     ptr: ia
     left: ia
     right: ia
+
 
 @wp.struct
 class Tasks:
@@ -127,8 +157,15 @@ def column(vals: wp.array[float], slot: int, diag: int, lane: int):
 
 
 @wp.func
-def update(vals: wp.array[float], dst: int, begin: int, end: int,
-           left_slots: wp.array[wp.int32], right_slots: wp.array[wp.int32], lane: int):
+def update(
+    vals: wp.array[float],
+    dst: int,
+    begin: int,
+    end: int,
+    left_slots: wp.array[wp.int32],
+    right_slots: wp.array[wp.int32],
+    lane: int,
+):
     """Four lanes per operand row hold columns 0..3, with columns 4..5 in extra registers."""
     row = lane >> 2
     col = lane & 3
@@ -176,6 +213,7 @@ def update(vals: wp.array[float], dst: int, begin: int, end: int,
         if col < 2:
             vals[offset + 4] = second
 
+
 @wp.func
 def _subst_rhs(data: fa, row: int, lane: int) -> float:
     value = float(0.0)
@@ -186,8 +224,18 @@ def _subst_rhs(data: fa, row: int, lane: int) -> float:
 
 @wp.func
 def _subst_entries(
-    vals: fa, delta: fa, row: int, body_start: int, neighbors: ia, slots: ia,
-    first: int, last: int, initial: float, lane: int, upper: bool, chunked: bool,
+    vals: fa,
+    delta: fa,
+    row: int,
+    body_start: int,
+    neighbors: ia,
+    slots: ia,
+    first: int,
+    last: int,
+    initial: float,
+    lane: int,
+    upper: bool,
+    chunked: bool,
 ) -> float:
     """Four 8-lane groups compute independent dots; lanes 0..5 consume them in entry order."""
     group = lane // 8
@@ -319,7 +367,9 @@ def _subst_finish(vals: fa, delta: fa, row: int, diag: int, residual: float, lan
 
 
 @wp.func
-def factor_front(layout: Sparse, vals: fa, sol: fa, piv: ia, row: int, lane: int, residual: float, source: fa, offset: int):
+def factor_front(
+    layout: Sparse, vals: fa, sol: fa, piv: ia, row: int, lane: int, residual: float, source: fa, offset: int
+):
     """One register per column, an independent diagonal recurrence, and one RHS row in lane 30."""
     group = lane // 6
     local = lane % 6
@@ -345,8 +395,11 @@ def factor_front(layout: Sparse, vals: fa, sol: fa, piv: ia, row: int, lane: int
     col3 = wp.where(lane == 30, shfl(residual, 3), pair23[1])
     col4 = wp.where(lane == 30, shfl(residual, 4), pair45[0])
     col5 = wp.where(lane == 30, shfl(residual, 5), pair45[1])
-    diagonal = wp.where(lane < 2, wp.where(lane == 0, col0, col1),
-                        wp.where(lane < 4, wp.where(lane == 2, col2, col3), wp.where(lane == 4, col4, col5)))
+    diagonal = wp.where(
+        lane < 2,
+        wp.where(lane == 0, col0, col1),
+        wp.where(lane < 4, wp.where(lane == 2, col2, col3), wp.where(lane == 4, col4, col5)),
+    )
     guard = wp.max(1.0e-30, 1.0e-6 * wp.abs(diagonal))
     clamped = False
     accepted = diagonal > guard
@@ -429,53 +482,116 @@ def register_front(layout: Sparse, vals: fa, sol: fa, piv: ia, row: int, lane: i
 
 
 @wp.func
-def forward(vals: fa, rhs: fa, delta: fa, row: int, body_start: int,
-            row_offsets: ia, cols: ia, diag_slots: ia, lane: int):
+def forward(
+    vals: fa, rhs: fa, delta: fa, row: int, body_start: int, row_offsets: ia, cols: ia, diag_slots: ia, lane: int
+):
     value = _subst_rhs(rhs, row, lane)
-    value = _subst_entries(vals, delta, row, body_start, cols, cols, row_offsets[row],
-                           row_offsets[row + 1], value, lane, False, False)
+    value = _subst_entries(
+        vals, delta, row, body_start, cols, cols, row_offsets[row], row_offsets[row + 1], value, lane, False, False
+    )
     _subst_finish(vals, delta, row, diag_slots[row], value, lane, False)
 
 
 @wp.func
-def backward(vals: fa, delta: fa, row: int, body_start: int,
-             col_offsets: ia, col_rows: ia, col_slots: ia, diag_slots: ia, lane: int):
+def backward(
+    vals: fa,
+    delta: fa,
+    row: int,
+    body_start: int,
+    col_offsets: ia,
+    col_rows: ia,
+    col_slots: ia,
+    diag_slots: ia,
+    lane: int,
+):
     value = _subst_rhs(delta, row, lane)
-    value = _subst_entries(vals, delta, row, body_start, col_rows, col_slots, col_offsets[row],
-                           col_offsets[row + 1], value, lane, True, False)
+    value = _subst_entries(
+        vals,
+        delta,
+        row,
+        body_start,
+        col_rows,
+        col_slots,
+        col_offsets[row],
+        col_offsets[row + 1],
+        value,
+        lane,
+        True,
+        False,
+    )
     _subst_finish(vals, delta, row, diag_slots[row], value, lane, True)
 
 
 @wp.func
-def backward_long(vals: fa, delta: fa, row: int, body_start: int,
-                  col_offsets: ia, col_rows: ia, col_slots: ia, diag_slots: ia,
-                  chunk_first: int, chunk_last: int, chunk_begin: ia, chunk_end: ia, lane: int):
+def backward_long(
+    vals: fa,
+    delta: fa,
+    row: int,
+    body_start: int,
+    col_offsets: ia,
+    col_rows: ia,
+    col_slots: ia,
+    diag_slots: ia,
+    chunk_first: int,
+    chunk_last: int,
+    chunk_begin: ia,
+    chunk_end: ia,
+    lane: int,
+):
     value = _subst_rhs(delta, row, lane)
     for chunk in range(chunk_first, chunk_last):
-        partial = _subst_entries(vals, delta, row, body_start, col_rows, col_slots, chunk_begin[chunk],
-                                 chunk_end[chunk], 0.0, lane, True, True)
+        partial = _subst_entries(
+            vals,
+            delta,
+            row,
+            body_start,
+            col_rows,
+            col_slots,
+            chunk_begin[chunk],
+            chunk_end[chunk],
+            0.0,
+            lane,
+            True,
+            True,
+        )
         value = value - partial
     _subst_finish(vals, delta, row, diag_slots[row], value, lane, True)
 
+
 @wp.func
-def row_front(layout:Sparse, vals:fa, sol:fa, piv:ia, row:int, lane:int, residual:float):
-    register_front(layout,vals,sol,piv,row,lane,residual)
+def row_front(layout: Sparse, vals: fa, sol: fa, piv: ia, row: int, lane: int, residual: float):
+    register_front(layout, vals, sol, piv, row, lane, residual)
     begin = layout.colptr[row]
-    end = layout.colptr[row+1]
+    end = layout.colptr[row + 1]
     diag = layout.diag[row]
-    if begin+4<end:
+    if begin + 4 < end:
         sync_warp()
-        for entry in range(begin+4,end):
-            column(vals,layout.slots[entry],diag,lane)
+        for entry in range(begin + 4, end):
+            column(vals, layout.slots[entry], diag, lane)
+
 
 @wp.func
-def front_short(layout:Sparse, vals:fa, rhs:fa, sol:fa, piv:ia, row:int, base:int, lane:int):
-    value = _subst_rhs(rhs,row,lane)
-    value = _subst_entries(vals,sol,row,base,layout.cols,layout.cols,layout.rowptr[row],layout.rowptr[row+1],value,lane,False,False)
-    row_front(layout,vals,sol,piv,row,lane,value)
+def front_short(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, row: int, base: int, lane: int):
+    value = _subst_rhs(rhs, row, lane)
+    value = _subst_entries(
+        vals,
+        sol,
+        row,
+        base,
+        layout.cols,
+        layout.cols,
+        layout.rowptr[row],
+        layout.rowptr[row + 1],
+        value,
+        lane,
+        False,
+        False,
+    )
+    row_front(layout, vals, sol, piv, row, lane, value)
+
 
 @wp.func
-def _split_vec_load(data: wp.array(dtype=wp.float32), index: int):
+def _split_vec_load(data: wp.array[wp.float32], index: int):
     vector = wp.spatial_vector()
     for component in range(6):
         vector[component] = data[6 * index + component]
@@ -483,7 +599,7 @@ def _split_vec_load(data: wp.array(dtype=wp.float32), index: int):
 
 
 @wp.func
-def _split_block_load(vals: wp.array(dtype=wp.float32), slot: int):
+def _split_block_load(vals: wp.array[wp.float32], slot: int):
     block = wp.spatial_matrix()
     for block_row in range(6):
         for block_col in range(6):
@@ -492,7 +608,7 @@ def _split_block_load(vals: wp.array(dtype=wp.float32), slot: int):
 
 
 @wp.func
-def _split_reduce(scratch: wp.array(dtype=wp.float32), base: int, orig_threads: int, tid: int):
+def _split_reduce(scratch: wp.array[wp.float32], base: int, orig_threads: int, tid: int):
     sync_block()
     count = orig_threads
     while count > 1:
@@ -506,11 +622,18 @@ def _split_reduce(scratch: wp.array(dtype=wp.float32), base: int, orig_threads: 
 
 @wp.func
 def forward_split(
-    vals: wp.array(dtype=wp.float32), rhs: wp.array(dtype=wp.float32),
-    delta: wp.array(dtype=wp.float32), row: int, body_start: int,
-    row_offsets: wp.array(dtype=wp.int32), cols: wp.array(dtype=wp.int32),
-    diag_slots: wp.array(dtype=wp.int32), scratch: wp.array(dtype=wp.float32),
-    art: int, orig_threads: int, tid: int,
+    vals: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
+    delta: wp.array[wp.float32],
+    row: int,
+    body_start: int,
+    row_offsets: wp.array[wp.int32],
+    cols: wp.array[wp.int32],
+    diag_slots: wp.array[wp.int32],
+    scratch: wp.array[wp.float32],
+    art: int,
+    orig_threads: int,
+    tid: int,
 ):
     base = 6 * art * orig_threads
     for logical_lane in range(tid, orig_threads, wp.block_dim()):
@@ -539,11 +662,18 @@ def forward_split(
 
 @wp.func
 def backward_split(
-    vals: wp.array(dtype=wp.float32), delta: wp.array(dtype=wp.float32),
-    row: int, body_start: int, col_offsets: wp.array(dtype=wp.int32),
-    col_rows: wp.array(dtype=wp.int32), col_slots: wp.array(dtype=wp.int32),
-    diag_slots: wp.array(dtype=wp.int32), scratch: wp.array(dtype=wp.float32),
-    art: int, orig_threads: int, tid: int,
+    vals: wp.array[wp.float32],
+    delta: wp.array[wp.float32],
+    row: int,
+    body_start: int,
+    col_offsets: wp.array[wp.int32],
+    col_rows: wp.array[wp.int32],
+    col_slots: wp.array[wp.int32],
+    diag_slots: wp.array[wp.int32],
+    scratch: wp.array[wp.float32],
+    art: int,
+    orig_threads: int,
+    tid: int,
 ):
     base = 6 * art * orig_threads
     for logical_lane in range(tid, orig_threads, wp.block_dim()):
@@ -571,16 +701,27 @@ def backward_split(
             delta[6 * row + component] = result[component]
     sync_block()
 
+
 @wp.kernel
-def first_front(layout:Sparse, tasks:Tasks, vals:fa, rhs:fa, sol:fa, piv:ia, first:int):
+def first_front(layout: Sparse, tasks: Tasks, vals: fa, rhs: fa, sol: fa, piv: ia, first: int):
     tid = wp.tid()
     lane = tid & 31
     row = tasks.short_ids[first + tid // 32]
-    row_front(layout,vals,sol,piv,row,lane,_subst_rhs(rhs,row,lane))
+    row_front(layout, vals, sol, piv, row, lane, _subst_rhs(rhs, row, lane))
+
 
 @wp.kernel
-def eliminate(layout:Sparse, tasks:Tasks, vals:fa, rhs:fa, sol:fa, piv:ia,
-              short_begin:int, short_count:int, long_begin:int):
+def eliminate(
+    layout: Sparse,
+    tasks: Tasks,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    piv: ia,
+    short_begin: int,
+    short_count: int,
+    long_begin: int,
+):
     tid = wp.tid()
     work = tid // 32
     lane = tid % 32
@@ -596,20 +737,43 @@ def eliminate(layout:Sparse, tasks:Tasks, vals:fa, rhs:fa, sol:fa, piv:ia,
         idx = long_begin + work - short_count
         row = tasks.long_ids[idx]
         first = tasks.long_chunk_offsets[idx]
-        last = tasks.long_chunk_offsets[idx+1]
+        last = tasks.long_chunk_offsets[idx + 1]
         base = tasks.chunk_aux[first]
     if work < short_count:
-        front_short(layout,vals,rhs,sol,piv,row,base,lane)
+        front_short(layout, vals, rhs, sol, piv, row, base, lane)
     else:
-        value = _subst_rhs(rhs,row,lane)
-        for chunk in range(first,last):
-            partial = _subst_entries(vals,sol,row,base,layout.cols,layout.cols,tasks.chunk_begin[chunk],tasks.chunk_end[chunk],0.0,lane,False,True)
+        value = _subst_rhs(rhs, row, lane)
+        for chunk in range(first, last):
+            partial = _subst_entries(
+                vals,
+                sol,
+                row,
+                base,
+                layout.cols,
+                layout.cols,
+                tasks.chunk_begin[chunk],
+                tasks.chunk_end[chunk],
+                0.0,
+                lane,
+                False,
+                True,
+            )
             value -= partial
-        row_front(layout,vals,sol,piv,row,lane,value)
+        row_front(layout, vals, sol, piv, row, lane, value)
+
 
 @wp.kernel
-def broad_front(layout:Sparse, tasks:Tasks, vals:fa, rhs:fa, sol:fa, piv:ia,
-                short_begin:int, short_count:int, long_begin:int):
+def broad_front(
+    layout: Sparse,
+    tasks: Tasks,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    piv: ia,
+    short_begin: int,
+    short_count: int,
+    long_begin: int,
+):
     tid = wp.tid()
     work = tid // 128
     local = tid & 127
@@ -619,140 +783,224 @@ def broad_front(layout:Sparse, tasks:Tasks, vals:fa, rhs:fa, sol:fa, piv:ia,
     first = int(0)
     last = int(0)
     if work < short_count:
-        idx = short_begin+work
+        idx = short_begin + work
         row = tasks.short_ids[idx]
         base = tasks.short_aux[idx]
     else:
-        idx = long_begin+work-short_count
+        idx = long_begin + work - short_count
         row = tasks.long_ids[idx]
         first = tasks.long_chunk_offsets[idx]
-        last = tasks.long_chunk_offsets[idx+1]
+        last = tasks.long_chunk_offsets[idx + 1]
         base = tasks.chunk_aux[first]
     if local < 32:
-        value = _subst_rhs(rhs,row,lane)
+        value = _subst_rhs(rhs, row, lane)
         if work < short_count:
-            value = _subst_entries(vals,sol,row,base,layout.cols,layout.cols,layout.rowptr[row],layout.rowptr[row+1],value,lane,False,False)
+            value = _subst_entries(
+                vals,
+                sol,
+                row,
+                base,
+                layout.cols,
+                layout.cols,
+                layout.rowptr[row],
+                layout.rowptr[row + 1],
+                value,
+                lane,
+                False,
+                False,
+            )
         else:
-            for chunk in range(first,last):
-                value -= _subst_entries(vals,sol,row,base,layout.cols,layout.cols,tasks.chunk_begin[chunk],tasks.chunk_end[chunk],0.0,lane,False,True)
-        register_front(layout,vals,sol,piv,row,lane,value)
-    begin = layout.colptr[row]+4
-    end = layout.colptr[row+1]
-    if begin<end:
+            for chunk in range(first, last):
+                value -= _subst_entries(
+                    vals,
+                    sol,
+                    row,
+                    base,
+                    layout.cols,
+                    layout.cols,
+                    tasks.chunk_begin[chunk],
+                    tasks.chunk_end[chunk],
+                    0.0,
+                    lane,
+                    False,
+                    True,
+                )
+        register_front(layout, vals, sol, piv, row, lane, value)
+    begin = layout.colptr[row] + 4
+    end = layout.colptr[row + 1]
+    if begin < end:
         sync_block()
-        diag = layout.diag[row]*36
-        for job in range(local,6*(end-begin),128):
-            slot = layout.slots[begin+job//6]
-            address = slot*36+6*(job%6)
+        diag = layout.diag[row] * 36
+        for job in range(local, 6 * (end - begin), 128):
+            slot = layout.slots[begin + job // 6]
+            address = slot * 36 + 6 * (job % 6)
             solved = wp.spatial_vector()
             for col in range(6):
-                value = vals[address+col]
+                value = vals[address + col]
                 for inner in range(6):
                     if inner < col:
-                        value -= solved[inner]*vals[diag+6*col+inner]
-                solved[col] = value/vals[diag+7*col]
+                        value -= solved[inner] * vals[diag + 6 * col + inner]
+                solved[col] = value / vals[diag + 7 * col]
             for col in range(6):
-                vals[address+col] = solved[col]
+                vals[address + col] = solved[col]
+
 
 @wp.kernel
-def apply_updates(layout:Sparse, tasks:Tasks, vals:fa, short_begin:int, short_count:int, long_begin:int):
+def apply_updates(layout: Sparse, tasks: Tasks, vals: fa, short_begin: int, short_count: int, long_begin: int):
     tid = wp.tid()
     work = tid // 32
     lane = tid % 32
     if work < short_count:
-        ident = tasks.short_ids[short_begin+work]
-        update(vals,layout.dest[ident],layout.ptr[ident],layout.ptr[ident+1],layout.left,layout.right,lane)
+        ident = tasks.short_ids[short_begin + work]
+        update(vals, layout.dest[ident], layout.ptr[ident], layout.ptr[ident + 1], layout.left, layout.right, lane)
     else:
         idx = long_begin + work - short_count
         dst = layout.dest[tasks.long_ids[idx]]
-        for elem in range(lane,36,32):
-            value = vals[dst*36+elem]
-            for chunk in range(tasks.long_chunk_offsets[idx],tasks.long_chunk_offsets[idx+1]):
+        for elem in range(lane, 36, 32):
+            value = vals[dst * 36 + elem]
+            for chunk in range(tasks.long_chunk_offsets[idx], tasks.long_chunk_offsets[idx + 1]):
                 total = float(0.0)
-                for term in range(tasks.chunk_begin[chunk],tasks.chunk_end[chunk]):
-                    left = layout.left[term]*36 + (elem//6)*6
-                    right = layout.right[term]*36 + (elem%6)*6
+                for term in range(tasks.chunk_begin[chunk], tasks.chunk_end[chunk]):
+                    left = layout.left[term] * 36 + (elem // 6) * 6
+                    right = layout.right[term] * 36 + (elem % 6) * 6
                     dot = float(0.0)
                     for comp in range(6):
-                        dot += vals[left+comp]*vals[right+comp]
+                        dot += vals[left + comp] * vals[right + comp]
                     total += dot
                 value -= total
-            vals[dst*36+elem] = value
+            vals[dst * 36 + elem] = value
+
 
 @wp.kernel
-def back_sub(layout:Sparse, tasks:Tasks, vals:fa, sol:fa, short_begin:int,short_count:int,long_begin:int):
+def back_sub(layout: Sparse, tasks: Tasks, vals: fa, sol: fa, short_begin: int, short_count: int, long_begin: int):
     tid = wp.tid()
-    work = tid//32
-    lane = tid%32
+    work = tid // 32
+    lane = tid % 32
     if work < short_count:
         idx = short_begin + work
-        backward(vals,sol,tasks.short_ids[idx],tasks.short_aux[idx],layout.colptr,layout.rows,layout.slots,layout.diag,lane)
+        backward(
+            vals,
+            sol,
+            tasks.short_ids[idx],
+            tasks.short_aux[idx],
+            layout.colptr,
+            layout.rows,
+            layout.slots,
+            layout.diag,
+            lane,
+        )
     else:
         idx = long_begin + work - short_count
         first = tasks.long_chunk_offsets[idx]
-        last = tasks.long_chunk_offsets[idx+1]
-        backward_long(vals,sol,tasks.long_ids[idx],tasks.chunk_aux[first],layout.colptr,layout.rows,layout.slots,layout.diag,first,last,tasks.chunk_begin,tasks.chunk_end,lane)
+        last = tasks.long_chunk_offsets[idx + 1]
+        backward_long(
+            vals,
+            sol,
+            tasks.long_ids[idx],
+            tasks.chunk_aux[first],
+            layout.colptr,
+            layout.rows,
+            layout.slots,
+            layout.diag,
+            first,
+            last,
+            tasks.chunk_begin,
+            tasks.chunk_end,
+            lane,
+        )
+
 
 @wp.kernel
-def cooperative_tail(layout:Sparse,vals:fa,rhs:fa,sol:fa,piv:ia,scratch:fa,cut:int,split:int,orig_threads:int):
+def cooperative_tail(
+    layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, scratch: fa, cut: int, split: int, orig_threads: int
+):
     tid = wp.tid()
     threads = wp.block_dim()
-    art = tid//threads
-    local = tid%threads
-    group = local//32
-    groups = threads//32
-    lane = local%32
+    art = tid // threads
+    local = tid % threads
+    group = local // 32
+    groups = threads // 32
+    lane = local % 32
     base = layout.base[art]
-    end = layout.artlev[art+1]
-    start = wp.min(layout.artlev[art]+cut,end)
-    for lev in range(start,end):
+    end = layout.artlev[art + 1]
+    start = wp.min(layout.artlev[art] + cut, end)
+    for lev in range(start, end):
         r0 = layout.levrow[lev]
-        r1 = layout.levrow[lev+1]
-        if split<=0:
-            for row in range(r0+group,r1,groups):
-                front_short(layout,vals,rhs,sol,piv,row,base,lane)
+        r1 = layout.levrow[lev + 1]
+        if split <= 0:
+            for row in range(r0 + group, r1, groups):
+                front_short(layout, vals, rhs, sol, piv, row, base, lane)
             sync_block()
-            for ident in range(layout.levupd[lev]+group,layout.levupd[lev+1],groups):
-                update(vals,layout.dest[ident],layout.ptr[ident],layout.ptr[ident+1],layout.left,layout.right,lane)
+            for ident in range(layout.levupd[lev] + group, layout.levupd[lev + 1], groups):
+                update(
+                    vals, layout.dest[ident], layout.ptr[ident], layout.ptr[ident + 1], layout.left, layout.right, lane
+                )
             sync_block()
             continue
-        for row in range(r0+group,r1,groups):
-            chol(vals,layout.diag[row],piv,lane)
+        for row in range(r0 + group, r1, groups):
+            chol(vals, layout.diag[row], piv, lane)
         sync_block()
-        for task in range(layout.levcol[lev]+group,layout.levcol[lev+1],groups):
-            column(vals,layout.cslot[task],layout.cdiag[task],lane)
-        for row in range(r0+group,r1,groups):
-            if split<=0 or layout.rowptr[row+1]-layout.rowptr[row]<=split:
-                forward(vals,rhs,sol,row,base,layout.rowptr,layout.cols,layout.diag,lane)
-        if split>0:
-            for row in range(r0,r1):
-                if layout.rowptr[row+1]-layout.rowptr[row]>split:
-                    forward_split(vals,rhs,sol,row,base,layout.rowptr,layout.cols,layout.diag,scratch,art,orig_threads,local)
+        for task in range(layout.levcol[lev] + group, layout.levcol[lev + 1], groups):
+            column(vals, layout.cslot[task], layout.cdiag[task], lane)
+        for row in range(r0 + group, r1, groups):
+            if split <= 0 or layout.rowptr[row + 1] - layout.rowptr[row] <= split:
+                forward(vals, rhs, sol, row, base, layout.rowptr, layout.cols, layout.diag, lane)
+        if split > 0:
+            for row in range(r0, r1):
+                if layout.rowptr[row + 1] - layout.rowptr[row] > split:
+                    forward_split(
+                        vals,
+                        rhs,
+                        sol,
+                        row,
+                        base,
+                        layout.rowptr,
+                        layout.cols,
+                        layout.diag,
+                        scratch,
+                        art,
+                        orig_threads,
+                        local,
+                    )
         sync_block()
-        for ident in range(layout.levupd[lev]+group,layout.levupd[lev+1],groups):
-            update(vals,layout.dest[ident],layout.ptr[ident],layout.ptr[ident+1],layout.left,layout.right,lane)
+        for ident in range(layout.levupd[lev] + group, layout.levupd[lev + 1], groups):
+            update(vals, layout.dest[ident], layout.ptr[ident], layout.ptr[ident + 1], layout.left, layout.right, lane)
         sync_block()
-    for off in range(end-start):
-        lev = end-off-1
+    for off in range(end - start):
+        lev = end - off - 1
         r0 = layout.levrow[lev]
-        r1 = layout.levrow[lev+1]
-        for row in range(r0+group,r1,groups):
-            if split<=0 or layout.colptr[row+1]-layout.colptr[row]<=split:
-                backward(vals,sol,row,base,layout.colptr,layout.rows,layout.slots,layout.diag,lane)
-        if split>0:
-            for row in range(r0,r1):
-                if layout.colptr[row+1]-layout.colptr[row]>split:
-                    backward_split(vals,sol,row,base,layout.colptr,layout.rows,layout.slots,layout.diag,scratch,art,orig_threads,local)
+        r1 = layout.levrow[lev + 1]
+        for row in range(r0 + group, r1, groups):
+            if split <= 0 or layout.colptr[row + 1] - layout.colptr[row] <= split:
+                backward(vals, sol, row, base, layout.colptr, layout.rows, layout.slots, layout.diag, lane)
+        if split > 0:
+            for row in range(r0, r1):
+                if layout.colptr[row + 1] - layout.colptr[row] > split:
+                    backward_split(
+                        vals,
+                        sol,
+                        row,
+                        base,
+                        layout.colptr,
+                        layout.rows,
+                        layout.slots,
+                        layout.diag,
+                        scratch,
+                        art,
+                        orig_threads,
+                        local,
+                    )
         sync_block()
 
-@wp.func_native('''
+
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ float storage[1728];
     return wp::array_t<float>(storage, 1728);
 #else
     return wp::array_t<float>();
 #endif
-''')
+""")
 def dense_tail_tile() -> fa:
     pass
 
@@ -769,8 +1017,7 @@ def dense_tail_sparse(layout: Sparse, vals: fa, piv: ia, start: int, stop: int, 
             column(vals, layout.cslot[task], layout.cdiag[task], lane)
         sync_block()
         for task in range(layout.levupd[level] + group, layout.levupd[level + 1], 4):
-            update(vals, layout.dest[task], layout.ptr[task], layout.ptr[task + 1],
-                   layout.left, layout.right, lane)
+            update(vals, layout.dest[task], layout.ptr[task], layout.ptr[task + 1], layout.left, layout.right, lane)
         sync_block()
 
 
@@ -803,9 +1050,13 @@ def dense_tail_prepare(layout: Sparse, work: ia, cut: int, size: int):
     column_begin = layout.levcol[level]
     update_begin = layout.levupd[level]
     updates = remaining * (remaining + 1) // 2
-    if (base < head or layout.levrow[level] != actual or layout.diag[actual] != end - 1
-            or layout.levcol[level + 1] - column_begin != remaining
-            or layout.levupd[level + 1] - update_begin != updates):
+    if (
+        base < head
+        or layout.levrow[level] != actual
+        or layout.diag[actual] != end - 1
+        or layout.levcol[level + 1] - column_begin != remaining
+        or layout.levupd[level + 1] - update_begin != updates
+    ):
         if local == 0:
             work[row_map + row] = -1
         return
@@ -817,7 +1068,7 @@ def dense_tail_prepare(layout: Sparse, work: ia, cut: int, size: int):
             valid = False
     if local < size:
         work[row_map + local] = wp.where(local <= row, base + local, -1)
-    if layout.colptr[actual+1] - layout.colptr[actual] != remaining:
+    if layout.colptr[actual + 1] - layout.colptr[actual] != remaining:
         valid = False
     if local < remaining:
         outer = row + 1 + local
@@ -825,9 +1076,9 @@ def dense_tail_prepare(layout: Sparse, work: ia, cut: int, size: int):
         if layout.cslot[column_begin + local] != source or layout.cdiag[column_begin + local] != end - 1:
             valid = False
         entry = layout.colptr[actual] + local
-        if entry >= layout.colptr[actual+1]:
+        if entry >= layout.colptr[actual + 1]:
             valid = False
-        elif layout.base[0]+layout.rows[entry] != first+outer or layout.slots[entry] != source:
+        elif layout.base[0] + layout.rows[entry] != first + outer or layout.slots[entry] != source:
             valid = False
     for offset in range(local, updates, 128):
         outer = dense_tail_tri_row(offset)
@@ -848,8 +1099,9 @@ def dense_tail_prepare(layout: Sparse, work: ia, cut: int, size: int):
 
 
 @wp.kernel
-def dense_tail_substitute(layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: fa,
-                          cut: int, split: int, orig_threads: int):
+def dense_tail_substitute(
+    layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: fa, cut: int, split: int, orig_threads: int
+):
     """After all factors are published, use the original CSR/CSC substitution ordering."""
     tid = wp.tid()
     lane = tid & 31
@@ -866,8 +1118,20 @@ def dense_tail_substitute(layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: f
         if split > 0:
             for row in range(first, last):
                 if layout.rowptr[row + 1] - layout.rowptr[row] > split:
-                    forward_split(vals, rhs, sol, row, base, layout.rowptr, layout.cols, layout.diag,
-                                  scratch, 0, orig_threads, tid)
+                    forward_split(
+                        vals,
+                        rhs,
+                        sol,
+                        row,
+                        base,
+                        layout.rowptr,
+                        layout.cols,
+                        layout.diag,
+                        scratch,
+                        0,
+                        orig_threads,
+                        tid,
+                    )
         sync_block()
     for reverse in range(stop - start):
         level = stop - reverse - 1
@@ -879,160 +1143,191 @@ def dense_tail_substitute(layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: f
         if split > 0:
             for row in range(first, last):
                 if layout.colptr[row + 1] - layout.colptr[row] > split:
-                    backward_split(vals, sol, row, base, layout.colptr, layout.rows, layout.slots, layout.diag,
-                                   scratch, 0, orig_threads, tid)
+                    backward_split(
+                        vals,
+                        sol,
+                        row,
+                        base,
+                        layout.colptr,
+                        layout.rows,
+                        layout.slots,
+                        layout.diag,
+                        scratch,
+                        0,
+                        orig_threads,
+                        tid,
+                    )
         sync_block()
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ float tile[294];
     return wp::array_t<float>(tile,294);
 #else
     return wp::array_t<float>();
 #endif
-''')
+""")
 def sub_tile() -> fa:
     pass
 
 
 def dense_tail_size(plan, cut):
     """Returns zero for schedules that must stay on the general tail path."""
-    count = plan['level_count']
-    rows = plan['rows_per_level']
-    if (plan['articulation_count'] == 1 and 0 <= cut < count and count - cut <= 48
-            and len(rows) == count and all(value == 1 for value in rows[cut:])):
+    count = plan.level_count
+    rows = plan.rows_per_level
+    if (
+        plan.articulation_count == 1
+        and 0 <= cut < count
+        and count - cut <= 48
+        and len(rows) == count
+        and all(value == 1 for value in rows[cut:])
+    ):
         return count - cut
     return 0
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ float packed[4*48*36];
     return wp::array_t<float>(packed,4*48*36);
 #else
     return wp::array_t<float>();
 #endif
-''')
+""")
 def substitution_stage() -> fa:
     pass
 
 
 @wp.func
-def external_dot(layout: Sparse, vals:fa, sol:fa, base:int, slot:int, component:int):
-    address = slot*36+6*component
-    neighbor = 6*(base+layout.cols[slot])
-    total = float(0.)
+def external_dot(layout: Sparse, vals: fa, sol: fa, base: int, slot: int, component: int):
+    address = slot * 36 + 6 * component
+    neighbor = 6 * (base + layout.cols[slot])
+    total = float(0.0)
     for part in range(6):
-        total += vals[address+part]*sol[neighbor+part]
+        total += vals[address + part] * sol[neighbor + part]
     return total
 
 
 @wp.func
-def staged_term(factors:fa,state:fa,base:int,other:int,component:int,upper:bool):
-    address = 36*(base+other)+6*component
+def staged_term(factors: fa, state: fa, base: int, other: int, component: int, upper: bool):
+    address = 36 * (base + other) + 6 * component
     stride = int(1)
     if upper:
-        address = 36*(base+other)+component
+        address = 36 * (base + other) + component
         stride = 6
-    total = float(0.)
+    total = float(0.0)
     for index in range(6):
-        total += factors[address+stride*index]*state[6*other+index]
+        total += factors[address + stride * index] * state[6 * other + index]
     return total
 
 
 @wp.func
-def substitution_run(layout:Sparse,vals:fa,rhs:fa,boundary:fa,work:ia,first:int,size:int,split:int,
-                     factors:fa,state:fa,tid:int,upper:bool):
-    component = wp.min(tid//16,5)
-    member = tid&15
-    lane = tid&31
-    for panel in range(0,size,4):
-        count = wp.min(4,size-panel)
-        for quad in range(tid,9*size*count,128):
-            block = quad//9
-            part = block//size
-            other = block%size
-            row = wp.where(upper,size-1-panel-part,panel+part)
-            if (upper and other>=row) or (not upper and other<=row):
-                slot = work[1+wp.max(row,other)*size]+wp.min(row,other)
-                _small_copy4(factors,4*quad,vals,36*slot+4*(quad%9))
+def substitution_run(
+    layout: Sparse,
+    vals: fa,
+    rhs: fa,
+    boundary: fa,
+    work: ia,
+    first: int,
+    size: int,
+    split: int,
+    factors: fa,
+    state: fa,
+    tid: int,
+    upper: bool,
+):
+    component = wp.min(tid // 16, 5)
+    member = tid & 15
+    lane = tid & 31
+    for panel in range(0, size, 4):
+        count = wp.min(4, size - panel)
+        for quad in range(tid, 9 * size * count, 128):
+            block = quad // 9
+            part = block // size
+            other = block % size
+            row = wp.where(upper, size - 1 - panel - part, panel + part)
+            if (upper and other >= row) or (not upper and other <= row):
+                slot = work[1 + wp.max(row, other) * size] + wp.min(row, other)
+                _small_copy4(factors, 4 * quad, vals, 36 * slot + 4 * (quad % 9))
         sync_block()
         for part in range(count):
-            row = wp.where(upper,size-1-panel-part,panel+part)
-            base = part*size
+            row = wp.where(upper, size - 1 - panel - part, panel + part)
+            base = part * size
             previous = int(0)
             span = row
             start = int(0)
             extent = int(0)
-            initial = float(0.)
+            initial = float(0.0)
             if upper:
-                start = row+1
-                span = size-start
+                start = row + 1
+                span = size - start
                 extent = span
-                initial = state[6*row+component]
+                initial = state[6 * row + component]
             else:
-                previous = work[1+row*size] - layout.rowptr[first+row]
-                extent = previous+span+1
-                initial = rhs[6*(first+row)+component]
+                previous = work[1 + row * size] - layout.rowptr[first + row]
+                extent = previous + span + 1
+                initial = rhs[6 * (first + row) + component]
             result = initial
-            if split<=0 or extent<=split:
+            if split <= 0 or extent <= split:
                 if not upper:
-                    result = boundary[128*(6*row+component)]
-                for block in range(0,span,16):
-                    term = float(0.)
-                    if block+member < span:
-                        term = staged_term(factors,state,base,start+block+member,component,upper)
-                    for source in range(wp.min(16,span-block)):
-                        result -= shfl(term,(lane&16)+source)
+                    result = boundary[128 * (6 * row + component)]
+                for block in range(0, span, 16):
+                    term = float(0.0)
+                    if block + member < span:
+                        term = staged_term(factors, state, base, start + block + member, component, upper)
+                    for source in range(wp.min(16, span - block)):
+                        result -= shfl(term, (lane & 16) + source)
             else:
                 partial = eight()
                 for stripe in range(8):
-                    logical = member+16*stripe
-                    value = float(0.)
+                    logical = member + 16 * stripe
+                    value = float(0.0)
                     if not upper:
-                        value = boundary[128*(6*row+component)+logical]
-                    pos = (logical - previous)&127
-                    if pos<span:
-                        value += staged_term(factors,state,base,start+pos,component,upper)
+                        value = boundary[128 * (6 * row + component) + logical]
+                    pos = (logical - previous) & 127
+                    if pos < span:
+                        value += staged_term(factors, state, base, start + pos, component, upper)
                     partial[stripe] = value
-                value = ((partial[0]+partial[4])+(partial[2]+partial[6]))+((partial[1]+partial[5])+(partial[3]+partial[7]))
+                value = ((partial[0] + partial[4]) + (partial[2] + partial[6])) + (
+                    (partial[1] + partial[5]) + (partial[3] + partial[7])
+                )
                 for distance in range(4):
-                    value += shfl(value,lane^(8>>distance))
+                    value += shfl(value, lane ^ (8 >> distance))
                 result -= value
-            if tid<96 and member==0:
-                state[288+component] = result
+            if tid < 96 and member == 0:
+                state[288 + component] = result
             sync_block()
-            if tid<32:
-                _subst_finish(factors,state,row,base+row,state[288+wp.min(lane,5)],lane,upper)
+            if tid < 32:
+                _subst_finish(factors, state, row, base + row, state[288 + wp.min(lane, 5)], lane, upper)
             sync_block()
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ int storage[1925];
     return wp::array_t<int>(storage + offset, count);
 #else
     return wp::array_t<int>();
 #endif
-''')
+""")
 def small_ints(offset: int, count: int) -> ia:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ float storage[4800];
     return wp::array_t<float>(storage + offset, count);
 #else
     return wp::array_t<float>();
 #endif
-''')
+""")
 def small_floats(offset: int, count: int) -> fa:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     int total = width;
     #pragma unroll
@@ -1044,18 +1339,18 @@ def small_floats(offset: int, count: int) -> fa:
 #else
     return 0;
 #endif
-''')
+""")
 def small_exclusive(width: int, lane: int) -> int:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __syncthreads_or(bad);
 #else
     return bad;
 #endif
-''')
+""")
 def small_any(bad: int) -> int:
     pass
 
@@ -1106,8 +1401,7 @@ def small_updates(packed: Sparse, blocks: fa, begin: int, end: int, tid: int):
 
 
 @wp.func
-def small_unpacked(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia,
-                   base: int, start: int, stop: int, tid: int):
+def small_unpacked(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, base: int, start: int, stop: int, tid: int):
     """Unsplit fallback for a whole CTA. Executes the explicit column task schedule."""
     dense_tail_sparse(layout, vals, piv, start, stop, tid)
     group = tid >> 5
@@ -1123,36 +1417,36 @@ def small_unpacked(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia,
         sync_block()
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __shfl_sync(0xffu << (threadIdx.x & 24u),data,source,8);
 #else
     return data;
 #endif
-''')
-def group_share(data:float,source:int)->float:
+""")
+def group_share(data: float, source: int) -> float:
     pass
 
 
 def small_tail_launch(launch, plan, layout, vals, rhs, sol, piv, cut):
-    """Try after leading updates, instead of the ordinary tail, before leading back-sub.
-
-    Source-integrate at module scope; launch is run()'s current-stream, block_dim=128
-    closure. Returns True iff it enqueued the entire tail. False leaves the original
-    dispatch untouched, including its split threshold, logical lanes and scratch.
-    rows_per_level is an aggregate hint only; each CTA bounds its own allocation.
-    """
-    count = plan['level_count']
-    arts = plan['articulation_count']
-    rows = plan['rows_per_level']
-    if (arts <= 0 or not 0 <= cut < count or count - cut > 16 or len(rows) != count or
-            plan['tail_split_entries'] > 0 or sum(rows[cut:]) > 32 * arts):
+    """Solve short tails in shared memory; each block validates its articulation's footprint."""
+    count = plan.level_count
+    arts = plan.articulation_count
+    rows = plan.rows_per_level
+    if (
+        arts <= 0
+        or not 0 <= cut < count
+        or count - cut > 16
+        or len(rows) != count
+        or plan.tail_split_entries > 0
+        or sum(rows[cut:]) > 32 * arts
+    ):
         return False
     launch(small_sparse_tail, 128 * arts, [layout, vals, rhs, sol, piv, cut])
     return True
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     if (data.strides[0] == sizeof(float) && !(reinterpret_cast<size_t>(data.data) & 15u)) {
         const float4 words = *reinterpret_cast<const float4*>(data.data + start);
@@ -1161,13 +1455,13 @@ def small_tail_launch(launch, plan, layout, vals, rhs, sol, piv, cut):
 #endif
     return wp::vec4(wp::index(data, start), wp::index(data, start+1),
                     wp::index(data, start+2), wp::index(data, start+3));
-''')
+""")
 def _schur_load4(data: fa, start: int) -> wp.vec4:
     """Four logical entries. All call-site starts are multiples of four floats."""
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     if (data.strides[0] == sizeof(float) && !(reinterpret_cast<size_t>(data.data) & 7u)) {
         const float2 words = *reinterpret_cast<const float2*>(data.data + start);
@@ -1175,7 +1469,7 @@ def _schur_load4(data: fa, start: int) -> wp.vec4:
     }
 #endif
     return wp::vec2(wp::index(data, start), wp::index(data, start+1));
-''')
+""")
 def _schur_load2(data: fa, start: int) -> wp.vec2:
     """Two logical entries, starting at an even float index."""
     pass
@@ -1183,8 +1477,7 @@ def _schur_load2(data: fa, start: int) -> wp.vec2:
 
 @wp.func
 def _schur_outer(acc: wp.vec4, left0: float, left1: float, right0: float, right1: float):
-    return wp.vec4(acc[0] + left0 * right0, acc[1] + left0 * right1,
-                   acc[2] + left1 * right0, acc[3] + left1 * right1)
+    return wp.vec4(acc[0] + left0 * right0, acc[1] + left0 * right1, acc[2] + left1 * right0, acc[3] + left1 * right1)
 
 
 @wp.func
@@ -1237,13 +1530,13 @@ def short_updates(layout: Sparse, tasks: Tasks, vals: fa, short_begin: int):
     _schur_short(layout, tasks, vals, short_begin, wp.tid())
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __shfl_sync(0xffu << (threadIdx.x & 24u), value, source, 8);
 #else
     return value;
 #endif
-''')
+""")
 def _schur_gather8(value: float, source: int) -> float:
     """Only the eight lanes owning this chunk must participate."""
     pass
@@ -1299,8 +1592,9 @@ def _schur_long(layout: Sparse, tasks: Tasks, vals: fa, long_begin: int, tid: in
 
 
 @wp.kernel
-def split_updates(layout: Sparse, tasks: Tasks, vals: fa, short_begin: int,
-                  short_count: int, long_begin: int, long_count: int):
+def split_updates(
+    layout: Sparse, tasks: Tasks, vals: fa, short_begin: int, short_count: int, long_begin: int, long_count: int
+):
     tid = wp.tid()
     prefix = long_count * (36 * 32)
     if tid < prefix:
@@ -1313,170 +1607,247 @@ level_marks = wp.types.vector(length=16, dtype=wp.int32)
 
 
 @wp.kernel
-def index_and_front(layout:Sparse, rows:Tasks, updates:Tasks, vals:fa, rhs:fa, sol:fa, piv:ia,
-                    lookup:ia, slots:int, cut:int, limits:level_marks, first_update:int,
-                    update_count:int, first_row:int, row_count:int):
+def index_and_front(
+    layout: Sparse,
+    rows: Tasks,
+    updates: Tasks,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    piv: ia,
+    lookup: ia,
+    slots: int,
+    cut: int,
+    limits: level_marks,
+    first_update: int,
+    update_count: int,
+    first_row: int,
+    row_count: int,
+):
     tid = wp.tid()
-    if tid < 32*row_count:
+    if tid < 32 * row_count:
         lane = tid & 31
-        row = rows.short_ids[first_row+tid//32]
-        row_front(layout,vals,sol,piv,row,lane,_subst_rhs(rhs,row,lane))
+        row = rows.short_ids[first_row + tid // 32]
+        row_front(layout, vals, sol, piv, row, lane, _subst_rhs(rhs, row, lane))
     else:
-        index = first_update+tid-32*row_count
+        index = first_update + tid - 32 * row_count
         level = int(0)
-        for position in range(cut-1):
+        for position in range(cut - 1):
             if index >= limits[position]:
                 level += 1
         ident = updates.short_ids[index]
         slot = layout.dest[ident]
-        lookup[slots*(level+1)+slot] = ident
-        wp.atomic_or(lookup,slot,1<<level)
+        lookup[slots * (level + 1) + slot] = ident
+        wp.atomic_or(lookup, slot, 1 << level)
 
 
-@wp.func_native('return __ffs(mask)-1;')
-def first_mark(mask:int)->int:
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return __ffs(mask)-1;
+#else
+    for (int i = 0; i < 32; ++i)
+        if (unsigned(mask) & (1u << i)) return i;
+    return -1;
+#endif
+""")
+def first_mark(mask: int) -> int:
     pass
 
 
 @wp.func
-def fold_history(layout:Sparse, vals:fa, lookup:ia, slots:int, slot:int, tile:int):
+def fold_history(layout: Sparse, vals: fa, lookup: ia, slots: int, slot: int, tile: int):
     mask = lookup[slot]
     if mask != 0:
-        row_pair = tile//3
-        col_pair = tile%3
-        dst = 36*slot+12*row_pair+2*col_pair
-        upper = _schur_load2(vals,dst)
-        lower = _schur_load2(vals,dst+6)
-        accum = wp.vec4(upper[0],upper[1],lower[0],lower[1])
+        row_pair = tile // 3
+        col_pair = tile % 3
+        dst = 36 * slot + 12 * row_pair + 2 * col_pair
+        upper = _schur_load2(vals, dst)
+        lower = _schur_load2(vals, dst + 6)
+        accum = wp.vec4(upper[0], upper[1], lower[0], lower[1])
         while mask != 0:
             bit = first_mark(mask)
-            ident = lookup[slots*(bit+1)+slot]
-            for term in range(layout.ptr[ident],layout.ptr[ident+1]):
-                accum = accum - _schur_tile_dot(layout,vals,term,row_pair,col_pair)
-            mask = mask & (mask-1)
-        _front_store_pair(vals,dst,accum[0],accum[1])
-        _front_store_pair(vals,dst+6,accum[2],accum[3])
+            ident = lookup[slots * (bit + 1) + slot]
+            for term in range(layout.ptr[ident], layout.ptr[ident + 1]):
+                accum = accum - _schur_tile_dot(layout, vals, term, row_pair, col_pair)
+            mask = mask & (mask - 1)
+        _front_store_pair(vals, dst, accum[0], accum[1])
+        _front_store_pair(vals, dst + 6, accum[2], accum[3])
 
 
 @wp.func
-def materialize_column(layout:Sparse,vals:fa,lookup:ia,slots:int,row:int,lane:int):
+def materialize_column(layout: Sparse, vals: fa, lookup: ia, slots: int, row: int, lane: int):
     begin = layout.colptr[row]
-    end = layout.colptr[row+1]
-    for group in range(lane,9*(1+end-begin),32):
-        block = group//9
+    end = layout.colptr[row + 1]
+    for group in range(lane, 9 * (1 + end - begin), 32):
+        block = group // 9
         slot = layout.diag[row]
         if block != 0:
-            slot = layout.slots[begin+block-1]
-        fold_history(layout,vals,lookup,slots,slot,group%9)
+            slot = layout.slots[begin + block - 1]
+        fold_history(layout, vals, lookup, slots, slot, group % 9)
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ __align__(16) float panels[720];
     return wp::array_t<float>(panels,720);
 #else
     return wp::array_t<float>();
 #endif
-''')
+""")
 def front_tile() -> fa:
     pass
 
 
 @wp.kernel
-def tiled_indexed_front(layout:Sparse,tasks:Tasks,vals:fa,rhs:fa,sol:fa,piv:ia,lookup:ia,slots:int,first:int):
+def tiled_indexed_front(
+    layout: Sparse, tasks: Tasks, vals: fa, rhs: fa, sol: fa, piv: ia, lookup: ia, slots: int, first: int
+):
     tid = wp.tid()
-    lane = tid & 31
-    index = first + tid//32
+    index = first + tid // 32
     row = tasks.short_ids[index]
-    tile_assemble(layout,vals,rhs,sol,piv,lookup,slots,row,tasks.short_aux[index],tid)
+    tile_assemble(layout, vals, rhs, sol, piv, lookup, slots, row, tasks.short_aux[index], tid)
+
 
 @wp.func
-def tile_assemble(layout:Sparse,vals:fa,rhs:fa,sol:fa,piv:ia,lookup:ia,slots:int,row:int,base:int,tid:int):
+def tile_assemble(
+    layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, lookup: ia, slots: int, row: int, base: int, tid: int
+):
     lane = tid & 31
     begin = layout.colptr[row]
-    end = layout.colptr[row+1]
-    residual = _subst_entries(vals,sol,row,base,layout.cols,layout.cols,
-                              layout.rowptr[row],layout.rowptr[row+1],_subst_rhs(rhs,row,lane),lane,False,False)
-    if end-begin > 4:
-        materialize_column(layout,vals,lookup,slots,row,lane)
+    end = layout.colptr[row + 1]
+    residual = _subst_entries(
+        vals,
+        sol,
+        row,
+        base,
+        layout.cols,
+        layout.cols,
+        layout.rowptr[row],
+        layout.rowptr[row + 1],
+        _subst_rhs(rhs, row, lane),
+        lane,
+        False,
+        False,
+    )
+    if end - begin > 4:
+        materialize_column(layout, vals, lookup, slots, row, lane)
         sync_warp()
-        row_front(layout,vals,sol,piv,row,lane,residual)
+        row_front(layout, vals, sol, piv, row, lane, residual)
     else:
-        offset = 180*((tid&127)//32)
+        offset = 180 * ((tid & 127) // 32)
         panel = front_tile()
-        for job in range(lane,9*(1+end-begin),32):
-            block = job//9
-            tile = job%9
-            row_pair = tile//3
-            col_pair = tile%3
+        for job in range(lane, 9 * (1 + end - begin), 32):
+            block = job // 9
+            tile = job % 9
+            row_pair = tile // 3
+            col_pair = tile % 3
             slot = layout.diag[row]
             if block != 0:
-                slot = layout.slots[begin+block-1]
-            address = 12*row_pair+2*col_pair
-            src = 36*slot+address
-            high = _schur_load2(vals,src)
-            low = _schur_load2(vals,src+6)
-            acc = wp.vec4(high[0],high[1],low[0],low[1])
+                slot = layout.slots[begin + block - 1]
+            address = 12 * row_pair + 2 * col_pair
+            src = 36 * slot + address
+            high = _schur_load2(vals, src)
+            low = _schur_load2(vals, src + 6)
+            acc = wp.vec4(high[0], high[1], low[0], low[1])
             mask = lookup[slot]
             while mask != 0:
                 bit = first_mark(mask)
-                ident = lookup[slots*(bit+1)+slot]
-                for term in range(layout.ptr[ident],layout.ptr[ident+1]):
-                    acc = acc - _schur_tile_dot(layout,vals,term,row_pair,col_pair)
-                mask = mask & (mask-1)
-            dst = offset+36*block+address
-            _front_store_pair(panel,dst,acc[0],acc[1])
-            _front_store_pair(panel,dst+6,acc[2],acc[3])
+                ident = lookup[slots * (bit + 1) + slot]
+                for term in range(layout.ptr[ident], layout.ptr[ident + 1]):
+                    acc = acc - _schur_tile_dot(layout, vals, term, row_pair, col_pair)
+                mask = mask & (mask - 1)
+            dst = offset + 36 * block + address
+            _front_store_pair(panel, dst, acc[0], acc[1])
+            _front_store_pair(panel, dst + 6, acc[2], acc[3])
         sync_warp()
-        factor_front(layout,vals,sol,piv,row,lane,residual,panel,offset)
+        factor_front(layout, vals, sol, piv, row, lane, residual, panel, offset)
 
 
 @wp.kernel
-def indexed_boundary(layout:Sparse,vals:fa,rhs:fa,sol:fa,lookup:ia,slots:int,width:int,cut:int):
+def indexed_boundary(layout: Sparse, vals: fa, rhs: fa, sol: fa, lookup: ia, slots: int, width: int, cut: int):
     tid = wp.tid()
-    lane = tid&31
-    grid_row = tid//32
-    art = grid_row//width
-    end = layout.artlev[art+1]
-    first = layout.levrow[wp.min(layout.artlev[art]+cut,end)]
-    for row in range(first+grid_row%width,layout.levrow[end],width):
-        materialize_column(layout,vals,lookup,slots,row,lane)
-        value = _subst_entries(vals,sol,first,layout.base[art],layout.cols,layout.cols,
-                               layout.rowptr[row],layout.rowptr[row+1],_subst_rhs(rhs,row,lane),lane,False,False)
-        if lane<6:
-            sol[6*row+lane] = value
+    lane = tid & 31
+    grid_row = tid // 32
+    art = grid_row // width
+    end = layout.artlev[art + 1]
+    first = layout.levrow[wp.min(layout.artlev[art] + cut, end)]
+    for row in range(first + grid_row % width, layout.levrow[end], width):
+        materialize_column(layout, vals, lookup, slots, row, lane)
+        value = _subst_entries(
+            vals,
+            sol,
+            first,
+            layout.base[art],
+            layout.cols,
+            layout.cols,
+            layout.rowptr[row],
+            layout.rowptr[row + 1],
+            _subst_rhs(rhs, row, lane),
+            lane,
+            False,
+            False,
+        )
+        if lane < 6:
+            sol[6 * row + lane] = value
 
 
 def launch_schur(launch, layout, tasks, vals, short_begin, short_count, long_begin, long_count):
-    """Use inside run().scheduled for apply_updates only; launch keeps the existing stream."""
+    """Schedule short and split Schur updates in one launch per level."""
     if long_count:
-        launch(split_updates, (36 * 32) * long_count + 9 * short_count,
-               [layout, tasks, vals, short_begin, short_count, long_begin, long_count])
+        launch(
+            split_updates,
+            (36 * 32) * long_count + 9 * short_count,
+            [layout, tasks, vals, short_begin, short_count, long_begin, long_count],
+        )
     elif short_count:
         launch(short_updates, 9 * short_count, [layout, tasks, vals, short_begin])
 
 
 @wp.kernel
-def update_and_gather(layout: Sparse, tasks: Tasks, vals: fa, rhs:fa, sol:fa,
-                      short_begin:int, long_begin:int, long_count:int, width:int, arts:int, cut:int):
+def update_and_gather(
+    layout: Sparse,
+    tasks: Tasks,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    short_begin: int,
+    long_begin: int,
+    long_count: int,
+    width: int,
+    arts: int,
+    cut: int,
+):
     tid = wp.tid()
-    gather_size = 32*arts*width
-    if tid<gather_size:
+    gather_size = 32 * arts * width
+    if tid < gather_size:
         warp_id = tid >> 5
         lane = tid & 31
         art = warp_id // width
-        end = layout.artlev[art+1]
-        start = wp.min(layout.artlev[art]+cut,end)
+        end = layout.artlev[art + 1]
+        start = wp.min(layout.artlev[art] + cut, end)
         first = layout.levrow[start]
-        row = first+warp_id%width
-        if row<layout.levrow[end]:
-            result = _subst_entries(vals,sol,first,layout.base[art],layout.cols,layout.cols,layout.rowptr[row],layout.rowptr[row+1],_subst_rhs(rhs,row,lane),lane,False,False)
-            if lane<6:
-                sol[6*row+lane] = result
-    elif tid<gather_size+1152*long_count:
-        _schur_long(layout,tasks,vals,long_begin,tid-gather_size)
+        row = first + warp_id % width
+        if row < layout.levrow[end]:
+            result = _subst_entries(
+                vals,
+                sol,
+                first,
+                layout.base[art],
+                layout.cols,
+                layout.cols,
+                layout.rowptr[row],
+                layout.rowptr[row + 1],
+                _subst_rhs(rhs, row, lane),
+                lane,
+                False,
+                False,
+            )
+            if lane < 6:
+                sol[6 * row + lane] = result
+    elif tid < gather_size + 1152 * long_count:
+        _schur_long(layout, tasks, vals, long_begin, tid - gather_size)
     else:
-        _schur_short(layout,tasks,vals,short_begin,tid-gather_size-1152*long_count)
+        _schur_short(layout, tasks, vals, short_begin, tid - gather_size - 1152 * long_count)
 
 
 @wp.func
@@ -1553,8 +1924,17 @@ def _branch_wide(layout: Sparse, vals: fa, residual: fa, sol: fa, piv: ia, row: 
 
 
 @wp.kernel
-def branch_front(layout: Sparse, tasks: Tasks, vals: fa, residual: fa, sol: fa, piv: ia,
-                 long_begin: int, long_count: int, short_begin: int):
+def branch_front(
+    layout: Sparse,
+    tasks: Tasks,
+    vals: fa,
+    residual: fa,
+    sol: fa,
+    piv: ia,
+    long_begin: int,
+    long_count: int,
+    short_begin: int,
+):
     tid = wp.tid()
     if tid < 128 * long_count:
         row = tasks.long_ids[long_begin + tid // 128]
@@ -1564,21 +1944,22 @@ def branch_front(layout: Sparse, tasks: Tasks, vals: fa, residual: fa, sol: fa, 
         row_front(layout, vals, sol, piv, row, tid & 31, _subst_rhs(residual, row, tid & 31))
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     __shared__ float ordered_chunks[16 * 6];
     return wp::array_t<float>(ordered_chunks, 16 * 6);
 #else
     return wp::array_t<float>();
 #endif
-''')
+""")
 def _branch_partials() -> fa:
     pass
 
 
 @wp.func
-def _branch_long_residual(layout: Sparse, tasks: Tasks, vals: fa, source: fa, sol: fa,
-                          index: int, local: int, upper: bool) -> float:
+def _branch_long_residual(
+    layout: Sparse, tasks: Tasks, vals: fa, source: fa, sol: fa, index: int, local: int, upper: bool
+) -> float:
     """Up to sixteen independent chunk sums at once; consume in original order."""
     row = tasks.long_ids[index]
     component = local & 7
@@ -1623,12 +2004,21 @@ def _branch_long_residual(layout: Sparse, tasks: Tasks, vals: fa, source: fa, so
 
 
 @wp.kernel
-def branch_update_forward(layout: Sparse, updates: Tasks, forwards: Tasks,
-                          vals: fa, rhs: fa, sol: fa,
-                          long_forward_begin: int, long_forward_count: int,
-                          long_update_begin: int, long_update_count: int,
-                          short_forward_begin: int, short_forward_count: int,
-                          short_update_begin: int):
+def branch_update_forward(
+    layout: Sparse,
+    updates: Tasks,
+    forwards: Tasks,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    long_forward_begin: int,
+    long_forward_count: int,
+    long_update_begin: int,
+    long_update_count: int,
+    short_forward_begin: int,
+    short_forward_count: int,
+    short_update_begin: int,
+):
     tid = wp.tid()
     after_long_forward = tid - 128 * long_forward_count
     after_long_update = after_long_forward - 1152 * long_update_count
@@ -1644,9 +2034,20 @@ def branch_update_forward(layout: Sparse, updates: Tasks, forwards: Tasks,
         lane = tid & 31
         idx = short_forward_begin + after_long_update // 32
         row = forwards.short_ids[idx]
-        result = _subst_entries(vals, sol, row, forwards.short_aux[idx], layout.cols, layout.cols,
-                                layout.rowptr[row], layout.rowptr[row + 1], _subst_rhs(rhs, row, lane),
-                                lane, False, False)
+        result = _subst_entries(
+            vals,
+            sol,
+            row,
+            forwards.short_aux[idx],
+            layout.cols,
+            layout.cols,
+            layout.rowptr[row],
+            layout.rowptr[row + 1],
+            _subst_rhs(rhs, row, lane),
+            lane,
+            False,
+            False,
+        )
         if lane < 6:
             sol[6 * row + lane] = result
     else:
@@ -1654,8 +2055,9 @@ def branch_update_forward(layout: Sparse, updates: Tasks, forwards: Tasks,
 
 
 @wp.kernel
-def branch_backward(layout: Sparse, tasks: Tasks, vals: fa, sol: fa,
-                    long_begin: int, long_count: int, short_begin: int):
+def branch_backward(
+    layout: Sparse, tasks: Tasks, vals: fa, sol: fa, long_begin: int, long_count: int, short_begin: int
+):
     tid = wp.tid()
     local = tid & 127
     lane = tid & 31
@@ -1667,23 +2069,32 @@ def branch_backward(layout: Sparse, tasks: Tasks, vals: fa, sol: fa,
             _subst_finish(vals, sol, row, layout.diag[row], result, lane, True)
     else:
         idx = short_begin + (tid - 128 * long_count) // 32
-        backward(vals, sol, tasks.short_ids[idx], tasks.short_aux[idx], layout.colptr, layout.rows,
-                 layout.slots, layout.diag, lane)
+        backward(
+            vals,
+            sol,
+            tasks.short_ids[idx],
+            tasks.short_aux[idx],
+            layout.colptr,
+            layout.rows,
+            layout.slots,
+            layout.diag,
+            lane,
+        )
 
 
 def branch_enabled(plan):
     """Use the pipelined launch layout for large leading schedules with both kinds of fan-in."""
-    cut = plan['leading_level_count']
-    if cut < 2 or plan['row_offsets'][cut] - plan['row_offsets'][0] < 512:
+    cut = plan.leading_level_count
+    if cut < 2 or plan.row_offsets[cut] - plan.row_offsets[0] < 512:
         return False
-    upd = plan['update']['fields']['long_offsets']
-    bwd = plan['backward']['fields']['long_offsets']
-    fwd = plan['forward']['fields']['long_offsets']
+    upd = plan.update.long_offsets
+    bwd = plan.backward.long_offsets
+    fwd = plan.forward.long_offsets
     return upd[cut] > upd[0] and bwd[cut] > bwd[0] and fwd[1] == fwd[0]
 
 
 def _branch_ranges(scheme, level):
-    shorts, longs, tasks = scheme
+    shorts, longs, _tasks = scheme
     return shorts[level], shorts[level + 1] - shorts[level], longs[level], longs[level + 1] - longs[level]
 
 
@@ -1691,27 +2102,50 @@ def branch_level(launch, layout, fwd, upd, bwd, vals, rhs, sol, piv, level, cut)
     short_row, short_rows, long_row, long_rows = _branch_ranges(bwd, level)
     residual = rhs if level == 0 else sol
     if long_rows:
-        launch(branch_front, 128 * long_rows + 32 * short_rows,
-               [layout, bwd[2], vals, residual, sol, piv, long_row, long_rows, short_row])
+        launch(
+            branch_front,
+            128 * long_rows + 32 * short_rows,
+            [layout, bwd.tasks, vals, residual, sol, piv, long_row, long_rows, short_row],
+        )
     else:
-        launch(first_front, 32 * short_rows, [layout, bwd[2], vals, residual, sol, piv, short_row])
+        launch(first_front, 32 * short_rows, [layout, bwd.tasks, vals, residual, sol, piv, short_row])
     short_dst, short_dsts, long_dst, long_dsts = _branch_ranges(upd, level)
     if level + 1 == cut:
-        launch_schur(launch, layout, upd[2], vals, short_dst, short_dsts, long_dst, long_dsts)
+        launch_schur(launch, layout, upd.tasks, vals, short_dst, short_dsts, long_dst, long_dsts)
         return
     short_fwd, short_fwds, long_fwd, long_fwds = _branch_ranges(fwd, level + 1)
-    launch(branch_update_forward, 128 * long_fwds + 1152 * long_dsts + 32 * short_fwds + 9 * short_dsts,
-           [layout, upd[2], fwd[2], vals, rhs, sol, long_fwd, long_fwds, long_dst, long_dsts,
-            short_fwd, short_fwds, short_dst])
+    launch(
+        branch_update_forward,
+        128 * long_fwds + 1152 * long_dsts + 32 * short_fwds + 9 * short_dsts,
+        [
+            layout,
+            upd.tasks,
+            fwd.tasks,
+            vals,
+            rhs,
+            sol,
+            long_fwd,
+            long_fwds,
+            long_dst,
+            long_dsts,
+            short_fwd,
+            short_fwds,
+            short_dst,
+        ],
+    )
 
 
 def branch_reverse(launch, layout, bwd, vals, sol, level):
     short_row, short_rows, long_row, long_rows = _branch_ranges(bwd, level)
     if not long_rows:
         return False
-    launch(branch_backward, 128 * long_rows + 32 * short_rows,
-           [layout, bwd[2], vals, sol, long_row, long_rows, short_row])
+    launch(
+        branch_backward,
+        128 * long_rows + 32 * short_rows,
+        [layout, bwd.tasks, vals, sol, long_row, long_rows, short_row],
+    )
     return True
+
 
 @wp.func
 def panel_rank6(residual: wp.spatial_vector, tile: fa, stage: int, lane: int, column_group: int):
@@ -1725,51 +2159,51 @@ def panel_rank6(residual: wp.spatial_vector, tile: fa, stage: int, lane: int, co
     return residual - sums
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return static_cast<int>(__ballot_sync(0xffffffffu, keep != 0));
 #else
     return keep;
 #endif
-''')
+""")
 def _small_ballot(keep: int) -> int:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __popc(static_cast<unsigned>(bits) & ((1u << lane) - 1u));
 #else
     return 0;
 #endif
-''')
+""")
 def _small_before(bits: int, lane: int) -> int:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __popc(static_cast<unsigned>(bits));
 #else
     return 0;
 #endif
-''')
+""")
 def _small_pop(bits: int) -> int:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __shfl_sync(0xffffffffu, value, source);
 #else
     return value;
 #endif
-''')
+""")
 def _small_broadcast(value: int, source: int) -> int:
     pass
 
 
-@wp.func_native('''
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     if (dst.strides[0] == sizeof(float) && src.strides[0] == sizeof(float) &&
         !((reinterpret_cast<size_t>(dst.data + di) | reinterpret_cast<size_t>(src.data + si)) & 15u)) {
@@ -1778,30 +2212,14 @@ def _small_broadcast(value: int, source: int) -> int:
     }
 #endif
     for (int k = 0; k < 4; ++k) wp::index(dst, di+k) = wp::index(src, si+k);
-''')
+""")
 def _small_copy4(dst: fa, di: int, src: fa, si: int):
     pass
 
 
-@wp.func
-def copy_quad(dest:fa, src:fa, index:int):
-    begin = 4*index
-    if begin+3 < dest.shape[0]:
-        _small_copy4(dest,begin,src,begin)
-    elif begin < dest.shape[0]:
-        for offset in range(begin,dest.shape[0]):
-            dest[offset] = src[offset]
-
-
 @wp.kernel
-def initialize_wide(values:fa, delta:fa, piv:ia, dest:fa, sol:fa, count:ia, marks:ia, size:int):
-    index = wp.tid()
-    copy_quad(dest,values,index)
-    copy_quad(sol,delta,index)
-    if index < count.shape[0]:
-        count[index] = piv[index]
-    if index < size:
-        marks[index] = 0
+def clear_slot_masks(lookup: ia):
+    lookup[wp.tid()] = 0
 
 
 @wp.func
@@ -1814,9 +2232,20 @@ def _small_rank(mapping: ia, index: int, span: int, total: int) -> int:
 
 
 @wp.func
-def small_stage(layout: Sparse, packed: Sparse, vals: fa, rhs: fa, sol: fa,
-                blocks: fa, vectors: fa, inverse: ia, base: int, start: int, stop: int,
-                tid: int) -> bool:
+def small_stage(
+    layout: Sparse,
+    packed: Sparse,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    blocks: fa,
+    vectors: fa,
+    inverse: ia,
+    base: int,
+    start: int,
+    stop: int,
+    tid: int,
+) -> bool:
     """Compact contiguous slot stripes, preserving CSR order and the gathered RHS split."""
     first = layout.levrow[start]
     last = layout.levrow[stop]
@@ -1831,8 +2260,15 @@ def small_stage(layout: Sparse, packed: Sparse, vals: fa, rhs: fa, sol: fa,
     update1 = layout.levupd[stop]
     term0 = layout.ptr[update0]
     terms = layout.ptr[update1] - term0
-    if (count > 32 or stop - start > 16 or span > 512 or edges > 128 or
-            update1 - update0 > 128 or terms > 256 or layout.levcol[stop] - column0 != edges):
+    if (
+        count > 32
+        or stop - start > 16
+        or span > 512
+        or edges > 128
+        or update1 - update0 > 128
+        or terms > 256
+        or layout.levcol[stop] - column0 != edges
+    ):
         return False
 
     mapping = small_ints(1285, 512)
@@ -1896,8 +2332,7 @@ def small_stage(layout: Sparse, packed: Sparse, vals: fa, rhs: fa, sol: fa,
         packed.rowptr[tid] = lower
         packed.diag[tid] = diagonal
         suffix = end - (upper - lower)
-        if (_small_rank(mapping, suffix, span, total) != lower or
-                diagonal < lower or diagonal != upper - 1):
+        if _small_rank(mapping, suffix, span, total) != lower or diagonal < lower or diagonal != upper - 1:
             bad = 1
         elif packed.cols[diagonal] != tid:
             bad = 1
@@ -1908,11 +2343,19 @@ def small_stage(layout: Sparse, packed: Sparse, vals: fa, rhs: fa, sol: fa,
             mapped = small_map(mapping, slot, slot0, slot1)
             packed.slots[edge] = mapped
             packed.rows[edge] = other
-            if (other <= tid or other >= count or mapped < 0 or
-                    layout.cslot[column0 + edge] != slot or layout.cdiag[column0 + edge] != layout.diag[row]):
+            if (
+                other <= tid
+                or other >= count
+                or mapped < 0
+                or layout.cslot[column0 + edge] != slot
+                or layout.cdiag[column0 + edge] != layout.diag[row]
+            ):
                 bad = 1
-            elif (packed.cols[mapped] != tid or slot < layout.rowptr[first + other] or
-                  slot >= layout.rowptr[first + other + 1]):
+            elif (
+                packed.cols[mapped] != tid
+                or slot < layout.rowptr[first + other]
+                or slot >= layout.rowptr[first + other + 1]
+            ):
                 bad = 1
     for entry in range(tid, update1 - update0 + 1, 128):
         task = update0 + entry
@@ -1941,8 +2384,9 @@ def group_front(packed: Sparse, blocks: fa, vectors: fa, piv: ia, row: int, lane
     begin = packed.rowptr[row]
     end = packed.diag[row]
     if begin < end:
-        residual = _subst_entries(blocks, vectors, row, 0, packed.cols, packed.cols,
-                                  begin, end, residual, lane, False, False)
+        residual = _subst_entries(
+            blocks, vectors, row, 0, packed.cols, packed.cols, begin, end, residual, lane, False, False
+        )
     row_front(packed, blocks, vectors, piv, row, lane, residual)
 
 
@@ -1999,8 +2443,10 @@ def small_sparse_tail(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, cut: 
 
     levels = stop - start
     count = packed.levrow[levels]
-    terminal = (packed.levupd[levels - 1] == packed.levupd[levels] and
-                packed.colptr[packed.levrow[levels - 1]] == packed.colptr[count])
+    terminal = (
+        packed.levupd[levels - 1] == packed.levupd[levels]
+        and packed.colptr[packed.levrow[levels - 1]] == packed.colptr[count]
+    )
     first = layout.levrow[start]
     lane = local & 31
     comp = local & 7
@@ -2031,6 +2477,7 @@ def small_sparse_tail(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, cut: 
             sync_block()
     for quad in range(local, 9 * packed.rowptr[count], 128):
         _small_copy4(vals, 36 * inverse[quad // 9] + 4 * (quad % 9), blocks, 4 * quad)
+
 
 @wp.func
 def lookahead_column(residual: wp.spatial_vector, group: int, lane: int, piv: ia, owner: bool):
@@ -2077,8 +2524,7 @@ def lookahead_store_row(data: fa, start: int, row: wp.spatial_vector):
 
 
 @wp.func
-def lookahead_strip(vals: fa, piv: ia, work: ia, pending: fa, size: int, panel: int,
-                    strip: int, local: int, tile: fa):
+def lookahead_strip(vals: fa, piv: ia, work: ia, pending: fa, size: int, panel: int, strip: int, local: int, tile: fa):
     group = local >> 5
     lane = local & 31
     width = wp.min(size - panel, 4)
@@ -2172,8 +2618,7 @@ def lookahead_prefix(vals: fa, work: ia, size: int, panel: int, block: int, loca
         prior = job // 9
         row_pair = (job % 9) // 3
         col_pair = job % 3
-        sums = lookahead_dot(vals, 36 * (left + prior) + 12 * row_pair,
-                             36 * (right + prior) + 12 * col_pair)
+        sums = lookahead_dot(vals, 36 * (left + prior) + 12 * row_pair, 36 * (right + prior) + 12 * col_pair)
         target = 36 * prior + 12 * row_pair + 2 * col_pair
         dots[target] = sums[0]
         dots[target + 1] = sums[1]
@@ -2187,8 +2632,9 @@ def lookahead_prefix(vals: fa, work: ia, size: int, panel: int, block: int, loca
 
 
 @wp.kernel
-def lookahead_factor_step(layout: Sparse, vals: fa, piv: ia, work: ia, pending: fa,
-                          cut: int, size: int, panel: int, strips: int):
+def lookahead_factor_step(
+    layout: Sparse, vals: fa, piv: ia, work: ia, pending: fa, cut: int, size: int, panel: int, strips: int
+):
     tid = wp.tid()
     cta = tid >> 7
     local = tid & 127
@@ -2215,43 +2661,38 @@ def lookahead_factor_step(layout: Sparse, vals: fa, piv: ia, work: ia, pending: 
 
 
 def panel_launch_factor(launch, layout, vals, piv, work, cut, size, device):
-    """Replace panel_pivot_column through panel_launch_factor in fast.py; keep panel_rank6 and run.
-
-    Same runtime dense_tail_size gate (8..48), map validation, 128-thread stream launches,
-    pending-front lifetime and substitution dispatch. Never combine this prefix schedule
-    with panel_far_tile: each future destination is prepared exactly once.
-    """
-    storage = torch.empty(4 * 24 * 6, device=device, dtype=torch.float32)
-    pending = wp.from_torch(storage, requires_grad=False)
+    """Factor the validated singleton tail in four-column panels."""
+    pending = wp.empty(4 * 24 * 6, dtype=float, device=device)
     launch(dense_tail_prepare, 128 * size, [layout, work, cut, size])
     for panel in range(0, size, 4):
         trailing = max(0, size - panel - 4)
         strips = max(1, trailing)
         width = min(4, trailing)
         ahead = width * trailing - width * (width - 1) // 2 if panel else 0
-        launch(lookahead_factor_step, 128 * (strips + ahead),
-               [layout, vals, piv, work, pending, cut, size, panel, strips])
+        launch(
+            lookahead_factor_step, 128 * (strips + ahead), [layout, vals, piv, work, pending, cut, size, panel, strips]
+        )
 
-@wp.func_native('''
+
+@wp.func_native("""
 #if defined(__CUDA_ARCH__)
     return __shfl_sync(0x7u << (threadIdx.x & 28u), value, source, 4);
 #else
     return value;
 #endif
-''')
+""")
 def _sback_share(value: float, source: int) -> float:
     pass
 
 
-@wp.func_native('return fmaf(coeff, weight, accum);')
+@wp.func_native("return fmaf(coeff, weight, accum);")
 def _sback_fma(coeff: float, weight: float, accum: float) -> float:
     pass
 
 
 @wp.func
 def _sback_axpy(coeff: wp.vec2, weight: float, accum: wp.vec2) -> wp.vec2:
-    return wp.vec2(_sback_fma(coeff[0], weight, accum[0]),
-                   _sback_fma(coeff[1], weight, accum[1]))
+    return wp.vec2(_sback_fma(coeff[0], weight, accum[0]), _sback_fma(coeff[1], weight, accum[1]))
 
 
 @wp.func
@@ -2277,15 +2718,16 @@ def _sback_dot(layout: Sparse, vals: fa, sol: fa, base: int, entry: int, column:
 
 
 @wp.func
-def _sback_solve_pair(residual: wp.vec2, even: float, odd_row: wp.vec2,
-                      inv_even: wp.float64, inv_odd: wp.float64) -> wp.vec2:
+def _sback_solve_pair(
+    residual: wp.vec2, even: float, odd_row: wp.vec2, inv_even: wp.float64, inv_odd: wp.float64
+) -> wp.vec2:
     odd = _front_quotient(residual[1], odd_row[1], inv_odd)
     updated = _sback_fma(odd_row[0], -odd, residual[0])
     return wp.vec2(_front_quotient(updated, even, inv_even), odd)
 
 
 @wp.func
-def reverse_local(layout:Sparse,vals:fa,sol:fa,forward_data:fa,base:int,row:int,pair:int):
+def reverse_local(layout: Sparse, vals: fa, sol: fa, forward_data: fa, base: int, row: int, pair: int):
     column = 2 * pair
     diag = 36 * layout.diag[row]
     entry = layout.colptr[row]
@@ -2334,6 +2776,7 @@ def reverse_local(layout:Sparse,vals:fa,sol:fa,forward_data:fa,base:int,row:int,
         solved = _sback_solve_pair(residual, even, odd_row, inv_even, inv_odd)
     return solved
 
+
 @wp.kernel
 def short_leading_back(layout: Sparse, tasks: Tasks, vals: fa, sol: fa, begin: int, count: int):
     """Three live lanes per four-thread group own column pairs (0,1), (2,3), (4,5)."""
@@ -2345,17 +2788,13 @@ def short_leading_back(layout: Sparse, tasks: Tasks, vals: fa, sol: fa, begin: i
     index = begin + work
     row = tasks.short_ids[index]
     base = tasks.short_aux[index]
-    solved = reverse_local(layout,vals,sol,sol,base,row,pair)
-    _front_store_pair(sol,6*row+2*pair,solved[0],solved[1])
+    solved = reverse_local(layout, vals, sol, sol, base, row, pair)
+    _front_store_pair(sol, 6 * row + 2 * pair, solved[0], solved[1])
 
 
 @wp.kernel
-def adjacent_state(src:fa, entry_delta:fa, entry_pivot:ia, vals:fa, sol:fa, piv:ia, lookup:ia, owner:ia, check:ia, slots:int):
+def clear_adjacent_workspace(lookup: ia, owner: ia, check: ia, slots: int):
     index = wp.tid()
-    copy_quad(vals,src,index)
-    copy_quad(sol,entry_delta,index)
-    if index < piv.shape[0]:
-        piv[index] = entry_pivot[index]
     if index < slots:
         lookup[index] = 0
     if index < owner.shape[0]:
@@ -2365,142 +2804,229 @@ def adjacent_state(src:fa, entry_delta:fa, entry_pivot:ia, vals:fa, sol:fa, piv:
 
 
 @wp.kernel
-def adjacent_symbolic(layout:Sparse,rows:Tasks,updates:Tasks,lookup:ia,owner:ia,check:ia,slots:int,cut:int,arts:int,
-                      row_ends:level_marks,update_ends:level_marks,row_begin:int,update_begin:int,update_count:int):
+def adjacent_symbolic(
+    layout: Sparse,
+    rows: Tasks,
+    updates: Tasks,
+    lookup: ia,
+    owner: ia,
+    check: ia,
+    slots: int,
+    cut: int,
+    arts: int,
+    row_ends: level_marks,
+    update_ends: level_marks,
+    row_begin: int,
+    update_begin: int,
+    update_count: int,
+):
     index = wp.tid()
     if index < update_count:
         task = index + update_begin
         level = int(0)
-        while level+1 < cut and task >= update_ends[level]:
+        while level + 1 < cut and task >= update_ends[level]:
             level += 1
         ident = updates.short_ids[task]
         slot = layout.dest[ident]
-        lookup[(level+1)*slots+slot] = ident
-        wp.atomic_or(lookup,slot,1<<level)
+        lookup[(level + 1) * slots + slot] = ident
+        wp.atomic_or(lookup, slot, 1 << level)
     else:
-        task = index-update_count+row_begin
+        task = index - update_count + row_begin
         level = int(0)
-        while level+1 < cut and task >= row_ends[level]:
+        while level + 1 < cut and task >= row_ends[level]:
             level += 1
-        if (level & 1) == 0 and level+1 < cut:
+        if (level & 1) == 0 and level + 1 < cut:
             row = rows.short_ids[task]
             base = rows.short_aux[task]
             art = int(0)
             stop = arts
-            while art+1 < stop:
-                middle = (art+stop)//2
+            while art + 1 < stop:
+                middle = (art + stop) // 2
                 if layout.base[middle] <= row:
                     art = middle
                 else:
                     stop = middle
-            end = layout.artlev[art+1]
-            lower = layout.levrow[wp.min(end,layout.artlev[art]+level+1)]
-            upper = layout.levrow[wp.min(end,layout.artlev[art]+level+2)]
+            end = layout.artlev[art + 1]
+            lower = layout.levrow[wp.min(end, layout.artlev[art] + level + 1)]
+            upper = layout.levrow[wp.min(end, layout.artlev[art] + level + 2)]
             parent = int(-1)
-            for edge in range(layout.colptr[row],layout.colptr[row+1]):
+            for edge in range(layout.colptr[row], layout.colptr[row + 1]):
                 other = base + layout.rows[edge]
                 if lower <= other and other < upper:
                     if parent != -1:
-                        wp.atomic_or(check,level//2,1)
+                        wp.atomic_or(check, level // 2, 1)
                     parent = other
             owner[row] = parent
 
 
 @wp.func
-def adjacent_row(layout:Sparse,vals:fa,rhs:fa,sol:fa,piv:ia,lookup:ia,slots:int,base:int,row:int,tid:int,level:int,reverse:bool):
+def adjacent_row(
+    layout: Sparse,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    piv: ia,
+    lookup: ia,
+    slots: int,
+    base: int,
+    row: int,
+    tid: int,
+    level: int,
+    reverse: bool,
+):
     lane = tid & 31
     if reverse:
-        backward(vals,sol,row,base,layout.colptr,layout.rows,layout.slots,layout.diag,lane)
+        backward(vals, sol, row, base, layout.colptr, layout.rows, layout.slots, layout.diag, lane)
     elif level == 0:
-        row_front(layout,vals,sol,piv,row,lane,_subst_rhs(rhs,row,lane))
+        row_front(layout, vals, sol, piv, row, lane, _subst_rhs(rhs, row, lane))
     else:
-        tile_assemble(layout,vals,rhs,sol,piv,lookup,slots,row,base,tid)
+        tile_assemble(layout, vals, rhs, sol, piv, lookup, slots, row, base, tid)
 
 
 @wp.kernel
-def adjacent_band(layout:Sparse,rows:Tasks,vals:fa,rhs:fa,sol:fa,piv:ia,lookup:ia,owner:ia,check:ia,slots:int,
-                  begin:int,middle:int,end:int,level:int,reverse:int):
+def adjacent_band(
+    layout: Sparse,
+    rows: Tasks,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    piv: ia,
+    lookup: ia,
+    owner: ia,
+    check: ia,
+    slots: int,
+    begin: int,
+    middle: int,
+    end: int,
+    level: int,
+    reverse: int,
+):
     tid = wp.tid()
-    block = tid>>7
-    warp = (tid>>5)&3
+    block = tid >> 7
+    warp = (tid >> 5) & 3
     revert = reverse != 0
-    if check[level//2] != 0:
+    if check[level // 2] != 0:
         if block == 0:
             for step in range(2):
                 upper = (revert and step == 0) or (not revert and step == 1)
-                for index in range(wp.where(upper,middle,begin)+warp,wp.where(upper,end,middle),4):
-                    adjacent_row(layout,vals,rhs,sol,piv,lookup,slots,rows.short_aux[index],rows.short_ids[index],tid,level+int(upper),revert)
+                for index in range(wp.where(upper, middle, begin) + warp, wp.where(upper, end, middle), 4):
+                    adjacent_row(
+                        layout,
+                        vals,
+                        rhs,
+                        sol,
+                        piv,
+                        lookup,
+                        slots,
+                        rows.short_aux[index],
+                        rows.short_ids[index],
+                        tid,
+                        level + int(upper),
+                        revert,
+                    )
                 sync_block()
-    elif block < end-middle:
-        index = middle+block
+    elif block < end - middle:
+        index = middle + block
         base = rows.short_aux[index]
         parent = rows.short_ids[index]
         if revert:
             if warp == 0:
-                adjacent_row(layout,vals,rhs,sol,piv,lookup,slots,base,parent,tid,level+1,True)
+                adjacent_row(layout, vals, rhs, sol, piv, lookup, slots, base, parent, tid, level + 1, True)
             sync_block()
-        for slot in range(layout.rowptr[parent]+warp,layout.rowptr[parent+1],4):
-            child = base+layout.cols[slot]
+        for slot in range(layout.rowptr[parent] + warp, layout.rowptr[parent + 1], 4):
+            child = base + layout.cols[slot]
             if owner[child] == parent:
-                adjacent_row(layout,vals,rhs,sol,piv,lookup,slots,base,child,tid,level,revert)
+                adjacent_row(layout, vals, rhs, sol, piv, lookup, slots, base, child, tid, level, revert)
         if not revert:
             sync_block()
             if warp == 0:
-                adjacent_row(layout,vals,rhs,sol,piv,lookup,slots,base,parent,tid,level+1,False)
+                adjacent_row(layout, vals, rhs, sol, piv, lookup, slots, base, parent, tid, level + 1, False)
     else:
-        index = begin+4*(block-end+middle)+warp
+        index = begin + 4 * (block - end + middle) + warp
         if index < middle:
             row = rows.short_ids[index]
             if owner[row] < 0:
-                adjacent_row(layout,vals,rhs,sol,piv,lookup,slots,rows.short_aux[index],row,tid,level,revert)
+                adjacent_row(layout, vals, rhs, sol, piv, lookup, slots, rows.short_aux[index], row, tid, level, revert)
 
 
-def adjacent_launch(launch,plan,layout,fwd,upd,bwd,copies,rhs,initial_dim,device):
-    cut = plan['leading_level_count']
-    levels = plan['level_count']
-    arts = plan['articulation_count']
-    widths = plan['rows_per_level']
-    if (not 6 <= cut <= 16 or cut>levels or arts<1 or len(widths)!=levels or
-            levels-cut > 16 or sum(widths[cut:])>32*arts or plan['tail_split_entries']>0 or dense_tail_size(plan,cut)>=8):
+def adjacent_launch(launch, plan, layout, fwd, upd, bwd, vals, rhs, sol, piv, slots, device):
+    cut = plan.leading_level_count
+    levels = plan.level_count
+    arts = plan.articulation_count
+    widths = plan.rows_per_level
+    if (
+        not 6 <= cut <= 16
+        or cut > levels
+        or arts < 1
+        or len(widths) != levels
+        or levels - cut > 16
+        or sum(widths[cut:]) > 32 * arts
+        or plan.tail_split_entries > 0
+        or dense_tail_size(plan, cut) >= 8
+    ):
         return False
-    if any(scheme[1][cut] != scheme[1][0] for scheme in (fwd,upd,bwd)):
+    if any(scheme.long_offsets[cut] != scheme.long_offsets[0] for scheme in (fwd, upd, bwd)):
         return False
-    if any(fwd[0][level+1]-fwd[0][level]!=widths[level] for level in range(cut)):
+    if any(fwd.short_offsets[level + 1] - fwd.short_offsets[level] != widths[level] for level in range(cut)):
         return False
-    vals,sol,piv = copies[3:]
-    slots = vals.shape[0]//36
     rows = layout.diag.shape[0]
-    bands = (cut+1)//2
-    scratch = torch.empty((cut+1)*slots+rows+bands,dtype=torch.int32,device=device)
-    mask_limit = (cut+1)*slots
-    lookup = wp.from_torch(scratch[:mask_limit],requires_grad=False)
-    owner = wp.from_torch(scratch[mask_limit:mask_limit+rows],requires_grad=False)
-    check = wp.from_torch(scratch[mask_limit+rows:],requires_grad=False)
-    launch(adjacent_state,max(initial_dim,rows,bands),[*copies,lookup,owner,check,slots])
+    bands = (cut + 1) // 2
+    lookup = wp.empty((cut + 1) * slots, dtype=wp.int32, device=device)
+    owner = wp.empty(rows, dtype=wp.int32, device=device)
+    check = wp.empty(bands, dtype=wp.int32, device=device)
+    launch(clear_adjacent_workspace, max(slots, rows, bands), [lookup, owner, check, slots])
+
     def bounds(scheme):
-        return level_marks(*(list(scheme[0][1:cut+1])+[0]*(16-cut)))
-    first = fwd[0][0]
-    update_count = upd[0][cut]-upd[0][0]
-    launch(adjacent_symbolic,update_count+fwd[0][cut]-first,[layout,fwd[2],upd[2],lookup,owner,check,slots,cut,arts,bounds(fwd),bounds(upd),first,upd[0][0],update_count])
-    def band(level,reverse):
-        begin = fwd[0][level]
-        middle = fwd[0][level+1]
-        end = fwd[0][min(level+2,cut)]
-        launch(adjacent_band,128*(end-middle+(middle-begin+3)//4),[layout,fwd[2],vals,rhs,sol,piv,lookup,owner,check,slots,begin,middle,end,level,reverse])
-    for level in range(0,cut,2):
-        band(level,0)
-    if cut<levels:
-        width = min(32,sum(widths[cut:]))
-        launch(indexed_boundary,32*arts*width,[layout,vals,rhs,sol,lookup,slots,width,cut])
-        launch(small_sparse_tail,128*arts,[layout,vals,rhs,sol,piv,cut])
-    for level in reversed(range(0,cut,2)):
-        band(level,1)
+        return level_marks(*(list(scheme.short_offsets[1 : cut + 1]) + [0] * (16 - cut)))
+
+    first = fwd.short_offsets[0]
+    update_count = upd.short_offsets[cut] - upd.short_offsets[0]
+    launch(
+        adjacent_symbolic,
+        update_count + fwd.short_offsets[cut] - first,
+        [
+            layout,
+            fwd.tasks,
+            upd.tasks,
+            lookup,
+            owner,
+            check,
+            slots,
+            cut,
+            arts,
+            bounds(fwd),
+            bounds(upd),
+            first,
+            upd.short_offsets[0],
+            update_count,
+        ],
+    )
+
+    def band(level, reverse):
+        begin = fwd.short_offsets[level]
+        middle = fwd.short_offsets[level + 1]
+        end = fwd.short_offsets[min(level + 2, cut)]
+        launch(
+            adjacent_band,
+            128 * (end - middle + (middle - begin + 3) // 4),
+            [layout, fwd.tasks, vals, rhs, sol, piv, lookup, owner, check, slots, begin, middle, end, level, reverse],
+        )
+
+    for level in range(0, cut, 2):
+        band(level, 0)
+    if cut < levels:
+        width = min(32, sum(widths[cut:]))
+        launch(indexed_boundary, 32 * arts * width, [layout, vals, rhs, sol, lookup, slots, width, cut])
+        launch(small_sparse_tail, 128 * arts, [layout, vals, rhs, sol, piv, cut])
+    for level in reversed(range(0, cut, 2)):
+        band(level, 1)
     return True
 
 
 @wp.func
-def _wave_strip(vals: fa, piv: ia, work: ia, incoming: fa, outgoing: fa, size: int, panel: int,
-                    strip: int, local: int, tile: fa):
+def _wave_strip(
+    vals: fa, piv: ia, work: ia, incoming: fa, outgoing: fa, size: int, panel: int, strip: int, local: int, tile: fa
+):
     group = local >> 5
     lane = local & 31
     width = wp.min(size - panel, 4)
@@ -2553,35 +3079,38 @@ def _wave_strip(vals: fa, piv: ia, work: ia, incoming: fa, outgoing: fa, size: i
 
 
 @wp.func
-def _wave_boundary(layout:Sparse,vals:fa,rhs:fa,sol:fa,work:ia,boundary:fa,cut:int,size:int,split:int,tid:int):
+def _wave_boundary(
+    layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary: fa, cut: int, size: int, split: int, tid: int
+):
     local = tid & 127
-    component = (tid >> 7)%6
-    index = tid//(6*128)
-    first = layout.levrow[layout.artlev[0]+cut]
-    row = first+index
+    component = (tid >> 7) % 6
+    index = tid // (6 * 128)
+    first = layout.levrow[layout.artlev[0] + cut]
+    row = first + index
     base = layout.base[0]
     head = layout.rowptr[row]
-    end = work[1+index*size]
-    if split>0 and end-head+index+1 > split:
-        partial = float(0.)
-        for entry in range(head+local,end,128):
-            partial += external_dot(layout,vals,sol,base,entry,component)
+    end = work[1 + index * size]
+    if split > 0 and end - head + index + 1 > split:
+        partial = float(0.0)
+        for entry in range(head + local, end, 128):
+            partial += external_dot(layout, vals, sol, base, entry, component)
         boundary[tid] = partial
-    elif local<32:
-        result = rhs[6*row+component]
-        for block in range(head,end,32):
-            term = float(0.)
-            if block+local<end:
-                term = external_dot(layout,vals,sol,base,block+local,component)
-            for lane in range(wp.min(32,end-block)):
-                result -= shfl(term,lane)
+    elif local < 32:
+        result = rhs[6 * row + component]
+        for block in range(head, end, 32):
+            term = float(0.0)
+            if block + local < end:
+                term = external_dot(layout, vals, sol, base, block + local, component)
+            for lane in range(wp.min(32, end - block)):
+                result -= shfl(term, lane)
         if local == 0:
             boundary[tid] = result
 
 
 @wp.func
-def _wave_sparse_solve(layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: fa,
-                          cut: int, split: int, orig_threads: int, tid: int):
+def _wave_sparse_solve(
+    layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: fa, cut: int, split: int, orig_threads: int, tid: int
+):
     """After all factors are published, use the original CSR/CSC substitution ordering."""
     lane = tid & 31
     group = tid >> 5
@@ -2597,8 +3126,20 @@ def _wave_sparse_solve(layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: fa,
         if split > 0:
             for row in range(first, last):
                 if layout.rowptr[row + 1] - layout.rowptr[row] > split:
-                    forward_split(vals, rhs, sol, row, base, layout.rowptr, layout.cols, layout.diag,
-                                  scratch, 0, orig_threads, tid)
+                    forward_split(
+                        vals,
+                        rhs,
+                        sol,
+                        row,
+                        base,
+                        layout.rowptr,
+                        layout.cols,
+                        layout.diag,
+                        scratch,
+                        0,
+                        orig_threads,
+                        tid,
+                    )
         sync_block()
     for reverse in range(stop - start):
         level = stop - reverse - 1
@@ -2610,15 +3151,41 @@ def _wave_sparse_solve(layout: Sparse, vals: fa, rhs: fa, sol: fa, scratch: fa,
         if split > 0:
             for row in range(first, last):
                 if layout.colptr[row + 1] - layout.colptr[row] > split:
-                    backward_split(vals, sol, row, base, layout.colptr, layout.rows, layout.slots, layout.diag,
-                                   scratch, 0, orig_threads, tid)
+                    backward_split(
+                        vals,
+                        sol,
+                        row,
+                        base,
+                        layout.colptr,
+                        layout.rows,
+                        layout.slots,
+                        layout.diag,
+                        scratch,
+                        0,
+                        orig_threads,
+                        tid,
+                    )
         sync_block()
 
 
 @wp.func
-def _wave_forward(layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary: fa,
-                  incoming: fa, tile: fa, state: fa, first: int, size: int, split: int,
-                  panel: int, local: int, published: bool):
+def _wave_forward(
+    layout: Sparse,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    work: ia,
+    boundary: fa,
+    incoming: fa,
+    tile: fa,
+    state: fa,
+    first: int,
+    size: int,
+    split: int,
+    panel: int,
+    local: int,
+    published: bool,
+):
     """Solve one panel. Older wings are final; the immediate panel core may still be private."""
     component = wp.min(local >> 4, 5)
     member = local & 15
@@ -2657,7 +3224,9 @@ def _wave_forward(layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary
                 if other < row:
                     value += staged_term(tile, state, 0, other, component, False)
                 partial[stripe] = value
-            subtotal = ((partial[0]+partial[4])+(partial[2]+partial[6])) + ((partial[1]+partial[5])+(partial[3]+partial[7]))
+            subtotal = ((partial[0] + partial[4]) + (partial[2] + partial[6])) + (
+                (partial[1] + partial[5]) + (partial[3] + partial[7])
+            )
             for stage in range(4):
                 subtotal += shfl(subtotal, lane ^ (8 >> stage))
             residual = rhs[6 * (first + row) + component] - subtotal
@@ -2673,9 +3242,23 @@ def _wave_forward(layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary
 
 
 @wp.kernel
-def _wave_step(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, work: ia, boundary: fa,
-               incoming: fa, outgoing: fa, cut: int, size: int, split: int,
-               panel: int, strips: int, side: int):
+def _wave_step(
+    layout: Sparse,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    piv: ia,
+    work: ia,
+    boundary: fa,
+    incoming: fa,
+    outgoing: fa,
+    cut: int,
+    size: int,
+    split: int,
+    panel: int,
+    strips: int,
+    side: int,
+):
     tid = wp.tid()
     block = tid >> 7
     local = tid & 127
@@ -2703,13 +3286,39 @@ def _wave_step(layout: Sparse, vals: fa, rhs: fa, sol: fa, piv: ia, work: ia, bo
         _wave_boundary(layout, vals, rhs, sol, work, boundary, cut, size, split, tid - 128 * side)
     else:
         first = layout.levrow[layout.artlev[0] + cut]
-        _wave_forward(layout, vals, rhs, sol, work, boundary, incoming, tile, sub_tile(),
-                      first, size, split, panel - 4, local, False)
+        _wave_forward(
+            layout,
+            vals,
+            rhs,
+            sol,
+            work,
+            boundary,
+            incoming,
+            tile,
+            sub_tile(),
+            first,
+            size,
+            split,
+            panel - 4,
+            local,
+            False,
+        )
 
 
 @wp.kernel
-def _wave_finish(layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary: fa,
-                 scratch: fa, cut: int, size: int, split: int, last_panel: int):
+def _wave_finish(
+    layout: Sparse,
+    vals: fa,
+    rhs: fa,
+    sol: fa,
+    work: ia,
+    boundary: fa,
+    scratch: fa,
+    cut: int,
+    size: int,
+    split: int,
+    last_panel: int,
+):
     local = wp.tid()
     if work[0] == 0:
         _wave_sparse_solve(layout, vals, rhs, sol, scratch, cut, split, 128, local)
@@ -2717,8 +3326,9 @@ def _wave_finish(layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary:
         first = layout.levrow[layout.artlev[0] + cut]
         factors = substitution_stage()
         state = sub_tile()
-        _wave_forward(layout, vals, rhs, sol, work, boundary, vals, factors, state, first,
-                      size, split, last_panel, local, True)
+        _wave_forward(
+            layout, vals, rhs, sol, work, boundary, vals, factors, state, first, size, split, last_panel, local, True
+        )
         substitution_run(layout, vals, rhs, boundary, work, first, size, split, factors, state, local, True)
         for scalar in range(local, 6 * size, 128):
             sol[6 * first + scalar] = state[scalar]
@@ -2726,12 +3336,13 @@ def _wave_finish(layout: Sparse, vals: fa, rhs: fa, sol: fa, work: ia, boundary:
 
 def dense_wave_launch(launch, plan, layout, vals, rhs, sol, piv, scratch, cut, size, device):
     """The caller's dense_tail_size gate ensures one articulation and 8..48 singleton levels."""
-    def floats(count):
-        return wp.from_torch(torch.empty(count, device=device, dtype=torch.float32), requires_grad=False)
 
-    work = wp.from_torch(torch.empty(1 + size * size, device=device, dtype=torch.int32), requires_grad=False)
-    split = plan['tail_split_entries']
-    threads = plan['tail_block_dim']
+    def floats(count):
+        return wp.empty(count, dtype=float, device=device)
+
+    work = wp.empty(1 + size * size, dtype=wp.int32, device=device)
+    split = plan.tail_split_entries
+    threads = plan.tail_block_dim
     if threads != 128:
         panel_launch_factor(launch, layout, vals, piv, work, cut, size, device)
         launch(dense_tail_substitute, 128, [layout, vals, rhs, sol, scratch, cut, split, threads])
@@ -2747,133 +3358,244 @@ def dense_wave_launch(launch, plan, layout, vals, rhs, sol, piv, scratch, cut, s
         ahead = width * trailing - width * (width - 1) // 2 if panel else 0
         side = strips + ahead
         blocks = side + (1 if panel else 6 * size)
-        launch(_wave_step, 128 * blocks, [layout, vals, rhs, sol, piv, work, boundary, incoming,
-                                          outgoing, cut, size, split, panel, strips, side])
+        launch(
+            _wave_step,
+            128 * blocks,
+            [layout, vals, rhs, sol, piv, work, boundary, incoming, outgoing, cut, size, split, panel, strips, side],
+        )
         incoming, outgoing = outgoing, incoming
-    launch(_wave_finish, 128, [layout, vals, rhs, sol, work, boundary, scratch, cut, size, split,
-                               ((size - 1) // 4) * 4])
+    launch(
+        _wave_finish, 128, [layout, vals, rhs, sol, work, boundary, scratch, cut, size, split, ((size - 1) // 4) * 4]
+    )
 
 
-def run(plan_rows, plan_columns, plan_update_short, plan_update_short_aux, plan_update_long, plan_update_long_chunk_offsets, plan_update_chunk_owner, plan_update_chunk_aux, plan_update_chunk_begin, plan_update_chunk_end, plan_update_partial, plan_forward_short, plan_forward_short_aux, plan_forward_long, plan_forward_long_chunk_offsets, plan_forward_chunk_owner, plan_forward_chunk_aux, plan_forward_chunk_begin, plan_forward_chunk_end, plan_forward_partial, plan_backward_short, plan_backward_short_aux, plan_backward_long, plan_backward_long_chunk_offsets, plan_backward_chunk_owner, plan_backward_chunk_aux, plan_backward_chunk_begin, plan_backward_chunk_end, plan_backward_partial, plan_tail_partial, layout_articulation_body_offsets, layout_articulation_block_row_offsets, layout_articulation_block_cols, layout_articulation_block_col_offsets, layout_articulation_block_col_rows, layout_articulation_block_col_slots, layout_articulation_diag_slots, layout_levels_articulation_level_offsets, layout_levels_level_body_offsets, layout_levels_level_column_offsets, layout_levels_level_column_slots, layout_levels_level_column_diag_slots, layout_levels_level_update_offsets, layout_levels_level_update_dst_slots, layout_levels_level_update_term_offsets, layout_levels_level_update_left_slots, layout_levels_level_update_right_slots, values, rhs, delta, pivot_clamped, dispatch, out_values, out_delta, out_pivot_clamped):
-    tensors = locals().copy()
-    device = values.device
-    stream = wp.get_stream(str(device))
-    params = json.loads(dispatch)['params']
-    plan = params['plan']['fields']
-    sparse = params['layout']['fields']
-    levels = sparse['levels']['fields']
+class _Buffer(Enum):
+    VALUES = 0
+    RHS = 1
+    DELTA = 2
+    PIVOT_CLAMPED = 3
 
-    def view(name):
-        return wp.from_torch(tensors[name],requires_grad=False)
 
-    def bind(obj):
-        return view(obj['array'])
+class _Phase(NamedTuple):
+    short_offsets: list[int]
+    long_offsets: list[int]
+    tasks: Tasks
 
-    layout = Sparse()
-    for field, key in [('base','body_offsets'),('rowptr','block_row_offsets'),('cols','block_cols'),('colptr','block_col_offsets'),('rows','block_col_rows'),('slots','block_col_slots'),('diag','diag_slots')]:
-        setattr(layout,field,bind(sparse['articulation_'+key]))
-    for field,key in [('artlev','articulation_level_offsets'),('levrow','level_body_offsets'),('levcol','level_column_offsets'),('levupd','level_update_offsets'),('cslot','level_column_slots'),('cdiag','level_column_diag_slots'),('dest','level_update_dst_slots'),('ptr','level_update_term_offsets'),('left','level_update_left_slots'),('right','level_update_right_slots')]:
-        setattr(layout,field,bind(levels[key]))
-    def phase(name):
-        fields = plan[name]['fields']
-        tasks = Tasks()
-        for key in ('short','short_aux','long','long_chunk_offsets','chunk_begin','chunk_end','chunk_aux'):
-            setattr(tasks,key+'_ids' if key in ('short','long') else key,bind(fields[key]))
-        return fields['short_offsets'],fields['long_offsets'],tasks
-    fwd, upd, bwd = (phase(name) for name in ('forward','update','backward'))
-    val, sol, piv = (view(name) for name in ('out_values','out_delta','out_pivot_clamped'))
-    b = bind(params['rhs'])
-    tmp = bind(plan['tail_partial'])
-    def launch(kernel, dim, args):
+
+def _bind_phase(phase: "LevelLaunchPhaseTasks") -> _Phase:
+    tasks = Tasks()
+    tasks.short_ids = phase.short
+    tasks.short_aux = phase.short_aux
+    tasks.long_ids = phase.long
+    tasks.long_chunk_offsets = phase.long_chunk_offsets
+    tasks.chunk_begin = phase.chunk_begin
+    tasks.chunk_end = phase.chunk_end
+    tasks.chunk_aux = phase.chunk_aux
+    return _Phase(phase.short_offsets, phase.long_offsets, tasks)
+
+
+@dataclass
+class WarpLevelSchedule:
+    """Kernel arguments fixed by a layout, with slots for the four per-call arrays."""
+
+    layout: "RigidArticulationSparseLayout"
+    commands: list
+
+    def launch(self, values, rhs, delta, pivot_clamped, device):
+        buffers = (values, rhs, delta, pivot_clamped)
+        for kernel, dim, arguments, bindings in self.commands:
+            inputs = arguments.copy()
+            for index, buffer in bindings:
+                inputs[index] = buffers[buffer]
+            wp.launch(kernel, dim=dim, inputs=inputs, device=device, block_dim=128)
+
+
+def build_warp_schedule(
+    plan: "RigidArticulationLevelLaunchPlan", layout: "RigidArticulationSparseLayout", device: "wp.context.Devicelike"
+) -> WarpLevelSchedule:
+    schedule = WarpLevelSchedule(layout, [])
+    sparse = Sparse()
+    sparse.base = layout.articulation_body_offsets
+    sparse.rowptr = layout.articulation_block_row_offsets
+    sparse.cols = layout.articulation_block_cols
+    sparse.colptr = layout.articulation_block_col_offsets
+    sparse.rows = layout.articulation_block_col_rows
+    sparse.slots = layout.articulation_block_col_slots
+    sparse.diag = layout.articulation_diag_slots
+    levels = layout.levels
+    sparse.artlev = levels.articulation_level_offsets
+    sparse.levrow = levels.level_body_offsets
+    sparse.levcol = levels.level_column_offsets
+    sparse.levupd = levels.level_update_offsets
+    sparse.cslot = levels.level_column_slots
+    sparse.cdiag = levels.level_column_diag_slots
+    sparse.dest = levels.level_update_dst_slots
+    sparse.ptr = levels.level_update_term_offsets
+    sparse.left = levels.level_update_left_slots
+    sparse.right = levels.level_update_right_slots
+
+    def record(kernel, dim, args):
         if dim:
-            wp.launch(kernel,dim=dim,inputs=args,device=val.device,stream=stream,block_dim=128)
+            bindings = [(index, arg.value) for index, arg in enumerate(args) if isinstance(arg, _Buffer)]
+            schedule.commands.append((kernel, dim, args, bindings))
+
+    _schedule_launches(record, plan, sparse, device)
+    return schedule
+
+
+def _schedule_launches(launch, plan, layout, device):
+    fwd, upd, bwd = (_bind_phase(phase) for phase in (plan.forward, plan.update, plan.backward))
+    val, b, sol, piv = _Buffer
+    tmp = plan.tail_partial
+    # Only block slots described by the sparse layout can occur in its Schur tasks.
+    slots = layout.cols.shape[0]
+
     def scheduled(kernel, scheme, level, buffers):
-        short,long,tasks = scheme
+        short, long, tasks = scheme
         first = short[level]
-        size = short[level+1]-first
+        size = short[level + 1] - first
         long_first = long[level]
-        total = size+long[level+1]-long_first
+        total = size + long[level + 1] - long_first
         if kernel is apply_updates:
-            long_count = long[level+1]-long_first
-            launch_schur(launch,layout,tasks,buffers[0],first,size,long_first,long_count)
+            long_count = long[level + 1] - long_first
+            launch_schur(launch, layout, tasks, buffers[0], first, size, long_first, long_count)
             return
-        if kernel is eliminate and upd[1][level+1] > upd[1][level]:
-            launch(broad_front,128*total,[layout,tasks,*buffers,first,size,long_first])
+        if kernel is eliminate and upd.long_offsets[level + 1] > upd.long_offsets[level]:
+            launch(broad_front, 128 * total, [layout, tasks, *buffers, first, size, long_first])
             return
-        launch(kernel, 32*total,[layout,tasks,*buffers,first,size,long_first])
-    cut = plan['leading_level_count']
-    arts = plan['articulation_count']
-    widths = plan['rows_per_level']
-    if arts>0 and len(widths)==plan['level_count'] and plan['tail_split_entries']<=0 and 0<cut<6:
-        while cut>0 and widths[cut-1]<=4*arts and len(widths)-cut+1<=16 and sum(widths[cut-1:])<=32*arts:
-            if any(scheme[1][cut-1]!=scheme[1][cut] for scheme in (fwd,upd,bwd)) or dense_tail_size(plan,cut-1)>=8:
+        launch(kernel, 32 * total, [layout, tasks, *buffers, first, size, long_first])
+
+    cut = plan.leading_level_count
+    arts = plan.articulation_count
+    widths = plan.rows_per_level
+    if arts > 0 and len(widths) == plan.level_count and plan.tail_split_entries <= 0 and 0 < cut < 6:
+        while (
+            cut > 0
+            and widths[cut - 1] <= 4 * arts
+            and len(widths) - cut + 1 <= 16
+            and sum(widths[cut - 1 :]) <= 32 * arts
+        ):
+            if (
+                any(scheme.long_offsets[cut - 1] != scheme.long_offsets[cut] for scheme in (fwd, upd, bwd))
+                or dense_tail_size(plan, cut - 1) >= 8
+            ):
                 break
             cut -= 1
-    tail_rows = plan['rows_per_level'][cut:]
-    gather = (cut < plan['level_count'] and arts > 0 and len(tail_rows) <= 16 and
-              len(plan['rows_per_level']) == plan['level_count'] and
-              plan['tail_split_entries']<=0 and sum(tail_rows)<=32*arts and dense_tail_size(plan,cut)<8)
-    width = min(32,sum(tail_rows)) if gather else 0
+    tail_rows = plan.rows_per_level[cut:]
+    gather = (
+        cut < plan.level_count
+        and arts > 0
+        and len(tail_rows) <= 16
+        and len(plan.rows_per_level) == plan.level_count
+        and plan.tail_split_entries <= 0
+        and sum(tail_rows) <= 32 * arts
+        and dense_tail_size(plan, cut) < 8
+    )
+    width = min(32, sum(tail_rows)) if gather else 0
     branched = branch_enabled(plan) and not gather
-    indexed = (width>0 and 6 <= cut <= 16 and fwd[1][cut] == fwd[1][0] and upd[1][cut] == upd[1][0]
-               and bwd[1][cut] == bwd[1][0])
-    copies = [view('values'),view('delta'),view('pivot_clamped'),val,sol,piv]
-    initial_dim = max((out_values.numel()+3)//4,(out_delta.numel()+3)//4,out_pivot_clamped.numel())
-    if adjacent_launch(launch,plan,layout,fwd,upd,bwd,copies,b,initial_dim,device):
+    indexed = (
+        width > 0
+        and 6 <= cut <= 16
+        and fwd.long_offsets[cut] == fwd.long_offsets[0]
+        and upd.long_offsets[cut] == upd.long_offsets[0]
+        and bwd.long_offsets[cut] == bwd.long_offsets[0]
+    )
+    if adjacent_launch(launch, plan, layout, fwd, upd, bwd, val, b, sol, piv, slots, device):
         return
     if indexed:
-        slots = out_values.numel()//36
-        index_storage = torch.empty((cut+1)*slots,device=device,dtype=torch.int32)
-        lookup = wp.from_torch(index_storage,requires_grad=False)
-        launch(initialize_wide,max(initial_dim,slots),[*copies,lookup,slots])
-        limits = level_marks(*(list(upd[0][1:cut+1])+[0]*(16-cut)))
-        rows = fwd[0][1]-fwd[0][0]
-        updates = upd[0][cut]-upd[0][0]
-        launch(index_and_front,32*rows+updates,[layout,fwd[2],upd[2],val,b,sol,piv,lookup,slots,cut,limits,upd[0][0],updates,fwd[0][0],rows])
-        for level in range(1,cut):
-            launch(tiled_indexed_front,32*(fwd[0][level+1]-fwd[0][level]),[layout,fwd[2],val,b,sol,piv,lookup,slots,fwd[0][level]])
-        launch(indexed_boundary,32*arts*width,[layout,val,b,sol,lookup,slots,width,cut])
-    else:
-        launch(initialize_wide,initial_dim,[*copies,piv,0])
-    if width and cut==0:
-        launch(update_and_gather,32*arts*width,[layout,upd[2],val,b,sol,0,0,0,width,arts,cut])
+        lookup = wp.empty((cut + 1) * slots, device=device, dtype=wp.int32)
+        launch(clear_slot_masks, slots, [lookup])
+        limits = level_marks(*(list(upd.short_offsets[1 : cut + 1]) + [0] * (16 - cut)))
+        rows = fwd.short_offsets[1] - fwd.short_offsets[0]
+        updates = upd.short_offsets[cut] - upd.short_offsets[0]
+        launch(
+            index_and_front,
+            32 * rows + updates,
+            [
+                layout,
+                fwd.tasks,
+                upd.tasks,
+                val,
+                b,
+                sol,
+                piv,
+                lookup,
+                slots,
+                cut,
+                limits,
+                upd.short_offsets[0],
+                updates,
+                fwd.short_offsets[0],
+                rows,
+            ],
+        )
+        for level in range(1, cut):
+            launch(
+                tiled_indexed_front,
+                32 * (fwd.short_offsets[level + 1] - fwd.short_offsets[level]),
+                [layout, fwd.tasks, val, b, sol, piv, lookup, slots, fwd.short_offsets[level]],
+            )
+        launch(indexed_boundary, 32 * arts * width, [layout, val, b, sol, lookup, slots, width, cut])
+    if width and cut == 0:
+        launch(update_and_gather, 32 * arts * width, [layout, upd.tasks, val, b, sol, 0, 0, 0, width, arts, cut])
     for level in range(0 if indexed else cut):
         if branched:
-            branch_level(launch,layout,fwd,upd,bwd,val,b,sol,piv,level,cut)
+            branch_level(launch, layout, fwd, upd, bwd, val, b, sol, piv, level, cut)
             continue
-        pipelined = (fwd[1][level+1] == fwd[1][level] and
-                     (level == 0 or upd[1][level] == upd[1][level-1]))
+        pipelined = fwd.long_offsets[level + 1] == fwd.long_offsets[level] and (
+            level == 0 or upd.long_offsets[level] == upd.long_offsets[level - 1]
+        )
         if pipelined:
-            launch(first_front,32*(fwd[0][level+1]-fwd[0][level]),
-                   [layout,fwd[2],val,b if level == 0 else sol,sol,piv,fwd[0][level]])
+            launch(
+                first_front,
+                32 * (fwd.short_offsets[level + 1] - fwd.short_offsets[level]),
+                [layout, fwd.tasks, val, b if level == 0 else sol, sol, piv, fwd.short_offsets[level]],
+            )
         else:
-            scheduled(eliminate,fwd,level,[val,b,sol,piv])
-        if width and level+1==cut:
-            first,shorts,long_first,longs = _branch_ranges(upd,level)
-            launch(update_and_gather,32*arts*width+9*shorts+1152*longs,
-                   [layout,upd[2],val,b,sol,first,long_first,longs,width,arts,cut])
-        elif level+1 < cut and fwd[1][level+2] == fwd[1][level+1] and upd[1][level+1] == upd[1][level]:
-            first,shorts,long_first,longs = _branch_ranges(upd,level)
-            rows,row_count,_,_ = _branch_ranges(fwd,level+1)
-            launch(branch_update_forward,9*shorts+32*row_count,
-                   [layout,upd[2],fwd[2],val,b,sol,0,0,0,0,rows,row_count,first])
+            scheduled(eliminate, fwd, level, [val, b, sol, piv])
+        if width and level + 1 == cut:
+            first, shorts, long_first, longs = _branch_ranges(upd, level)
+            launch(
+                update_and_gather,
+                32 * arts * width + 9 * shorts + 1152 * longs,
+                [layout, upd.tasks, val, b, sol, first, long_first, longs, width, arts, cut],
+            )
+        elif (
+            level + 1 < cut
+            and fwd.long_offsets[level + 2] == fwd.long_offsets[level + 1]
+            and upd.long_offsets[level + 1] == upd.long_offsets[level]
+        ):
+            first, shorts, long_first, longs = _branch_ranges(upd, level)
+            rows, row_count, _, _ = _branch_ranges(fwd, level + 1)
+            launch(
+                branch_update_forward,
+                9 * shorts + 32 * row_count,
+                [layout, upd.tasks, fwd.tasks, val, b, sol, 0, 0, 0, 0, rows, row_count, first],
+            )
         else:
-            scheduled(apply_updates,upd,level,[val])
-    if cut < plan['level_count']:
-        size = dense_tail_size(plan,cut)
+            scheduled(apply_updates, upd, level, [val])
+    if cut < plan.level_count:
+        size = dense_tail_size(plan, cut)
         if size >= 8:
-            dense_wave_launch(launch,plan,layout,val,b,sol,piv,tmp,cut,size,device)
-        elif not small_tail_launch(launch,plan,layout,val,b,sol,piv,cut):
-            launch(cooperative_tail,128*plan['articulation_count'],[layout,val,b,sol,piv,tmp,cut,plan['tail_split_entries'],plan['tail_block_dim']])
+            dense_wave_launch(launch, plan, layout, val, b, sol, piv, tmp, cut, size, device)
+        elif not small_tail_launch(launch, plan, layout, val, b, sol, piv, cut):
+            launch(
+                cooperative_tail,
+                128 * plan.articulation_count,
+                [layout, val, b, sol, piv, tmp, cut, plan.tail_split_entries, plan.tail_block_dim],
+            )
     for level in reversed(range(cut)):
         if indexed:
-            scheduled(back_sub,bwd,level,[val,sol])
+            scheduled(back_sub, bwd, level, [val, sol])
             continue
-        if bwd[1][level] == bwd[1][level+1] and bwd[0][level+1]-bwd[0][level]>=256:
-            begin = bwd[0][level]
-            count = bwd[0][level+1] - begin
-            launch(short_leading_back,4*count,[layout,bwd[2],val,sol,begin,count])
+        if (
+            bwd.long_offsets[level] == bwd.long_offsets[level + 1]
+            and bwd.short_offsets[level + 1] - bwd.short_offsets[level] >= 256
+        ):
+            begin = bwd.short_offsets[level]
+            count = bwd.short_offsets[level + 1] - begin
+            launch(short_leading_back, 4 * count, [layout, bwd.tasks, val, sol, begin, count])
             continue
-        if branched and branch_reverse(launch,layout,bwd,val,sol,level):
+        if branched and branch_reverse(launch, layout, bwd, val, sol, level):
             continue
-        scheduled(back_sub,bwd,level,[val,sol])
+        scheduled(back_sub, bwd, level, [val, sol])
