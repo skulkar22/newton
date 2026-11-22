@@ -641,6 +641,9 @@ python -m newton.examples --describe robot_omniwheel
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_driven_finger.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_driven_finger.jpg" alt="Cable Driven Finger">
+      </a>
     </td>
   </tr>
   <tr>
@@ -651,6 +654,35 @@ python -m newton.examples --describe robot_omniwheel
       <code>python -m newton.examples cable_spline</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples cable_driven_finger</code>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_driven_hand.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_driven_hand.jpg" alt="Cable Driven Hand">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_driven_hand_elastic.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_driven_hand_elastic.jpg" alt="Cable Driven Hand Elastic">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cable/example_cable_driven_hand_soft.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_driven_hand_soft.jpg" alt="Cable Driven Hand Soft">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cable_driven_hand</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cable_driven_hand_elastic</code>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cable_driven_hand_soft</code>
     </td>
   </tr>
   <tr>

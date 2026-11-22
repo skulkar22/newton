@@ -46,6 +46,7 @@ Newton Physics
    Deterministic Simulation <concepts/determinism>
    Coupled Solvers <concepts/coupling>
    Actuators <concepts/actuators>
+   Cable-Driven Mechanisms <concepts/cable_driven_mechanisms>
 
 .. toctree::
    :maxdepth: 1

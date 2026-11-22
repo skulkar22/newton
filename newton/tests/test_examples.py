@@ -759,6 +759,84 @@ add_example_test(
     use_viewer=True,
     test_options={"num-frames": 540},
 )
+# The cable-driven finger and hand examples are registered with short runs, for runtime: one full loop takes 1064
+# frames of the finger and 1182 frames of the hand (several minutes each).
+# Covered: three holds of the two-cable index finger (rest, knuckle cable alone, both cables), three holds
+# of the one-cable ring finger while the tension rises, the seating stroke and the first counted pose of
+# the choreography, and the can grasp and the block pinch with tendons up to the end of the lifted hold.
+# Not simulated by these variants: the way back down a staircase (the unloading branch), cable friction,
+# position mode, the other digits beyond what the hand runs show, the later poses of the choreography (two
+# to five, the two-cable pose, the pinches, the fist), the tilt, set-down and release of a grasp, and the
+# lifted ball grasp and the rod grasps. A plain `--test` run of each example covers a full loop.
+add_example_batch(
+    TestCableExamples,
+    name="cable.example_cable_driven_finger",
+    variants=[
+        # Two-cable index finger: rest, the knuckle cable alone, then the curl cable on top (three holds of
+        # 93 frames; the commands are blended from hold to hold). The test also fails if a cable falls below
+        # 0.5 N.
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 279, "tension-pairs": ["2,2", "2,20", "9,20"]},
+            "test_suffix": "tendon",
+        },
+        # One-cable ring finger: rest, first joint partly closed, all joints closed (three holds of 103 frames).
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 309, "digit": "ring", "tension-levels": [2, 12, 32]},
+            "test_suffix": "tendon_one_cable",
+        },
+        # Rod cables on the two-cable index finger: the seating stroke (rest, 16 N, rest), then rest and the
+        # knuckle cable alone (five holds of 147 frames; several minutes on a GPU). The test fails if the
+        # cables are not within 3 % of the rest tension after the stroke or if a cable falls below 0.5 N
+        # after it.
+        {
+            "devices": cuda_test_devices,
+            "test_options": {
+                "num-frames": 735,
+                "tension-pairs": ["2,2", "2,20"],
+                "cable-model": "rod",
+                "test_timeout": 1200,
+            },
+            "test_suffix": "rod",
+        },
+    ],
+)
+add_example_batch(
+    TestCableExamples,
+    name="cable.example_cable_driven_hand",
+    variants=[
+        # Choreography: the seating stroke and its rest pose (3.1 s), then the wave and the first counted
+        # pose, whose hold ends at 5.75 s.
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 360},
+            "test_suffix": "tendon_choreography",
+        },
+        # Grasp up to the end of the lifted hold (6.0 s).
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 360, "scene": "grasp"},
+            "test_suffix": "tendon_grasp",
+        },
+        # Block pinch with the two-cable fingers up to the end of the lifted hold (6.0 s).
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 360, "scene": "grasp", "object": "block"},
+            "test_suffix": "tendon_block_pinch",
+        },
+        # Rod cables: the same choreography run; its test also checks that the two ends of every rod agree
+        # within 3 % in tension after the seating stroke and that no cable falls below 0.5 N after it. The
+        # rod grasp is not registered: it needs 480 frames of the rod hand to reach the end of its lifted
+        # hold (a seating stroke of 2 s comes first). A plain `--test` run of the example covers the rod
+        # grasps of the can and the ball; the block is refused with rod cables.
+        {
+            "devices": cuda_test_devices,
+            "test_options": {"num-frames": 410, "cable-model": "rod", "test_timeout": 1200},
+            "test_suffix": "rod_choreography",
+        },
+    ],
+)
 add_example_test(
     TestCableExamples,
     name="cable.example_cable_initial_rest_pose",
@@ -786,6 +864,30 @@ add_example_test(
     devices=test_devices,
     use_viewer=True,
     test_options={"num-frames": 60},
+)
+add_example_batch(
+    TestCableExamples,
+    name="cable.example_cable_driven_hand_elastic",
+    variants=[
+        # Headphones (reduced elastic body) up to the end of the lifted hold (5.2 s).
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 312, "test_timeout": 1200},
+            "test_suffix": "tendon_headphones",
+        },
+    ],
+)
+add_example_batch(
+    TestCableExamples,
+    name="cable.example_cable_driven_hand_soft",
+    variants=[
+        # Soft foam ball (finite elements) up to the end of the squeeze hold (10.2 s).
+        {
+            "devices": test_devices,
+            "test_options": {"num-frames": 612, "test_timeout": 1200},
+            "test_suffix": "tendon_soft_ball",
+        },
+    ],
 )
 
 

@@ -13,6 +13,7 @@ Open the notebooks directly in Colab:
 
 - :doc:`Introduction </tutorials/00_introduction>` |intro-colab|
 - :doc:`Robotics </tutorials/01_robotics>` |robotics-colab|
+- :doc:`Cable-Driven Finger </tutorials/02_cable_driven_finger>` |cable-finger-colab|
 
 You can also explore the examples in the ``newton/examples/`` directory for more use cases.
 
@@ -22,3 +23,4 @@ You can also explore the examples in the ``newton/examples/`` directory for more
 
    /tutorials/00_introduction
    /tutorials/01_robotics
+   /tutorials/02_cable_driven_finger

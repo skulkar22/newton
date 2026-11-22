@@ -213,6 +213,10 @@ rst_epilog = f"""
 .. |robotics-colab| image:: https://colab.research.google.com/assets/colab-badge.svg
    :target: https://colab.research.google.com/github/newton-physics/newton/blob/{github_version}/docs/tutorials/01_robotics.ipynb
    :alt: Open in Colab
+
+.. |cable-finger-colab| image:: https://colab.research.google.com/assets/colab-badge.svg
+   :target: https://colab.research.google.com/github/newton-physics/newton/blob/{github_version}/docs/tutorials/02_cable_driven_finger.ipynb
+   :alt: Open in Colab
 """
 
 doctest_global_setup = """
