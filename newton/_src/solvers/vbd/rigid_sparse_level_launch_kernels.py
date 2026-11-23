@@ -10,11 +10,10 @@ the same order as ordinary launches: one launch per (phase, level) over that lev
 every articulation, so the large early levels spread over the whole GPU. Kernel boundaries
 replace the block barriers.
 
-On CUDA, plans with split leading tasks can use warp-cooperative pivots, Schur updates and
-substitution at the default block size. The static schedule fuses adjacent phases and selects
-a tail kernel from the layout and split settings. Plans with unsplit leading phases retain the
-per-phase decomposition below, which preserves the cooperative solver's operation order for
-fully unsplit plans:
+On CUDA, a single articulation with split Schur updates at each leading level can use a
+warp-cooperative schedule at the default block size. The standard per-phase schedule is used
+for other layouts, and preserves the cooperative solver's operation order for fully unsplit
+plans:
 
 - diagonal: one thread per pivot row, the same 6 x 6 Cholesky;
 - column: one thread per (column entry, block row), the same right solve;
@@ -863,7 +862,7 @@ def build_level_launch_plan(
         # CUDA kernels are registered only for the warp-cooperative solver.
         from .rigid_sparse_level_warp_kernels import build_warp_schedule  # noqa: PLC0415
 
-        plan._warp_schedule = build_warp_schedule(plan, layout, device)
+        plan._warp_schedule = build_warp_schedule(plan, layout)
     return plan
 
 
