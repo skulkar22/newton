@@ -10,6 +10,7 @@ from newton._src.solvers.vbd.joint_coordinates import JointCoordinateData
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _SMALL_ANGLE_EPS,
     _SMALL_LENGTH_EPS,
+    ElasticContactTerms,
     RigidForceElementAdjacencyInfo,
     _load_solve_weight,
     contact_surface_separation,
@@ -248,6 +249,7 @@ def _accumulate_elastic_contact_modes(
     elastic_shape_vertex_phi: wp.array[wp.vec3],
     joint_q_prev: wp.array[float],
     joint_q: wp.array[float],
+    elastic_contact_terms: wp.array[ElasticContactTerms],
     elastic_body_block_grad: wp.array2d[float],
     elastic_body_block_matrix: wp.array3d[float],
 ):
@@ -275,117 +277,126 @@ def _accumulate_elastic_contact_modes(
     if elastic_body != body or elastic_sample < 0:
         return
 
-    cp0_local = rigid_contact_point0[contact_idx]
-    cp1_local = rigid_contact_point1[contact_idx]
-    cp0_world, cp0_world_prev = evaluate_contact_point_world(
-        b0,
-        cp0_local,
-        elastic_sample0,
-        body_q,
-        body_q_prev,
-        body_elastic_index,
-        elastic_joint,
-        elastic_mode_count,
-        joint_q,
-        joint_q_prev,
-        joint_q_start,
-        elastic_shape_vertex_local,
-        elastic_shape_vertex_phi,
-        elastic_max_mode_count,
-    )
-    cp1_world, cp1_world_prev = evaluate_contact_point_world(
-        b1,
-        cp1_local,
-        elastic_sample1,
-        body_q,
-        body_q_prev,
-        body_elastic_index,
-        elastic_joint,
-        elastic_mode_count,
-        joint_q,
-        joint_q_prev,
-        joint_q_start,
-        elastic_shape_vertex_local,
-        elastic_shape_vertex_phi,
-        elastic_max_mode_count,
-    )
+    if elastic_contact_terms and body_inv_mass[body] > 0.0:
+        terms = elastic_contact_terms[contact_idx]
+        elastic_force = terms.force
+        elastic_h = terms.hessian_ll
+        elastic_h_al = terms.hessian_al
+    else:
+        # Kinematic frames are skipped by the rigid pass, but their modes can still deform.
+        cp0_local = rigid_contact_point0[contact_idx]
+        cp1_local = rigid_contact_point1[contact_idx]
+        cp0_world, cp0_world_prev = evaluate_contact_point_world(
+            b0,
+            cp0_local,
+            elastic_sample0,
+            body_q,
+            body_q_prev,
+            body_elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            joint_q,
+            joint_q_prev,
+            joint_q_start,
+            elastic_shape_vertex_local,
+            elastic_shape_vertex_phi,
+            elastic_max_mode_count,
+        )
+        cp1_world, cp1_world_prev = evaluate_contact_point_world(
+            b1,
+            cp1_local,
+            elastic_sample1,
+            body_q,
+            body_q_prev,
+            body_elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            joint_q,
+            joint_q_prev,
+            joint_q_start,
+            elastic_shape_vertex_local,
+            elastic_shape_vertex_phi,
+            elastic_max_mode_count,
+        )
 
-    contact_normal = rigid_contact_normal[contact_idx]
-    C_n = -contact_surface_separation(
-        cp0_world,
-        cp1_world,
-        contact_normal,
-        rigid_contact_margin0[contact_idx],
-        rigid_contact_margin1[contact_idx],
-    )
-    lam_vec = wp.vec3(0.0)
-    lam_n = float(0.0)
-    C_eff = C_n
-    friction_c0 = wp.vec3(0.0)
-    normal_solve_weight = _load_solve_weight(contact_penalty_k, contact_normal_rho, contact_idx, contact_compliant_alm)
-    material_k = contact_material_ke[contact_idx]
-    if legacy_hard_contacts == 0 and contact_compliant_alm == 0:
-        normal_solve_weight = material_k
-    tangent_solve_weight = contact_tangent_rho[contact_idx]
+        contact_normal = rigid_contact_normal[contact_idx]
+        C_n = -contact_surface_separation(
+            cp0_world,
+            cp1_world,
+            contact_normal,
+            rigid_contact_margin0[contact_idx],
+            rigid_contact_margin1[contact_idx],
+        )
+        lam_vec = wp.vec3(0.0)
+        lam_n = float(0.0)
+        C_eff = C_n
+        friction_c0 = wp.vec3(0.0)
+        normal_solve_weight = _load_solve_weight(
+            contact_penalty_k, contact_normal_rho, contact_idx, contact_compliant_alm
+        )
+        material_k = contact_material_ke[contact_idx]
+        if legacy_hard_contacts == 0 and contact_compliant_alm == 0:
+            normal_solve_weight = material_k
+        tangent_solve_weight = contact_tangent_rho[contact_idx]
 
-    if legacy_hard_contacts == 1 or contact_compliant_alm == 1:
-        lam_vec = contact_lambda[contact_idx]
-        lam_n = wp.dot(lam_vec, contact_normal)
-        C0_vec = contact_C0[contact_idx]
-        C0_n = wp.dot(contact_normal, C0_vec)
-        C_eff = C_n - stab_alpha * C0_n
-        friction_c0 = (1.0 - stab_alpha) * (C0_vec - contact_normal * C0_n)
+        if legacy_hard_contacts == 1 or contact_compliant_alm == 1:
+            lam_vec = contact_lambda[contact_idx]
+            lam_n = wp.dot(lam_vec, contact_normal)
+            C0_vec = contact_C0[contact_idx]
+            C0_n = wp.dot(contact_normal, C0_vec)
+            C_eff = C_n - stab_alpha * C0_n
+            friction_c0 = (1.0 - stab_alpha) * (C0_vec - contact_normal * C0_n)
 
-    if C_n <= _SMALL_LENGTH_EPS and lam_n <= 0.0:
-        return
+        if C_n <= _SMALL_LENGTH_EPS and lam_n <= 0.0:
+            return
 
-    (
-        force_0,
-        _torque_0,
-        h_ll_0,
-        h_al_0,
-        _h_aa_0,
-        force_1,
-        _torque_1,
-        h_ll_1,
-        h_al_1,
-        _h_aa_1,
-    ) = evaluate_rigid_contact_from_collision(
-        b0,
-        b1,
-        body_q,
-        body_q_prev,
-        body_com,
-        cp0_world,
-        cp1_world,
-        cp0_world_prev,
-        cp1_world_prev,
-        wp.vec3(0.0),  # mesh surface velocity is not applied to reduced elastic contacts
-        rigid_contact_offset0[contact_idx],
-        rigid_contact_offset1[contact_idx],
-        1,
-        contact_normal,
-        C_eff,
-        normal_solve_weight,
-        material_k,
-        tangent_solve_weight,
-        contact_material_kd[contact_idx],
-        lam_vec,
-        contact_material_mu[contact_idx],
-        friction_epsilon,
-        legacy_hard_contacts,
-        contact_compliant_alm,
-        dt,
-        friction_c0,
-    )
+        (
+            force_0,
+            _torque_0,
+            h_ll_0,
+            h_al_0,
+            _h_aa_0,
+            force_1,
+            _torque_1,
+            h_ll_1,
+            h_al_1,
+            _h_aa_1,
+        ) = evaluate_rigid_contact_from_collision(
+            b0,
+            b1,
+            body_q,
+            body_q_prev,
+            body_com,
+            cp0_world,
+            cp1_world,
+            cp0_world_prev,
+            cp1_world_prev,
+            wp.vec3(0.0),  # mesh surface velocity is not applied to reduced elastic contacts
+            rigid_contact_offset0[contact_idx],
+            rigid_contact_offset1[contact_idx],
+            1,
+            contact_normal,
+            C_eff,
+            normal_solve_weight,
+            material_k,
+            tangent_solve_weight,
+            contact_material_kd[contact_idx],
+            lam_vec,
+            contact_material_mu[contact_idx],
+            friction_epsilon,
+            legacy_hard_contacts,
+            contact_compliant_alm,
+            dt,
+            friction_c0,
+        )
 
-    elastic_force = force_1
-    elastic_h = h_ll_1
-    elastic_h_al = h_al_1
-    if use_side0:
-        elastic_force = force_0
-        elastic_h = h_ll_0
-        elastic_h_al = h_al_0
+        elastic_force = force_1
+        elastic_h = h_ll_1
+        elastic_h_al = h_al_1
+        if use_side0:
+            elastic_force = force_0
+            elastic_h = h_ll_0
+            elastic_h_al = h_al_0
 
     elastic_force_local = body_R_T * elastic_force
     elastic_h_local = body_R_T * (elastic_h * body_R)
@@ -1465,6 +1476,7 @@ def assemble_elastic_contacts(
     elastic_shape_vertex_phi: wp.array[wp.vec3],
     joint_q_prev: wp.array[float],
     joint_q: wp.array[float],
+    elastic_contact_terms: wp.array[ElasticContactTerms],
     elastic_body_block_grad: wp.array2d[float],
     elastic_body_block_matrix: wp.array3d[float],
 ):
@@ -1543,6 +1555,7 @@ def assemble_elastic_contacts(
                     elastic_shape_vertex_phi,
                     joint_q_prev,
                     joint_q,
+                    elastic_contact_terms,
                     elastic_body_block_grad,
                     elastic_body_block_matrix,
                 )
@@ -1596,6 +1609,7 @@ def assemble_elastic_contacts(
                 elastic_shape_vertex_phi,
                 joint_q_prev,
                 joint_q,
+                elastic_contact_terms,
                 elastic_body_block_grad,
                 elastic_body_block_matrix,
             )

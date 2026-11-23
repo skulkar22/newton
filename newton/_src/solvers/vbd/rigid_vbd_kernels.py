@@ -6698,6 +6698,18 @@ def compute_rod_dahl_parameters(
 # -----------------------------
 # Iteration kernels (per color per iteration)
 # -----------------------------
+@wp.struct
+class ElasticContactTerms:
+    """World-space force and Hessian blocks for a sampled elastic body.
+
+    Indexed by contact slot and refreshed during frame assembly in each solver iteration.
+    """
+
+    force: wp.vec3
+    hessian_ll: wp.mat33
+    hessian_al: wp.mat33
+
+
 @functools.cache
 def create_accumulate_body_body_contacts_per_body():
     """Create the rigid contact accumulation kernel."""
@@ -6753,6 +6765,7 @@ def create_accumulate_body_body_contacts_per_body():
         body_hessian_ll: wp.array[wp.mat33],
         body_hessian_al: wp.array[wp.mat33],
         body_hessian_aa: wp.array[wp.mat33],
+        elastic_contact_terms: wp.array[ElasticContactTerms],
     ):
         """
         Per-body contact force/Hessian accumulation (compliant ALM or legacy penalty)
@@ -6813,6 +6826,14 @@ def create_accumulate_body_body_contacts_per_body():
             # world positions (now and previous step).
             elastic_sample0 = rigid_contact_elastic_sample0[contact_idx]
             elastic_sample1 = rigid_contact_elastic_sample1[contact_idx]
+            # The sampled body's frame thread owns the slot read by modal assembly.
+            store_elastic_terms = False
+            if elastic_contact_terms:
+                if elastic_sample0 >= 0:
+                    store_elastic_terms = body_id == b0
+                elif elastic_sample1 >= 0:
+                    store_elastic_terms = body_id == b1
+
             point_a = cp0_local
             point_b = cp1_local
             point_a_prev = cp0_local
@@ -6886,6 +6907,8 @@ def create_accumulate_body_body_contacts_per_body():
                 friction_c0 = (1.0 - stab_alpha) * (C0_vec - contact_normal * C0_n)
 
             if C_n <= _SMALL_LENGTH_EPS and lam_n <= 0.0:
+                if store_elastic_terms:
+                    elastic_contact_terms[contact_idx] = ElasticContactTerms()
                 i += _NUM_CONTACT_THREADS_PER_BODY
                 continue
 
@@ -6894,6 +6917,8 @@ def create_accumulate_body_body_contacts_per_body():
             )
             f_n_check = normal_primal_k * C_eff + lambda_n_eff
             if f_n_check <= 0.0 and lam_n <= 0.0:
+                if store_elastic_terms:
+                    elastic_contact_terms[contact_idx] = ElasticContactTerms()
                 i += _NUM_CONTACT_THREADS_PER_BODY
                 continue
 
@@ -6943,6 +6968,18 @@ def create_accumulate_body_body_contacts_per_body():
                 dt,
                 friction_c0,
             )
+
+            if store_elastic_terms:
+                terms = ElasticContactTerms()
+                if body_id == b0:
+                    terms.force = force_0
+                    terms.hessian_ll = h_ll_0
+                    terms.hessian_al = h_al_0
+                else:
+                    terms.force = force_1
+                    terms.hessian_ll = h_ll_1
+                    terms.hessian_al = h_al_1
+                elastic_contact_terms[contact_idx] = terms
 
             if body_id == b0:
                 force_acc += force_0
