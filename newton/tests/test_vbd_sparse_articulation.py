@@ -1449,6 +1449,59 @@ add_function_test(
 )
 
 
+def test_sparse_frame_solve_fallback_preserves_other_articulations(test, device):
+    """Take a finite step for an indefinite articulation without affecting a healthy one."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    bodies = []
+    for x in (0.0, 1.0):
+        body = builder.add_link(xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_articulation([builder.add_joint_fixed(parent=-1, child=body)])
+        bodies.append(body)
+    builder.color()
+    model = builder.finalize(device=device)
+
+    def step(indefinite: bool):
+        solver = newton.solvers.SolverVBD(model, iterations=1, rigid_articulation_solve="block_sparse_joints")
+        test.assertEqual(solver.rigid_articulation_sparse_layout.rigid_articulation_count, 2)
+        state_in, state_out = model.state(), model.state()
+        assemble_contacts = solver._accumulate_rigid_contact_forces
+
+        def inject_frame_terms(*args, **kwargs):
+            assemble_contacts(*args, **kwargs)
+            solver.body_forces.fill_(wp.vec3(10.0, 0.0, 0.0))
+            if indefinite:
+                # Positive diagonal but an indefinite 2x2 principal minor in the first frame.
+                ll = np.zeros((model.body_count, 3, 3), dtype=np.float32)
+                ll[bodies[0], 0, 1] = ll[bodies[0], 1, 0] = 1.0e10
+                solver.body_hessian_ll.assign(ll)
+
+        with mock.patch.object(solver, "_accumulate_rigid_contact_forces", inject_frame_terms):
+            solver.step(state_in, state_out, model.control(), None, 0.01)
+        return solver, state_out.body_q.numpy()
+
+    _, healthy = step(False)
+    solver, actual = step(True)
+    test.assertTrue(np.isfinite(actual).all())
+    np.testing.assert_allclose(actual, healthy, rtol=1.0e-6, atol=1.0e-8)
+    np.testing.assert_array_equal(
+        solver._sparse_frame_factor_status.numpy(),
+        [
+            rigid_sparse_articulation_kernels.SPARSE_FRAME_FACTOR_INDEFINITE,
+            rigid_sparse_articulation_kernels.SPARSE_FRAME_FACTOR_OK,
+        ],
+    )
+    np.testing.assert_array_equal(solver._sparse_frame_failure_info.numpy(), [1, 0])
+
+
+add_function_test(
+    TestVBDSparseArticulationDevices,
+    "test_sparse_frame_solve_fallback_preserves_other_articulations",
+    test_sparse_frame_solve_fallback_preserves_other_articulations,
+    devices=devices,
+)
+
+
 def test_sparse_body_particle_attachment_reactions(test, device):
     """Transfer particle loads to both sparse articulation and local fallback bodies."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))

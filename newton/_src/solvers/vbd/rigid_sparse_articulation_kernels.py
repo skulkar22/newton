@@ -107,6 +107,10 @@ _SPARSE_BLOCK_SIZE = wp.constant(36)
 _WARP_THREADS = wp.constant(32)
 SPARSE_ARTICULATION_CTA_THREADS = 128
 
+SPARSE_FRAME_FACTOR_OK = wp.constant(0)
+SPARSE_FRAME_FACTOR_INDEFINITE = wp.constant(1)
+SPARSE_FRAME_SOLVE_NONFINITE = wp.constant(2)
+
 
 # Warp has no public device-side block or warp barriers for ordinary kernels.
 # The cooperative CUDA factorization requires both between dependent phases.
@@ -258,7 +262,21 @@ def _mat66_from_angular_block(aa: wp.mat33) -> mat66f:
 
 
 @wp.func
-def _cholesky66_serial(A_in: mat66f) -> mat66f:
+def _sparse_pivot_ok(value: float) -> bool:
+    return value > 0.0 and wp.isfinite(value)
+
+
+@wp.func
+def _sparse_diagonal_step(rhs: float, diagonal: float) -> float:
+    if _sparse_pivot_ok(diagonal):
+        update = rhs / diagonal
+        if wp.isfinite(update):
+            return update
+    return 0.0
+
+
+@wp.func
+def _cholesky66_serial(A_in: mat66f):
     """Factor one diagonal block in the serial block-sparse Cholesky path."""
     L = mat66f(0.0)
     for i in range(6):
@@ -269,10 +287,12 @@ def _cholesky66_serial(A_in: mat66f) -> mat66f:
                     if k < j:
                         value = value - L[i, k] * L[j, k]
                 if i == j:
+                    if not _sparse_pivot_ok(value):
+                        return L, False
                     L[i, j] = wp.sqrt(value)
                 else:
                     L[i, j] = value / L[j, j]
-    return L
+    return L, True
 
 
 @wp.func
@@ -3140,12 +3160,15 @@ def _cholesky66_scalar(values: wp.array[float], slot: int):
                     if k < j:
                         value = value - _scalar_block_get(values, slot, i, k) * _scalar_block_get(values, slot, j, k)
                 if i == j:
+                    if not _sparse_pivot_ok(value):
+                        return False
                     value = wp.sqrt(value)
                 else:
                     value = value / _scalar_block_get(values, slot, j, j)
                 _scalar_block_set(values, slot, i, j, value)
             else:
                 _scalar_block_set(values, slot, i, j, 0.0)
+    return True
 
 
 @wp.func
@@ -3199,6 +3222,9 @@ def solve_articulation_sparse_block32_scalar(
     values_scalar: wp.array[float],
     rhs_scalar: wp.array[float],
     delta_scalar: wp.array[float],
+    diagonal_backup: wp.array[vec6f],
+    factor_status: wp.array[wp.int32],
+    failure_info: wp.array[wp.int32],
 ):
     thread_id = wp.tid()
     thread_count = wp.block_dim()
@@ -3212,14 +3238,26 @@ def solve_articulation_sparse_block32_scalar(
     body_end = articulation_body_offsets[articulation_id + 1]
     body_count = body_end - body_start
 
+    for row in range(body_start + lane, body_end, thread_count):
+        diag_slot = articulation_diag_slots[row]
+        diagonal = vec6f(0.0)
+        for component in range(6):
+            diagonal[component] = _scalar_block_get(values_scalar, diag_slot, component, component)
+        diagonal_backup[row] = diagonal
+    if lane == 0:
+        factor_status[articulation_id] = SPARSE_FRAME_FACTOR_OK
+    _block_sync()
+
     for local_k in range(body_count):
         row_k = body_start + local_k
         diag_slot = articulation_diag_slots[row_k]
 
-        if lane == 0:
-            _cholesky66_scalar(values_scalar, diag_slot)
+        if lane == 0 and not _cholesky66_scalar(values_scalar, diag_slot):
+            factor_status[articulation_id] = SPARSE_FRAME_FACTOR_INDEFINITE
 
         _block_sync()
+        if factor_status[articulation_id] != SPARSE_FRAME_FACTOR_OK:
+            break
 
         col_begin = articulation_block_col_offsets[row_k]
         col_end = articulation_block_col_offsets[row_k + 1]
@@ -3252,58 +3290,76 @@ def solve_articulation_sparse_block32_scalar(
 
         _block_sync()
 
-    for local_i in range(body_count):
-        row_i = body_start + local_i
-        if warp == 0 and warp_lane < _SPARSE_BLOCK_DIM:
-            value = _scalar_vec_get(rhs_scalar, row_i, warp_lane)
-            row_begin = articulation_block_row_offsets[row_i]
-            row_end = articulation_block_row_offsets[row_i + 1]
-            for row_entry in range(row_begin, row_end):
-                local_j = articulation_block_cols[row_entry]
-                if local_j < local_i:
+    if factor_status[articulation_id] == SPARSE_FRAME_FACTOR_OK:
+        for local_i in range(body_count):
+            row_i = body_start + local_i
+            if warp == 0 and warp_lane < _SPARSE_BLOCK_DIM:
+                value = _scalar_vec_get(rhs_scalar, row_i, warp_lane)
+                row_begin = articulation_block_row_offsets[row_i]
+                row_end = articulation_block_row_offsets[row_i + 1]
+                for row_entry in range(row_begin, row_end):
+                    local_j = articulation_block_cols[row_entry]
+                    if local_j < local_i:
+                        accum = float(0.0)
+                        for col in range(6):
+                            accum = accum + _scalar_block_get(
+                                values_scalar, row_entry, warp_lane, col
+                            ) * _scalar_vec_get(delta_scalar, body_start + local_j, col)
+                        value = value - accum
+                _scalar_vec_set(delta_scalar, row_i, warp_lane, value)
+
+            if warp == 0:
+                _warp_sync()
+
+            if lane == 0:
+                _lower_solve66_scalar(values_scalar, articulation_diag_slots[row_i], delta_scalar, row_i)
+
+            if warp == 0:
+                _warp_sync()
+
+        for local_ii in range(body_count):
+            local_i = body_count - 1 - local_ii
+            row_i = body_start + local_i
+            if warp == 0 and warp_lane < _SPARSE_BLOCK_DIM:
+                value = _scalar_vec_get(delta_scalar, row_i, warp_lane)
+                col_begin = articulation_block_col_offsets[row_i]
+                col_end = articulation_block_col_offsets[row_i + 1]
+                for col_entry in range(col_begin, col_end):
+                    local_j = articulation_block_col_rows[col_entry]
+                    slot_ji = articulation_block_col_slots[col_entry]
                     accum = float(0.0)
                     for col in range(6):
-                        accum = accum + _scalar_block_get(values_scalar, row_entry, warp_lane, col) * _scalar_vec_get(
+                        accum = accum + _scalar_block_get(values_scalar, slot_ji, col, warp_lane) * _scalar_vec_get(
                             delta_scalar, body_start + local_j, col
                         )
                     value = value - accum
-            _scalar_vec_set(delta_scalar, row_i, warp_lane, value)
+                _scalar_vec_set(delta_scalar, row_i, warp_lane, value)
 
-        if warp == 0:
-            _warp_sync()
+            if warp == 0:
+                _warp_sync()
 
-        if lane == 0:
-            _lower_solve66_scalar(values_scalar, articulation_diag_slots[row_i], delta_scalar, row_i)
+            if lane == 0:
+                _upper_solve66_scalar(values_scalar, articulation_diag_slots[row_i], delta_scalar, row_i)
 
-        if warp == 0:
-            _warp_sync()
+            if warp == 0:
+                _warp_sync()
 
-    for local_ii in range(body_count):
-        local_i = body_count - 1 - local_ii
-        row_i = body_start + local_i
-        if warp == 0 and warp_lane < _SPARSE_BLOCK_DIM:
-            value = _scalar_vec_get(delta_scalar, row_i, warp_lane)
-            col_begin = articulation_block_col_offsets[row_i]
-            col_end = articulation_block_col_offsets[row_i + 1]
-            for col_entry in range(col_begin, col_end):
-                local_j = articulation_block_col_rows[col_entry]
-                slot_ji = articulation_block_col_slots[col_entry]
-                accum = float(0.0)
-                for col in range(6):
-                    accum = accum + _scalar_block_get(values_scalar, slot_ji, col, warp_lane) * _scalar_vec_get(
-                        delta_scalar, body_start + local_j, col
-                    )
-                value = value - accum
-            _scalar_vec_set(delta_scalar, row_i, warp_lane, value)
-
-        if warp == 0:
-            _warp_sync()
-
-        if lane == 0:
-            _upper_solve66_scalar(values_scalar, articulation_diag_slots[row_i], delta_scalar, row_i)
-
-        if warp == 0:
-            _warp_sync()
+    _block_sync()
+    if factor_status[articulation_id] == SPARSE_FRAME_FACTOR_OK:
+        for row in range(body_start + lane, body_end, thread_count):
+            for component in range(6):
+                if not wp.isfinite(_scalar_vec_get(delta_scalar, row, component)):
+                    wp.atomic_max(factor_status, articulation_id, SPARSE_FRAME_SOLVE_NONFINITE)
+                    break
+    _block_sync()
+    if factor_status[articulation_id] != SPARSE_FRAME_FACTOR_OK:
+        if lane == 0 and wp.atomic_add(failure_info, 0, 1) == 0:
+            failure_info[1] = articulation_id
+        for row in range(body_start + lane, body_end, thread_count):
+            diagonal = diagonal_backup[row]
+            for component in range(6):
+                value = _sparse_diagonal_step(_scalar_vec_get(rhs_scalar, row, component), diagonal[component])
+                _scalar_vec_set(delta_scalar, row, component, value)
 
 
 @wp.kernel
@@ -3417,6 +3473,9 @@ def solve_articulation_sparse_serial_scalar(
     body_disp_ang: wp.array[wp.vec3],
     use_displacement: int,
     body_q_new: wp.array[wp.transform],
+    diagonal_backup: wp.array[vec6f],
+    factor_status: wp.array[wp.int32],
+    failure_info: wp.array[wp.int32],
 ):
     articulation_id = wp.tid()
     body_start = articulation_body_offsets[articulation_id]
@@ -3521,6 +3580,14 @@ def solve_articulation_sparse_serial_scalar(
             )
 
     body_count = body_end - body_start
+    status = int(SPARSE_FRAME_FACTOR_OK)
+    for row in range(body_start, body_end):
+        block = values[articulation_diag_slots[row]]
+        diagonal = vec6f(0.0)
+        for component in range(6):
+            diagonal[component] = block[component, component]
+        diagonal_backup[row] = diagonal
+
     for local_k in range(body_count):
         row_k = body_start + local_k
         diag_slot = articulation_diag_slots[row_k]
@@ -3534,7 +3601,10 @@ def solve_articulation_sparse_serial_scalar(
                 Lks = values[slot_ks]
                 Akk = Akk - Lks * wp.transpose(Lks)
 
-        Lkk = _cholesky66_serial(Akk)
+        Lkk, ok = _cholesky66_serial(Akk)
+        if not ok:
+            status = SPARSE_FRAME_FACTOR_INDEFINITE
+            break
         values[diag_slot] = Lkk
 
         for local_i in range(local_k + 1, body_count):
@@ -3554,30 +3624,48 @@ def solve_articulation_sparse_serial_scalar(
                         Aik = Aik - values[slot_is] * wp.transpose(values[slot_ks])
                 values[slot_ik] = _solve_right_lower_transpose66(Aik, Lkk)
 
-    for local_i in range(body_count):
-        row_i = body_start + local_i
-        accum = rhs[row_i]
-        for local_j in range(local_i):
-            slot_ij = _find_block_slot(
-                articulation_block_row_offsets, articulation_block_cols, body_start, local_i, local_j
-            )
-            if slot_ij >= 0:
-                accum = accum - values[slot_ij] * delta[body_start + local_j]
-        Lii = values[articulation_diag_slots[row_i]]
-        delta[row_i] = _solve_lower66(Lii, accum)
+    if status == SPARSE_FRAME_FACTOR_OK:
+        for local_i in range(body_count):
+            row_i = body_start + local_i
+            accum = rhs[row_i]
+            for local_j in range(local_i):
+                slot_ij = _find_block_slot(
+                    articulation_block_row_offsets, articulation_block_cols, body_start, local_i, local_j
+                )
+                if slot_ij >= 0:
+                    accum = accum - values[slot_ij] * delta[body_start + local_j]
+            Lii = values[articulation_diag_slots[row_i]]
+            delta[row_i] = _solve_lower66(Lii, accum)
 
-    for local_ii in range(body_count):
-        local_i = body_count - 1 - local_ii
-        row_i = body_start + local_i
-        accum = delta[row_i]
-        for local_j in range(local_i + 1, body_count):
-            slot_ji = _find_block_slot(
-                articulation_block_row_offsets, articulation_block_cols, body_start, local_j, local_i
-            )
-            if slot_ji >= 0:
-                accum = accum - wp.transpose(values[slot_ji]) * delta[body_start + local_j]
-        Lii = values[articulation_diag_slots[row_i]]
-        delta[row_i] = _solve_upper66_from_lower(Lii, accum)
+        for local_ii in range(body_count):
+            local_i = body_count - 1 - local_ii
+            row_i = body_start + local_i
+            accum = delta[row_i]
+            for local_j in range(local_i + 1, body_count):
+                slot_ji = _find_block_slot(
+                    articulation_block_row_offsets, articulation_block_cols, body_start, local_j, local_i
+                )
+                if slot_ji >= 0:
+                    accum = accum - wp.transpose(values[slot_ji]) * delta[body_start + local_j]
+            Lii = values[articulation_diag_slots[row_i]]
+            delta[row_i] = _solve_upper66_from_lower(Lii, accum)
+
+        for row in range(body_start, body_end):
+            for component in range(6):
+                if not wp.isfinite(delta[row][component]):
+                    status = SPARSE_FRAME_SOLVE_NONFINITE
+
+    factor_status[articulation_id] = status
+    if status != SPARSE_FRAME_FACTOR_OK:
+        if wp.atomic_add(failure_info, 0, 1) == 0:
+            failure_info[1] = articulation_id
+        for row in range(body_start, body_end):
+            diagonal = diagonal_backup[row]
+            r = rhs[row]
+            update = vec6f(0.0)
+            for component in range(6):
+                update[component] = _sparse_diagonal_step(r[component], diagonal[component])
+            delta[row] = update
 
     for local_body in range(body_start, body_end):
         _apply_sparse_delta_value_to_body(

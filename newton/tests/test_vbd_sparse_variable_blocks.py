@@ -1078,6 +1078,9 @@ def _launch_legacy_serial_solve(layout, values, rhs, delta, body_count, device):
             body_vec,
             0,
             body_q_new,
+            wp.empty(rhs.shape, dtype=legacy_kernels.vec6f, device=device),
+            wp.zeros(layout.articulation_count, dtype=wp.int32, device=device),
+            wp.zeros(2, dtype=wp.int32, device=device),
         ],
         device=device,
     )

@@ -1576,6 +1576,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.rigid_articulation_sparse_values_scalar = None
         self.rigid_articulation_sparse_rhs_scalar = None
         self.rigid_articulation_sparse_delta_scalar = None
+        self._sparse_frame_diagonal_backup = None
+        self._sparse_frame_factor_status = None
+        self._sparse_frame_failure_info = None
+        self._sparse_frame_failure_info_host = None
+        self._sparse_frame_failure_warned = False
         self.rigid_articulation_sparse_joint_dof_dim = model.joint_dof_dim
         self._rigid_articulation_sparse_zero_views: tuple[wp.array, ...] = ()
         if self.rigid_articulation_solve == "block_sparse_joints":
@@ -1612,6 +1617,17 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 # mixed values and right-hand side, and the coupled solve writes every mixed update
                 # component.
                 self._rigid_articulation_sparse_zero_views = (values_view, rhs_view, delta_view)
+                if layout.rigid_articulation_count > 0:
+                    self._sparse_frame_diagonal_backup = wp.empty(
+                        layout.rigid_body_row_count, dtype=vec6f, device=self.device
+                    )
+                    self._sparse_frame_factor_status = wp.zeros(
+                        layout.rigid_articulation_count, dtype=wp.int32, device=self.device
+                    )
+                    self._sparse_frame_failure_info = wp.zeros(2, dtype=wp.int32, device=self.device)
+                    self._sparse_frame_failure_info_host = wp.zeros(
+                        2, dtype=wp.int32, device="cpu", pinned=self.device.is_cuda
+                    )
                 if self.device.is_cuda:
                     self.rigid_articulation_sparse_values_scalar = self._rigid_articulation_sparse_values_scalar
                     self.rigid_articulation_sparse_rhs_scalar = self._rigid_articulation_sparse_rhs_scalar
@@ -2032,6 +2048,25 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             f"block-sparse articulation solve ({failures} times so far). Those bodies' frames are solved "
             f"without the modal elimination and their modes take a diagonal (Jacobi) step, which converges "
             f"slowly. The modal mass, stiffness, or damping is likely inconsistent or indefinite.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    def _warn_sparse_frame_failures(self) -> None:
+        if (
+            self._sparse_frame_failure_warned
+            or self._sparse_frame_failure_info_host is None
+            or self.device.is_capturing
+        ):
+            return
+        failures, articulation_id = self._sparse_frame_failure_info_host.numpy()
+        if failures == 0:
+            return
+        self._sparse_frame_failure_warned = True
+        warnings.warn(
+            f"SolverVBD could not factor or solve a block-sparse frame system. The affected articulations "
+            f"took diagonal (Jacobi) steps. The first failure was at solver articulation index {articulation_id} "
+            f"({failures} failures so far).",
             UserWarning,
             stacklevel=3,
         )
@@ -2796,6 +2831,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # with kinematic bodies zeroed out.
         self._init_kinematic_state()
 
+        self._elastic_contact_terms = None
+
         # Pre-allocate body-body contact buffers when the contact capacity is
         # already known; otherwise lazy allocation handles the first step.
         rcm = getattr(model, "rigid_contact_max", 0) or 0
@@ -2830,6 +2867,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._apply_module_options()
         self._warn_sparse_elastic_indefinite()
         self._warn_coupled_articulation_failures()
+        self._warn_sparse_frame_failures()
         # Mimic relationships are notified with CONSTRAINT_PROPERTIES.
         if flags & (ModelFlags.JOINT_PROPERTIES | ModelFlags.CONSTRAINT_PROPERTIES):
             self._has_joint_mimics = self._integrates_rigid_bodies and has_supported_joint_mimics(
@@ -3189,6 +3227,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self.body_body_contact_tangent_rho = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
         self.body_body_contact_lambda = wp.zeros(rigid_contact_max, dtype=wp.vec3, device=self.device)
         self.body_body_contact_C0 = wp.zeros(rigid_contact_max, dtype=wp.vec3, device=self.device)
+        if self.model.elastic_shape_vertex_total_count > 0:
+            self._elastic_contact_terms = wp.empty(
+                rigid_contact_max, dtype=rigid_vbd_kernels.ElasticContactTerms, device=self.device
+            )
 
     def _validate_contact_materials(self) -> None:
         """Validate shape materials for particle contacts and compliant rigid contacts."""
@@ -4164,6 +4206,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         self._apply_module_options()
         self._warn_sparse_elastic_indefinite()
         self._warn_coupled_articulation_failures()
+        self._warn_sparse_frame_failures()
         if self.tendon_material_direct != self._tendon_material_state.enabled:
             raise ValueError("Reconstruct SolverVBD to change tendon_material_direct")
         if self.tendon_material_direct and (state_in.requires_grad or state_out.requires_grad):
@@ -4239,6 +4282,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 state_in, state_out, control, contacts, dt, report_unsupported_wrap=False, iteration=iter_num
             )
             self._solve_particle_iteration(state_in, state_out, contacts, dt)
+
+        if self._sparse_frame_failure_info is not None and not self._sparse_frame_failure_warned:
+            wp.copy(self._sparse_frame_failure_info_host, self._sparse_frame_failure_info)
 
         # Opt-in contact force export: evaluate at the final iterate while the pose history the
         # iterations used is still intact (finalization advances it below).
@@ -6459,6 +6505,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.body_hessian_ll,
                     self.body_hessian_al,
                     self.body_hessian_aa,
+                    self._elastic_contact_terms,
                 ],
                 device=self.device,
             )
@@ -7163,7 +7210,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._body_disp_ang,
                         self._use_body_displacement,
                     ],
-                    outputs=[state_in.body_q],
+                    outputs=[
+                        state_in.body_q,
+                        self._sparse_frame_diagonal_backup,
+                        self._sparse_frame_factor_status,
+                        self._sparse_frame_failure_info,
+                    ],
                     device=self.device,
                 )
 
@@ -7198,7 +7250,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         self._rigid_articulation_sparse_values_scalar,
                         self._rigid_articulation_sparse_rhs_scalar,
                     ],
-                    outputs=[self._rigid_articulation_sparse_delta_scalar],
+                    outputs=[
+                        self._rigid_articulation_sparse_delta_scalar,
+                        self._sparse_frame_diagonal_backup,
+                        self._sparse_frame_factor_status,
+                        self._sparse_frame_failure_info,
+                    ],
                     device=self.device,
                     block_dim=SPARSE_ARTICULATION_CTA_THREADS,
                 )
@@ -7474,6 +7531,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     model.elastic_shape_vertex_phi,
                     state_in.joint_q,
                     state_out.joint_q,
+                    self._elastic_contact_terms,
                 ],
                 outputs=[
                     self.elastic_body_block_grad,

@@ -2565,6 +2565,35 @@ def test_vbd_elastic_contact_overflow_assembles_consistent_block(test, device):
             _check_vbd_elastic_contact_overflow_assembles_consistent_block(test, device, compliant)
 
 
+def test_vbd_elastic_contact_uses_frame_linearization(test, device):
+    """Use the frame contact linearization for the modal force and Hessian."""
+
+    def assemble(perturb_after_frame: bool):
+        model, _ = _build_elastic_ground_contact_model(device, z=0.04, is_kinematic=False)
+        state_in, state_out = model.state(), model.state()
+        pipeline = newton.CollisionPipeline(model, broad_phase="explicit", deterministic=True)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_in, contacts)
+        test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        solver = _make_vbd_solver(model, compliant=False, iterations=1)
+        original_assemble = solver._launch_assemble_elastic_bodies
+
+        def assemble_modes(*args, **kwargs):
+            if perturb_after_frame:
+                # A second contact evaluation would see a different separation.
+                contacts.rigid_contact_margin0.fill_(0.1)
+            return original_assemble(*args, **kwargs)
+
+        solver._launch_assemble_elastic_bodies = assemble_modes
+        solver.step(state_in, state_out, model.control(), contacts, 0.01)
+        return solver.elastic_body_block_grad.numpy(), solver.elastic_body_block_matrix.numpy()
+
+    expected_grad, expected_matrix = assemble(False)
+    actual_grad, actual_matrix = assemble(True)
+    np.testing.assert_allclose(actual_grad, expected_grad, rtol=2.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(actual_matrix, expected_matrix, rtol=2.0e-6, atol=1.0e-6)
+
+
 def test_elastic_contact_local_mat33_projection_matches_world(test, device):
     """Check that projecting a contact force and Hessian onto modes in the body frame matches the world frame."""
     del device
@@ -7513,6 +7542,12 @@ for device in devices:
         test_vbd_elastic_contact_overflow_assembles_consistent_block,
         devices=[device],
         check_output=False,
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_vbd_elastic_contact_uses_frame_linearization",
+        test_vbd_elastic_contact_uses_frame_linearization,
+        devices=[device],
     )
     add_function_test(
         TestReducedElasticBody,

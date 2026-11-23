@@ -1,0 +1,1 @@
+Reuse the contact force and Hessian from the reduced elastic frame solve when assembling modal and frame–mode terms. Guard the block-sparse frame solve against invalid Cholesky pivots and nonfinite updates.
