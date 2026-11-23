@@ -10,7 +10,10 @@ the same order as ordinary launches: one launch per (phase, level) over that lev
 every articulation, so the large early levels spread over the whole GPU. Kernel boundaries
 replace the block barriers.
 
-Each task is the loop body of the matching phase of the cooperative kernel:
+On CUDA, a single articulation with split Schur updates at each leading level can use a
+warp-cooperative schedule at the default block size. The standard per-phase schedule is used
+for other layouts, and preserves the cooperative solver's operation order for fully unsplit
+plans:
 
 - diagonal: one thread per pivot row, the same 6 x 6 Cholesky;
 - column: one thread per (column entry, block row), the same right solve;
@@ -50,6 +53,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import warp as wp
@@ -71,6 +75,10 @@ from .rigid_sparse_levels_kernels import (
     _load_block66_scalar,
     _right_solve_lower_transpose66_scalar_row,
 )
+
+if TYPE_CHECKING:
+    from .rigid_sparse_level_warp_kernels import WarpLevelSchedule
+
 
 wp.set_module_options({"enable_backward": False})
 
@@ -713,12 +721,18 @@ class RigidArticulationLevelLaunchPlan:
     tail_partial: wp.array[float]
     """Scratch of the tail's long rows, ``6 * tail_block_dim`` floats per articulation (or 6)."""
 
+    _warp_schedule: WarpLevelSchedule | None = field(default=None, init=False, repr=False, compare=False)
+    """Static CUDA dispatch and workspace for the default 128-thread launches."""
+
     @property
     def has_tail(self) -> bool:
         return self.leading_level_count < self.level_count
 
     def launch_count(self) -> int:
         """Kernel launches per solve (static)."""
+
+        if self._warp_schedule is not None:
+            return len(self._warp_schedule.commands)
 
         def nonempty(offsets, level):
             return int(offsets[level + 1] > offsets[level])
@@ -827,7 +841,7 @@ def build_level_launch_plan(
     def ints(values):
         return wp.array(np.asarray(values, dtype=np.int32).reshape(-1), dtype=wp.int32, device=device)
 
-    return RigidArticulationLevelLaunchPlan(
+    plan = RigidArticulationLevelLaunchPlan(
         articulation_count=articulation_count,
         level_count=level_count,
         leading_level_count=leading_level_count,
@@ -843,6 +857,13 @@ def build_level_launch_plan(
         tail_split_entries=tail_split_entries,
         tail_partial=wp.zeros(tail_scratch, dtype=float, device=device),
     )
+
+    if wp.get_device(device).is_cuda:
+        # CUDA kernels are registered only for the warp-cooperative solver.
+        from .rigid_sparse_level_warp_kernels import build_warp_schedule  # noqa: PLC0415
+
+        plan._warp_schedule = build_warp_schedule(plan, layout)
+    return plan
 
 
 def launch_level_scheduled_solve(
@@ -864,6 +885,11 @@ def launch_level_scheduled_solve(
     come from the plan, so the sequence can be captured in a CUDA graph. ``block_dim`` is the
     block size of the per-level launches; the tail uses ``plan.tail_block_dim``.
     """
+    schedule = plan._warp_schedule
+    if block_dim == LEVEL_LAUNCH_BLOCK_DIM and schedule is not None and layout is schedule.layout:
+        schedule.launch(values, rhs, delta, pivot_clamped, device)
+        return
+
     levels = layout.levels
 
     def launch(kernel, dim, inputs, outputs):
