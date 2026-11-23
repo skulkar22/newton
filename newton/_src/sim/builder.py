@@ -3761,40 +3761,42 @@ class ModelBuilder:
         if "joint_X_p" not in array_starts:
             self.joint_X_p.extend(source_list("joint_X_p") * world_count)
         joint_q = np.tile(np.asarray(builder.joint_q, dtype=np.float32), world_count)
-        # joint_qd is parent-frame. Free-root twists use the same rotation as joint_q
+        # joint_qd is parent-frame. Floating-root twists use the same rotation as joint_q
         # (xform conjugated by joint_X_p). Other joint velocities are unchanged.
         joint_qd_source = np.asarray(builder.joint_qd, dtype=np.float32)
         joint_qd = np.tile(joint_qd_source, world_count)
         if counts["joint"]:
             joint_types = np.asarray(builder.joint_type, dtype=np.int64)
             joint_parents = np.asarray(builder.joint_parent, dtype=np.int64)
-            nonfree_roots = np.flatnonzero((joint_parents == -1) & (joint_types != int(JointType.FREE)))
+            # An ELASTIC owner stores its floating frame in the leading coordinates, like FREE.
+            is_floating = np.isin(joint_types, (int(JointType.FREE), int(JointType.ELASTIC)))
+            anchored_roots = np.flatnonzero((joint_parents == -1) & ~is_floating)
             for world_index, xform in enumerate(xforms):
                 if xform is None:
                     continue
-                for joint in nonfree_roots.tolist():
+                for joint in anchored_roots.tolist():
                     source = wp.transform(*builder.joint_X_p[joint])
                     target = joint_X_p_start + world_index * counts["joint"] + joint
                     transformed = transform_mul(xform, source)
                     self.joint_X_p[target] = transformed
 
-            free_roots = np.flatnonzero((joint_parents == -1) & (joint_types == int(JointType.FREE)))
-            if len(free_roots) and any(xform is not None for xform in xforms):
+            floating_roots = np.flatnonzero((joint_parents == -1) & is_floating)
+            if len(floating_roots) and any(xform is not None for xform in xforms):
                 # Per-joint frames are invariant across worlds; compute them once.
-                free_root_frames = []
-                for joint in free_roots.tolist():
+                floating_root_frames = []
+                for joint in floating_roots.tolist():
                     source_q = builder.joint_q_start[joint]
                     source_qd = builder.joint_qd_start[joint]
                     xform_prev = wp.transform(*builder.joint_q[source_q : source_q + 7])
                     X_pj = wp.transform(*builder.joint_X_p[joint])
-                    free_root_frames.append((source_q, source_qd, X_pj, wp.transform_inverse(X_pj), xform_prev))
+                    floating_root_frames.append((source_q, source_qd, X_pj, wp.transform_inverse(X_pj), xform_prev))
                 for world_index, xform in enumerate(xforms):
                     if xform is None:
                         continue
                     coord_base = world_index * counts["joint_coord"]
                     dof_base = world_index * len(joint_qd_source)
                     rotate_qd = not np.array_equal(np.asarray(xform.q), _IDENTITY_ROTATION)
-                    for source_q, source_qd, X_pj, X_pj_inv, xform_prev in free_root_frames:
+                    for source_q, source_qd, X_pj, X_pj_inv, xform_prev in floating_root_frames:
                         xform_local = transform_mul(transform_mul(X_pj_inv, xform), X_pj)
                         transformed = transform_mul(xform_local, xform_prev)
                         target_q = coord_base + source_q

@@ -434,6 +434,35 @@ class TestModelBuilderReplicate(unittest.TestCase):
         expected = np.tile(np.asarray(source.joint_q, dtype=np.float32), 2)
         np.testing.assert_array_equal(np.asarray(replicated.joint_q, dtype=np.float32), expected)
 
+    def test_copy_transforms_elastic_owner_frame(self):
+        """Transform the floating frame of an elastic replica while preserving its modes."""
+        source = ModelBuilder()
+        body = source.add_body_elastic(
+            xform=wp.transform((1.0, 0.0, 0.0), wp.quat_identity()), mode_count=1, mode_q=[0.25], mode_qd=[-0.3]
+        )
+        owner = source.body_elastic_joint[body]
+        qd_start = source.joint_qd_start[owner]
+        source.joint_qd[qd_start : qd_start + 6] = [2.0, 0.0, 0.0, 3.0, 0.0, 0.0]
+        yaw = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi / 2)
+        xform = wp.transform((5.0, 2.0, 3.0), yaw)
+
+        for merge in ("add_world", "replicate"):
+            with self.subTest(merge=merge):
+                scene = ModelBuilder()
+                if merge == "add_world":
+                    scene.add_world(source, xform)
+                else:
+                    scene.replicate(source, 2, xforms=[wp.transform_identity(), xform])
+
+                copied_body = scene.body_count - 1
+                copied_owner = scene.body_elastic_joint[copied_body]
+                q_start = scene.joint_q_start[copied_owner]
+                qd_start = scene.joint_qd_start[copied_owner]
+                np.testing.assert_allclose(scene.joint_q[q_start : q_start + 7], scene.body_q[copied_body], atol=1e-6)
+                np.testing.assert_allclose(scene.joint_X_p[copied_owner], wp.transform_identity(), atol=1e-6)
+                np.testing.assert_allclose(scene.joint_qd[qd_start : qd_start + 7], [0, 2, 0, 0, 3, 0, -0.3], atol=1e-6)
+                self.assertEqual(scene.joint_q[q_start + 7], 0.25)
+
     def test_validation_failure_does_not_mutate_destination(self):
         def make_builder(default: int, value: int) -> ModelBuilder:
             builder = ModelBuilder()
