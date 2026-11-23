@@ -462,6 +462,28 @@ def test_level_launch_matches_levels(test, device):
                     np.testing.assert_array_equal(solution.numpy(), actual)
 
 
+def test_fused_level_solve(test, device):
+    """Exercise the CUDA specialization on nonuniform fronts and a partial final thread block."""
+    groups = [_star(5, 4)]
+    layout = _layout(groups, device)
+    plan = build_level_launch_plan(layout, device, tail_rows=4, split_entries=4, split_terms=1)
+    test.assertIs(plan._front_layout, layout)
+    _, _, original, rhs = _random_system(groups, layout, device)
+    stock_values, stock_solution = _solve_levels(layout, original, rhs, device)
+    values = wp.clone(original)
+    solution = wp.zeros_like(rhs)
+    clamped = wp.zeros(1, dtype=wp.int32, device=device)
+    launch_level_scheduled_solve(plan, layout, values, rhs, solution, device, clamped)
+    _assert_launch_matches(test, plan, values, solution, stock_values, stock_solution, "fused")
+    test.assertEqual(clamped.numpy()[0], 0)
+
+    values.zero_()
+    rhs.zero_()
+    launch_level_scheduled_solve(plan, layout, values, rhs, solution, device, clamped)
+    test.assertEqual(clamped.numpy()[0], 6 * layout.articulation_body_count)
+    np.testing.assert_array_equal(solution.numpy(), 0.0)
+
+
 class TestVBDSparseLevels(unittest.TestCase):
     pass
 
@@ -496,6 +518,12 @@ add_function_test(
     "test_level_launch_serial_matches_levels",
     test_level_launch_serial_matches_levels,
     devices=[device for device in get_test_devices() if device.is_cpu],
+)
+add_function_test(
+    TestVBDSparseLevels,
+    "test_fused_level_solve",
+    test_fused_level_solve,
+    devices=[device for device in get_test_devices() if device.is_cuda],
 )
 add_function_test(
     TestVBDSparseLevels,
