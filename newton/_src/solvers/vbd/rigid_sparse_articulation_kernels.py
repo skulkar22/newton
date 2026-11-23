@@ -390,16 +390,22 @@ def _angular_constraint_force_hessian(
 
 
 @wp.func
-def _add_mat66_scalar_atomic(values_scalar: wp.array[float], slot: int, block: mat66f):
+def _add_mat66_scalar_atomic(values_scalar: wp.array[float], slot: int, block: mat66f, angular_only: bool = False):
     if slot >= 0:
-        for i in range(6):
-            for j in range(6):
-                wp.atomic_add(values_scalar, _scalar_block_index(slot, i, j), block[i, j])
+        if angular_only:
+            for i in range(3):
+                for j in range(3):
+                    wp.atomic_add(values_scalar, _scalar_block_index(slot, 3 + i, 3 + j), block[3 + i, 3 + j])
+        else:
+            for i in range(6):
+                for j in range(6):
+                    wp.atomic_add(values_scalar, _scalar_block_index(slot, i, j), block[i, j])
 
 
 @wp.func
-def _add_rhs_scalar_atomic(rhs_scalar: wp.array[float], index: int, value: vec6f):
-    for i in range(6):
+def _add_rhs_scalar_atomic(rhs_scalar: wp.array[float], index: int, value: vec6f, angular_only: bool = False):
+    start = 3 if angular_only else 0
+    for i in range(start, 6):
         wp.atomic_add(rhs_scalar, _scalar_vec_index(index, i), value[i])
 
 
@@ -643,34 +649,34 @@ def _assemble_angular_direct_pair_scalar(
     rhs_parent, rhs_child, H_block, H_cross = _angular_direct_pair_blocks(torque_parent, H_aa)
 
     if parent_body >= 0 and parent_local >= 0:
-        _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, rhs_parent)
-        _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child)
+        _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, rhs_parent, True)
+        _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child, True)
         slot_pp = _find_block_slot(
             articulation_block_row_offsets, articulation_block_cols, body_start, parent_local, parent_local
         )
         slot_cc = _find_block_slot(
             articulation_block_row_offsets, articulation_block_cols, body_start, child_local, child_local
         )
-        _add_mat66_scalar_atomic(values_scalar, slot_pp, H_block)
-        _add_mat66_scalar_atomic(values_scalar, slot_cc, H_block)
+        _add_mat66_scalar_atomic(values_scalar, slot_pp, H_block, True)
+        _add_mat66_scalar_atomic(values_scalar, slot_cc, H_block, True)
 
         if parent_local >= child_local:
             slot_pc = _find_block_slot(
                 articulation_block_row_offsets, articulation_block_cols, body_start, parent_local, child_local
             )
-            _add_mat66_scalar_atomic(values_scalar, slot_pc, H_cross)
+            _add_mat66_scalar_atomic(values_scalar, slot_pc, H_cross, True)
         else:
             slot_cp = _find_block_slot(
                 articulation_block_row_offsets, articulation_block_cols, body_start, child_local, parent_local
             )
-            _add_mat66_scalar_atomic(values_scalar, slot_cp, H_cross)
-        _add_mat66_scalar_atomic(values_scalar, cross_slot, H_cross)
+            _add_mat66_scalar_atomic(values_scalar, slot_cp, H_cross, True)
+        _add_mat66_scalar_atomic(values_scalar, cross_slot, H_cross, True)
     else:
-        _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child)
+        _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child, True)
         slot_cc = _find_block_slot(
             articulation_block_row_offsets, articulation_block_cols, body_start, child_local, child_local
         )
-        _add_mat66_scalar_atomic(values_scalar, slot_cc, H_block)
+        _add_mat66_scalar_atomic(values_scalar, slot_cc, H_block, True)
 
 
 @wp.func
@@ -922,23 +928,24 @@ def _assemble_coordinate_row_scalar(
     force: float,
     hessian: float,
     cross_slot: int,
+    angular_only: bool,
 ):
     """Assemble a joint-coordinate row, including the parent-child coupling."""
     rhs_parent, rhs_child, H_pp, H_cc, H_pc = _coordinate_row_blocks(gradient_parent, gradient_child, force, hessian)
     slot_cc = _find_block_slot(row_offsets, cols, body_start, child_local, child_local)
-    _add_mat66_scalar_atomic(values_scalar, slot_cc, H_cc)
-    _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child)
+    _add_mat66_scalar_atomic(values_scalar, slot_cc, H_cc, angular_only)
+    _add_rhs_scalar_atomic(rhs_scalar, body_start + child_local, rhs_child, angular_only)
     if parent_local >= 0:
         slot_pp = _find_block_slot(row_offsets, cols, body_start, parent_local, parent_local)
-        _add_mat66_scalar_atomic(values_scalar, slot_pp, H_pp)
-        _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, rhs_parent)
+        _add_mat66_scalar_atomic(values_scalar, slot_pp, H_pp, angular_only)
+        _add_rhs_scalar_atomic(rhs_scalar, body_start + parent_local, rhs_parent, angular_only)
         if parent_local >= child_local:
             slot_pc = _find_block_slot(row_offsets, cols, body_start, parent_local, child_local)
-            _add_mat66_scalar_atomic(values_scalar, slot_pc, H_pc)
+            _add_mat66_scalar_atomic(values_scalar, slot_pc, H_pc, angular_only)
         else:
             slot_cp = _find_block_slot(row_offsets, cols, body_start, child_local, parent_local)
-            _add_mat66_scalar_atomic(values_scalar, slot_cp, wp.transpose(H_pc))
-        _add_mat66_scalar_atomic(values_scalar, cross_slot, H_pc)
+            _add_mat66_scalar_atomic(values_scalar, slot_cp, wp.transpose(H_pc), angular_only)
+        _add_mat66_scalar_atomic(values_scalar, cross_slot, H_pc, angular_only)
 
 
 @wp.func
@@ -2115,6 +2122,7 @@ def _assemble_articulation_joint_scalar(
                     force,
                     hessian,
                     cross_slot,
+                    jt == JointType.REVOLUTE,
                 )
 
     if jt == JointType.REVOLUTE:
@@ -2135,6 +2143,7 @@ def _assemble_articulation_joint_scalar(
                 force,
                 hessian,
                 cross_slot,
+                True,
             )
 
     if jt == JointType.REVOLUTE:
