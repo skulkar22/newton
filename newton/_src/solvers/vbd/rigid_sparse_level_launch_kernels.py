@@ -10,10 +10,10 @@ the same order as ordinary launches: one launch per (phase, level) over that lev
 every articulation, so the large early levels spread over the whole GPU. Kernel boundaries
 replace the block barriers.
 
-On CUDA, a single articulation with split Schur updates at each leading level can use
-warp-cooperative front and backward-substitution kernels at the default block size. It
-reuses the standard Schur and tail kernels. Other layouts follow the per-phase schedule
-below, preserving the cooperative solver's operation order for fully unsplit plans:
+For eligible CUDA plans, a warp factors a pivot and solves its columns and forward row together.
+The following per-phase schedule also handles split substitution rows and multiple articulations.
+
+Each task is the loop body of the matching phase of the cooperative kernel:
 
 - diagonal: one thread per pivot row, the same 6 x 6 Cholesky;
 - column: one thread per (column entry, block row), the same right solve;
@@ -53,7 +53,6 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import numpy as np
 import warp as wp
@@ -61,6 +60,7 @@ import warp as wp
 from .rigid_sparse_articulation import RigidArticulationSparseLayout
 from .rigid_sparse_articulation_kernels import (
     _block_sync,
+    _guard_pivot,
     _scalar_block_get,
     _scalar_block_set,
     _scalar_vec_get,
@@ -68,6 +68,7 @@ from .rigid_sparse_articulation_kernels import (
     _scalar_vec_set,
     _solve_lower66,
     _solve_upper66_from_lower,
+    _warp_sync,
     vec6f,
 )
 from .rigid_sparse_levels_kernels import (
@@ -75,10 +76,6 @@ from .rigid_sparse_levels_kernels import (
     _load_block66_scalar,
     _right_solve_lower_transpose66_scalar_row,
 )
-
-if TYPE_CHECKING:
-    from .rigid_sparse_level_warp_kernels import WarpLevelSchedule
-
 
 wp.set_module_options({"enable_backward": False})
 
@@ -174,6 +171,143 @@ def _level_backward_row(
 # ---------------------------------------------------------------------------
 # Per-level kernels: one thread per task of one level across all articulations.
 # ---------------------------------------------------------------------------
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return __shfl_sync(0xffffffffu, value, source);
+#else
+    return value;
+#endif
+""")
+def _broadcast_within_warp(value: float, source: int) -> float:
+    pass
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    // The last warp may contain fewer than four row groups.
+    unsigned mask = 0xffu << (threadIdx.x & 24u);
+    return __shfl_sync(mask, value, source, 8);
+#else
+    return value;
+#endif
+""")
+def _broadcast_within_eight_lanes(value: float, source: int) -> float:
+    pass
+
+
+@wp.kernel
+def level_launch_front(
+    begin: int,
+    rows: wp.array[wp.int32],
+    body_starts: wp.array[wp.int32],
+    row_offsets: wp.array[wp.int32],
+    cols: wp.array[wp.int32],
+    col_offsets: wp.array[wp.int32],
+    col_slots: wp.array[wp.int32],
+    diag_slots: wp.array[wp.int32],
+    values: wp.array[float],
+    rhs: wp.array[float],
+    delta: wp.array[float],
+    pivot_clamped: wp.array[wp.int32],
+):
+    """Factor a pivot and solve its columns and forward row in a single warp."""
+    task = begin + wp.tid() // 32
+    lane = wp.tid() % 32
+    row = rows[task]
+    diag = diag_slots[row]
+    first = col_offsets[row]
+    end = col_offsets[row + 1]
+    # Six lanes hold the six rows of a block. Four neighboring blocks fit
+    # beside the diagonal in one warp and share its pivots through shuffles.
+    group = lane // 6
+    component = lane % 6
+    slot = diag
+    active = group == 0
+    if group > 0 and group <= 4 and first + group <= end:
+        slot = col_slots[first + group - 1]
+        active = True
+    block_row = wp.spatial_vector()
+    if active:
+        for j in range(6):
+            block_row[j] = _scalar_block_get(values, slot, component, j)
+    residual = float(0.0)
+    if lane < 6:
+        residual = rhs[6 * row + lane]
+        body_start = body_starts[task]
+        for entry in range(row_offsets[row], row_offsets[row + 1]):
+            col = body_start + cols[entry]
+            if col < row:
+                product = _scalar_block_get(values, entry, lane, 0) * delta[6 * col]
+                for j in range(1, 6):
+                    product += _scalar_block_get(values, entry, lane, j) * delta[6 * col + j]
+                residual -= product
+    # Lane 30 carries the RHS through the same triangular solve as the column blocks.
+    for j in range(6):
+        value = _broadcast_within_warp(residual, j)
+        if lane == 30:
+            block_row[j] = value
+    original_diagonal = block_row[component]
+    for k in range(6):
+        root = float(0.0)
+        if lane == k:
+            root = wp.sqrt(_guard_pivot(block_row[k], original_diagonal, pivot_clamped))
+        root = _broadcast_within_warp(root, k)
+        solved = block_row[k] / root
+        block_row[k] = wp.where(lane == k, root, solved)
+        for j in range(6):
+            if j > k:
+                block_row[j] = block_row[j] - solved * _broadcast_within_warp(solved, j)
+    if active:
+        for j in range(6):
+            _scalar_block_set(values, slot, component, j, wp.where(lane < j, 0.0, block_row[j]))
+    if lane == 30:
+        for j in range(6):
+            delta[6 * row + j] = block_row[j]
+    first = first + 4
+    _warp_sync()
+    for job in range(lane, 6 * (end - first), 32):
+        _right_solve_lower_transpose66_scalar_row(values, col_slots[first + job // 6], diag, job % 6)
+
+
+@wp.kernel
+def level_launch_backward_warp(
+    begin: int,
+    rows: wp.array[wp.int32],
+    body_starts: wp.array[wp.int32],
+    col_offsets: wp.array[wp.int32],
+    col_rows: wp.array[wp.int32],
+    col_slots: wp.array[wp.int32],
+    diag_slots: wp.array[wp.int32],
+    values: wp.array[float],
+    delta: wp.array[float],
+):
+    """Eight lanes per row, one component of the transposed block solve per active lane."""
+    tid = wp.tid()
+    task = begin + tid // 8
+    component = tid % 8
+    row = rows[task]
+    diag = diag_slots[row]
+    value = float(0.0)
+    if component < 6:
+        value = delta[6 * row + component]
+        for entry in range(col_offsets[row], col_offsets[row + 1]):
+            col = body_starts[task] + col_rows[entry]
+            slot = col_slots[entry]
+            product = _scalar_block_get(values, slot, 0, component) * delta[6 * col]
+            for j in range(1, 6):
+                product += _scalar_block_get(values, slot, j, component) * delta[6 * col + j]
+            value -= product
+    for k in range(6):
+        pivot = 5 - k
+        if component == pivot:
+            value = value / _scalar_block_get(values, diag, pivot, pivot)
+        solved = _broadcast_within_eight_lanes(value, pivot)
+        if component < pivot:
+            value -= _scalar_block_get(values, diag, pivot, component) * solved
+    if component < 6:
+        delta[6 * row + component] = value
 
 
 @wp.kernel
@@ -721,8 +855,20 @@ class RigidArticulationLevelLaunchPlan:
     tail_partial: wp.array[float]
     """Scratch of the tail's long rows, ``6 * tail_block_dim`` floats per articulation (or 6)."""
 
-    _warp_schedule: WarpLevelSchedule | None = field(default=None, init=False, repr=False, compare=False)
-    """Static CUDA dispatch and workspace for the default 128-thread launches."""
+    _front_layout: RigidArticulationSparseLayout | None = field(default=None, init=False, repr=False, compare=False)
+
+    def _supports_fused_front(self) -> bool:
+        """Select the measured single-articulation schedule with unsplit substitution rows."""
+        return (
+            self.articulation_count == 1
+            and self.leading_level_count > 0
+            and 0 < self.level_count - self.leading_level_count < 8
+            and self.tail_split_entries > 0
+            and self.tail_block_dim == LEVEL_LAUNCH_BLOCK_DIM
+            and not self.forward.long.shape[0]
+            and not self.backward.long.shape[0]
+            and all(self.update.level_range(level)[-1] for level in range(self.leading_level_count))
+        )
 
     @property
     def has_tail(self) -> bool:
@@ -731,16 +877,17 @@ class RigidArticulationLevelLaunchPlan:
     def launch_count(self) -> int:
         """Kernel launches per solve (static)."""
 
-        if self._warp_schedule is not None:
-            return len(self._warp_schedule.commands)
-
         def nonempty(offsets, level):
             return int(offsets[level + 1] > offsets[level])
 
         count = 0
+        fused = self._front_layout is not None
+        phases = (self.update, self.backward) if fused else (self.update, self.forward, self.backward)
         for level in range(self.leading_level_count):
-            count += nonempty(self.row_offsets, level) + nonempty(self.column_offsets, level)
-            for phase in (self.update, self.forward, self.backward):
+            count += nonempty(self.row_offsets, level)
+            if not fused:
+                count += nonempty(self.column_offsets, level)
+            for phase in phases:
                 count += max(nonempty(phase.short_offsets, level), nonempty(phase.chunk_offsets, level))
                 count += nonempty(phase.long_offsets, level)
         return count + int(self.has_tail)
@@ -858,11 +1005,8 @@ def build_level_launch_plan(
         tail_partial=wp.zeros(tail_scratch, dtype=float, device=device),
     )
 
-    if wp.get_device(device).is_cuda:
-        # CUDA kernels are registered only for the warp-cooperative solver.
-        from .rigid_sparse_level_warp_kernels import build_warp_schedule  # noqa: PLC0415
-
-        plan._warp_schedule = build_warp_schedule(plan, layout)
+    if wp.get_device(device).is_cuda and plan._supports_fused_front():
+        plan._front_layout = layout
     return plan
 
 
@@ -885,11 +1029,6 @@ def launch_level_scheduled_solve(
     come from the plan, so the sequence can be captured in a CUDA graph. ``block_dim`` is the
     block size of the per-level launches; the tail uses ``plan.tail_block_dim``.
     """
-    schedule = plan._warp_schedule
-    if block_dim == LEVEL_LAUNCH_BLOCK_DIM and schedule is not None and layout is schedule.layout:
-        schedule.launch(values, rhs, delta, pivot_clamped, device)
-        return
-
     levels = layout.levels
 
     def launch(kernel, dim, inputs, outputs):
@@ -899,16 +1038,39 @@ def launch_level_scheduled_solve(
     def offsets_range(offsets, level):
         return offsets[level], offsets[level + 1] - offsets[level]
 
+    fused_front = plan._front_layout is layout and block_dim == LEVEL_LAUNCH_BLOCK_DIM
     for level in range(plan.leading_level_count):
-        begin, count = offsets_range(plan.row_offsets, level)
-        launch(level_launch_diag, count, [begin, plan.rows, layout.articulation_diag_slots, pivot_clamped], [values])
-        begin, count = offsets_range(plan.column_offsets, level)
-        launch(
-            level_launch_column,
-            6 * count,
-            [begin, plan.columns, levels.level_column_slots, levels.level_column_diag_slots],
-            [values],
-        )
+        if fused_front:
+            begin, count = offsets_range(plan.forward.short_offsets, level)
+            launch(
+                level_launch_front,
+                32 * count,
+                [
+                    begin,
+                    plan.forward.short,
+                    plan.forward.short_aux,
+                    layout.articulation_block_row_offsets,
+                    layout.articulation_block_cols,
+                    layout.articulation_block_col_offsets,
+                    layout.articulation_block_col_slots,
+                    layout.articulation_diag_slots,
+                    values,
+                    rhs,
+                ],
+                [delta, pivot_clamped],
+            )
+        else:
+            begin, count = offsets_range(plan.row_offsets, level)
+            launch(
+                level_launch_diag, count, [begin, plan.rows, layout.articulation_diag_slots, pivot_clamped], [values]
+            )
+            begin, count = offsets_range(plan.column_offsets, level)
+            launch(
+                level_launch_column,
+                6 * count,
+                [begin, plan.columns, levels.level_column_slots, levels.level_column_diag_slots],
+                [values],
+            )
         short_begin, short_count, chunk_begin, chunk_count, long_begin, long_count = plan.update.level_range(level)
         launch(
             level_launch_update,
@@ -940,7 +1102,8 @@ def launch_level_scheduled_solve(
             [values],
         )
 
-    for level in range(plan.leading_level_count):
+    separate_forward_levels = 0 if fused_front else plan.leading_level_count
+    for level in range(separate_forward_levels):
         short_begin, short_count, chunk_begin, chunk_count, long_begin, long_count = plan.forward.level_range(level)
         launch(
             level_launch_forward,
@@ -1014,6 +1177,23 @@ def launch_level_scheduled_solve(
 
     for level in reversed(range(plan.leading_level_count)):
         short_begin, short_count, chunk_begin, chunk_count, long_begin, long_count = plan.backward.level_range(level)
+        if fused_front:
+            launch(
+                level_launch_backward_warp,
+                8 * short_count,
+                [
+                    short_begin,
+                    plan.backward.short,
+                    plan.backward.short_aux,
+                    layout.articulation_block_col_offsets,
+                    layout.articulation_block_col_rows,
+                    layout.articulation_block_col_slots,
+                    layout.articulation_diag_slots,
+                    values,
+                ],
+                [delta],
+            )
+            continue
         launch(
             level_launch_backward,
             short_count + 6 * chunk_count,
