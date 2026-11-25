@@ -121,12 +121,16 @@ def _elastic_endpoint_xform(
     q_start = joint_q_start[owner_joint] + 7
     mode_count = elastic_mode_count[elastic_index]
 
+    # Sum the small modal displacement first and add it to the rest position once. Adding each term to
+    # the position instead rounds it at the float32 spacing of the position (0.12 um at 1 m), once per mode.
+    delta = wp.vec3(0.0, 0.0, 0.0)
     theta = wp.vec3(0.0, 0.0, 0.0)
     for mode in range(elastic_max_mode_count):
         if mode < mode_count:
             idx = endpoint * elastic_max_mode_count + mode
-            p = p + elastic_endpoint_phi[idx] * joint_q[q_start + mode]
+            delta = delta + elastic_endpoint_phi[idx] * joint_q[q_start + mode]
             theta = theta + elastic_endpoint_psi[idx] * joint_q[q_start + mode]
+    p = p + delta
 
     angle = wp.length(theta)
     if angle > _SMALL_ANGLE_EPS:

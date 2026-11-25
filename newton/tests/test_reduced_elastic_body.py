@@ -13,7 +13,9 @@ import warp as wp
 
 import newton
 from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pairs
+from newton._src.solvers.vbd.joint_coordinates import eval_elastic_endpoint_xform
 from newton._src.solvers.vbd.reduced_elastic_kernels import (
+    _elastic_endpoint_xform,
     accumulate_elastic_frame_coupling,
     compute_elastic_mode_sums,
     create_solve_elastic_body_tiled,
@@ -5835,6 +5837,126 @@ def test_vbd_elastic_block_capacity_steps_at_tiled_limit(test, device):
 
 
 @wp.kernel
+def _elastic_endpoint_anchor_probe(
+    xform_rest: wp.array[wp.transform],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_joint: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    joint_q: wp.array[float],
+    joint_q_start: wp.array[wp.int32],
+    joint_parent_elastic_endpoint: wp.array[wp.int32],
+    joint_child_elastic_endpoint: wp.array[wp.int32],
+    elastic_endpoint_phi: wp.array[wp.vec3],
+    elastic_endpoint_psi: wp.array[wp.vec3],
+    elastic_max_mode_count: int,
+    anchor_coordinates: wp.array[wp.vec3],
+    anchor_solver: wp.array[wp.vec3],
+):
+    joint = wp.tid()
+    anchor_coordinates[joint] = wp.transform_get_translation(
+        eval_elastic_endpoint_xform(
+            joint,
+            0,
+            False,
+            xform_rest[joint],
+            body_elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            joint_q,
+            joint_q_start,
+            joint_parent_elastic_endpoint,
+            joint_child_elastic_endpoint,
+            elastic_endpoint_phi,
+            elastic_endpoint_psi,
+            elastic_max_mode_count,
+        )
+    )
+    anchor_solver[joint] = wp.transform_get_translation(
+        _elastic_endpoint_xform(
+            joint,
+            0,
+            False,
+            xform_rest[joint],
+            body_elastic_index,
+            elastic_joint,
+            elastic_mode_count,
+            joint_q,
+            joint_q_start,
+            joint_parent_elastic_endpoint,
+            joint_child_elastic_endpoint,
+            elastic_endpoint_phi,
+            elastic_endpoint_psi,
+            elastic_max_mode_count,
+        )
+    )
+
+
+def _elastic_endpoint_anchor_errors(device, mode_count, endpoint_count=96, seed=7):
+    """Evaluate deformed joint anchors 1 to 3 m from the body origin in float32 against float64.
+
+    Returns the anchors of the coordinate and the solver evaluation, the float64 reference, the anchors of a
+    per-mode float32 accumulation onto the rest position, and the float32 spacing at the reference.
+    """
+    rng = np.random.default_rng(seed)
+    rest = (rng.uniform(1.0, 3.0, (endpoint_count, 3)) * rng.choice([-1.0, 1.0], (endpoint_count, 3))).astype(
+        np.float32
+    )
+    phi = rng.uniform(-1.0, 1.0, (endpoint_count, mode_count, 3)).astype(np.float32)
+    modal = (1.0e-4 * rng.uniform(-1.0, 1.0, mode_count)).astype(np.float32)
+    xforms = np.zeros((endpoint_count, 7), dtype=np.float32)
+    xforms[:, :3] = rest
+    xforms[:, 6] = 1.0
+    joint_q = np.zeros(7 + mode_count, dtype=np.float32)
+    joint_q[7:] = modal
+    anchors = [wp.zeros(endpoint_count, dtype=wp.vec3, device=device) for _ in range(2)]
+    wp.launch(
+        _elastic_endpoint_anchor_probe,
+        dim=endpoint_count,
+        inputs=[
+            wp.array(xforms, dtype=wp.transform, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([mode_count], dtype=wp.int32, device=device),
+            wp.array(joint_q, dtype=float, device=device),
+            wp.zeros(endpoint_count, dtype=wp.int32, device=device),
+            wp.full(endpoint_count, -1, dtype=wp.int32, device=device),
+            wp.array(np.arange(endpoint_count), dtype=wp.int32, device=device),
+            wp.array(phi.reshape(-1, 3), dtype=wp.vec3, device=device),
+            wp.zeros(endpoint_count * mode_count, dtype=wp.vec3, device=device),
+            mode_count,
+        ],
+        outputs=anchors,
+        device=device,
+    )
+    reference = rest.astype(np.float64) + np.einsum("emc,m->ec", phi.astype(np.float64), modal.astype(np.float64))
+    per_mode = rest.copy()
+    for mode in range(mode_count):
+        per_mode = per_mode + phi[:, mode] * modal[mode]
+    spacing = np.spacing(np.abs(reference).astype(np.float32)).astype(np.float64)
+    return anchors[0].numpy(), anchors[1].numpy(), reference, per_mode, spacing
+
+
+def test_elastic_endpoint_anchor_accumulation(test, device):
+    """Round the deformed joint anchor of a reduced elastic body once, not once per mode.
+
+    For anchors 1 to 3 m from the body origin and 300 modes, the float32 anchor lies within about half a
+    float32 spacing of the float64 value, while adding each modal term to the rest position accumulates
+    several spacings; no anchor is further from the float64 value than with the per-mode accumulation.
+    """
+    for mode_count in (64, 300):
+        coordinates, solver, reference, per_mode, spacing = _elastic_endpoint_anchor_errors(device, mode_count)
+        np.testing.assert_array_equal(coordinates, solver)
+        error = np.abs(coordinates.astype(np.float64) - reference) / spacing
+        error_per_mode = np.abs(per_mode.astype(np.float64) - reference) / spacing
+        test.assertLess(float(np.max(error)), 0.55)
+        test.assertTrue(np.all(error <= np.maximum(error_per_mode, 0.55)))
+        rms = float(np.sqrt(np.mean(error**2)))
+        rms_per_mode = float(np.sqrt(np.mean(error_per_mode**2)))
+        test.assertGreater(float(np.max(error_per_mode)), 2.0)
+        test.assertGreater(rms_per_mode / rms, 3.0)
+
+
+@wp.kernel
 def _elastic_reduced_mobility_probe(
     mobility: ElasticReducedMobility,
     mode_count: int,
@@ -8605,6 +8727,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_endpoint_uses_attachment_frame",
         test_elastic_endpoint_uses_attachment_frame,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_endpoint_anchor_accumulation",
+        test_elastic_endpoint_anchor_accumulation,
         devices=[device],
     )
     add_function_test(

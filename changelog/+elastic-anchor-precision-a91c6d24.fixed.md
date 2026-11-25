@@ -1,0 +1,1 @@
+Fix the deformed joint anchor of a reduced elastic body in `SolverVBD` losing float32 precision with the number of modes: the modal displacement is now summed before it is added to the rest position, so an anchor 1 m from the body origin is rounded once at the float32 spacing (0.12 um) instead of once per mode.
