@@ -23,7 +23,11 @@ from newton._src.solvers.vbd.reduced_elastic_kernels import (
     elastic_block_dense_width,
     launch_solve_elastic_body_dense,
 )
-from newton._src.solvers.vbd.rigid_vbd_kernels import ElasticReducedMobility, _elastic_reduced_mobility_pair
+from newton._src.solvers.vbd.rigid_vbd_kernels import (
+    ElasticReducedMobility,
+    _elastic_reduced_mobility_pair,
+    evaluate_contact_point_world,
+)
 from newton._src.solvers.vbd.solver_vbd import _elastic_schur_inverse_blocks, _max_elastic_block_solve_tiled_width
 from newton.examples.basic._reduced_elastic import (
     beam_render_sample_points,
@@ -5943,19 +5947,47 @@ def _elastic_contact_vertex_probe(
     vertex_phi: wp.array[wp.vec3],
     joint_q: wp.array[float],
     mode_count: int,
+    joint_q_prev: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_elastic_index: wp.array[wp.int32],
+    elastic_joint: wp.array[wp.int32],
+    elastic_mode_count: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
     vertex_local: wp.array[wp.vec3],
+    vertex_solver: wp.array[wp.vec3],
+    vertex_solver_prev: wp.array[wp.vec3],
 ):
     vertex = wp.tid()
     vertex_local[vertex] = eval_elastic_vertex_local(
         vertex, vertex_rest[vertex], vertex_phi, joint_q, 7, mode_count, mode_count
     )
+    # The contact evaluation of the solver, for a body at the origin: the body-local vertex again.
+    now, previous = evaluate_contact_point_world(
+        0,
+        vertex_rest[vertex],
+        vertex,
+        body_q,
+        body_q,
+        body_elastic_index,
+        elastic_joint,
+        elastic_mode_count,
+        joint_q,
+        joint_q_prev,
+        joint_q_start,
+        vertex_rest,
+        vertex_phi,
+        mode_count,
+    )
+    vertex_solver[vertex] = now
+    vertex_solver_prev[vertex] = previous
 
 
 def test_elastic_contact_vertex_accumulation(test, device):
     """Round the deformed contact vertex of a reduced elastic shape once, not once per mode.
 
     The vertices lie 1 to 3 m from the body origin, as the joint anchors of
-    test_elastic_endpoint_anchor_accumulation, with 300 modes.
+    test_elastic_endpoint_anchor_accumulation, with 300 modes. The contact evaluation of the solver
+    returns the same vertex as contact detection.
     """
     rng = np.random.default_rng(11)
     vertex_count, mode_count = 96, 300
@@ -5963,7 +5995,10 @@ def test_elastic_contact_vertex_accumulation(test, device):
     phi = rng.uniform(-1.0, 1.0, (vertex_count, mode_count, 3)).astype(np.float32)
     joint_q = np.zeros(7 + mode_count, dtype=np.float32)
     joint_q[7:] = 1.0e-4 * rng.uniform(-1.0, 1.0, mode_count)
-    vertices = wp.zeros(vertex_count, dtype=wp.vec3, device=device)
+    joint_q_prev = np.zeros(7 + mode_count, dtype=np.float32)
+    joint_q_prev[7:] = 1.0e-4 * rng.uniform(-1.0, 1.0, mode_count)
+    identity = np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+    vertices, solver_now, solver_prev = (wp.zeros(vertex_count, dtype=wp.vec3, device=device) for _ in range(3))
     wp.launch(
         _elastic_contact_vertex_probe,
         dim=vertex_count,
@@ -5972,8 +6007,14 @@ def test_elastic_contact_vertex_accumulation(test, device):
             wp.array(phi.reshape(-1, 3), dtype=wp.vec3, device=device),
             wp.array(joint_q, dtype=float, device=device),
             mode_count,
+            wp.array(joint_q_prev, dtype=float, device=device),
+            wp.array(identity, dtype=wp.transform, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.array([mode_count], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
         ],
-        outputs=[vertices],
+        outputs=[vertices, solver_now, solver_prev],
         device=device,
     )
     reference = rest.astype(np.float64) + np.einsum("vmc,m->vc", phi.astype(np.float64), joint_q[7:].astype(np.float64))
@@ -5986,6 +6027,14 @@ def test_elastic_contact_vertex_accumulation(test, device):
     test.assertLess(float(np.max(error)), 0.55)
     test.assertGreater(float(np.max(error_per_mode)), 2.0)
     test.assertTrue(np.all(error <= np.maximum(error_per_mode, 0.55)))
+    # Contact detection and the contact evaluation of the solver see the same vertex, for the current and
+    # the previous modal coordinates.
+    np.testing.assert_array_equal(solver_now.numpy(), vertices.numpy())
+    reference_prev = rest.astype(np.float64) + np.einsum(
+        "vmc,m->vc", phi.astype(np.float64), joint_q_prev[7:].astype(np.float64)
+    )
+    spacing_prev = np.spacing(np.abs(reference_prev).astype(np.float32)).astype(np.float64)
+    test.assertLess(float(np.max(np.abs(solver_prev.numpy().astype(np.float64) - reference_prev) / spacing_prev)), 0.55)
 
 
 def test_elastic_endpoint_anchor_accumulation(test, device):

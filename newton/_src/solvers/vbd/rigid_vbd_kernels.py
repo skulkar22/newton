@@ -31,7 +31,7 @@ from typing import Any
 import warp as wp
 
 from newton._src.core.types import MAXVAL
-from newton._src.geometry.kernels import triangle_closest_point
+from newton._src.geometry.kernels import eval_elastic_vertex_local, triangle_closest_point
 from newton._src.math import orthonormal_basis, quat_velocity
 from newton._src.sim import JointType
 from newton._src.sim.contacts import contact_surface_point, contact_surface_separation
@@ -1526,11 +1526,16 @@ def _elastic_contact_row_mobility_pair(
     mode_count = elastic_mode_count[elastic_index]
     owner_joint = elastic_joint[elastic_index]
     q_start = joint_q_start[owner_joint] + 7
-    deformed_point_local = elastic_shape_vertex_local[elastic_sample]
-    for mode in range(elastic_max_mode_count):
-        if mode < mode_count:
-            phi = elastic_shape_vertex_phi[elastic_sample * elastic_max_mode_count + mode]
-            deformed_point_local = deformed_point_local + phi * joint_q[q_start + mode]
+    # The same evaluation as contact detection, so that both see one deformed vertex.
+    deformed_point_local = eval_elastic_vertex_local(
+        elastic_sample,
+        elastic_shape_vertex_local[elastic_sample],
+        elastic_shape_vertex_phi,
+        joint_q,
+        q_start,
+        mode_count,
+        elastic_max_mode_count,
+    )
 
     lever_local = deformed_point_local + offset_local - body_com[body_id]
     rotation = wp.transform_get_rotation(body_q[body_id])
@@ -2294,13 +2299,26 @@ def evaluate_contact_point_world(
             owner_joint = elastic_joint[elastic_index]
             mode_q_start = joint_q_start[owner_joint] + 7
             mode_count = elastic_mode_count[elastic_index]
-            local_now = elastic_shape_vertex_local[elastic_sample]
-            local_prev = local_now
-            for mode in range(elastic_max_mode_count):
-                if mode < mode_count:
-                    phi = elastic_shape_vertex_phi[elastic_sample * elastic_max_mode_count + mode]
-                    local_now = local_now + phi * joint_q[mode_q_start + mode]
-                    local_prev = local_prev + phi * joint_q_prev[mode_q_start + mode]
+            # The same evaluation as contact detection, so that both see one deformed vertex.
+            vertex_rest = elastic_shape_vertex_local[elastic_sample]
+            local_now = eval_elastic_vertex_local(
+                elastic_sample,
+                vertex_rest,
+                elastic_shape_vertex_phi,
+                joint_q,
+                mode_q_start,
+                mode_count,
+                elastic_max_mode_count,
+            )
+            local_prev = eval_elastic_vertex_local(
+                elastic_sample,
+                vertex_rest,
+                elastic_shape_vertex_phi,
+                joint_q_prev,
+                mode_q_start,
+                mode_count,
+                elastic_max_mode_count,
+            )
 
     return wp.transform_point(body_q[body_index], local_now), wp.transform_point(body_q_prev[body_index], local_prev)
 
