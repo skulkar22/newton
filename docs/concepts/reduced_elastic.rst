@@ -312,10 +312,7 @@ after 30 power iterations on :math:`\mathbf{M}^{-1}\mathbf{K}`. The bound
 alone is close for three-DOF meshes but exceeds the largest eigenvalue 41
 times on a consistent-mass shell panel and about 1200 times on a welded
 two-panel shell with small (drilling-ratio) rotary inertia, which would put
-the threshold above genuine elastic modes. Fixed-interface eigenvalues of
-:class:`ModalGeneratorCraigBamptonFEM` at or below ``eigenvalue_tolerance``
-times this scale are reported as mechanisms, and the reduction report
-records the scale and its source. The
+the threshold above genuine elastic modes. The
 factorization dominates time and memory: its fill grows much faster for
 volume meshes than for shell meshes of the same size. For large models, also
 pass ``sample_node_indices`` (sample points that coincide with nodes are
@@ -337,6 +334,36 @@ frame fixed; a mechanism that remains, such as a part that is not tied to the
 rest, raises. The generator exposes the intermediate matrices and a report of
 residuals and timings, and :meth:`~ModalGeneratorCraigBamptonFEM.save_npz`
 writes the reduced model as arrays named like the generator arguments.
+
+The interior stiffness :math:`\mathbf{K}_{ii}` is factored after symmetric
+diagonal equilibration, :math:`\mathbf{K}_s = \mathbf{D}\mathbf{K}_{ii}
+\mathbf{D}` with :math:`\mathbf{D} = \operatorname{diag}(\mathbf{K}_{ii})
+^{-1/2}`, so the units of translations and rotations do not affect the
+factorization. The mechanism test of this class does not use the largest
+eigenvalue, which small rotary inertia or a stiff, light part lifts many
+decades above the first modes. It uses three quantities, each recorded in the
+report next to its limit:
+
+- the energy ratio :math:`\mathbf{y}^T \mathbf{K}_s \mathbf{y} /
+  (\|\mathbf{K}_s\|_1\, \mathbf{y}^T \mathbf{y})` of every computed
+  fixed-interface mode :math:`\boldsymbol{\phi} = \mathbf{D}\mathbf{y}` and of
+  the softest direction of :math:`\mathbf{K}_s`, which must exceed
+  ``eigenvalue_tolerance`` (default :math:`10^{-12}`). It is the reciprocal
+  condition number of the equilibrated stiffness, so a sound model that double
+  precision cannot resolve, such as a very slender and finely meshed beam, is
+  refused as well;
+- the relative tie stiffness of every coordinate,
+  :math:`(\sum_{j \ne i} |K_{ij}| / \sqrt{K_{ii} K_{jj}})^2`, against the same
+  tolerance: a node that hangs on springs of roundoff stiffness against what
+  it is attached to is refused, and one below :math:`10^{-6}` gives a warning
+  with the lowest fixed-interface frequency;
+- the test with which :class:`ModalGeneratorCraigBampton` separates the six
+  rigid-body modes (``rigid_mode_tolerance`` times the largest eigenvalue of
+  the reduced model), applied in
+  :meth:`~ModalGeneratorCraigBamptonFEM.reduce`, so that a model which could
+  not be built is not returned or exported. This last test does depend on the
+  stiffest coordinate of the reduced model, for example a small rigid
+  interface patch.
 
 Assemblies of separately meshed parts are joined with linear multi-point
 constraints :math:`\mathbf{C}\mathbf{u} = 0`, which

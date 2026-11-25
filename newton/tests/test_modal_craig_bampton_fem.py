@@ -1233,9 +1233,35 @@ def test_cb_fem_mechanisms_are_rejected_in_any_scaling(test, device):
             else:
                 with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
                     reduce(tied_points, tied_mass, tied.tocsc(), eigensolver)
-    # The soft tie falls below a tolerance that the user raises above its energy ratio.
-    with test.assertRaisesRegex(ValueError, "zero-energy mechanism.*energy ratio"):
-        reduce(tied_points, tied_mass, tied.tocsc(), "arpack", eigenvalue_tolerance=1.0e-5)
+    # The soft tie falls below a tolerance that the user raises above its energy ratio: the softest
+    # direction of the equilibrated stiffness decides on both paths.
+    for eigensolver in ("arpack", "dense"):
+        with test.assertRaisesRegex(ValueError, "softest direction of the equilibrated interior stiffness"):
+            reduce(tied_points, tied_mass, tied.tocsc(), eigensolver, eigenvalue_tolerance=1.0e-5)
+    # If the inverse iteration of the sparse path missed that direction, the lowest computed mode decides.
+    interior_count = tied.shape[0] - 6
+    with mock.patch.object(modal_sparse, "smallest_eigenvalue_estimate", return_value=(1.0, np.zeros(interior_count))):
+        with test.assertRaisesRegex(
+            ValueError, r"lowest fixed-interface eigenvalue .* Hz is at or below the zero-energy threshold"
+        ):
+            reduce(tied_points, tied_mass, tied.tocsc(), "arpack", eigenvalue_tolerance=1.0e-5)
+    # The roundoff tie leaves non-positive pivots in the equilibrated factor of the sparse path.
+    roundoff = sparse.lil_matrix(sparse.block_diag((stiffness, hung_stiffness)))
+    for component in range(6):
+        k = 1.0e-14 * stiffness[tip + component, tip + component]
+        a, b = tip + component, root + component
+        roundoff[a, a] += k
+        roundoff[b, b] += k
+        roundoff[a, b] -= k
+        roundoff[b, a] -= k
+    with test.assertRaisesRegex(ValueError, r"equilibrated interior stiffness has \d+ non-positive pivots"):
+        reduce(tied_points, tied_mass, roundoff.tocsc(), "arpack")
+    # The pivot-ratio limit of the factorization is a separate decision with its own message.
+    with mock.patch.object(modal_sparse, "SINGULAR_PIVOT_RATIO", 1.0):
+        with test.assertRaisesRegex(
+            ValueError, "smallest pivot of the equilibrated interior stiffness is .* at or below the limit 1 of"
+        ):
+            reduce(points, mass, stiffness, "arpack")
 
     # The interior mass matrix must be positive definite: a zero diagonal and an indefinite coupling raise.
     massless = sparse.lil_matrix(mass)
@@ -1247,6 +1273,96 @@ def test_cb_fem_mechanisms_are_rejected_in_any_scaling(test, device):
             reduce(points, massless.tocsc(), stiffness, eigensolver)
         with test.assertRaisesRegex(ValueError, "mass_matrix must be positive definite on the interior DOFs"):
             reduce(points, indefinite.tocsc(), stiffness, eigensolver)
+
+
+def _beam_with_hung_node(fraction):
+    """Return :func:`_frame_beam` with a node of the tip mass on six springs at its tip.
+
+    Each spring has ``fraction`` of the tip stiffness in its DOF. The whole stiffness of the node is its
+    tie, so its equilibrated diagonal is one whatever the fraction is.
+    """
+    from scipy import sparse
+
+    points, mass, stiffness = _frame_beam()
+    size = stiffness.shape[0]
+    tip = size - 6
+    extended = sparse.lil_matrix((size + 6, size + 6))
+    extended[:size, :size] = stiffness
+    for component in range(6):
+        k = fraction * stiffness[tip + component, tip + component]
+        a, b = tip + component, size + component
+        extended[a, a] += k
+        extended[b, b] += k
+        extended[a, b] -= k
+        extended[b, a] -= k
+    extended_mass = sparse.diags(np.concatenate((mass.diagonal(), mass.diagonal()[tip:]))).tocsc()
+    return np.vstack((points, points[-1:])), extended_mass, extended.tocsc()
+
+
+def test_cb_fem_soft_and_free_nodes(test, device):
+    """Refuse a node whose ties are roundoff against what it hangs on, and warn of a soft but resolved one.
+
+    The energy ratio does not see such a node, because its whole stiffness is small. Ties of 1e-12 or less of
+    the neighboring stiffness are refused by the relative tie stiffness on both paths; reduce() also refuses
+    what build() could not separate from the rigid-body modes. Ties of 1e-8 and 1e-10 give modes at 1.8 Hz
+    and 0.18 Hz below the 8.2 Hz of the beam: the model reduces and builds, with a warning.
+    """
+    from scipy import sparse
+
+    clamp = [{"name": "root", "node_indices": [0], "coupling": "node"}]
+
+    def generator(fraction, eigensolver, **options):
+        points, mass, stiffness = _beam_with_hung_node(fraction)
+        if eigensolver == "dense":
+            mass, stiffness = mass.toarray(), stiffness.toarray()
+        return newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, clamp, fixed_mode_count=8, eigensolver=eigensolver, **options
+        )
+
+    for eigensolver in ("arpack", "dense"):
+        for fraction, frequency in ((1.0e-8, 1.8), (1.0e-10, 0.18)):
+            soft = generator(fraction, eigensolver)
+            with test.assertWarnsRegex(
+                UserWarning, r"DOF 246 \(node 41 ux\) is tied to the rest of the model with only .* a soft part"
+            ) as caught:
+                soft.reduce()
+            test.assertRegex(str(caught.warning), r"lowest fixed-interface mode lies at .* Hz, a factor")
+            np.testing.assert_allclose(soft.fixed_interface_frequencies[0], frequency, rtol=0.1)
+            np.testing.assert_allclose(soft.report["zero_energy_tie_ratio_min"], fraction, rtol=1.0e-6)
+            test.assertEqual(soft.report["zero_energy_tie_coordinate"], "DOF 246 (node 41 ux)")
+            test.assertGreater(soft.report["reduced_elastic_eigenvalue_ratio"], 1.0e-8)
+            test.assertEqual(soft.report["reduced_elastic_eigenvalue_limit"], 1.0e-8)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="derive_psi", category=UserWarning)
+                soft.craig_bampton.build()
+        for fraction in (1.0e-12, 1.0e-13, 1.0e-14):
+            with test.assertRaisesRegex(
+                ValueError, r"zero-energy mechanism.*node 41 .* is tied to the rest of the model with"
+            ):
+                generator(fraction, eigensolver).reduce()
+
+    # With the tolerance at its roundoff floor the 1e-13 tie passes the tie test, but the reduced model
+    # could not be built: reduce() refuses it, on the sparse path already in the eigensolver.
+    with test.assertRaisesRegex(ValueError, "zero-energy mechanism.*cannot be separated from the six rigid-body"):
+        generator(1.0e-13, "dense", eigenvalue_tolerance=0.0).reduce()
+    with test.assertRaisesRegex(ValueError, "zero-energy mechanism.*(cannot resolve|cannot be separated)"):
+        generator(1.0e-13, "arpack", eigenvalue_tolerance=0.0).reduce()
+
+    # A rotational DOF cut out of the model and left with a negligible stiffness of its own.
+    points, mass, stiffness = _frame_beam()
+    dof = 6 * 20 + 3
+    cut = sparse.lil_matrix(stiffness)
+    original = cut[dof, dof]
+    cut[dof, :] = 0.0
+    cut[:, dof] = 0.0
+    cut[dof, dof] = 1.0e-25 * original
+    for eigensolver in ("arpack", "dense"):
+        matrices = (mass, cut.tocsc()) if eigensolver == "arpack" else (mass.toarray(), cut.toarray())
+        isolated = newton.ModalGeneratorCraigBamptonFEM(
+            points, *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver
+        )
+        with test.assertRaisesRegex(ValueError, rf"DOF {dof} \(node 20 rx\) is tied to the rest of the model with 0 "):
+            isolated.reduce()
 
 
 def test_cb_fem_equilibration_keeps_well_scaled_results(test, device):
@@ -1804,6 +1920,7 @@ _TESTS = (
     test_cb_fem_small_rotary_inertia_is_not_a_mechanism,
     test_cb_fem_bad_scaling_is_not_a_mechanism,
     test_cb_fem_mechanisms_are_rejected_in_any_scaling,
+    test_cb_fem_soft_and_free_nodes,
     test_cb_fem_equilibration_keeps_well_scaled_results,
     test_cb_fem_static_correction_reproduces_statics,
     test_cb_fem_static_correction_span_and_options,
