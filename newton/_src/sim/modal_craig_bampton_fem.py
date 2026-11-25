@@ -89,13 +89,21 @@ class ModalGeneratorCraigBamptonFEM:
     normalized like the modes. The exact response to ``f`` is
     ``u_i = Psi u_b + K_ii^-1 f_i`` for any motion ``u_b`` of the interface
     frames, so the reduced static solution for every combination of the
-    given loads equals the full finite-element one for any interface
-    condition and any ``fixed_mode_count``. The reduced model then has
+    given loads equals the full finite-element one for any
+    ``fixed_mode_count`` when the model is supported statically through its
+    interface frames: frames held, released, or on springs. This does not
+    extend to loads balanced by inertia (a free body under acceleration),
+    and ``rigid_consistency="project"`` changes the reduced stiffness, so
+    the solution is then exact only as far as the projected residual is
+    small (measured on a drifting grid: 1e-14 with every frame held, 1.5e-4
+    with one frame released). The reduced model then has
     ``6 * interface_count + fixed_mode_count + static_correction_count``
-    coordinates. The vectors are not eigenvectors: their Rayleigh
-    frequencies are reported separately, and ``fixed_interface_modes``,
-    ``fixed_interface_eigenvalues``, ``fixed_interface_frequencies``, and
-    the eigenpair residual cover the fixed-interface modes only.
+    coordinates. The vectors are not eigenvectors: each is a stiff
+    coordinate whose Rayleigh frequency lies above every retained
+    fixed-interface mode. These frequencies are reported separately, and
+    ``fixed_interface_modes``, ``fixed_interface_eigenvalues``,
+    ``fixed_interface_frequencies``, and the eigenpair residual cover the
+    fixed-interface modes only.
 
     Interfaces are mappings with the keys:
 
@@ -1058,18 +1066,24 @@ class ModalGeneratorCraigBamptonFEM:
         return message
 
     def _static_correction_vectors(
-        self, transform, stiffness_ii, mass_ii, modes: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, list[int], list[float]]:
+        self, transform, stiffness_ii, mass_ii, modes: np.ndarray, solve: Any = None
+    ) -> tuple[np.ndarray, np.ndarray, list[int], list[float], float]:
         """Return the static correction vectors of ``static_correction_loads`` on the interior coordinates.
 
         The fixed-interface response ``K_ii^-1 f_i`` of each load is orthogonalized twice in the mass
         inner product against ``modes`` and the vectors already retained, dropped when its remaining
         mass norm is below :attr:`_STATIC_CORRECTION_SPAN_TOLERANCE` of the original one, normalized to
-        unit modal mass, and oriented like the modes.
+        unit modal mass, and oriented like the modes. ``solve`` returns ``K_ii^-1 b`` for the columns of
+        ``b``; without it ``K_ii`` is factored here.
 
         Returns:
             The vectors, shape ``[interior_count, static_correction_count]``, their Rayleigh quotients
-            [1/s^2], the load index of each vector, and the relative remaining norm of every load.
+            [1/s^2], the load index of each vector, the relative remaining norm of every load, and the
+            largest deviation of the vectors from mass-orthonormality against the modes and each other.
+
+        Warns:
+            UserWarning: If a load has no part on the interior coordinates (it is zero or acts on
+                interface DOFs only) and so adds no vector.
         """
         interior_count = int(stiffness_ii.shape[0])
         vectors: list[np.ndarray] = []
@@ -1079,9 +1093,9 @@ class ModalGeneratorCraigBamptonFEM:
         loads = self.static_correction_loads
         if loads is not None and loads.shape[1] > 0 and interior_count > 0:
             interior_loads = np.ascontiguousarray(np.asarray(transform.T @ loads)[:interior_count])
-            solve = self._interior_solve
             if solve is None:
-                # An overridden interior solve did not provide the factorization of K_ii.
+                # A subclass that overrides the interior solve, as wrappers written for earlier versions
+                # do, does not provide the factorization of K_ii: factor it here.
                 if modal_sparse.is_sparse(stiffness_ii):
                     scaling = self._interior_scaling(stiffness_ii)
                     factor = modal_sparse.ShiftedFactorization(
@@ -1114,6 +1128,12 @@ class ModalGeneratorCraigBamptonFEM:
                     norm_after = math.sqrt(max(float(vector @ mass_vector), 0.0))
                 relative = norm_after / norm_before if norm_before > 0.0 and math.isfinite(norm_before) else 0.0
                 relative_norms.append(relative)
+                if norm_before == 0.0:
+                    warnings.warn(
+                        f"static_correction_loads column {column} has no load on the interior coordinates (it "
+                        "is zero or acts on interface DOFs only) and adds no correction vector",
+                        stacklevel=3,
+                    )
                 if not relative >= self._STATIC_CORRECTION_SPAN_TOLERANCE:
                     continue
                 sign = -1.0 if vector[int(np.argmax(np.abs(vector)))] < 0.0 else 1.0
@@ -1122,11 +1142,16 @@ class ModalGeneratorCraigBamptonFEM:
                 indices.append(column)
         elif loads is not None:
             relative_norms = [0.0] * loads.shape[1]
+        orthogonality = 0.0
         if vectors:
             stacked = np.column_stack(vectors)
+            mass_stacked = np.column_stack(mass_vectors)
+            gram = stacked.T @ mass_stacked - np.eye(stacked.shape[1])
+            orthogonality = max(float(np.max(np.abs(gram))), float(np.max(np.abs(modes.T @ mass_stacked), initial=0.0)))
         else:
             stacked = np.zeros((interior_count, 0), dtype=np.float64)
-        return stacked, modal_sparse.quadratic_form_diag(stacked, stiffness_ii), indices, relative_norms
+        values = modal_sparse.quadratic_form_diag(stacked, stiffness_ii)
+        return stacked, values, indices, relative_norms, orthogonality
 
     def _lumped_sample_mass(self) -> np.ndarray:
         """Return the row-sum lumped translational mass [kg] of each sample node."""
@@ -1204,9 +1229,12 @@ class ModalGeneratorCraigBamptonFEM:
             )
         solve = self._interior_sparse if sparse else self._interior_dense
         self._zero_energy = {}
+        self._interior_solve = None
         constraint_modes, eigenvalues, modes, pivot_ratio, threshold = solve(
             stiffness_ii, stiffness_ib, mass_ii, self.fixed_mode_count
         )
+        # The factorization of K_ii serves the correction vectors below and is not kept on the generator.
+        interior_solve, self._interior_solve = self._interior_solve, None
         modal_mass = modal_sparse.quadratic_form_diag(modes, mass_ii)
         if not np.all(modal_mass > 0.0):
             raise ValueError("mass_matrix must be positive definite on the interior DOFs")
@@ -1215,9 +1243,14 @@ class ModalGeneratorCraigBamptonFEM:
             pivot = int(np.argmax(np.abs(modes[:, mode])))
             if modes[pivot, mode] < 0.0:
                 modes[:, mode] *= -1.0
-        corrections, correction_values, correction_indices, correction_norms = self._static_correction_vectors(
-            transform, stiffness_ii, mass_ii, modes
-        )
+        (
+            corrections,
+            correction_values,
+            correction_indices,
+            correction_norms,
+            correction_orthogonality,
+        ) = self._static_correction_vectors(transform, stiffness_ii, mass_ii, modes, interior_solve)
+        del interior_solve
         timings["interior_solve"] = time.perf_counter() - clock
 
         clock = time.perf_counter()
@@ -1400,6 +1433,7 @@ class ModalGeneratorCraigBamptonFEM:
             "static_correction_dropped": sorted(set(range(len(correction_norms))) - set(correction_indices)),
             "static_correction_relative_norms": list(correction_norms),
             "static_correction_frequencies_hz": self.static_correction_frequencies.tolist(),
+            "static_correction_orthogonality": correction_orthogonality,
             "zero_energy_threshold": float(threshold),
             # Replaced by the interior solve; a subclass that overrides it leaves these defaults.
             "zero_energy_scale": math.nan,

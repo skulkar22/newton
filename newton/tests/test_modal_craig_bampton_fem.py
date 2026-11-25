@@ -15,6 +15,7 @@ import inspect
 import json
 import math
 import os
+import pickle
 import sys
 import tempfile
 import time
@@ -1365,6 +1366,40 @@ def test_cb_fem_soft_and_free_nodes(test, device):
             isolated.reduce()
 
 
+def test_cb_fem_generator_pickles(test, device):
+    """Pickle the generator before and after reduce() on both paths, and default the report of an old override."""
+    points, mass, stiffness = _frame_grid()
+    interfaces = _grid_interfaces("rbe2")
+    load = _gravity_load(mass, points.shape[0])
+    for eigensolver in ("arpack", "dense"):
+        matrices = (mass, stiffness) if eigensolver == "arpack" else (mass.toarray(), stiffness.toarray())
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, *matrices, interfaces, fixed_mode_count=6, eigensolver=eigensolver, static_correction_loads=load
+        )
+        fresh = pickle.loads(pickle.dumps(generator))
+        generator.reduce()
+        # The factorization of the interior stiffness is released with reduce().
+        test.assertIsNone(generator._interior_solve)
+        restored = pickle.loads(pickle.dumps(generator))
+        np.testing.assert_array_equal(restored.reduced_stiffness_matrix, generator.reduced_stiffness_matrix)
+        test.assertEqual(restored._describe_interior(0), generator._describe_interior(0))
+        fresh.reduce()
+        np.testing.assert_array_equal(fresh.reduced_stiffness_matrix, generator.reduced_stiffness_matrix)
+
+    # An interior solve written for the former five-value contract still reduces; the report keeps every key.
+    class Overridden(newton.ModalGeneratorCraigBamptonFEM):
+        def _interior_sparse(self, *args):
+            result = super()._interior_sparse(*args)
+            self._zero_energy = {}
+            return result
+
+    overridden = Overridden(points, mass, stiffness, interfaces, fixed_mode_count=6)
+    overridden.reduce()
+    test.assertTrue(math.isnan(overridden.report["zero_energy_scale"]))
+    test.assertEqual(overridden.report["zero_energy_scale_source"], "")
+    test.assertGreater(overridden.report["zero_energy_threshold"], 0.0)
+
+
 def test_cb_fem_equilibration_keeps_well_scaled_results(test, device):
     """Reproduce an unequilibrated dense reduction of well-scaled models to 1e-10 on the sparse path."""
     from scipy import linalg, sparse
@@ -1828,7 +1863,10 @@ def test_cb_fem_static_correction_span_and_options(test, device):
     generator = newton.ModalGeneratorCraigBamptonFEM(
         points, mass, stiffness, interfaces, static_correction_loads=loads, **options
     )
-    basis = generator.build()
+    # A load without a part on the interior coordinates is reported with a warning.
+    with test.assertWarnsRegex(UserWarning, "static_correction_loads column 3 has no load on the interior"):
+        generator.reduce()
+    basis = generator.craig_bampton.build()
     report = generator.report
     test.assertEqual(report["static_correction_load_count"], 4)
     test.assertEqual(report["static_correction_count"], 1)
@@ -1901,6 +1939,139 @@ def test_cb_fem_static_correction_span_and_options(test, device):
         )
 
 
+def test_cb_fem_static_correction_conditions(test, device):
+    """Keep the static correction exact with constraints, distributing interfaces, sprung frames, and no modes.
+
+    Also: a load close to an earlier one needs the second orthogonalization pass, and the built modal basis
+    spans the same static solution.
+    """
+    from scipy import sparse
+
+    points, mass, stiffness = _frame_grid()
+    node_count = points.shape[0]
+    translations = _translation_rows(node_count)
+    load = _gravity_load(mass, node_count)
+
+    def relative_error(generator, nodal_load, fixed, matrix=stiffness):
+        full = _full_fe_static(generator, matrix, nodal_load, fixed)
+        reduced = _reduced_static(generator, nodal_load, fixed)
+        rows = _translation_rows(generator.node_count)
+        return _relative((reduced - full)[rows], full[rows])
+
+    # Distributing interfaces and no fixed-interface modes at all.
+    for coupling, count in (("rbe3", 4), ("rbe2", 0), ("rbe3", 0)):
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points,
+            mass,
+            stiffness,
+            _grid_interfaces(coupling),
+            fixed_mode_count=count,
+            static_correction_loads=load,
+        )
+        generator.reduce()
+        test.assertEqual(generator.static_correction_count, 1)
+        for fixed in ([0, 1], [0]):
+            test.assertLess(relative_error(generator, load, fixed), 1.0e-9, f"{coupling} {count} {fixed}")
+
+    interfaces = _grid_interfaces("rbe2")
+    frames = 6 * len(interfaces)
+    generator = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, interfaces, fixed_mode_count=4, static_correction_loads=load
+    )
+    craig_bampton = generator.reduce()
+
+    # Every interface frame on springs instead of held.
+    transform = generator.transformation
+    interior = generator.interior_count
+    stiffness_z = (transform.T @ stiffness @ transform).toarray()
+    springs = 1.0e5 * np.eye(frames)
+    stiffness_z[interior:, interior:] += springs
+    full = transform @ np.linalg.solve(stiffness_z, transform.T @ load)
+    recovery = generator.full_recovery_matrix()
+    sprung = generator.reduced_stiffness_matrix.copy()
+    sprung[:frames, :frames] += springs
+    reduced = recovery @ np.linalg.solve(sprung, recovery.T @ load)
+    test.assertLess(_relative((reduced - full)[translations], full[translations]), 1.0e-9)
+
+    # The built basis spans the same solution: solve in rigid and modal coordinates with one frame held.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="derive_psi", category=UserWarning)
+        basis = craig_bampton.build()
+    test.assertEqual(basis.mode_count, frames + 4 + 1 - 6)
+    coordinates = np.hstack((craig_bampton.rigid_matrix, craig_bampton.modal_matrix))
+    modal_stiffness = coordinates.T @ generator.reduced_stiffness_matrix @ coordinates
+    held = coordinates[:6]
+    saddle = np.block([[modal_stiffness, held.T], [held, np.zeros((6, 6))]])
+    rhs = np.concatenate((coordinates.T @ (recovery.T @ load), np.zeros(6)))
+    built = recovery @ (coordinates @ np.linalg.solve(saddle, rhs)[: coordinates.shape[1]])
+    full = _full_fe_static(generator, stiffness, load, [0])
+    test.assertLess(_relative((built - full)[translations], full[translations]), 1.0e-8)
+
+    # A second load that differs from the first by 1e-7 leaves a response almost inside the span. One
+    # orthogonalization pass would leave it 1e-9 away from mass-orthogonality; two reach roundoff.
+    other = np.zeros(6 * node_count)
+    other[0::6] = 1.0
+    close = np.column_stack(
+        (load, load + 1.0e-7 * np.linalg.norm(load) / np.linalg.norm(mass @ other) * (mass @ other))
+    )
+    generator = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, interfaces, fixed_mode_count=4, static_correction_loads=close
+    )
+    generator.reduce()
+    test.assertEqual(generator.static_correction_count, 2)
+    test.assertLess(generator.report["static_correction_relative_norms"][1], 1.0e-5)
+    test.assertLess(generator.report["static_correction_orthogonality"], 1.0e-12)
+    for column in range(2):
+        for fixed in ([0, 1], [0]):
+            test.assertLess(relative_error(generator, close[:, column], fixed), 1.0e-8)
+
+    # Constraints: a coincident node carries a mass and is tied to an interior node. The load is given in
+    # the original DOF numbering, on the dependent node as well; the reference solves the constrained
+    # problem with Lagrange multipliers.
+    host = int(np.argmin(np.linalg.norm(points - points.mean(axis=0), axis=1)))
+    tied_points = np.vstack((points, points[host : host + 1]))
+    size = 6 * node_count
+    tied_stiffness = sparse.block_diag((stiffness, sparse.csc_matrix((6, 6))), format="csc")
+    tied_mass = sparse.block_diag((mass, 5.0 * mass[6 * host : 6 * host + 6, 6 * host : 6 * host + 6]), format="csc")
+    ties = _tie_rows([node_count], [host], node_count + 1)
+    tied_load = _gravity_load(tied_mass, node_count + 1)
+    test.assertGreater(float(np.abs(tied_load[size:]).max()), 0.0)
+    generator = newton.ModalGeneratorCraigBamptonFEM(
+        tied_points,
+        tied_mass,
+        tied_stiffness,
+        interfaces,
+        fixed_mode_count=4,
+        constraints=ties,
+        static_correction_loads=tied_load,
+    )
+    generator.reduce()
+    test.assertEqual(generator.static_correction_count, 1)
+    patch_nodes = np.concatenate([np.asarray(interface["node_indices"]) for interface in interfaces])
+    clamped = (patch_nodes[:, None] * 6 + np.arange(6)).reshape(-1)
+    free = np.setdiff1d(np.arange(size + 6), clamped)
+    constraint_free = ties.toarray()[:, free]
+    saddle = np.block(
+        [
+            [tied_stiffness.toarray()[np.ix_(free, free)], constraint_free.T],
+            [constraint_free, np.zeros((ties.shape[0], ties.shape[0]))],
+        ]
+    )
+    reference = np.zeros(size + 6)
+    reference[free] = np.linalg.solve(saddle, np.concatenate((tied_load[free], np.zeros(ties.shape[0]))))[
+        : free.shape[0]
+    ]
+    reduced = _reduced_static(generator, tied_load, [0, 1])
+    rows = _translation_rows(node_count + 1)
+    test.assertLess(_relative((reduced - reference)[rows], reference[rows]), 1.0e-9)
+    plain = newton.ModalGeneratorCraigBamptonFEM(
+        tied_points, tied_mass, tied_stiffness, interfaces, fixed_mode_count=4, constraints=ties
+    )
+    plain.reduce()
+    truncated = _reduced_static(plain, tied_load, [0, 1])
+    test.assertGreater(_relative((truncated - reference)[rows], reference[rows]), 1.0e-3)
+
+
 class TestModalCraigBamptonFem(unittest.TestCase):
     pass
 
@@ -1921,9 +2092,11 @@ _TESTS = (
     test_cb_fem_bad_scaling_is_not_a_mechanism,
     test_cb_fem_mechanisms_are_rejected_in_any_scaling,
     test_cb_fem_soft_and_free_nodes,
+    test_cb_fem_generator_pickles,
     test_cb_fem_equilibration_keeps_well_scaled_results,
     test_cb_fem_static_correction_reproduces_statics,
     test_cb_fem_static_correction_span_and_options,
+    test_cb_fem_static_correction_conditions,
     test_cb_fem_rigid_consistency_projection,
     test_cb_fem_rigid_consistency_guards,
     test_cb_fem_rigid_consistency_defaults,

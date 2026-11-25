@@ -365,6 +365,21 @@ report next to its limit:
   stiffest coordinate of the reduced model, for example a small rigid
   interface patch.
 
+A truncated set of fixed-interface modes reproduces the static response to a
+load on the interior, such as gravity, only approximately. With
+``static_correction_loads`` the generator appends, for every given nodal
+load :math:`\mathbf{f}`, the fixed-interface static response
+:math:`\mathbf{K}_{ii}^{-1}\mathbf{f}_i` to the interior basis,
+mass-orthogonalized against the retained modes and normalized. The reduced
+static solution for these loads then equals the full finite-element one for
+any number of modes, as long as the model is supported through its interface
+frames (held, released, or on springs) and ``rigid_consistency`` is
+``"check"``. Each vector adds one coordinate. It is not an eigenvector but a
+stiff coordinate: its Rayleigh frequency, reported as
+``static_correction_frequencies``, lies above every retained
+fixed-interface mode, so it responds quasi-statically at the usual time
+steps.
+
 Assemblies of separately meshed parts are joined with linear multi-point
 constraints :math:`\mathbf{C}\mathbf{u} = 0`, which
 :class:`ConstraintElimination` removes with a coordinate transformation
