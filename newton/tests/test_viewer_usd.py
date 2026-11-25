@@ -447,6 +447,7 @@ class TestViewerUSD(unittest.TestCase):
         )
 
     def test_log_mesh_authors_per_vertex_display_color(self):
+        """Author per-vertex mesh colors with the displayColor interpolation "vertex"."""
         viewer = self._make_viewer()
         points = wp.array(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
