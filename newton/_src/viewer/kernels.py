@@ -180,9 +180,11 @@ def deform_elastic_shape_vertices(
     i = wp.tid()
     vertex = vertex_start + i
     rest = vertex_local[vertex]
-    local = rest
+    # Sum the small modal displacement first, so that the rest position is rounded once, not once per mode.
+    displacement = wp.vec3(0.0, 0.0, 0.0)
     for mode in range(mode_count):
-        local = local + vertex_phi[vertex * max_modes + mode] * joint_q[q_start + mode]
+        displacement = displacement + vertex_phi[vertex * max_modes + mode] * joint_q[q_start + mode]
+    local = rest + displacement
     point = local
     if body >= 0:
         point = wp.transform_point(body_q[body], local)
@@ -190,7 +192,7 @@ def deform_elastic_shape_vertices(
         point = point + world_offsets[world]
     points[i] = point
     if with_colors != 0:
-        s = wp.clamp(wp.length(local - rest) * inv_color_max, 0.0, 1.0)
+        s = wp.clamp(wp.length(displacement) * inv_color_max, 0.0, 1.0)
         colors[i] = wp.vec3(
             wp.clamp(1.5 - wp.abs(4.0 * s - 3.0), 0.0, 1.0),
             wp.clamp(1.5 - wp.abs(4.0 * s - 2.0), 0.0, 1.0),

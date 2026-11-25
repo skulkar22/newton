@@ -1323,6 +1323,30 @@ def create_soft_contacts(
             soft_contact_normal[index] = world_normal
 
 
+@wp.func
+def eval_elastic_vertex_local(
+    vertex_index: int,
+    vertex_rest: wp.vec3,
+    vertex_phi: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    mode_q_start: int,
+    mode_count: int,
+    max_mode_count: int,
+):
+    """Return a vertex of a reduced elastic shape in body coordinates, ``x_rest + sum_k phi_k q_k`` [m].
+
+    The modal displacement is summed first and added to the rest position once, so the position is rounded
+    once at its float32 spacing instead of once per mode.
+    """
+    displacement = wp.vec3(0.0, 0.0, 0.0)
+    for mode in range(max_mode_count):
+        if mode < mode_count:
+            displacement = (
+                displacement + vertex_phi[vertex_index * max_mode_count + mode] * joint_q[mode_q_start + mode]
+            )
+    return vertex_rest + displacement
+
+
 @wp.kernel
 def create_elastic_shape_contacts(
     body_q: wp.array[wp.transform],
@@ -1432,13 +1456,15 @@ def create_elastic_shape_contacts(
     )
 
     elastic_point_local_rest = elastic_shape_vertex_local[vertex_index]
-    elastic_point_local = elastic_point_local_rest
-    for mode in range(elastic_max_mode_count):
-        if mode < mode_count:
-            elastic_point_local = (
-                elastic_point_local
-                + elastic_shape_vertex_phi[vertex_index * elastic_max_mode_count + mode] * joint_q[mode_q_start + mode]
-            )
+    elastic_point_local = eval_elastic_vertex_local(
+        vertex_index,
+        elastic_point_local_rest,
+        elastic_shape_vertex_phi,
+        joint_q,
+        mode_q_start,
+        mode_count,
+        elastic_max_mode_count,
+    )
 
     elastic_point_world = wp.transform_point(X_we, elastic_point_local)
 

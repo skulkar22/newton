@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.kernels import eval_elastic_vertex_local
 from newton._src.sim.modal import _estimate_sample_psi, _reduced_inertia_from_pairs
 from newton._src.solvers.vbd.joint_coordinates import eval_elastic_endpoint_xform
 from newton._src.solvers.vbd.reduced_elastic_kernels import (
@@ -5936,6 +5937,57 @@ def _elastic_endpoint_anchor_errors(device, mode_count, endpoint_count=96, seed=
     return anchors[0].numpy(), anchors[1].numpy(), reference, per_mode, spacing
 
 
+@wp.kernel
+def _elastic_contact_vertex_probe(
+    vertex_rest: wp.array[wp.vec3],
+    vertex_phi: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    mode_count: int,
+    vertex_local: wp.array[wp.vec3],
+):
+    vertex = wp.tid()
+    vertex_local[vertex] = eval_elastic_vertex_local(
+        vertex, vertex_rest[vertex], vertex_phi, joint_q, 7, mode_count, mode_count
+    )
+
+
+def test_elastic_contact_vertex_accumulation(test, device):
+    """Round the deformed contact vertex of a reduced elastic shape once, not once per mode.
+
+    The vertices lie 1 to 3 m from the body origin, as the joint anchors of
+    test_elastic_endpoint_anchor_accumulation, with 300 modes.
+    """
+    rng = np.random.default_rng(11)
+    vertex_count, mode_count = 96, 300
+    rest = (rng.uniform(1.0, 3.0, (vertex_count, 3)) * rng.choice([-1.0, 1.0], (vertex_count, 3))).astype(np.float32)
+    phi = rng.uniform(-1.0, 1.0, (vertex_count, mode_count, 3)).astype(np.float32)
+    joint_q = np.zeros(7 + mode_count, dtype=np.float32)
+    joint_q[7:] = 1.0e-4 * rng.uniform(-1.0, 1.0, mode_count)
+    vertices = wp.zeros(vertex_count, dtype=wp.vec3, device=device)
+    wp.launch(
+        _elastic_contact_vertex_probe,
+        dim=vertex_count,
+        inputs=[
+            wp.array(rest, dtype=wp.vec3, device=device),
+            wp.array(phi.reshape(-1, 3), dtype=wp.vec3, device=device),
+            wp.array(joint_q, dtype=float, device=device),
+            mode_count,
+        ],
+        outputs=[vertices],
+        device=device,
+    )
+    reference = rest.astype(np.float64) + np.einsum("vmc,m->vc", phi.astype(np.float64), joint_q[7:].astype(np.float64))
+    per_mode = rest.copy()
+    for mode in range(mode_count):
+        per_mode = per_mode + phi[:, mode] * joint_q[7 + mode]
+    spacing = np.spacing(np.abs(reference).astype(np.float32)).astype(np.float64)
+    error = np.abs(vertices.numpy().astype(np.float64) - reference) / spacing
+    error_per_mode = np.abs(per_mode.astype(np.float64) - reference) / spacing
+    test.assertLess(float(np.max(error)), 0.55)
+    test.assertGreater(float(np.max(error_per_mode)), 2.0)
+    test.assertTrue(np.all(error <= np.maximum(error_per_mode, 0.55)))
+
+
 def test_elastic_endpoint_anchor_accumulation(test, device):
     """Round the deformed joint anchor of a reduced elastic body once, not once per mode.
 
@@ -8733,6 +8785,12 @@ for device in devices:
         TestReducedElasticBody,
         "test_elastic_endpoint_anchor_accumulation",
         test_elastic_endpoint_anchor_accumulation,
+        devices=[device],
+    )
+    add_function_test(
+        TestReducedElasticBody,
+        "test_elastic_contact_vertex_accumulation",
+        test_elastic_contact_vertex_accumulation,
         devices=[device],
     )
     add_function_test(
