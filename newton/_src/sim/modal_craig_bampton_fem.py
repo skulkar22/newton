@@ -159,7 +159,9 @@ class ModalGeneratorCraigBamptonFEM:
     its diagonal to one. Two further checks cover it. The relative tie
     stiffness of a coordinate ``i`` is ``(sum_j |K_ij| / sqrt(K_ii
     K_jj))^2`` over its neighbors ``j``, for a single spring the spring
-    stiffness over the stiffness of what it is attached to; a value at or
+    stiffness over the stiffness of what it is attached to (a coupling to
+    an interface frame, which is held, counts against the coordinate's own
+    stiffness, so the size of an interface patch does not matter); a value at or
     below the same tolerance raises, and one below ``1e-6`` warns with the
     lowest fixed-interface frequency. The rule sees a single weakly tied
     coordinate, not a soft cluster: several nodes joined to each other and
@@ -790,21 +792,30 @@ class ModalGeneratorCraigBamptonFEM:
         """Return the smallest relative tie stiffness of an interior coordinate, that coordinate, and the
         uncoupled interior coordinates.
 
-        The relative tie stiffness of coordinate ``i`` is ``(sum_{j != i} |K_ij| / sqrt(K_ii K_jj))^2``
-        over all coordinates ``j``, interface frames included. For a coordinate on a single spring it is
-        the spring stiffness over the stiffness of the coordinate it is attached to, and it does not
-        depend on the units of the DOFs. Coordinates with a non-positive diagonal are left to the
+        The relative tie stiffness of coordinate ``i`` is ``(sum_{j != i} |K_ij| / sqrt(K_ii K_jj) +
+        sum_f |K_if| / K_ii)^2`` over the interior coordinates ``j`` and the interface frame coordinates
+        ``f``. For a coordinate on a single spring to another interior coordinate it is the spring
+        stiffness over the stiffness of that coordinate, and it does not depend on the units of the
+        DOFs. A coupling to a frame coordinate is a support, because the frames are held: it is measured
+        against the coordinate's own diagonal, not against the diagonal of the frame, which gathers the
+        stiffness of every node of its patch and grows with the patch. Coordinates with a non-positive
+        diagonal are left to the
         interior solve, which names them. A coordinate without any off-diagonal entry is uncoupled, not
         weakly tied: it is listed separately and does not enter the minimum.
         """
-        diagonal = np.asarray(stiffness_z.diagonal(), dtype=np.float64).reshape(-1)
+        interior = np.arange(interior_count)
+        frames = np.arange(interior_count, stiffness_z.shape[0])
+        stiffness_ii = modal_sparse.submatrix(stiffness_z, interior, interior)
+        stiffness_if = modal_sparse.submatrix(stiffness_z, interior, frames)
+        diagonal = np.asarray(stiffness_ii.diagonal(), dtype=np.float64).reshape(-1)
         positive = (diagonal > 0.0) & np.isfinite(diagonal)
         scale = np.zeros_like(diagonal)
         scale[positive] = 1.0 / np.sqrt(diagonal[positive])
-        scaled = abs(modal_sparse.scale_symmetric(stiffness_z, scale))
+        scaled = abs(modal_sparse.scale_symmetric(stiffness_ii, scale))
         row_sums = np.asarray(scaled.sum(axis=1)).reshape(-1) - np.asarray(scaled.diagonal()).reshape(-1)
-        uncoupled = np.flatnonzero((positive & (row_sums == 0.0))[:interior_count])
-        coupling = np.where(positive & (row_sums > 0.0), row_sums, math.inf)[:interior_count]
+        row_sums = row_sums + np.asarray(abs(stiffness_if).sum(axis=1)).reshape(-1) * scale * scale
+        uncoupled = np.flatnonzero(positive & (row_sums == 0.0))
+        coupling = np.where(positive & (row_sums > 0.0), row_sums, math.inf)
         if coupling.shape[0] == 0 or not np.any(np.isfinite(coupling)):
             return math.inf, -1, uncoupled
         weakest = int(np.argmin(coupling))

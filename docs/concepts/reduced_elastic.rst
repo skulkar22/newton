@@ -354,7 +354,9 @@ report next to its limit:
   refused as well;
 - the relative tie stiffness of every coordinate,
   :math:`(\sum_{j \ne i} |K_{ij}| / \sqrt{K_{ii} K_{jj}})^2`, against the same
-  tolerance: a node that hangs on springs of roundoff stiffness against what
+  tolerance, where a coupling to an interface frame counts as support
+  against the coordinate's own stiffness: a node that hangs on springs of
+  roundoff stiffness against what
   it is attached to is refused, and one below :math:`10^{-6}` gives a warning
   with the lowest fixed-interface frequency. The rule sees a single weakly
   tied coordinate, not a soft cluster of several nodes, and a coordinate with

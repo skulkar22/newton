@@ -1401,6 +1401,52 @@ def test_cb_fem_soft_and_free_nodes(test, device):
     test.assertGreater(on_frame.report["zero_energy_tie_ratio_min"], 1.0e-4)
 
 
+def test_cb_fem_node_enclosed_by_a_large_patch(test, device):
+    """Keep a node whose only neighbors are the nodes of a large rigid interface patch, without a warning.
+
+    Its coordinates couple to the interface frame only, with their whole stiffness. The frame diagonal
+    gathers the stiffness of every patch node, so a tie ratio measured against it would fall with the
+    patch size (120 and 360 nodes here) and report a firmly held node as a soft part.
+    """
+    ratios = {}
+    for size in (12, 20):
+        points, mass, stiffness = _frame_grid(nx=size, ny=size)
+        node = np.arange(size * size).reshape(size, size)
+        enclosed = int(node[size // 2, size // 2])
+        patch = np.setdiff1d(node[: size - 1, : size - 1].reshape(-1), [enclosed])
+        test.assertEqual(patch.shape[0], (size - 1) ** 2 - 1)
+        interfaces = [{"name": "patch", "node_indices": patch, "coupling": "rbe2"}]
+        for eigensolver in ("arpack", "dense"):
+            matrices = (mass, stiffness) if eigensolver == "arpack" else (mass.toarray(), stiffness.toarray())
+            generator = newton.ModalGeneratorCraigBamptonFEM(
+                points, *matrices, interfaces, fixed_mode_count=4, eigensolver=eigensolver
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                generator.reduce()
+            test.assertEqual(generator.report["uncoupled_interior_count"], 0)
+            ratios[size, eigensolver] = generator.report["zero_energy_tie_ratio_min"]
+            # The enclosed node is held by the frame with its whole stiffness in every DOF.
+            interior = generator.interior_count
+            stiffness_z = generator.transformation.T @ stiffness @ generator.transformation
+            stiffness_z = stiffness_z.toarray() if hasattr(stiffness_z, "toarray") else np.asarray(stiffness_z)
+            rows = np.flatnonzero(
+                np.abs(
+                    np.asarray(generator.transformation[6 * enclosed : 6 * enclosed + 6, :interior].sum(axis=0))
+                ).reshape(-1)
+                > 0.0
+            )
+            test.assertEqual(rows.shape[0], 6)
+            for row in rows:
+                test.assertLess(float(np.sum(np.abs(stiffness_z[row, :interior])) - stiffness_z[row, row]), 1.0e-9)
+                support = float(np.sum(np.abs(stiffness_z[row, interior:]))) / stiffness_z[row, row]
+                test.assertGreaterEqual(support, 1.0 - 1.0e-9)
+    for value in ratios.values():
+        test.assertGreater(value, 0.1)
+    np.testing.assert_allclose(ratios[20, "arpack"], ratios[12, "arpack"], rtol=1.0e-9)
+    np.testing.assert_allclose(ratios[20, "dense"], ratios[12, "dense"], rtol=1.0e-9)
+
+
 def _beam_with_soft_cluster(fractions, mutual):
     """Return :func:`_frame_beam` with coincident extra nodes on its tip, each on six springs of the given
     fraction of the tip stiffness and joined to the next by springs of ``mutual`` times the tip stiffness."""
@@ -2235,6 +2281,7 @@ _TESTS = (
     test_cb_fem_mechanisms_are_rejected_in_any_scaling,
     test_cb_fem_soft_and_free_nodes,
     test_cb_fem_reduce_applies_build_checks,
+    test_cb_fem_node_enclosed_by_a_large_patch,
     test_cb_fem_generator_pickles,
     test_cb_fem_equilibration_keeps_well_scaled_results,
     test_cb_fem_static_correction_reproduces_statics,
