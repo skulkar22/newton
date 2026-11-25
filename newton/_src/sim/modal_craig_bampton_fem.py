@@ -166,7 +166,9 @@ class ModalGeneratorCraigBamptonFEM:
     to the model by equally soft springs have ordinary tie ratios. A
     coordinate with a stiffness diagonal and no coupling at all, such as a
     rotation stabilized by a diagonal penalty, is uncoupled rather than
-    weakly tied: it is kept and reported with one warning.
+    weakly tied: it is kept and reported with one warning. A returned mode
+    whose eigenpair residual exceeds ``1e-3`` is not an eigenvector and
+    raises; a residual above ``1e-5`` warns.
 
     Finally :meth:`reduce` runs the acceptance checks of
     :meth:`ModalGeneratorCraigBampton.build` on the reduced matrices: rigid
@@ -317,6 +319,10 @@ class ModalGeneratorCraigBamptonFEM:
 
     _EIGEN_RESIDUAL_WARNING: ClassVar[float] = 1.0e-5
     """Relative residual of a fixed-interface eigenpair above which :meth:`reduce` warns."""
+
+    _EIGEN_RESIDUAL_LIMIT: ClassVar[float] = 1.0e-3
+    """Relative residual of a fixed-interface eigenpair above which :meth:`reduce` raises: the returned
+    vector is not an eigenvector. Resolved modes of ill-conditioned but sound models stay below ``2e-4``."""
 
     _DENSE_EIGENVALUE_AGREEMENT: ClassVar[float] = 1.0e-8
     """Relative gap between a dense eigenvalue and the Rayleigh quotient of its vector above which the
@@ -1316,6 +1322,15 @@ class ModalGeneratorCraigBamptonFEM:
             residual = stiffness_modes - modal_sparse.matmul(mass_ii, modes) * eigenvalues
             eigen_residual = float(
                 np.max(np.linalg.norm(residual, axis=0) / np.maximum(np.linalg.norm(stiffness_modes, axis=0), 1e-300))
+            )
+        if eigen_residual > self._EIGEN_RESIDUAL_LIMIT:
+            raise ValueError(
+                self._mechanism_message(
+                    detail=f"a returned fixed-interface mode is not an eigenvector: its relative residual "
+                    f"||K phi - lambda M phi|| / ||K phi|| is {eigen_residual:.3g}, above the limit "
+                    f"{self._EIGEN_RESIDUAL_LIMIT:g}; the eigensolver cannot resolve a mode this far below the "
+                    "others"
+                )
             )
         if eigen_residual > self._EIGEN_RESIDUAL_WARNING:
             warnings.warn(

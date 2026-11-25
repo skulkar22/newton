@@ -1353,8 +1353,8 @@ def test_cb_fem_soft_and_free_nodes(test, device):
         generator(1.0e-13, "arpack", eigenvalue_tolerance=0.0).reduce()
 
     # A rotational DOF cut out of the model and left with a negligible stiffness of its own is uncoupled,
-    # which only warns and names it. Whether its mode at 3e-8 Hz is then refused depends on how the path
-    # resolves it; a refusal carries one of the messages below.
+    # which warns and names it; its mode at 3e-8 Hz is then refused. On the sparse path the reduced
+    # stiffness no longer preserves rigid motion; on the dense path the returned mode is not an eigenvector.
     points, mass, stiffness = _frame_beam()
     dof = 6 * 20 + 3
     cut = sparse.lil_matrix(stiffness)
@@ -1362,19 +1362,18 @@ def test_cb_fem_soft_and_free_nodes(test, device):
     cut[dof, :] = 0.0
     cut[:, dof] = 0.0
     cut[dof, dof] = 1.0e-25 * original
-    for eigensolver in ("arpack", "dense"):
+    for eigensolver, message in (
+        ("arpack", "does not preserve the six rigid-body modes"),
+        ("dense", "zero-energy mechanism.*a returned fixed-interface mode is not an eigenvector"),
+    ):
         matrices = (mass, cut.tocsc()) if eigensolver == "arpack" else (mass.toarray(), cut.toarray())
         isolated = newton.ModalGeneratorCraigBamptonFEM(
             points, *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver
         )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            try:
+            with test.assertRaisesRegex(ValueError, message):
                 isolated.reduce()
-            except ValueError as exc:
-                test.assertRegex(
-                    str(exc), "zero-energy mechanism|cannot be built|does not preserve the six rigid-body modes"
-                )
         test.assertTrue(
             any(
                 f"DOF {dof} (node 20 rx)" in str(item.message) and "no coupling" in str(item.message) for item in caught
