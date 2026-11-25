@@ -12,6 +12,7 @@ the original dense generator code, so dense results are unchanged.
 from __future__ import annotations
 
 import importlib
+import math
 import sys
 import warnings
 from typing import Any
@@ -43,6 +44,9 @@ _RESIDUAL_EPS_MULTIPLE = 1.0e3
 
 EIGENVALUE_SCALE_ITERATIONS = 30
 """Power iterations on ``M^-1 K`` used by :func:`generalized_eigenvalue_scale` [count]."""
+
+SMALLEST_EIGENVALUE_ITERATIONS = 5
+"""Inverse iterations used by :func:`smallest_eigenvalue_estimate` [count]."""
 
 EIGENVALUE_SCALE_SAFETY = 2.0
 """Factor on the power-iteration estimate in :func:`generalized_eigenvalue_scale` [dimensionless].
@@ -239,6 +243,69 @@ def max_row_nonzeros(matrix: Any) -> int:
     if matrix.shape[0] == 0:
         return 0
     return int(np.max(np.count_nonzero(matrix, axis=1)))
+
+
+def scale_symmetric(matrix: Any, scale: np.ndarray) -> Any:
+    """Return the congruence ``D A D`` with ``D = diag(scale)`` as a new matrix; sparse input stays CSC.
+
+    With ``scale = diag(A)^-1/2`` this is the symmetric diagonal
+    equilibration (Jacobi scaling) of a positive definite ``A``: the result
+    has a unit diagonal and entries of magnitude at most one, and its
+    condition number is within a factor of the largest row count of the best
+    one any diagonal scaling reaches. A congruence preserves the inertia, and
+    scaling both matrices of a pencil ``(K, M)`` preserves its eigenvalues;
+    the eigenvectors map back as ``phi = D y``.
+
+    Args:
+        matrix: Symmetric matrix, dense or sparse, shape ``[n, n]``.
+        scale: Diagonal of ``D``, shape ``[n]``.
+    """
+    scale = np.asarray(scale, dtype=np.float64).reshape(-1)
+    if is_sparse(matrix):
+        scaled = to_csc(matrix).copy()
+        scaled.data *= scale[scaled.indices]
+        scaled.data *= np.repeat(scale, np.diff(scaled.indptr))
+        return scaled
+    return scale[:, None] * np.asarray(matrix, dtype=np.float64) * scale[None, :]
+
+
+def smallest_eigenvalue_estimate(
+    matrix: Any, solve: Any, iterations: int = SMALLEST_EIGENVALUE_ITERATIONS
+) -> tuple[float, np.ndarray]:
+    """Estimate the smallest eigenvalue of a symmetric positive definite matrix by inverse iteration.
+
+    Returns the Rayleigh quotient ``v^T A v / v^T v`` after ``iterations``
+    solves with ``A`` from :func:`arpack_start_vector`, and the unit vector
+    ``v``. The quotient never lies below the smallest eigenvalue, and each
+    iteration shrinks its excess by ``(lambda_min / lambda_2)^2``, so an
+    isolated near-zero eigenvalue, the signature of a mechanism, is found
+    within one or two solves, while for a well-posed matrix the result only
+    confirms that no such direction exists. A solve that breaks down
+    (non-finite or zero result) returns ``0``.
+
+    Args:
+        matrix: Symmetric matrix, dense or sparse, shape ``[n, n]``.
+        solve: Callable returning ``A^-1 b`` for a vector ``b``, for example
+            :meth:`ShiftedFactorization.solve`.
+        iterations: Number of inverse iterations.
+
+    Returns:
+        The eigenvalue estimate, in the units of ``matrix``, and the unit
+        vector that attains it, shape ``[n]``.
+    """
+    size = int(matrix.shape[0])
+    if size == 0:
+        return math.inf, np.zeros(0, dtype=np.float64)
+    vector = arpack_start_vector(size, seed=1)
+    estimate = quadratic_form(vector, matrix)
+    for _ in range(max(int(iterations), 1)):
+        solved = np.asarray(solve(vector), dtype=np.float64).reshape(-1)
+        norm = float(np.linalg.norm(solved))
+        if not np.isfinite(norm) or norm <= 0.0:
+            return 0.0, vector
+        vector = solved / norm
+        estimate = quadratic_form(vector, matrix)
+    return float(estimate), vector
 
 
 def rigid_vectors(positions: np.ndarray, dofs_per_node: int, center: np.ndarray) -> np.ndarray:

@@ -905,13 +905,48 @@ def _frame_beam(element_count=40, length=1.0, rotary_fraction=1.0e-6, offset=(0.
     return points, sparse.diags(diagonal).tocsc(), stiffness.tocsc()
 
 
-def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
-    """Keep genuine elastic modes of six-DOF models whose Gershgorin bound far exceeds the largest eigenvalue.
+def _interior_rotation_units(node_count, scale):
+    """Return the diagonal of the congruence that measures the rotations of all nodes but node 0 in other units."""
+    diagonal = np.ones(6 * node_count)
+    for component in (3, 4, 5):
+        diagonal[6 + component :: 6] = scale
+    return diagonal
 
-    Small rotary inertia inflates the Gershgorin bound by orders of magnitude, so a threshold relative to the
-    bound alone rejected genuine fixed-interface modes as mechanisms (welded two-panel shell: bound 1.2e3
-    times the largest eigenvalue, 27.9 Hz mode against a 46.6 Hz threshold). The threshold now uses
-    generalized_eigenvalue_scale, and a part that is not tied to the rest is still rejected.
+
+def _rescaled(matrix, diagonal):
+    """Return the congruence ``D A D`` of a sparse matrix as CSC."""
+    from scipy import sparse
+
+    return sparse.csc_matrix(sparse.diags(diagonal) @ matrix @ sparse.diags(diagonal))
+
+
+def _lowest_eigenvalues(stiffness, mass, count):
+    """Return the lowest generalized eigenvalues of dense ``(K, M)``, accurate for any spread of the spectrum.
+
+    The inverse problem ``M x = (1 / lambda) K x`` resolves them to roundoff of themselves; the direct one
+    only to roundoff of the largest eigenvalue.
+    """
+    from scipy import linalg
+
+    return 1.0 / linalg.eigh(mass, stiffness, eigvals_only=True)[::-1][:count]
+
+
+def _energy_ratios(stiffness_ii, modes, eigenvalues):
+    """Return ``lambda_j / (||K_s||_1 phi_j^T diag(K_ii) phi_j)`` of M-orthonormal modes, with ``K_s = D K_ii D``."""
+    diagonal = stiffness_ii.diagonal()
+    scale = 1.0 / np.sqrt(diagonal)
+    norm = modal_sparse.matrix_one_norm(_rescaled(stiffness_ii, scale))
+    return eigenvalues / (norm * np.einsum("di,d,di->i", modes, diagonal, modes))
+
+
+def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
+    """Keep genuine elastic modes of six-DOF models whose largest eigenvalue lies far above the lowest ones.
+
+    Small rotary inertia lifts the top of the spectrum: a zero-energy threshold relative to the largest
+    eigenvalue, or to its Gershgorin bound, then rises above genuine fixed-interface modes (welded shell
+    models: a 27.9 Hz mode against a 46.6 Hz threshold, a 69.1 Hz mode against 308 Hz). The decision uses the
+    energy ratio in the equilibrated stiffness metric, which does not involve the mass matrix, and a part that
+    is not tied to the rest is still rejected.
     """
     from scipy import linalg, sparse
 
@@ -923,24 +958,69 @@ def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
     exact = linalg.eigh(stiffness_ii.toarray(), mass_ii.toarray(), eigvals_only=True)
     bound = modal_sparse.generalized_eigenvalue_bound(stiffness_ii, mass_ii)
     test.assertGreater(bound / exact[-1], 50.0)
-    # A tolerance between the two scales: relative to the bound it lies above the first mode, relative to the
-    # largest eigenvalue well below it.
-    tolerance = math.sqrt(exact[0] / exact[-1] * exact[0] / bound)
-    test.assertGreater(tolerance * bound, exact[0])
-    test.assertLess(4.0 * tolerance * exact[-1], exact[0])
 
     generator = newton.ModalGeneratorCraigBamptonFEM(
-        points, mass, stiffness, clamp, fixed_mode_count=4, eigensolver="arpack", eigenvalue_tolerance=tolerance
+        points, mass, stiffness, clamp, fixed_mode_count=4, eigensolver="arpack"
     )
     generator.reduce()
     np.testing.assert_allclose(generator.fixed_interface_eigenvalues, exact[:4], rtol=1.0e-6)
     report = generator.report
-    test.assertEqual(report["zero_energy_scale_source"], "power_iteration")
-    test.assertGreaterEqual(report["zero_energy_scale"], exact[-1])
-    test.assertLessEqual(report["zero_energy_scale"], 2.0 * exact[-1] * (1.0 + 1.0e-9))
-    test.assertLess(report["zero_energy_threshold"], exact[0])
+    test.assertEqual(report["zero_energy_decision"], "equilibrated_energy_ratio")
+    test.assertEqual(report["zero_energy_scale_source"], "equilibrated_energy_ratio")
+    tolerance = report["zero_energy_ratio_tolerance"]
+    test.assertEqual(tolerance, 1.0e-12)
+    # The reported ratios follow their definition: the mode ratio covers the retained modes and the margin,
+    # and the stiffness ratio is an upper estimate of the smallest eigenvalue of K_s over its norm.
+    ratios = _energy_ratios(stiffness_ii, generator.fixed_interface_modes, generator.fixed_interface_eigenvalues)
+    test.assertLessEqual(report["zero_energy_mode_ratio_min"], float(np.min(ratios)) * (1.0 + 1.0e-9))
+    np.testing.assert_allclose(report["zero_energy_mode_ratio_min"], float(np.min(ratios)), rtol=1.0e-6)
+    scale = 1.0 / np.sqrt(stiffness_ii.diagonal())
+    equilibrated = _rescaled(stiffness_ii, scale)
+    softest = float(np.linalg.eigvalsh(equilibrated.toarray())[0]) / modal_sparse.matrix_one_norm(equilibrated)
+    test.assertGreaterEqual(report["zero_energy_stiffness_ratio"], softest * (1.0 - 1.0e-9))
+    test.assertLess(report["zero_energy_stiffness_ratio"], 10.0 * softest)
+    test.assertEqual(
+        report["zero_energy_ratio_min"],
+        min(report["zero_energy_mode_ratio_min"], report["zero_energy_stiffness_ratio"]),
+    )
+    test.assertGreater(report["zero_energy_ratio_min"], 1.0e3 * tolerance)
+    test.assertGreater(report["zero_energy_threshold"], 0.0)
+    test.assertLess(report["zero_energy_threshold"], 1.0e-3 * exact[0])
+    np.testing.assert_allclose(report["interior_stiffness_scaling_min"], float(np.min(scale)), rtol=1.0e-12)
+    np.testing.assert_allclose(report["interior_stiffness_scaling_max"], float(np.max(scale)), rtol=1.0e-12)
+
+    # The dense path decides in the same way and agrees.
+    dense = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass.toarray(), stiffness.toarray(), clamp, fixed_mode_count=4, eigensolver="dense"
+    )
+    dense.reduce()
+    test.assertEqual(dense.report["zero_energy_decision"], "equilibrated_energy_ratio")
+    np.testing.assert_allclose(dense.fixed_interface_eigenvalues, exact[:4], rtol=1.0e-6)
+    np.testing.assert_allclose(dense.report["zero_energy_stiffness_ratio"], softest, rtol=1.0e-6)
+    np.testing.assert_allclose(dense.report["zero_energy_mode_ratio_min"], float(np.min(ratios)), rtol=1.0e-6)
+
+    # Rotary inertia of 1e-12 of the translational mass puts the largest eigenvalue more than 1e13 above
+    # the first mode: 1e-12 of it is far above the first modes, which are unchanged and must be kept.
+    _, light_mass, _ = _frame_beam(rotary_fraction=1.0e-12)
+    light_ii = light_mass[interior][:, interior]
+    reference = _lowest_eigenvalues(stiffness_ii.toarray(), light_ii.toarray(), 4)
+    largest = float(linalg.eigh(stiffness_ii.toarray(), light_ii.toarray(), eigvals_only=True)[-1])
+    test.assertGreater(largest / reference[0], 1.0e13)
+    test.assertGreater(1.0e-12 * largest, reference[3])
+    for eigensolver in ("arpack", "dense"):
+        matrices = (light_mass, stiffness) if eigensolver == "arpack" else (light_mass.toarray(), stiffness.toarray())
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver
+        )
+        generator.reduce()
+        np.testing.assert_allclose(generator.fixed_interface_eigenvalues, reference, rtol=1.0e-8)
+        test.assertGreater(generator.report["zero_energy_ratio_min"], 1.0e3 * tolerance)
+
+    # generalized_eigenvalue_scale, the scale of the ModalGeneratorFEM threshold, tightens the bound.
     scale, source = modal_sparse.generalized_eigenvalue_scale(stiffness_ii, mass_ii)
-    test.assertEqual((scale, source), (report["zero_energy_scale"], "power_iteration"))
+    test.assertEqual(source, "power_iteration")
+    test.assertGreaterEqual(scale, exact[-1])
+    test.assertLessEqual(scale, 2.0 * exact[-1] * (1.0 + 1.0e-9))
     np.testing.assert_allclose(
         modal_sparse.generalized_eigenvalue_scale(stiffness_ii.toarray(), mass_ii.toarray())[0], scale, rtol=1.0e-6
     )
@@ -950,20 +1030,6 @@ def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
     with np.errstate(over="ignore"):
         fallback = modal_sparse.generalized_eigenvalue_scale(stiffness_ii, singular.tocsc())
     test.assertEqual(fallback[1], "gershgorin_bound")
-
-    # The dense path uses the exact largest eigenvalue and agrees.
-    dense = newton.ModalGeneratorCraigBamptonFEM(
-        points,
-        mass.toarray(),
-        stiffness.toarray(),
-        clamp,
-        fixed_mode_count=4,
-        eigensolver="dense",
-        eigenvalue_tolerance=tolerance,
-    )
-    dense.reduce()
-    test.assertEqual(dense.report["zero_energy_scale_source"], "dense_eigenvalues")
-    np.testing.assert_allclose(dense.fixed_interface_eigenvalues, exact[:4], rtol=1.0e-6)
 
     # A second beam that is not tied to the clamped one is a mechanism and is still rejected.
     second_points, second_mass, second_stiffness = _frame_beam(offset=(0.0, 0.1, 0.0))
@@ -975,10 +1041,266 @@ def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
     for eigensolver in ("arpack", "dense"):
         matrices = pair[1:] if eigensolver == "arpack" else (pair[1].toarray(), pair[2].toarray())
         generator = newton.ModalGeneratorCraigBamptonFEM(
-            pair[0], *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver, eigenvalue_tolerance=tolerance
+            pair[0], *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver
         )
         with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
             generator.reduce()
+
+
+def _beam_with_appendix(stiffness_translation=1.0e9, stiffness_rotation=1.0e5, appendix_mass=1.0e-13):
+    """Return :func:`_frame_beam` with a stiff, light node on six springs at its tip.
+
+    The extra node coincides with the tip, so the springs preserve rigid-body motion. Its eigenvalues,
+    about ``2 k / m``, lie more than 1e13 above the first beam modes, which it leaves unchanged to 1e-9:
+    the springs are soft enough that adding them to the tip stiffness does not round it visibly.
+    """
+    from scipy import sparse
+
+    points, mass, stiffness = _frame_beam()
+    node_count = points.shape[0]
+    size = 6 * node_count
+    tip = 6 * (node_count - 1)
+    extended = sparse.lil_matrix((size + 6, size + 6))
+    extended[:size, :size] = stiffness
+    for component in range(6):
+        k = stiffness_translation if component < 3 else stiffness_rotation
+        a, b = tip + component, size + component
+        extended[a, a] += k
+        extended[b, b] += k
+        extended[a, b] -= k
+        extended[b, a] -= k
+    appendix = appendix_mass * np.array([1.0, 1.0, 1.0, 1.0e-4, 1.0e-4, 1.0e-4])
+    extended_mass = sparse.diags(np.concatenate((mass.diagonal(), appendix))).tocsc()
+    return np.vstack((points, points[-1:])), extended_mass, extended.tocsc()
+
+
+def test_cb_fem_bad_scaling_is_not_a_mechanism(test, device):
+    """Accept positive definite models whose DOF units or stiff parts spread the matrices over 13 decades.
+
+    The pivots of an unequilibrated factor then span more than twelve decades, the limit of the pivot test,
+    and the largest eigenvalue lies more than 1e13 above the first mode. Both cases reproduce the
+    well-scaled model.
+    """
+    from scipy import linalg
+
+    points, mass, stiffness = _frame_beam()
+    clamp = [{"name": "root", "node_indices": [0], "coupling": "node"}]
+    interior = np.arange(6, stiffness.shape[0])
+    translations = _translation_rows(points.shape[0])
+    reference = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, clamp, fixed_mode_count=6, eigensolver="arpack"
+    )
+    reference.reduce()
+
+    def assert_same(generator, sample_rows, tolerance):
+        np.testing.assert_allclose(
+            generator.fixed_interface_eigenvalues, reference.fixed_interface_eigenvalues, rtol=tolerance
+        )
+        for ours, theirs in (
+            (generator.reduced_stiffness_matrix, reference.reduced_stiffness_matrix),
+            (generator.reduced_mass_matrix, reference.reduced_mass_matrix),
+        ):
+            scale = float(np.max(np.abs(theirs)))
+            np.testing.assert_allclose(ours[:6, :6], theirs[:6, :6], rtol=0.0, atol=tolerance * scale)
+            np.testing.assert_allclose(np.diag(ours)[6:], np.diag(theirs)[6:], rtol=tolerance, atol=tolerance)
+            # Invariant under the sign of each mode.
+            np.testing.assert_allclose(
+                ours[:6, 6:] @ ours[6:, :6], theirs[:6, 6:] @ theirs[6:, :6], rtol=0.0, atol=tolerance * scale**2
+            )
+        ours = generator.full_recovery_matrix()[sample_rows]
+        theirs = reference.full_recovery_matrix()[translations]
+        np.testing.assert_allclose(ours[:, :6], theirs[:, :6], rtol=0.0, atol=tolerance)
+        np.testing.assert_allclose(
+            ours[:, 6:] @ ours[:, 6:].T, theirs[:, 6:] @ theirs[:, 6:].T, rtol=0.0, atol=tolerance
+        )
+
+    # Rotations of the interior nodes measured in units of 1e5 rad: a congruence of the same model.
+    units = _interior_rotation_units(points.shape[0], 1.0e-5)
+    scaled_mass, scaled_stiffness = _rescaled(mass, units), _rescaled(stiffness, units)
+    diagonal = scaled_stiffness.diagonal()[interior]
+    test.assertGreater(float(np.max(diagonal) / np.min(diagonal)), 1.0e13)
+    unscaled_factor = modal_sparse.ShiftedFactorization(
+        scaled_stiffness[interior][:, interior], scaled_mass[interior][:, interior], 0.0
+    )
+    test.assertTrue(unscaled_factor.numerically_singular)
+    for eigensolver in ("arpack", "dense"):
+        matrices = (scaled_mass, scaled_stiffness)
+        if eigensolver == "dense":
+            matrices = (scaled_mass.toarray(), scaled_stiffness.toarray())
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, *matrices, clamp, fixed_mode_count=6, eigensolver=eigensolver
+        )
+        generator.reduce()
+        assert_same(generator, translations, 1.0e-8)
+        report = generator.report
+        test.assertGreater(report["interior_stiffness_scaling_max"] / report["interior_stiffness_scaling_min"], 3.0e6)
+        test.assertGreater(report["interior_stiffness_pivot_ratio"], 1.0e-9)
+        # The energy ratio is invariant under the units of the DOFs.
+        np.testing.assert_allclose(
+            report["zero_energy_mode_ratio_min"], reference.report["zero_energy_mode_ratio_min"], rtol=1.0e-6
+        )
+        if eigensolver == "arpack":
+            np.testing.assert_allclose(
+                report["zero_energy_ratio_min"], reference.report["zero_energy_ratio_min"], rtol=1.0e-6
+            )
+        generator.craig_bampton.build()
+
+    # A stiff, light appendix lifts the largest eigenvalue more than 1e13 above the first mode.
+    appendix_points, appendix_mass, appendix_stiffness = _beam_with_appendix()
+    appendix_interior = np.arange(6, appendix_stiffness.shape[0])
+    largest = float(
+        linalg.eigh(
+            appendix_stiffness[appendix_interior][:, appendix_interior].toarray(),
+            appendix_mass[appendix_interior][:, appendix_interior].toarray(),
+            eigvals_only=True,
+        )[-1]
+    )
+    test.assertGreater(largest / reference.fixed_interface_eigenvalues[0], 1.0e13)
+    for eigensolver in ("arpack", "dense"):
+        matrices = (appendix_mass, appendix_stiffness)
+        if eigensolver == "dense":
+            matrices = (appendix_mass.toarray(), appendix_stiffness.toarray())
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            appendix_points, *matrices, clamp, fixed_mode_count=6, eigensolver=eigensolver
+        )
+        generator.reduce()
+        assert_same(generator, translations, 1.0e-8)
+        test.assertGreater(
+            generator.report["zero_energy_ratio_min"], 1.0e3 * generator.report["zero_energy_ratio_tolerance"]
+        )
+        generator.craig_bampton.build()
+
+
+def test_cb_fem_mechanisms_are_rejected_in_any_scaling(test, device):
+    """Reject parts without a tie in any DOF units, DOFs without stiffness, ties of roundoff stiffness, and an
+    indefinite mass matrix, and accept a soft tie."""
+    from scipy import sparse
+
+    points, mass, stiffness = _frame_beam()
+    node_count = points.shape[0]
+    clamp = [{"name": "root", "node_indices": [0], "coupling": "node"}]
+
+    def reduce(points, mass, stiffness, eigensolver, **options):
+        if eigensolver == "dense":
+            mass, stiffness = mass.toarray(), stiffness.toarray()
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, clamp, fixed_mode_count=4, eigensolver=eigensolver, **options
+        )
+        generator.reduce()
+        return generator
+
+    # A second beam without a tie, with the rotations of all interior nodes in units of 1e5 rad.
+    second_points, second_mass, second_stiffness = _frame_beam(offset=(0.0, 0.1, 0.0))
+    units = _interior_rotation_units(2 * node_count, 1.0e-5)
+    pair_points = np.vstack((points, second_points))
+    pair_mass = _rescaled(sparse.block_diag((mass, second_mass), format="csc"), units)
+    pair_stiffness = _rescaled(sparse.block_diag((stiffness, second_stiffness), format="csc"), units)
+    for eigensolver in ("arpack", "dense"):
+        with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
+            reduce(pair_points, pair_mass, pair_stiffness, eigensolver)
+
+    # A DOF without stiffness: the error names it.
+    dof = 6 * 20 + 3
+    released = sparse.lil_matrix(stiffness)
+    released[dof, :] = 0.0
+    released[:, dof] = 0.0
+    pattern = rf"zero-energy mechanism.*interior stiffness diagonal of DOF {dof} \(node 20 rx\) is 0"
+    for eigensolver in ("arpack", "dense"):
+        with test.assertRaisesRegex(ValueError, pattern):
+            reduce(points, mass, released.tocsc(), eigensolver)
+
+    # A short beam hangs on the tip of the clamped one through six springs, each a fraction of the tip
+    # stiffness: 1e-14 of it is roundoff, so the beam is free, while 1e-6 is a soft but genuine tie.
+    hung_points, hung_mass, hung_stiffness = _frame_beam(element_count=8, length=0.2, offset=(1.0, 0.0, 0.0))
+    tied_points = np.vstack((points, hung_points))
+    tied_mass = sparse.block_diag((mass, hung_mass), format="csc")
+    tip, root = 6 * (node_count - 1), 6 * node_count
+    for fraction, accepted in ((1.0e-14, False), (1.0e-6, True)):
+        tied = sparse.lil_matrix(sparse.block_diag((stiffness, hung_stiffness)))
+        for component in range(6):
+            k = fraction * stiffness[tip + component, tip + component]
+            a, b = tip + component, root + component
+            tied[a, a] += k
+            tied[b, b] += k
+            tied[a, b] -= k
+            tied[b, a] -= k
+        for eigensolver in ("arpack", "dense"):
+            if accepted:
+                generator = reduce(tied_points, tied_mass, tied.tocsc(), eigensolver)
+                report = generator.report
+                test.assertGreater(report["zero_energy_ratio_min"], 10.0 * report["zero_energy_ratio_tolerance"])
+                test.assertLess(report["zero_energy_ratio_min"], 1.0e-6)
+            else:
+                with test.assertRaisesRegex(ValueError, "zero-energy mechanism"):
+                    reduce(tied_points, tied_mass, tied.tocsc(), eigensolver)
+    # The soft tie falls below a tolerance that the user raises above its energy ratio.
+    with test.assertRaisesRegex(ValueError, "zero-energy mechanism.*energy ratio"):
+        reduce(tied_points, tied_mass, tied.tocsc(), "arpack", eigenvalue_tolerance=1.0e-5)
+
+    # The interior mass matrix must be positive definite: a zero diagonal and an indefinite coupling raise.
+    massless = sparse.lil_matrix(mass)
+    massless[dof, dof] = 0.0
+    indefinite = sparse.lil_matrix(mass)
+    indefinite[dof, dof + 6] = indefinite[dof + 6, dof] = 2.0 * mass[dof, dof]
+    for eigensolver in ("arpack", "dense"):
+        with test.assertRaisesRegex(ValueError, rf"positive definite on the interior DOFs.*DOF {dof} \(node 20 rx\)"):
+            reduce(points, massless.tocsc(), stiffness, eigensolver)
+        with test.assertRaisesRegex(ValueError, "mass_matrix must be positive definite on the interior DOFs"):
+            reduce(points, indefinite.tocsc(), stiffness, eigensolver)
+
+
+def test_cb_fem_equilibration_keeps_well_scaled_results(test, device):
+    """Reproduce an unequilibrated dense reduction of well-scaled models to 1e-10 on the sparse path."""
+    from scipy import linalg, sparse
+
+    lattice_points, lattice_mass, lattice_stiffness = _spring_lattice((4, 3, 3), 0.1, 1000.0, 0.01)
+    left = np.flatnonzero(np.isclose(lattice_points[:, 0], lattice_points[:, 0].min()))
+    right = np.flatnonzero(np.isclose(lattice_points[:, 0], lattice_points[:, 0].max()))
+    grid_points, grid_mass, grid_stiffness = _frame_grid()
+    cases = (
+        (
+            lattice_points,
+            sparse.csc_matrix(lattice_mass),
+            sparse.csc_matrix(lattice_stiffness),
+            [{"node_indices": left}, {"node_indices": right, "coupling": "rbe3"}],
+            3,
+            7,
+        ),
+        (grid_points, grid_mass, grid_stiffness, _grid_interfaces("rbe2"), 6, 6),
+        (grid_points, grid_mass, grid_stiffness, _grid_interfaces("rbe3"), 6, 6),
+    )
+    for points, mass, stiffness, interfaces, dofs, count in cases:
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, fixed_mode_count=count, dofs_per_node=dofs, eigensolver="arpack"
+        )
+        generator.reduce()
+        transform = generator.transformation
+        interior = generator.interior_count
+        frames = 6 * len(interfaces)
+        stiffness_z = (transform.T @ stiffness @ transform).toarray()
+        mass_z = (transform.T @ mass @ transform).toarray()
+        constraint_modes = -np.linalg.solve(stiffness_z[:interior, :interior], stiffness_z[:interior, interior:])
+        values, vectors = linalg.eigh(stiffness_z[:interior, :interior], mass_z[:interior, :interior])
+        test.assertGreater(values[count] - values[count - 1], 1.0e-6 * values[count])
+        # Signs and the rotation within repeated eigenvalues as chosen by the generator.
+        modes = vectors[:, :count]
+        modes = modes @ (modes.T @ mass_z[:interior, :interior] @ generator.fixed_interface_modes)
+        basis = np.zeros((interior + frames, frames + count))
+        basis[:interior, :frames] = constraint_modes
+        basis[:interior, frames:] = modes
+        basis[interior:, :frames] = np.eye(frames)
+        recovery = (transform @ basis)[(np.arange(points.shape[0])[:, None] * dofs + np.arange(3)).reshape(-1)]
+        np.testing.assert_allclose(generator.fixed_interface_eigenvalues, values[:count], rtol=1.0e-10)
+        for name, ours, theirs in (
+            ("constraint modes", generator.constraint_modes, constraint_modes),
+            ("stiffness", generator.reduced_stiffness_matrix, basis.T @ stiffness_z @ basis),
+            ("mass", generator.reduced_mass_matrix, basis.T @ mass_z @ basis),
+            ("recovery", generator.recovery_matrix, recovery),
+        ):
+            error = float(np.max(np.abs(ours - theirs))) / float(np.max(np.abs(theirs)))
+            test.assertLess(error, 1.0e-10, name)
+        frequencies = np.sqrt(values[:count]) / (2.0 * math.pi)
+        np.testing.assert_allclose(generator.fixed_interface_frequencies, frequencies, rtol=1.0e-10)
 
 
 def _frame_grid(nx=8, ny=5, spacing=0.1, rotary_fraction=1.0e-3):
@@ -1245,6 +1567,9 @@ _TESTS = (
     test_transformation_rank_checked,
     test_cb_fem_reduce_rejects_non_rigid_constraints,
     test_cb_fem_small_rotary_inertia_is_not_a_mechanism,
+    test_cb_fem_bad_scaling_is_not_a_mechanism,
+    test_cb_fem_mechanisms_are_rejected_in_any_scaling,
+    test_cb_fem_equilibration_keeps_well_scaled_results,
     test_cb_fem_rigid_consistency_projection,
     test_cb_fem_rigid_consistency_guards,
     test_cb_fem_rigid_consistency_defaults,

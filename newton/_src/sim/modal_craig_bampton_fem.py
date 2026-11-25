@@ -102,6 +102,23 @@ class ModalGeneratorCraigBamptonFEM:
     raises. The default ARPACK shift ``sigma = 0`` lets the factorization of
     ``K_ii`` serve both the constraint modes and the eigensolve.
 
+    The sparse path factors and solves the symmetrically equilibrated
+    matrices ``K_s = D K_ii D`` and ``M_s = D M_ii D`` with
+    ``D = diag(K_ii)^-1/2``, which have the eigenvalues of the original
+    pencil, so the units of the DOFs (translations next to rotations, stiff
+    next to soft parts) do not affect the factorization or its pivot tests.
+    A mechanism is detected by its energy ratio in this metric,
+    ``y^T K_s y / (||K_s||_1 y^T y)`` with ``phi = D y``: the strain energy
+    of a motion relative to the largest one the equilibrated stiffness can
+    hold. It is evaluated for every computed fixed-interface mode and for the
+    softest direction of ``K_s`` (a few inverse iterations, or all
+    eigenvalues on the dense path), and a ratio at or below
+    ``max(eigenvalue_tolerance, 8 n eps)``, with ``n`` the largest number of
+    nonzeros in a row of ``K_ii``, raises. The ratio does not involve the
+    mass matrix or the largest eigenvalue, so stiff, light parts and small
+    rotary inertia, which raise the top of the spectrum by many orders of
+    magnitude, do not turn a low elastic mode into an apparent mechanism.
+
     After :meth:`reduce` (called by :meth:`build`), the generator exposes
     ``transformation`` (``u = T_z z`` for the coordinates ``z`` after
     constraint and interface elimination, interior coordinates first and the
@@ -112,7 +129,10 @@ class ModalGeneratorCraigBamptonFEM:
     ``recovery_matrix`` and, for six-DOF nodes, ``rotation_recovery_matrix``
     of the sample nodes, :meth:`full_recovery_matrix`, ``craig_bampton`` (the
     :class:`ModalGeneratorCraigBampton`), and ``report`` with sizes,
-    residuals, conditioning, and stage timings.
+    residuals, conditioning, the zero-energy decision
+    (``zero_energy_decision``, ``zero_energy_ratio_min``,
+    ``zero_energy_ratio_tolerance``, and the range of the equilibration
+    scaling), and stage timings.
 
     The reduced model must reproduce rigid-body motion: zero stiffness and
     damping on the rigid motion ``R`` of the interface frames, a recovery
@@ -184,10 +204,10 @@ class ModalGeneratorCraigBamptonFEM:
             densely for dense input.
         constraint_tolerance: Relative tolerance of the constraint
             elimination; see :class:`ConstraintElimination`.
-        eigenvalue_tolerance: Fixed-interface eigenvalue threshold, relative
-            to an estimate of the largest eigenvalue, at or below which the
-            interior is reported as a mechanism. Values below the eigensolver
-            accuracy are raised to it, as in :class:`ModalGeneratorFEM`.
+        eigenvalue_tolerance: Smallest energy ratio of an interior motion
+            in the equilibrated stiffness metric (see above), at or below
+            which the interior is reported as a mechanism. Values below the
+            roundoff of the ratio, ``8 n eps``, are raised to it.
         rigid_mode_tolerance: Passed to :class:`ModalGeneratorCraigBampton`.
         damping_coupling_tolerance: Passed to :class:`ModalGeneratorCraigBampton`.
         damping_projection: Passed to :class:`ModalGeneratorCraigBampton`.
@@ -210,6 +230,10 @@ class ModalGeneratorCraigBamptonFEM:
 
     _SOLVE_CHUNK_COLUMNS: ClassVar[int] = 64
     """Number of constraint-mode right-hand sides solved at once."""
+
+    _DENSE_EIGENVALUE_AGREEMENT: ClassVar[float] = 1.0e-8
+    """Relative gap between a dense eigenvalue and the Rayleigh quotient of its vector above which the
+    dense path solves the inverse eigenproblem instead."""
 
     _RIGID_RESIDUAL_TOLERANCE: ClassVar[float] = 1.0e-7
     """Relative rigid-body residual of the reduced stiffness above which :meth:`reduce` raises.
@@ -338,7 +362,8 @@ class ModalGeneratorCraigBamptonFEM:
 
         self.craig_bampton: ModalGeneratorCraigBampton | None = None
         self.report: dict[str, Any] = {}
-        self._zero_energy_scale: tuple[float, str] = (math.nan, "")
+        self._zero_energy: dict[str, Any] = {}
+        self._describe_interior = lambda index: f"interior coordinate {int(index)}"
         self._rigid_projection: tuple[np.ndarray, np.ndarray] | None = None
 
     def _coerce_interfaces(self, interfaces: Sequence[Mapping[str, Any]]) -> list[_Interface]:
@@ -581,6 +606,8 @@ class ModalGeneratorCraigBamptonFEM:
         independent = result.independent_dofs
         if not np.array_equal(independent[-frame_count:], np.arange(coordinate_count, coordinate_count + frame_count)):
             raise RuntimeError("Interface frame coordinates were not retained as independent coordinates")
+        # Interior coordinate i is augmented coordinate independent[i]; name it in mechanism errors.
+        self._describe_interior = lambda index: describe_coordinate(int(independent[int(index)]))
         transform = result.transformation[:coordinate_count]
         if base is not None:
             transform = base @ transform
@@ -588,14 +615,130 @@ class ModalGeneratorCraigBamptonFEM:
             transform = modal_sparse.to_csc(transform)
         return transform, mpc_report, result.report
 
+    def _interior_scaling(self, stiffness_ii) -> np.ndarray:
+        """Return the equilibration scaling ``diag(K_ii)^-1/2``; a non-positive diagonal entry is a mechanism."""
+        diagonal = np.asarray(stiffness_ii.diagonal(), dtype=np.float64).reshape(-1)
+        invalid = np.flatnonzero(~(diagonal > 0.0) | ~np.isfinite(diagonal))
+        if invalid.shape[0] > 0:
+            first = int(invalid[0])
+            raise ValueError(
+                self._mechanism_message(
+                    detail=f"the interior stiffness diagonal of {self._describe_interior(first)} is "
+                    f"{diagonal[first]:.6g}; {invalid.shape[0]} interior coordinates have a non-positive diagonal"
+                )
+            )
+        return 1.0 / np.sqrt(diagonal)
+
+    def _check_interior_mass(self, mass_ii) -> None:
+        """Raise unless the interior mass matrix is positive definite."""
+        diagonal = np.asarray(mass_ii.diagonal(), dtype=np.float64).reshape(-1)
+        invalid = np.flatnonzero(~(diagonal > 0.0) | ~np.isfinite(diagonal))
+        if invalid.shape[0] > 0:
+            first = int(invalid[0])
+            raise ValueError(
+                "mass_matrix must be positive definite on the interior DOFs: the mass diagonal of "
+                f"{self._describe_interior(first)} is {diagonal[first]:.6g}"
+            )
+        if not modal_sparse.is_sparse(mass_ii) or mass_ii.nnz == mass_ii.shape[0]:
+            # Dense matrices are factored by the caller; a diagonal matrix is certified by its diagonal.
+            return
+        # The inertia of the equilibrated matrix is that of M_ii (Sylvester's law).
+        pivots = modal_sparse.nonpositive_pivot_count(modal_sparse.scale_symmetric(mass_ii, 1.0 / np.sqrt(diagonal)))
+        if pivots > 0:
+            raise ValueError(
+                "mass_matrix must be positive definite on the interior DOFs: its factorization has "
+                f"{pivots} non-positive pivots"
+            )
+
+    def _zero_energy_check(
+        self,
+        scaling: np.ndarray,
+        stiffness_norm: float,
+        tolerance: float,
+        softest_value: float,
+        softest_vector: np.ndarray,
+        values: np.ndarray,
+        mode_energy: np.ndarray,
+        mode_norm_squared: np.ndarray,
+        pivot_ratio: float,
+    ) -> float:
+        """Decide whether the interior has a zero-energy mechanism from equilibrated energy ratios.
+
+        Args:
+            scaling: Equilibration scaling ``d = diag(K_ii)^-1/2``.
+            stiffness_norm: One norm of the equilibrated stiffness ``K_s``.
+            tolerance: Smallest accepted energy ratio.
+            softest_value: Estimate of the smallest eigenvalue of ``K_s``.
+            softest_vector: Unit vector ``y`` of that estimate; may be empty.
+            values: Computed fixed-interface eigenvalues [1/s^2].
+            mode_energy: ``y_j^T K_s y_j`` of each computed mode ``phi_j = d y_j``.
+            mode_norm_squared: ``y_j^T y_j`` of each computed mode.
+            pivot_ratio: Pivot ratio of the equilibrated stiffness factor.
+
+        Returns:
+            The zero-energy threshold [1/s^2] of the mode with the smallest
+            ratio: the eigenvalue at which its ratio would equal ``tolerance``.
+
+        Raises:
+            ValueError: If a ratio is at or below ``tolerance``.
+        """
+        tiny = np.finfo(np.float64).tiny
+        norm = max(float(stiffness_norm), tiny)
+        stiffness_ratio = float(softest_value) / norm
+        mode_ratios = np.asarray(mode_energy, dtype=np.float64) / (norm * np.maximum(mode_norm_squared, tiny))
+        mode_ratio_min = float(np.min(mode_ratios)) if mode_ratios.shape[0] else math.inf
+        threshold = 0.0
+        scale = 0.0
+        if mode_ratios.shape[0]:
+            worst = int(np.argmin(mode_ratios))
+            # lambda_j = ratio_j * scale_j with scale_j = ||K_s|| y_j^T y_j / y_j^T M_s y_j.
+            scale = float(values[worst]) / mode_ratios[worst] if mode_ratios[worst] > 0.0 else math.inf
+            threshold = tolerance * scale
+        ratio_min = min(stiffness_ratio, mode_ratio_min)
+        self._zero_energy = {
+            "zero_energy_decision": "equilibrated_energy_ratio",
+            "zero_energy_ratio_min": ratio_min if math.isfinite(ratio_min) else None,
+            "zero_energy_ratio_tolerance": float(tolerance),
+            "zero_energy_mode_ratio_min": mode_ratio_min if math.isfinite(mode_ratio_min) else None,
+            "zero_energy_stiffness_ratio": stiffness_ratio if math.isfinite(stiffness_ratio) else None,
+            "zero_energy_threshold": float(threshold),
+            "zero_energy_scale": float(scale),
+            "zero_energy_scale_source": "equilibrated_energy_ratio",
+            "interior_stiffness_scaling_min": float(np.min(scaling, initial=math.inf)) if scaling.shape[0] else None,
+            "interior_stiffness_scaling_max": float(np.max(scaling, initial=0.0)) if scaling.shape[0] else None,
+            "interior_stiffness_pivot_ratio": float(pivot_ratio),
+        }
+        if mode_ratios.shape[0] and mode_ratios[worst] <= tolerance:
+            raise ValueError(
+                self._mechanism_message(
+                    float(values[worst]),
+                    threshold,
+                    detail=f"energy ratio {mode_ratios[worst]:.3g} in the equilibrated stiffness metric against "
+                    f"the tolerance {tolerance:.3g}",
+                )
+            )
+        if stiffness_ratio <= tolerance:
+            detail = (
+                f"the softest direction of the equilibrated interior stiffness has the energy ratio "
+                f"{stiffness_ratio:.3g}, at or below the tolerance {tolerance:.3g}"
+            )
+            if softest_vector.shape[0] == scaling.shape[0] and scaling.shape[0] > 0:
+                largest = int(np.argmax(np.abs(scaling * softest_vector)))
+                detail += f"; its motion is largest at {self._describe_interior(largest)}"
+            raise ValueError(self._mechanism_message(detail=detail))
+        return threshold
+
     def _interior_dense(self, stiffness_ii, stiffness_ib, mass_ii, count: int):
         """Solve the constraint modes and fixed-interface modes densely."""
+        scaling = self._interior_scaling(stiffness_ii)
+        self._check_interior_mass(mass_ii)
         try:
             chol_k = np.linalg.cholesky(stiffness_ii)
         except np.linalg.LinAlgError as exc:
             raise ValueError(self._mechanism_message()) from exc
         constraint_modes = -np.linalg.solve(chol_k.T, np.linalg.solve(chol_k, stiffness_ib))
-        diagonal = np.abs(np.diag(chol_k)) ** 2
+        # Pivots of the equilibrated factor: the Cholesky factor of D K D is D L.
+        diagonal = (scaling * np.abs(np.diag(chol_k))) ** 2
         pivot_ratio = float(np.min(diagonal) / np.max(diagonal)) if diagonal.shape[0] else 1.0
         try:
             chol_m = np.linalg.cholesky(mass_ii)
@@ -603,20 +746,63 @@ class ModalGeneratorCraigBamptonFEM:
             raise ValueError("mass_matrix must be positive definite on the interior DOFs") from exc
         standard = np.linalg.solve(chol_m, np.linalg.solve(chol_m, stiffness_ii).T).T
         values, vectors = np.linalg.eigh(0.5 * (standard + standard.T))
-        relative = max(self.eigenvalue_tolerance, 8.0 * stiffness_ii.shape[0] * np.finfo(np.float64).eps)
-        scale = float(np.max(np.abs(values), initial=0.0))
-        self._zero_energy_scale = (scale, "dense_eigenvalues")
-        threshold = relative * scale
-        if values.shape[0] > 0 and values[0] <= threshold:
-            raise ValueError(self._mechanism_message(float(values[0]), threshold))
         modes = np.linalg.solve(chol_m.T, vectors[:, :count])
-        return constraint_modes, values[:count], modes, pivot_ratio, threshold
+        values = values[:count]
+        # The standard form resolves an eigenvalue only to roundoff of the largest one. When a retained
+        # eigenvalue disagrees with the Rayleigh quotient of its vector, solve the inverse problem
+        # L_k^-1 M L_k^-T w = (1 / lambda) w instead, which resolves the lowest eigenvalues to roundoff
+        # of themselves.
+        rayleigh = modal_sparse.quadratic_form_diag(modes, stiffness_ii) / np.maximum(
+            modal_sparse.quadratic_form_diag(modes, mass_ii), np.finfo(np.float64).tiny
+        )
+        if np.any(np.abs(values - rayleigh) > self._DENSE_EIGENVALUE_AGREEMENT * np.abs(rayleigh)):
+            inverse = np.linalg.solve(chol_k, np.linalg.solve(chol_k, mass_ii).T).T
+            flexibility, vectors = np.linalg.eigh(0.5 * (inverse + inverse.T))
+            flexibility, vectors = flexibility[::-1][:count], vectors[:, ::-1][:, :count]
+            if not np.all(flexibility > 0.0):
+                raise ValueError("mass_matrix must be positive definite on the interior DOFs")
+            values = 1.0 / flexibility
+            modes = np.linalg.solve(chol_k.T, vectors) * np.sqrt(values)
+
+        stiffness_s = modal_sparse.scale_symmetric(stiffness_ii, scaling)
+        stiffness_s = 0.5 * (stiffness_s + stiffness_s.T)
+        size = stiffness_ii.shape[0]
+        tolerance = max(self.eigenvalue_tolerance, 8.0 * size * np.finfo(np.float64).eps)
+        softest_value, softest_vector = math.inf, np.zeros(0)
+        if size > 0:
+            softest_values, softest_vectors = np.linalg.eigh(stiffness_s)
+            softest_value, softest_vector = float(softest_values[0]), softest_vectors[:, 0]
+        # The softest eigenvalue of K_s bounds the ratio of every motion from below, so it decides; the
+        # ratios of the retained modes phi = D y are reported, from y^T K_s y = phi^T K_ii phi.
+        equilibrated = modes / scaling[:, None]
+        threshold = self._zero_energy_check(
+            scaling,
+            modal_sparse.matrix_one_norm(stiffness_s),
+            tolerance,
+            softest_value,
+            softest_vector,
+            values,
+            modal_sparse.quadratic_form_diag(modes, stiffness_ii),
+            np.einsum("di,di->i", equilibrated, equilibrated),
+            pivot_ratio,
+        )
+        return constraint_modes, values, modes, pivot_ratio, threshold
 
     def _interior_sparse(self, stiffness_ii, stiffness_ib, mass_ii, count: int):
-        """Solve the constraint modes and fixed-interface modes with SuperLU and ARPACK."""
+        """Solve the constraint modes and fixed-interface modes with SuperLU and ARPACK.
+
+        Works on the equilibrated matrices ``K_s = D K_ii D`` and
+        ``M_s = D M_ii D`` with ``D = diag(K_ii)^-1/2`` and maps the constraint
+        modes and eigenvectors back with ``D``; the eigenvalues are those of
+        the original pencil.
+        """
         sigma = 0.0 if self.arpack_shift is None else self.arpack_shift
+        scaling = self._interior_scaling(stiffness_ii)
+        self._check_interior_mass(mass_ii)
+        stiffness_s = modal_sparse.scale_symmetric(stiffness_ii, scaling)
+        mass_s = modal_sparse.scale_symmetric(mass_ii, scaling)
         try:
-            factorization = modal_sparse.ShiftedFactorization(stiffness_ii, mass_ii, sigma)
+            factorization = modal_sparse.ShiftedFactorization(stiffness_s, mass_s, sigma)
         except ValueError as exc:
             raise ValueError(self._mechanism_message()) from exc
         if sigma <= 0.0 and factorization.negative_pivot_count != 0:
@@ -631,50 +817,76 @@ class ModalGeneratorCraigBamptonFEM:
                     "a fixed-interface eigenvalue. Choose a different arpack_shift"
                 )
             try:
-                stiffness_factorization = modal_sparse.ShiftedFactorization(stiffness_ii, mass_ii, 0.0)
+                stiffness_factorization = modal_sparse.ShiftedFactorization(stiffness_s, mass_s, 0.0)
             except ValueError as exc:
                 raise ValueError(self._mechanism_message()) from exc
             if stiffness_factorization.negative_pivot_count != 0:
                 raise ValueError(self._mechanism_message())
         # SuperLU raises only for exactly zero pivots; a roundoff-sized pivot also reveals a mechanism.
+        # The pivots of the equilibrated matrix lie between its smallest eigenvalue and one, so their
+        # ratio does not depend on the units of the DOFs.
         if stiffness_factorization.numerically_singular:
-            raise ValueError(self._mechanism_message())
+            raise ValueError(
+                self._mechanism_message(
+                    detail=f"the smallest pivot of the equilibrated interior stiffness is "
+                    f"{stiffness_factorization.pivot_ratio:.3g} of the largest"
+                )
+            )
         pivot_ratio = stiffness_factorization.pivot_ratio
 
         rhs = stiffness_ib.toarray() if modal_sparse.is_sparse(stiffness_ib) else np.asarray(stiffness_ib)
         constraint_modes = np.empty_like(rhs)
         for start in range(0, rhs.shape[1], self._SOLVE_CHUNK_COLUMNS):
             stop = min(start + self._SOLVE_CHUNK_COLUMNS, rhs.shape[1])
-            constraint_modes[:, start:stop] = -stiffness_factorization.solve(np.ascontiguousarray(rhs[:, start:stop]))
+            scaled_rhs = np.ascontiguousarray(scaling[:, None] * rhs[:, start:stop])
+            constraint_modes[:, start:stop] = -scaling[:, None] * stiffness_factorization.solve(scaled_rhs)
 
-        # The Gershgorin bound alone overestimates the largest eigenvalue of six-DOF shells by up to three
-        # orders of magnitude (small rotary inertia), which would lift the mechanism threshold above genuine
-        # elastic modes; generalized_eigenvalue_scale tightens it with a few power iterations.
-        scale, scale_source = modal_sparse.generalized_eigenvalue_scale(stiffness_ii, mass_ii)
-        self._zero_energy_scale = (scale, scale_source)
+        # A mechanism is a direction without strain energy. Its energy ratio in the equilibrated metric,
+        # y^T K_s y / (||K_s||_1 y^T y), is at roundoff level whatever the mass matrix is, while a threshold
+        # relative to the largest eigenvalue of (K, M) rises above genuine elastic modes when small rotary
+        # inertia or a stiff, light part lifts the top of the spectrum. The softest direction of K_s covers
+        # motions with almost no mass, which lie far above the computed modes.
+        stiffness_norm = modal_sparse.matrix_one_norm(stiffness_s)
         row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness_ii), 1)
-        relative = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
-        threshold = relative * scale
-        if count == 0:
+        tolerance = max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
+        softest_value, softest_vector = modal_sparse.smallest_eigenvalue_estimate(
+            stiffness_s, stiffness_factorization.solve
+        )
+        empty = np.zeros(0)
+        if count == 0 or softest_value <= tolerance * stiffness_norm:
+            threshold = self._zero_energy_check(
+                scaling, stiffness_norm, tolerance, softest_value, softest_vector, empty, empty, empty, pivot_ratio
+            )
             return constraint_modes, np.zeros(0), np.zeros((stiffness_ii.shape[0], 0)), pivot_ratio, threshold
-        values, modes = modal_sparse.lowest_generalized_eigenpairs(
-            stiffness_ii,
-            mass_ii,
+        values, vectors = modal_sparse.lowest_generalized_eigenpairs(
+            stiffness_s,
+            mass_s,
             count,
             sigma=sigma,
-            zero_threshold=threshold,
+            zero_threshold=0.0,
             margin=self._ARPACK_MARGIN,
             tol=self.arpack_tol,
             maxiter=self.arpack_maxiter,
             ncv=self.arpack_ncv,
             factorization=factorization,
         )
-        if values[0] <= threshold:
-            raise ValueError(self._mechanism_message(float(values[0]), threshold))
-        return constraint_modes, values[:count], modes[:, :count], pivot_ratio, threshold
+        threshold = self._zero_energy_check(
+            scaling,
+            stiffness_norm,
+            tolerance,
+            softest_value,
+            softest_vector,
+            values,
+            modal_sparse.quadratic_form_diag(vectors, stiffness_s),
+            np.einsum("di,di->i", vectors, vectors),
+            pivot_ratio,
+        )
+        return constraint_modes, values[:count], scaling[:, None] * vectors[:, :count], pivot_ratio, threshold
 
     @staticmethod
-    def _mechanism_message(lowest: float | None = None, threshold: float | None = None) -> str:
+    def _mechanism_message(
+        lowest: float | None = None, threshold: float | None = None, detail: str | None = None
+    ) -> str:
         message = (
             "The interior stiffness matrix (every interface frame fixed) is singular or not positive definite: "
             "the model has a zero-energy mechanism, for example a part that is not tied to the rest or an "
@@ -687,8 +899,11 @@ class ModalGeneratorCraigBamptonFEM:
 
             message += (
                 f" (lowest fixed-interface eigenvalue {lowest:.6g} 1/s^2 = {hertz(lowest):.4g} Hz is at or below "
-                f"the zero-energy threshold {threshold:.6g} 1/s^2 = {hertz(threshold):.4g} Hz)"
+                f"the zero-energy threshold {threshold:.6g} 1/s^2 = {hertz(threshold):.4g} Hz"
             )
+            message += f"; {detail})" if detail else ")"
+        elif detail:
+            message += f" ({detail})"
         return message
 
     def _lumped_sample_mass(self) -> np.ndarray:
@@ -756,6 +971,7 @@ class ModalGeneratorCraigBamptonFEM:
 
         clock = time.perf_counter()
         solve = self._interior_sparse if sparse else self._interior_dense
+        self._zero_energy = {}
         constraint_modes, eigenvalues, modes, pivot_ratio, threshold = solve(
             stiffness_ii, stiffness_ib, mass_ii, self.fixed_mode_count
         )
@@ -898,8 +1114,6 @@ class ModalGeneratorCraigBamptonFEM:
             "fixed_interface_eigenvalues": self.fixed_interface_eigenvalues.tolist(),
             "fixed_interface_frequencies_hz": self.fixed_interface_frequencies.tolist(),
             "zero_energy_threshold": float(threshold),
-            "zero_energy_scale": float(self._zero_energy_scale[0]),
-            "zero_energy_scale_source": self._zero_energy_scale[1],
             "constraint_mode_residual": constraint_mode_residual,
             "eigen_residual": eigen_residual,
             "rigid_stiffness_residual": rigid_residual,
@@ -909,6 +1123,7 @@ class ModalGeneratorCraigBamptonFEM:
             "reduced_mass_condition": float(np.linalg.cond(reduced_mass)),
             "timings_s": timings,
         }
+        self.report.update(self._zero_energy)
         return self.craig_bampton
 
     @staticmethod
