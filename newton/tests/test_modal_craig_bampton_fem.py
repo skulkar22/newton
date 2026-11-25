@@ -1550,6 +1550,241 @@ def test_cb_fem_rigid_consistency_defaults(test, device):
         tight.build()
 
 
+def _full_fe_static(generator, stiffness, load, fixed_interfaces):
+    """Solve the full constrained finite-element static problem with the listed interface frames fixed.
+
+    Uses the coordinates of the generator (constraints and interface couplings eliminated) without any
+    modal truncation; returns the full DOF field.
+    """
+    from scipy import sparse
+    from scipy.sparse import linalg as sparse_linalg
+
+    transform = sparse.csc_matrix(generator.transformation)
+    stiffness_z = sparse.csc_matrix(transform.T @ sparse.csc_matrix(stiffness) @ transform)
+    load_z = transform.T @ load
+    frames = np.arange(generator.interior_count, transform.shape[1])
+    fixed_z = frames[(np.asarray(fixed_interfaces)[:, None] * 6 + np.arange(6)).reshape(-1)]
+    free_z = np.setdiff1d(np.arange(transform.shape[1]), fixed_z)
+    coordinates = np.zeros(transform.shape[1])
+    coordinates[free_z] = sparse_linalg.splu(sparse.csc_matrix(stiffness_z[free_z][:, free_z])).solve(load_z[free_z])
+    return transform @ coordinates
+
+
+def test_cb_fem_static_correction_reproduces_statics(test, device):
+    """Reproduce the full finite-element statics of the given loads exactly with static correction vectors.
+
+    With every interface fixed and with one released, at 4, 8, and 16 fixed-interface modes, the reduced
+    gravity response equals the full one to 1e-9 with the correction vector. Without it the truncation
+    error exceeds 1e-3 of the field with every interface fixed; with one released it is smaller relative
+    to the larger field (above 1e-5), because the constraint modes carry most of that response. Three
+    gravity axes make every gravity direction exact.
+    """
+    points, mass, stiffness = _frame_grid()
+    node_count = points.shape[0]
+    interfaces = _grid_interfaces("rbe2")
+    frames = 6 * len(interfaces)
+    load = _gravity_load(mass, node_count)
+    translations = _translation_rows(node_count)
+
+    def static_errors(generator, nodal_load):
+        errors = []
+        for fixed in ([0, 1], [0]):
+            full = _full_fe_static(generator, stiffness, nodal_load, fixed)
+            reduced = _reduced_static(generator, nodal_load, fixed)
+            errors.append(_relative((reduced - full)[translations], full[translations]))
+        return errors
+
+    for count in (4, 8, 16):
+        plain = newton.ModalGeneratorCraigBamptonFEM(points, mass, stiffness, interfaces, fixed_mode_count=count)
+        plain.reduce()
+        test.assertEqual(plain.static_correction_count, 0)
+        test.assertEqual(plain.report["static_correction_load_count"], 0)
+        test.assertNotIn("static_correction_frequencies_hz", plain.to_arrays(full_recovery=False))
+        truncated = static_errors(plain, load)
+        test.assertGreater(truncated[0], 1.0e-3)
+        test.assertGreater(truncated[1], 1.0e-5)
+
+        corrected = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, fixed_mode_count=count, static_correction_loads=load
+        )
+        basis = corrected.build()
+        for error in static_errors(corrected, load):
+            test.assertLess(error, 1.0e-9)
+        test.assertEqual(basis.mode_count, frames + count + 1 - 6)
+        report = corrected.report
+        test.assertEqual(report["reduced_dof_count"], frames + count + 1)
+        test.assertEqual(report["static_correction_load_count"], 1)
+        test.assertEqual(report["static_correction_count"], 1)
+        test.assertEqual(report["static_correction_load_indices"], [0])
+        test.assertEqual(report["static_correction_dropped"], [])
+        test.assertEqual(len(report["fixed_interface_frequencies_hz"]), count)
+        test.assertEqual(corrected.fixed_interface_modes.shape[1], count)
+        test.assertEqual(corrected.static_correction_vectors.shape, (corrected.interior_count, 1))
+        test.assertLess(report["eigen_residual"], 1.0e-8)
+        # The fixed-interface modes and their block of the reduced matrices are those of the plain model.
+        np.testing.assert_allclose(
+            corrected.fixed_interface_eigenvalues, plain.fixed_interface_eigenvalues, rtol=1.0e-12
+        )
+        for ours, theirs in (
+            (corrected.reduced_stiffness_matrix, plain.reduced_stiffness_matrix),
+            (corrected.reduced_mass_matrix, plain.reduced_mass_matrix),
+        ):
+            scale = float(np.max(np.abs(theirs)))
+            np.testing.assert_allclose(ours[:-1, :-1], theirs, rtol=0.0, atol=1.0e-12 * scale)
+        # The vector is stiffness-orthogonal to the constraint modes and the fixed-interface modes,
+        # mass-orthogonal to the modes, of unit modal mass, and stiffer than every retained mode.
+        reduced_stiffness, reduced_mass = corrected.reduced_stiffness_matrix, corrected.reduced_mass_matrix
+        test.assertLess(float(np.max(np.abs(reduced_stiffness[-1, :-1]))), 1.0e-9 * reduced_stiffness[-1, -1])
+        test.assertLess(float(np.max(np.abs(reduced_mass[-1, frames:-1]))), 1.0e-12)
+        test.assertAlmostEqual(reduced_mass[-1, -1], 1.0, delta=1.0e-12)
+        frequency = corrected.static_correction_frequencies[0]
+        test.assertGreater(frequency, corrected.fixed_interface_frequencies[-1])
+        np.testing.assert_allclose(reduced_stiffness[-1, -1], (2.0 * math.pi * frequency) ** 2, rtol=1.0e-12)
+        test.assertEqual(report["static_correction_frequencies_hz"], [frequency])
+        arrays = corrected.to_arrays(full_recovery=False)
+        np.testing.assert_array_equal(arrays["static_correction_frequencies_hz"], [frequency])
+        np.testing.assert_array_equal(arrays["static_correction_load_indices"], [0])
+        test.assertEqual(arrays["fixed_interface_frequencies_hz"].shape, (count,))
+        test.assertEqual(arrays["mass_matrix"].shape, (frames + count + 1, frames + count + 1))
+        test.assertEqual(arrays["recovery_matrix"].shape, (3 * node_count, frames + count + 1))
+
+    # The dense and the sparse path agree.
+    sparse_path = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, interfaces, fixed_mode_count=8, static_correction_loads=load, eigensolver="arpack"
+    )
+    sparse_path.reduce()
+    dense_path = newton.ModalGeneratorCraigBamptonFEM(
+        points,
+        mass.toarray(),
+        stiffness.toarray(),
+        interfaces,
+        fixed_mode_count=8,
+        static_correction_loads=load,
+        eigensolver="dense",
+    )
+    dense_path.reduce()
+    np.testing.assert_allclose(
+        dense_path.static_correction_frequencies, sparse_path.static_correction_frequencies, rtol=1.0e-8
+    )
+    for error in static_errors(dense_path, load):
+        test.assertLess(error, 1.0e-9)
+    for fixed in ([0, 1], [0]):
+        ours, theirs = _reduced_static(dense_path, load, fixed), _reduced_static(sparse_path, load, fixed)
+        test.assertLess(_relative((ours - theirs)[translations], theirs[translations]), 1.0e-9)
+
+    # Three gravity axes make every gravity direction exact.
+    axes = np.zeros((6 * node_count, 3))
+    for axis in range(3):
+        acceleration = np.zeros(6 * node_count)
+        acceleration[axis::6] = 1.0
+        axes[:, axis] = mass @ acceleration
+    three = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, interfaces, fixed_mode_count=4, static_correction_loads=axes
+    )
+    basis = three.build()
+    test.assertEqual(three.static_correction_count, 3)
+    test.assertEqual(basis.mode_count, frames + 4 + 3 - 6)
+    np.testing.assert_allclose(three.reduced_mass_matrix[frames + 4 :, frames + 4 :], np.eye(3), rtol=0.0, atol=1.0e-12)
+    for direction in ((0.3, -0.5, 0.8), (1.0, 0.0, 0.0), (-0.6, 0.7, 0.1)):
+        for error in static_errors(three, axes @ np.asarray(direction)):
+            test.assertLess(error, 1.0e-9)
+
+
+def test_cb_fem_static_correction_span_and_options(test, device):
+    """Drop loads that the basis already represents, keep the model unchanged without loads, and validate input."""
+    points, mass, stiffness = _frame_grid()
+    node_count = points.shape[0]
+    interfaces = _grid_interfaces("rbe2")
+    frames = 6 * len(interfaces)
+    load = _gravity_load(mass, node_count)
+    options = {"fixed_mode_count": 6}
+    plain = newton.ModalGeneratorCraigBamptonFEM(points, mass, stiffness, interfaces, **options)
+    plain.reduce()
+
+    # The interior coordinates of RBE2 interfaces without constraints are nodal DOFs, so M_ii phi_j, placed
+    # on them, is a nodal load whose fixed-interface response is phi_j / lambda_j: already in the span.
+    interior = plain.interior_count
+    selection = plain.transformation[:, :interior]
+    np.testing.assert_array_equal((selection.T @ selection).toarray(), np.eye(interior))
+    mass_ii = (plain.transformation.T @ mass @ plain.transformation)[:interior, :interior]
+    in_span = selection @ (mass_ii @ plain.fixed_interface_modes[:, 2])
+    loads = np.column_stack((in_span, load, -2.5 * load, np.zeros(6 * node_count)))
+    generator = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, interfaces, static_correction_loads=loads, **options
+    )
+    basis = generator.build()
+    report = generator.report
+    test.assertEqual(report["static_correction_load_count"], 4)
+    test.assertEqual(report["static_correction_count"], 1)
+    test.assertEqual(report["static_correction_load_indices"], [1])
+    test.assertEqual(report["static_correction_dropped"], [0, 2, 3])
+    norms = report["static_correction_relative_norms"]
+    test.assertLess(norms[0], 1.0e-10)
+    test.assertGreater(norms[1], 1.0e-3)
+    test.assertLess(norms[2], 1.0e-10)
+    test.assertEqual(norms[3], 0.0)
+    test.assertEqual(basis.mode_count, frames + 6 + 1 - 6)
+    np.testing.assert_array_equal(generator.static_correction_load_indices, [1])
+    # The same vector as for the gravity load alone.
+    single = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, stiffness, interfaces, static_correction_loads=load, **options
+    )
+    single.reduce()
+    np.testing.assert_allclose(
+        generator.static_correction_vectors, single.static_correction_vectors, rtol=0.0, atol=1.0e-12
+    )
+
+    # No loads, or loads that are all dropped, leave the reduced model as it is without the option.
+    for empty in (np.zeros((6 * node_count, 0)), in_span):
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, static_correction_loads=empty, **options
+        )
+        generator.reduce()
+        test.assertEqual(generator.static_correction_count, 0)
+        np.testing.assert_array_equal(generator.reduced_stiffness_matrix, plain.reduced_stiffness_matrix)
+        np.testing.assert_array_equal(generator.reduced_mass_matrix, plain.reduced_mass_matrix)
+        np.testing.assert_array_equal(generator.recovery_matrix, plain.recovery_matrix)
+        test.assertEqual(generator.to_arrays(full_recovery=False)["static_correction_frequencies_hz"].shape, (0,))
+
+    # With rigid_consistency="project" the correction coordinate keeps its stiffness: the rigid motion of
+    # the interface frames does not involve it.
+    drifting = stiffness + _rotation_drift(stiffness, _GRID_DRIFT)
+    projected = newton.ModalGeneratorCraigBamptonFEM(
+        points, mass, drifting, interfaces, static_correction_loads=load, rigid_consistency="project", **options
+    )
+    basis = projected.build()
+    test.assertEqual(basis.mode_count, frames + 6 + 1 - 6)
+    np.testing.assert_allclose(
+        projected.reduced_stiffness_matrix[-1, -1],
+        (2.0 * math.pi * projected.static_correction_frequencies[0]) ** 2,
+        rtol=1.0e-9,
+    )
+
+    # An interior solve overridden without the factorization closure still gets its correction vectors.
+    class Overridden(newton.ModalGeneratorCraigBamptonFEM):
+        def _interior_sparse(self, *args):
+            result = super()._interior_sparse(*args)
+            self._interior_solve = None
+            return result
+
+    overridden = Overridden(points, mass, stiffness, interfaces, static_correction_loads=load, **options)
+    overridden.reduce()
+    np.testing.assert_allclose(
+        overridden.static_correction_vectors, single.static_correction_vectors, rtol=0.0, atol=1.0e-9
+    )
+
+    with test.assertRaisesRegex(
+        ValueError, rf"static_correction_loads must have shape \[{6 * node_count}, load_count\]"
+    ):
+        newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, static_correction_loads=np.zeros((3, 6 * node_count)), **options
+        )
+    with test.assertRaisesRegex(ValueError, "static_correction_loads contains non-finite"):
+        newton.ModalGeneratorCraigBamptonFEM(
+            points, mass, stiffness, interfaces, static_correction_loads=np.full(6 * node_count, np.nan), **options
+        )
+
+
 class TestModalCraigBamptonFem(unittest.TestCase):
     pass
 
@@ -1570,6 +1805,8 @@ _TESTS = (
     test_cb_fem_bad_scaling_is_not_a_mechanism,
     test_cb_fem_mechanisms_are_rejected_in_any_scaling,
     test_cb_fem_equilibration_keeps_well_scaled_results,
+    test_cb_fem_static_correction_reproduces_statics,
+    test_cb_fem_static_correction_span_and_options,
     test_cb_fem_rigid_consistency_projection,
     test_cb_fem_rigid_consistency_guards,
     test_cb_fem_rigid_consistency_defaults,

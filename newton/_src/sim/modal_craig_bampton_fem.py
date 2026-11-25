@@ -78,6 +78,24 @@ class ModalGeneratorCraigBamptonFEM:
     modes. The reduced matrices therefore have ``6 * interface_count +
     fixed_mode_count`` coordinates, and the basis has six fewer modes.
 
+    A truncated set of fixed-interface modes reproduces the static response
+    to a load on the interior, such as gravity, only approximately.
+    ``static_correction_loads`` adds, for each given nodal load ``f``, the
+    fixed-interface static response ``K_ii^-1 f_i`` to the interior basis,
+    after the fixed-interface modes: ``T = [[I, 0, 0], [Psi, Phi, X]]``. Each
+    vector is made mass-orthogonal to the retained modes and to the earlier
+    vectors, dropped when the retained basis already represents it, and
+    normalized like the modes. The exact response to ``f`` is
+    ``u_i = Psi u_b + K_ii^-1 f_i`` for any motion ``u_b`` of the interface
+    frames, so the reduced static solution for every combination of the
+    given loads equals the full finite-element one for any interface
+    condition and any ``fixed_mode_count``. The reduced model then has
+    ``6 * interface_count + fixed_mode_count + static_correction_count``
+    coordinates. The vectors are not eigenvectors: their Rayleigh
+    frequencies are reported separately, and ``fixed_interface_modes``,
+    ``fixed_interface_eigenvalues``, ``fixed_interface_frequencies``, and
+    the eigenpair residual cover the fixed-interface modes only.
+
     Interfaces are mappings with the keys:
 
     - ``node_indices`` (required): the interface nodes.
@@ -124,7 +142,9 @@ class ModalGeneratorCraigBamptonFEM:
     constraint and interface elimination, interior coordinates first and the
     ``6 * interface_count`` frame coordinates last), ``constraint_modes``,
     ``fixed_interface_modes``, ``fixed_interface_eigenvalues`` [1/s^2],
-    ``fixed_interface_frequencies`` [Hz], ``reduction_basis`` (the
+    ``fixed_interface_frequencies`` [Hz], ``static_correction_vectors``,
+    ``static_correction_frequencies`` [Hz], ``static_correction_load_indices``
+    (the load of each retained vector), ``reduction_basis`` (the
     Craig-Bampton matrix ``T`` in ``z`` coordinates), the reduced matrices,
     ``recovery_matrix`` and, for six-DOF nodes, ``rotation_recovery_matrix``
     of the sample nodes, :meth:`full_recovery_matrix`, ``craig_bampton`` (the
@@ -168,6 +188,12 @@ class ModalGeneratorCraigBamptonFEM:
         interfaces: Interface specifications as described above. Their order
             defines the six-DOF blocks of the reduced matrices.
         fixed_mode_count: Number of fixed-interface modes to retain.
+        static_correction_loads: Optional nodal loads [N, N m for rotational
+            DOFs] whose static response the reduced model reproduces
+            exactly, shape ``[dof_count, load_count]`` or ``[dof_count]``,
+            node-major DOFs as for ``stiffness_matrix``; dense or SciPy
+            sparse. Only the direction of each load matters. Each load adds
+            at most one coordinate, as described above.
         damping_matrix: Optional nodal damping matrix [N s/m], with the shape
             of ``mass_matrix``; dense or SciPy sparse.
         dofs_per_node: DOFs per node: 3 (``[ux, uy, uz]``) or 6
@@ -231,6 +257,10 @@ class ModalGeneratorCraigBamptonFEM:
     _SOLVE_CHUNK_COLUMNS: ClassVar[int] = 64
     """Number of constraint-mode right-hand sides solved at once."""
 
+    _STATIC_CORRECTION_SPAN_TOLERANCE: ClassVar[float] = 1.0e-10
+    """Mass norm of a static response after orthogonalization, relative to its norm before, below which
+    the retained basis already represents it and no correction vector is added."""
+
     _DENSE_EIGENVALUE_AGREEMENT: ClassVar[float] = 1.0e-8
     """Relative gap between a dense eigenvalue and the Rayleigh quotient of its vector above which the
     dense path solves the inverse eigenproblem instead."""
@@ -249,6 +279,7 @@ class ModalGeneratorCraigBamptonFEM:
         interfaces: Sequence[Mapping[str, Any]],
         *,
         fixed_mode_count: int,
+        static_correction_loads: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray | None = None,
         damping_matrix: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray | None = None,
         dofs_per_node: Literal[3, 6] = 6,
         constraints: Sequence[Sequence[float]] | np.ndarray | spmatrix | sparray | None = None,
@@ -330,6 +361,19 @@ class ModalGeneratorCraigBamptonFEM:
             if damping_matrix is None
             else modal_sparse.coerce_symmetric_matrix(damping_matrix, size, "damping_matrix")
         )
+        self.static_correction_loads: np.ndarray | None = None
+        if static_correction_loads is not None:
+            loads = np.array(modal_sparse.to_dense(static_correction_loads), dtype=np.float64)
+            if loads.ndim == 1:
+                loads = loads[:, None]
+            if loads.ndim != 2 or loads.shape[0] != size:
+                raise ValueError(
+                    f"static_correction_loads must have shape [{size}, load_count] or [{size}], got "
+                    f"{tuple(np.shape(static_correction_loads))}"
+                )
+            if not np.all(np.isfinite(loads)):
+                raise ValueError("static_correction_loads contains non-finite entries")
+            self.static_correction_loads = loads
         if constraints is not None and transformation is not None:
             raise ValueError("Pass at most one of constraints and transformation")
         self.constraints = constraints
@@ -363,6 +407,7 @@ class ModalGeneratorCraigBamptonFEM:
         self.craig_bampton: ModalGeneratorCraigBampton | None = None
         self.report: dict[str, Any] = {}
         self._zero_energy: dict[str, Any] = {}
+        self._interior_solve: Any = None
         self._describe_interior = lambda index: f"interior coordinate {int(index)}"
         self._rigid_projection: tuple[np.ndarray, np.ndarray] | None = None
 
@@ -736,6 +781,7 @@ class ModalGeneratorCraigBamptonFEM:
             chol_k = np.linalg.cholesky(stiffness_ii)
         except np.linalg.LinAlgError as exc:
             raise ValueError(self._mechanism_message()) from exc
+        self._interior_solve = lambda rhs: np.linalg.solve(chol_k.T, np.linalg.solve(chol_k, rhs))
         constraint_modes = -np.linalg.solve(chol_k.T, np.linalg.solve(chol_k, stiffness_ib))
         # Pivots of the equilibrated factor: the Cholesky factor of D K D is D L.
         diagonal = (scaling * np.abs(np.diag(chol_k))) ** 2
@@ -834,12 +880,18 @@ class ModalGeneratorCraigBamptonFEM:
             )
         pivot_ratio = stiffness_factorization.pivot_ratio
 
+        def interior_solve(rhs: np.ndarray) -> np.ndarray:
+            """Return ``K_ii^-1 rhs`` for the columns of ``rhs`` through the equilibrated factor."""
+            result = np.empty_like(rhs)
+            for start in range(0, rhs.shape[1], self._SOLVE_CHUNK_COLUMNS):
+                stop = min(start + self._SOLVE_CHUNK_COLUMNS, rhs.shape[1])
+                scaled_rhs = np.ascontiguousarray(scaling[:, None] * rhs[:, start:stop])
+                result[:, start:stop] = scaling[:, None] * stiffness_factorization.solve(scaled_rhs)
+            return result
+
+        self._interior_solve = interior_solve
         rhs = stiffness_ib.toarray() if modal_sparse.is_sparse(stiffness_ib) else np.asarray(stiffness_ib)
-        constraint_modes = np.empty_like(rhs)
-        for start in range(0, rhs.shape[1], self._SOLVE_CHUNK_COLUMNS):
-            stop = min(start + self._SOLVE_CHUNK_COLUMNS, rhs.shape[1])
-            scaled_rhs = np.ascontiguousarray(scaling[:, None] * rhs[:, start:stop])
-            constraint_modes[:, start:stop] = -scaling[:, None] * stiffness_factorization.solve(scaled_rhs)
+        constraint_modes = -interior_solve(rhs)
 
         # A mechanism is a direction without strain energy. Its energy ratio in the equilibrated metric,
         # y^T K_s y / (||K_s||_1 y^T y), is at roundoff level whatever the mass matrix is, while a threshold
@@ -905,6 +957,77 @@ class ModalGeneratorCraigBamptonFEM:
         elif detail:
             message += f" ({detail})"
         return message
+
+    def _static_correction_vectors(
+        self, transform, stiffness_ii, mass_ii, modes: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, list[int], list[float]]:
+        """Return the static correction vectors of ``static_correction_loads`` on the interior coordinates.
+
+        The fixed-interface response ``K_ii^-1 f_i`` of each load is orthogonalized twice in the mass
+        inner product against ``modes`` and the vectors already retained, dropped when its remaining
+        mass norm is below :attr:`_STATIC_CORRECTION_SPAN_TOLERANCE` of the original one, normalized to
+        unit modal mass, and oriented like the modes.
+
+        Returns:
+            The vectors, shape ``[interior_count, static_correction_count]``, their Rayleigh quotients
+            [1/s^2], the load index of each vector, and the relative remaining norm of every load.
+        """
+        interior_count = int(stiffness_ii.shape[0])
+        vectors: list[np.ndarray] = []
+        mass_vectors: list[np.ndarray] = []
+        indices: list[int] = []
+        relative_norms: list[float] = []
+        loads = self.static_correction_loads
+        if loads is not None and loads.shape[1] > 0 and interior_count > 0:
+            interior_loads = np.ascontiguousarray(np.asarray(transform.T @ loads)[:interior_count])
+            solve = self._interior_solve
+            if solve is None:
+                # An overridden interior solve did not provide the factorization of K_ii.
+                if modal_sparse.is_sparse(stiffness_ii):
+                    scaling = self._interior_scaling(stiffness_ii)
+                    factor = modal_sparse.ShiftedFactorization(
+                        modal_sparse.scale_symmetric(stiffness_ii, scaling),
+                        modal_sparse.scale_symmetric(mass_ii, scaling),
+                        0.0,
+                    )
+
+                    def solve(rhs: np.ndarray) -> np.ndarray:
+                        return scaling[:, None] * factor.solve(np.ascontiguousarray(scaling[:, None] * rhs))
+
+                else:
+
+                    def solve(rhs: np.ndarray) -> np.ndarray:
+                        return np.linalg.solve(stiffness_ii, rhs)
+
+            responses = np.asarray(solve(interior_loads), dtype=np.float64)
+            mass_modes = modal_sparse.matmul(mass_ii, modes)
+            for column in range(responses.shape[1]):
+                vector = np.array(responses[:, column], dtype=np.float64)
+                norm_before = math.sqrt(max(modal_sparse.quadratic_form(vector, mass_ii), 0.0))
+                norm_after = 0.0
+                mass_vector = vector
+                if norm_before > 0.0 and math.isfinite(norm_before):
+                    for _ in range(2):
+                        vector -= modes @ (mass_modes.T @ vector)
+                        for kept, mass_kept in zip(vectors, mass_vectors, strict=True):
+                            vector -= kept * float(mass_kept @ vector)
+                    mass_vector = modal_sparse.matmul(mass_ii, vector)
+                    norm_after = math.sqrt(max(float(vector @ mass_vector), 0.0))
+                relative = norm_after / norm_before if norm_before > 0.0 and math.isfinite(norm_before) else 0.0
+                relative_norms.append(relative)
+                if not relative >= self._STATIC_CORRECTION_SPAN_TOLERANCE:
+                    continue
+                sign = -1.0 if vector[int(np.argmax(np.abs(vector)))] < 0.0 else 1.0
+                vectors.append(vector * (sign / norm_after))
+                mass_vectors.append(mass_vector * (sign / norm_after))
+                indices.append(column)
+        elif loads is not None:
+            relative_norms = [0.0] * loads.shape[1]
+        if vectors:
+            stacked = np.column_stack(vectors)
+        else:
+            stacked = np.zeros((interior_count, 0), dtype=np.float64)
+        return stacked, modal_sparse.quadratic_form_diag(stacked, stiffness_ii), indices, relative_norms
 
     def _lumped_sample_mass(self) -> np.ndarray:
         """Return the row-sum lumped translational mass [kg] of each sample node."""
@@ -983,13 +1106,18 @@ class ModalGeneratorCraigBamptonFEM:
             pivot = int(np.argmax(np.abs(modes[:, mode])))
             if modes[pivot, mode] < 0.0:
                 modes[:, mode] *= -1.0
+        corrections, correction_values, correction_indices, correction_norms = self._static_correction_vectors(
+            transform, stiffness_ii, mass_ii, modes
+        )
         timings["interior_solve"] = time.perf_counter() - clock
 
         clock = time.perf_counter()
-        reduced_count = frame_count + modes.shape[1]
+        mode_stop = frame_count + modes.shape[1]
+        reduced_count = mode_stop + corrections.shape[1]
         basis = np.zeros((coordinate_count, reduced_count), dtype=np.float64)
         basis[:interior_count, :frame_count] = constraint_modes
-        basis[:interior_count, frame_count:] = modes
+        basis[:interior_count, frame_count:mode_stop] = modes
+        basis[:interior_count, mode_stop:] = corrections
         basis[interior_count:, :frame_count] = np.eye(frame_count)
 
         def reduce_matrix(matrix):
@@ -1076,6 +1204,10 @@ class ModalGeneratorCraigBamptonFEM:
         self.fixed_interface_modes = modes
         self.fixed_interface_eigenvalues = np.asarray(eigenvalues, dtype=np.float64)
         self.fixed_interface_frequencies = np.sqrt(np.maximum(self.fixed_interface_eigenvalues, 0.0)) / (2.0 * math.pi)
+        self.static_correction_vectors = corrections
+        self.static_correction_count = int(corrections.shape[1])
+        self.static_correction_frequencies = np.sqrt(np.maximum(correction_values, 0.0)) / (2.0 * math.pi)
+        self.static_correction_load_indices = np.asarray(correction_indices, dtype=np.int64)
         self.reduction_basis = basis
         self.reduced_mass_matrix = reduced_mass
         self.reduced_stiffness_matrix = reduced_stiffness
@@ -1113,6 +1245,12 @@ class ModalGeneratorCraigBamptonFEM:
             "interface_elimination": interface_report,
             "fixed_interface_eigenvalues": self.fixed_interface_eigenvalues.tolist(),
             "fixed_interface_frequencies_hz": self.fixed_interface_frequencies.tolist(),
+            "static_correction_load_count": len(correction_norms),
+            "static_correction_count": self.static_correction_count,
+            "static_correction_load_indices": list(correction_indices),
+            "static_correction_dropped": sorted(set(range(len(correction_norms))) - set(correction_indices)),
+            "static_correction_relative_norms": list(correction_norms),
+            "static_correction_frequencies_hz": self.static_correction_frequencies.tolist(),
             "zero_energy_threshold": float(threshold),
             "constraint_mode_residual": constraint_mode_residual,
             "eigen_residual": eigen_residual,
@@ -1234,7 +1372,8 @@ class ModalGeneratorCraigBamptonFEM:
         """Reduce the model and build the mass-normalized elastic modal basis.
 
         Returns:
-            The basis with ``6 * interface_count + fixed_mode_count - 6`` elastic modes.
+            The basis with ``6 * interface_count + fixed_mode_count +
+            static_correction_count - 6`` elastic modes.
         """
         return self.reduce().build()
 
@@ -1269,7 +1408,9 @@ class ModalGeneratorCraigBamptonFEM:
         every interface has a single node, and ``fixed_interface_frequencies_hz``,
         ``sample_node_indices``, ``interface_node_indices``, and
         ``interface_node_offsets`` (CSR-style offsets into the node indices)
-        always.
+        always. With ``static_correction_loads``, ``static_correction_frequencies_hz``
+        and ``static_correction_load_indices`` describe the coordinates that
+        follow the fixed-interface modes.
 
         Args:
             full_recovery: Whether to include the dense full recovery matrix.
@@ -1287,6 +1428,9 @@ class ModalGeneratorCraigBamptonFEM:
             "interface_node_indices": np.concatenate([interface.nodes for interface in self.interfaces]),
             "interface_node_offsets": np.cumsum([0] + [interface.nodes.shape[0] for interface in self.interfaces]),
         }
+        if self.static_correction_loads is not None:
+            arrays["static_correction_frequencies_hz"] = self.static_correction_frequencies
+            arrays["static_correction_load_indices"] = self.static_correction_load_indices
         if self.reduced_damping_matrix is not None:
             arrays["damping_matrix"] = self.reduced_damping_matrix
         if full_recovery:
