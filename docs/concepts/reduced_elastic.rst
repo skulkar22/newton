@@ -356,14 +356,18 @@ report next to its limit:
   :math:`(\sum_{j \ne i} |K_{ij}| / \sqrt{K_{ii} K_{jj}})^2`, against the same
   tolerance: a node that hangs on springs of roundoff stiffness against what
   it is attached to is refused, and one below :math:`10^{-6}` gives a warning
-  with the lowest fixed-interface frequency;
-- the test with which :class:`ModalGeneratorCraigBampton` separates the six
-  rigid-body modes (``rigid_mode_tolerance`` times the largest eigenvalue of
-  the reduced model), applied in
-  :meth:`~ModalGeneratorCraigBamptonFEM.reduce`, so that a model which could
-  not be built is not returned or exported. This last test does depend on the
+  with the lowest fixed-interface frequency. The rule sees a single weakly
+  tied coordinate, not a soft cluster of several nodes, and a coordinate with
+  a stiffness diagonal but no coupling at all is kept with a warning;
+- the acceptance checks of :class:`ModalGeneratorCraigBampton` on the reduced
+  matrices, run in :meth:`~ModalGeneratorCraigBamptonFEM.reduce`, so that a
+  model which could not be built, a soft cluster among them, is refused there.
+  Among them, the softest elastic mode must lie above ``rigid_mode_tolerance``
+  times the largest eigenvalue of the reduced model; the report records the
+  ratio as ``reduced_elastic_eigenvalue_ratio``. This test does depend on the
   stiffest coordinate of the reduced model, for example a small rigid
-  interface patch.
+  interface patch: for a sound model that comes close to the limit,
+  ``rigid_mode_tolerance`` may be lowered.
 
 A truncated set of fixed-interface modes reproduces the static response to a
 load on the interior, such as gravity, only approximately. With

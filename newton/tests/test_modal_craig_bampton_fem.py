@@ -1010,8 +1010,11 @@ def test_cb_fem_small_rotary_inertia_is_not_a_mechanism(test, device):
     test.assertGreater(1.0e-12 * largest, reference[3])
     for eigensolver in ("arpack", "dense"):
         matrices = (light_mass, stiffness) if eigensolver == "arpack" else (light_mass.toarray(), stiffness.toarray())
+        # The reduced mass matrix of this model has a condition number of 2e12, and the rigid-body
+        # eigenvalues of the dense reduction reach 2e-7 of the largest one: rigid_mode_tolerance, which
+        # reduce() applies as build() does, is raised from its default 1e-8.
         generator = newton.ModalGeneratorCraigBamptonFEM(
-            points, *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver
+            points, *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver, rigid_mode_tolerance=1.0e-6
         )
         generator.reduce()
         np.testing.assert_allclose(generator.fixed_interface_eigenvalues, reference, rtol=1.0e-8)
@@ -1349,7 +1352,9 @@ def test_cb_fem_soft_and_free_nodes(test, device):
     with test.assertRaisesRegex(ValueError, "zero-energy mechanism.*(cannot resolve|cannot be separated)"):
         generator(1.0e-13, "arpack", eigenvalue_tolerance=0.0).reduce()
 
-    # A rotational DOF cut out of the model and left with a negligible stiffness of its own.
+    # A rotational DOF cut out of the model and left with a negligible stiffness of its own is uncoupled,
+    # which only warns and names it. Whether its mode at 3e-8 Hz is then refused depends on how the path
+    # resolves it; a refusal carries one of the messages below.
     points, mass, stiffness = _frame_beam()
     dof = 6 * 20 + 3
     cut = sparse.lil_matrix(stiffness)
@@ -1362,8 +1367,146 @@ def test_cb_fem_soft_and_free_nodes(test, device):
         isolated = newton.ModalGeneratorCraigBamptonFEM(
             points, *matrices, clamp, fixed_mode_count=4, eigensolver=eigensolver
         )
-        with test.assertRaisesRegex(ValueError, rf"DOF {dof} \(node 20 rx\) is tied to the rest of the model with 0 "):
-            isolated.reduce()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                isolated.reduce()
+            except ValueError as exc:
+                test.assertRegex(
+                    str(exc), "zero-energy mechanism|cannot be built|does not preserve the six rigid-body modes"
+                )
+        test.assertTrue(
+            any(
+                f"DOF {dof} (node 20 rx)" in str(item.message) and "no coupling" in str(item.message) for item in caught
+            )
+        )
+
+    # A node that hangs on the interface node only is tied through the interface frame: the frame columns
+    # count, so it is neither uncoupled nor weakly tied.
+    points, mass, stiffness = _frame_beam()
+    size = stiffness.shape[0]
+    hung = sparse.lil_matrix((size + 6, size + 6))
+    hung[:size, :size] = stiffness
+    for component in range(6):
+        k = 1.0e-3 * stiffness[component, component]
+        hung[component, component] += k
+        hung[size + component, size + component] += k
+        hung[component, size + component] -= k
+        hung[size + component, component] -= k
+    hung_mass = sparse.diags(np.concatenate((mass.diagonal(), mass.diagonal()[:6]))).tocsc()
+    on_frame = newton.ModalGeneratorCraigBamptonFEM(
+        np.vstack((points, points[:1])), hung_mass, hung.tocsc(), clamp, fixed_mode_count=4
+    )
+    on_frame.reduce()
+    test.assertEqual(on_frame.report["uncoupled_interior_count"], 0)
+    test.assertGreater(on_frame.report["zero_energy_tie_ratio_min"], 1.0e-4)
+
+
+def _beam_with_soft_cluster(fractions, mutual):
+    """Return :func:`_frame_beam` with coincident extra nodes on its tip, each on six springs of the given
+    fraction of the tip stiffness and joined to the next by springs of ``mutual`` times the tip stiffness."""
+    from scipy import sparse
+
+    points, mass, stiffness = _frame_beam()
+    size = stiffness.shape[0]
+    tip = size - 6
+    extra = len(fractions)
+    extended = sparse.lil_matrix((size + 6 * extra, size + 6 * extra))
+    extended[:size, :size] = stiffness
+
+    def spring(a, b, k):
+        extended[a, a] += k
+        extended[b, b] += k
+        extended[a, b] -= k
+        extended[b, a] -= k
+
+    for index, fraction in enumerate(fractions):
+        for component in range(6):
+            spring(
+                tip + component, size + 6 * index + component, fraction * stiffness[tip + component, tip + component]
+            )
+    for index in range(extra - 1):
+        for component in range(6):
+            spring(
+                size + 6 * index + component,
+                size + 6 * (index + 1) + component,
+                mutual * stiffness[tip + component, tip + component],
+            )
+    diagonal = np.concatenate([mass.diagonal()] + [mass.diagonal()[tip:]] * extra)
+    return np.vstack([points] + [points[-1:]] * extra), sparse.diags(diagonal).tocsc(), extended.tocsc()
+
+
+def test_cb_fem_reduce_applies_build_checks(test, device):
+    """Refuse in reduce() what build() could not build, and keep uncoupled DOFs with a warning.
+
+    Soft clusters of nodes pass the tie rule and the energy ratio; a stiff, heavy appendix spoils the rigid
+    mass block. Each of these reduced and then failed in build(). A lattice whose interior rotations have a
+    diagonal stiffness only reduces as before.
+    """
+    from scipy import sparse
+
+    clamp = [{"name": "root", "node_indices": [0], "coupling": "node"}]
+    cases = (
+        ("dense", _beam_with_soft_cluster([1.0e-10, 1.0e-10], 1.0e-10), "exactly six global rigid-body modes"),
+        ("arpack", _beam_with_soft_cluster([1.0e-14, 1.0e-14], 1.0e-14), "exactly six global rigid-body modes"),
+        ("arpack", _beam_with_soft_cluster([1.0e-11] * 3, 1.0e-11), "exactly six global rigid-body modes"),
+        ("arpack", _beam_with_appendix(1.0e12, 1.0e8, 1.0e-3), "physical rigid translational block"),
+    )
+    for index, (eigensolver, (points, mass, stiffness), message) in enumerate(cases):
+        matrices = (mass, stiffness) if eigensolver == "arpack" else (mass.toarray(), stiffness.toarray())
+        generator = newton.ModalGeneratorCraigBamptonFEM(
+            points, *matrices, clamp, fixed_mode_count=8 if index < 3 else 6, eigensolver=eigensolver
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with test.assertRaisesRegex(ValueError, f"The reduced model cannot be built: .*{message}"):
+                generator.reduce()
+        # The report of the refused model stays available.
+        test.assertIn("reduced_elastic_eigenvalue_ratio", generator.report)
+        if index == 1:
+            # The lowest modes of this cluster are poorly resolved, which is reported as well.
+            test.assertTrue(any("relative residual" in str(item.message) for item in caught))
+
+    # Six-DOF nodes on a translational spring lattice; the interior rotations have a diagonal stiffness only.
+    points, lattice_mass, lattice_stiffness = _spring_lattice((4, 3, 3), 0.1, 1000.0, 0.01)
+    node_count = points.shape[0]
+    left = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].min()))
+    right = np.flatnonzero(np.isclose(points[:, 0], points[:, 0].max()))
+    interfaces = [{"node_indices": left}, {"node_indices": right}]
+    interface_nodes = set(np.concatenate((left, right)).tolist())
+    translations = _translation_rows(node_count)
+    mean_stiffness = float(np.mean(np.diag(lattice_stiffness)))
+    mean_mass = float(np.mean(np.diag(lattice_mass)))
+    for fraction in (1.0, 1.0e-3, 1.0e-9):
+        stiffness = np.zeros((6 * node_count, 6 * node_count))
+        mass = np.zeros((6 * node_count, 6 * node_count))
+        stiffness[np.ix_(translations, translations)] = lattice_stiffness
+        mass[np.ix_(translations, translations)] = lattice_mass
+        for node in range(node_count):
+            for component in (3, 4, 5):
+                mass[6 * node + component, 6 * node + component] = 1.0e-4 * mean_mass
+                if node not in interface_nodes:
+                    stiffness[6 * node + component, 6 * node + component] = fraction * mean_stiffness * 1.0e-2
+        reference = None
+        for eigensolver in ("dense", "arpack"):
+            matrices = (
+                (mass, stiffness) if eigensolver == "dense" else (sparse.csc_matrix(mass), sparse.csc_matrix(stiffness))
+            )
+            generator = newton.ModalGeneratorCraigBamptonFEM(
+                points, *matrices, interfaces, fixed_mode_count=6, eigensolver=eigensolver
+            )
+            with test.assertWarnsRegex(
+                UserWarning, r"\d+ interior coordinates have a stiffness diagonal but no coupling"
+            ):
+                generator.reduce()
+            test.assertGreater(generator.report["uncoupled_interior_count"], 0)
+            if reference is None:
+                transform = np.asarray(generator.transformation)
+                interior = generator.interior_count
+                stiffness_ii = (transform.T @ stiffness @ transform)[:interior, :interior]
+                mass_ii = (transform.T @ mass @ transform)[:interior, :interior]
+                reference = _lowest_eigenvalues(stiffness_ii, mass_ii, 6)
+            np.testing.assert_allclose(generator.fixed_interface_eigenvalues, reference, rtol=1.0e-8)
 
 
 def test_cb_fem_generator_pickles(test, device):
@@ -2092,6 +2235,7 @@ _TESTS = (
     test_cb_fem_bad_scaling_is_not_a_mechanism,
     test_cb_fem_mechanisms_are_rejected_in_any_scaling,
     test_cb_fem_soft_and_free_nodes,
+    test_cb_fem_reduce_applies_build_checks,
     test_cb_fem_generator_pickles,
     test_cb_fem_equilibration_keeps_well_scaled_results,
     test_cb_fem_static_correction_reproduces_statics,

@@ -1626,13 +1626,10 @@ class ModalGeneratorCraigBampton:
         self.com = com
         self.inertia = inertia
 
-    def build(self) -> ModalBasis:
-        """Build the mass-normalized elastic modal basis."""
-        mass = self.mass_matrix
+    def _check_rigid_invariance(self, rigid: np.ndarray) -> None:
+        """Raise if the reduced stiffness or damping matrix resists the rigid motion ``rigid`` of the interfaces."""
         stiffness = self.stiffness_matrix
         damping = self.damping_matrix
-        rigid = self._rigid_map()
-
         stiffness_scale = max(float(np.linalg.norm(stiffness, ord=np.inf)), 1.0)
         rigid_scale = max(float(np.linalg.norm(rigid, ord=np.inf)), 1.0)
         rigid_stiffness_ratio = float(np.linalg.norm(stiffness @ rigid, ord=np.inf)) / (stiffness_scale * rigid_scale)
@@ -1650,6 +1647,15 @@ class ModalGeneratorCraigBampton:
                     f"(relative residual {rigid_damping_ratio:.3g})"
                 )
 
+    def _separate_rigid_modes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Solve the reduced eigenproblem and check that it has exactly six rigid-body modes.
+
+        Returns:
+            The Cholesky factor of the mass matrix, the ascending eigenvalues [1/s^2], the eigenvectors in
+            Cholesky coordinates, and the eigenvalue threshold [1/s^2] below which a mode counts as rigid.
+        """
+        mass = self.mass_matrix
+        stiffness = self.stiffness_matrix
         try:
             chol = np.linalg.cholesky(mass)
         except np.linalg.LinAlgError as exc:
@@ -1670,6 +1676,47 @@ class ModalGeneratorCraigBampton:
             raise ValueError(
                 "The Craig-Bampton system contains additional zero-energy modes beyond the six global rigid-body modes"
             )
+        return chol, eigenvalues, eigenvectors, rigid_threshold
+
+    def _check_rigid_recovery(self, rigid: np.ndarray) -> None:
+        """Raise if ``recovery_matrix`` does not map the rigid motion of the interfaces to that of the samples."""
+        sample_rigid = np.hstack(
+            (
+                np.tile(np.eye(3), (self.sample_points.shape[0], 1)),
+                np.vstack([-self._skew(point) for point in self.sample_points]),
+            )
+        )
+        recovery_scale = max(float(np.max(np.abs(sample_rigid))), 1.0)
+        recovery_rigid_error = float(np.max(np.abs(self.recovery_matrix @ rigid - sample_rigid)))
+        if recovery_rigid_error > self.rigid_recovery_tolerance * recovery_scale:
+            raise ValueError(
+                "recovery_matrix is inconsistent with rigid motion of sample_points "
+                f"(maximum error {recovery_rigid_error:.3g}, relative {recovery_rigid_error / recovery_scale:.3g} > "
+                f"rigid_recovery_tolerance {self.rigid_recovery_tolerance:.3g})"
+            )
+
+    def _check_buildable(self) -> None:
+        """Raise if :meth:`build` would refuse the reduced matrices.
+
+        Runs the acceptance checks of :meth:`build` without building the basis: rigid invariance of the
+        stiffness and damping matrices, exactly six rigid-body modes and no further zero-energy mode,
+        rigid recovery of the samples, and a physical rigid mass block. The projection of the damping
+        matrix (``damping_projection="error"``) is not part of it.
+        """
+        rigid = self._rigid_map()
+        self._check_rigid_invariance(rigid)
+        self._separate_rigid_modes()
+        self._check_rigid_recovery(rigid)
+        self._extract_rigid_properties(rigid.T @ self.mass_matrix @ rigid)
+
+    def build(self) -> ModalBasis:
+        """Build the mass-normalized elastic modal basis."""
+        mass = self.mass_matrix
+        stiffness = self.stiffness_matrix
+        damping = self.damping_matrix
+        rigid = self._rigid_map()
+        self._check_rigid_invariance(rigid)
+        chol, _eigenvalues, eigenvectors, rigid_threshold = self._separate_rigid_modes()
 
         modal_matrix = np.linalg.solve(chol.T, eigenvectors[:, self.rigid_mode_count :])
         for mode in range(self.mode_count):
@@ -1688,20 +1735,7 @@ class ModalGeneratorCraigBampton:
         else:
             mode_damping = _project_modal_damping(self, modal_matrix.T @ damping @ modal_matrix, "Craig-Bampton")
 
-        sample_rigid = np.hstack(
-            (
-                np.tile(np.eye(3), (self.sample_points.shape[0], 1)),
-                np.vstack([-self._skew(point) for point in self.sample_points]),
-            )
-        )
-        recovery_scale = max(float(np.max(np.abs(sample_rigid))), 1.0)
-        recovery_rigid_error = float(np.max(np.abs(self.recovery_matrix @ rigid - sample_rigid)))
-        if recovery_rigid_error > self.rigid_recovery_tolerance * recovery_scale:
-            raise ValueError(
-                "recovery_matrix is inconsistent with rigid motion of sample_points "
-                f"(maximum error {recovery_rigid_error:.3g}, relative {recovery_rigid_error / recovery_scale:.3g} > "
-                f"rigid_recovery_tolerance {self.rigid_recovery_tolerance:.3g})"
-            )
+        self._check_rigid_recovery(rigid)
 
         recovered_modes = self.recovery_matrix @ modal_matrix
         sample_phi = np.transpose(

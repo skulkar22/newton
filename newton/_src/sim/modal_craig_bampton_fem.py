@@ -161,11 +161,25 @@ class ModalGeneratorCraigBamptonFEM:
     K_jj))^2`` over its neighbors ``j``, for a single spring the spring
     stiffness over the stiffness of what it is attached to; a value at or
     below the same tolerance raises, and one below ``1e-6`` warns with the
-    lowest fixed-interface frequency. Finally :meth:`reduce` applies the
-    test with which :meth:`ModalGeneratorCraigBampton.build` separates the
-    rigid-body modes, so it never returns, or exports, a model that
-    :meth:`build` refuses for an elastic mode that is too soft against the
-    stiffest one of the reduced model.
+    lowest fixed-interface frequency. The rule sees a single weakly tied
+    coordinate, not a soft cluster: several nodes joined to each other and
+    to the model by equally soft springs have ordinary tie ratios. A
+    coordinate with a stiffness diagonal and no coupling at all, such as a
+    rotation stabilized by a diagonal penalty, is uncoupled rather than
+    weakly tied: it is kept and reported with one warning.
+
+    Finally :meth:`reduce` runs the acceptance checks of
+    :meth:`ModalGeneratorCraigBampton.build` on the reduced matrices: rigid
+    invariance, exactly six rigid-body modes, no further zero-energy mode,
+    rigid recovery, and a physical rigid mass block. A model that
+    :meth:`build` would refuse for one of them, a soft cluster among them,
+    raises here, after ``report`` is set. The softest elastic mode must lie
+    above ``rigid_mode_tolerance`` times the largest eigenvalue of the
+    reduced model; ``report["reduced_elastic_eigenvalue_ratio"]`` is that
+    ratio. A stiff reduced coordinate, such as a small rigid interface
+    patch, lowers it, so for a sound model that comes close to the limit
+    ``rigid_mode_tolerance`` may be lowered (the rigid-body eigenvalues of
+    a healthy reduced model lie near ``1e-14`` of the largest one).
 
     After :meth:`reduce` (called by :meth:`build`), the generator exposes
     ``transformation`` (``u = T_z z`` for the coordinates ``z`` after
@@ -293,6 +307,10 @@ class ModalGeneratorCraigBamptonFEM:
     _STATIC_CORRECTION_SPAN_TOLERANCE: ClassVar[float] = 1.0e-10
     """Mass norm of a static response after orthogonalization, relative to its norm before, below which
     the retained basis already represents it and no correction vector is added."""
+
+    _ARPACK_RESTARTS: ClassVar[int] = 8
+    """Searches for eigenpairs that the Sturm sequence count shows missing. Each finds further copies of a
+    repeated eigenvalue, such as that of many identical uncoupled coordinates."""
 
     _SOFT_TIE_RATIO: ClassVar[float] = 1.0e-6
     """Relative tie stiffness of a coordinate below which :meth:`reduce` warns of a soft part."""
@@ -762,14 +780,16 @@ class ModalGeneratorCraigBamptonFEM:
         row_nonzeros = max(modal_sparse.max_row_nonzeros(stiffness_ii), 1)
         return max(self.eigenvalue_tolerance, 8.0 * row_nonzeros * np.finfo(np.float64).eps)
 
-    def _weakest_tie(self, stiffness_z, interior_count: int) -> tuple[float, int]:
-        """Return the smallest relative tie stiffness of an interior coordinate and that coordinate.
+    def _weakest_tie(self, stiffness_z, interior_count: int) -> tuple[float, int, np.ndarray]:
+        """Return the smallest relative tie stiffness of an interior coordinate, that coordinate, and the
+        uncoupled interior coordinates.
 
         The relative tie stiffness of coordinate ``i`` is ``(sum_{j != i} |K_ij| / sqrt(K_ii K_jj))^2``
         over all coordinates ``j``, interface frames included. For a coordinate on a single spring it is
         the spring stiffness over the stiffness of the coordinate it is attached to, and it does not
         depend on the units of the DOFs. Coordinates with a non-positive diagonal are left to the
-        interior solve, which names them.
+        interior solve, which names them. A coordinate without any off-diagonal entry is uncoupled, not
+        weakly tied: it is listed separately and does not enter the minimum.
         """
         diagonal = np.asarray(stiffness_z.diagonal(), dtype=np.float64).reshape(-1)
         positive = (diagonal > 0.0) & np.isfinite(diagonal)
@@ -777,11 +797,12 @@ class ModalGeneratorCraigBamptonFEM:
         scale[positive] = 1.0 / np.sqrt(diagonal[positive])
         scaled = abs(modal_sparse.scale_symmetric(stiffness_z, scale))
         row_sums = np.asarray(scaled.sum(axis=1)).reshape(-1) - np.asarray(scaled.diagonal()).reshape(-1)
-        coupling = np.where(positive, row_sums, math.inf)[:interior_count]
-        if coupling.shape[0] == 0:
-            return math.inf, -1
+        uncoupled = np.flatnonzero((positive & (row_sums == 0.0))[:interior_count])
+        coupling = np.where(positive & (row_sums > 0.0), row_sums, math.inf)[:interior_count]
+        if coupling.shape[0] == 0 or not np.any(np.isfinite(coupling)):
+            return math.inf, -1, uncoupled
         weakest = int(np.argmin(coupling))
-        return float(coupling[weakest]) ** 2, weakest
+        return float(coupling[weakest]) ** 2, weakest, uncoupled
 
     def _zero_energy_check(
         self,
@@ -1019,6 +1040,7 @@ class ModalGeneratorCraigBamptonFEM:
                 maxiter=self.arpack_maxiter,
                 ncv=self.arpack_ncv,
                 factorization=factorization,
+                max_restarts=self._ARPACK_RESTARTS,
             )
         except ValueError as exc:
             if sigma != 0.0 or "inaccurate eigenpair" not in str(exc):
@@ -1172,9 +1194,10 @@ class ModalGeneratorCraigBamptonFEM:
         Raises:
             ValueError: If the constraints or interfaces are inconsistent, the
                 interior has a mechanism, the reduced mass matrix is not
-                positive definite, or the reduced stiffness matrix does not
+                positive definite, the reduced stiffness matrix does not
                 preserve the six rigid-body modes, for example because a
-                constraint grounds the body.
+                constraint grounds the body, or the reduced model fails an
+                acceptance check of :meth:`ModalGeneratorCraigBampton.build`.
         """
         timings: dict[str, float] = {}
         clock = time.perf_counter()
@@ -1217,7 +1240,15 @@ class ModalGeneratorCraigBamptonFEM:
         timings["projection"] = time.perf_counter() - clock
 
         clock = time.perf_counter()
-        tie_ratio, tie_coordinate = self._weakest_tie(stiffness_z, interior_count)
+        tie_ratio, tie_coordinate, uncoupled = self._weakest_tie(stiffness_z, interior_count)
+        if uncoupled.shape[0] > 0:
+            names = ", ".join(self._describe_interior(index) for index in uncoupled[:3])
+            warnings.warn(
+                f"{uncoupled.shape[0]} interior coordinates have a stiffness diagonal but no coupling to any "
+                f"other coordinate ({names}{', ...' if uncoupled.shape[0] > 3 else ''}): each moves on its own "
+                "stiffness, independent of the rest of the model",
+                stacklevel=2,
+            )
         tie_tolerance = self._energy_ratio_tolerance(stiffness_ii)
         if tie_ratio <= tie_tolerance:
             raise ValueError(
@@ -1446,12 +1477,19 @@ class ModalGeneratorCraigBamptonFEM:
             "interior_stiffness_pivot_ratio": pivot_ratio,
             "zero_energy_tie_ratio_min": tie_ratio if math.isfinite(tie_ratio) else None,
             "zero_energy_tie_coordinate": self._describe_interior(tie_coordinate) if tie_coordinate >= 0 else None,
+            "uncoupled_interior_count": int(uncoupled.shape[0]),
             "reduced_elastic_eigenvalue_ratio": elastic_ratio,
             "reduced_elastic_eigenvalue_limit": float(self._craig_bampton_options["rigid_mode_tolerance"]),
             "reduced_mass_condition": float(np.linalg.cond(reduced_mass)),
             "timings_s": timings,
         }
         self.report.update(self._zero_energy)
+        # The remaining acceptance checks of build(), on the same matrices and with the same code, so that a
+        # model that could not be built is refused here. The report above stays available for diagnosis.
+        try:
+            self.craig_bampton._check_buildable()
+        except ValueError as exc:
+            raise ValueError(f"The reduced model cannot be built: {exc}") from exc
         return self.craig_bampton
 
     @staticmethod
