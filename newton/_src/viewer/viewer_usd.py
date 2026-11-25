@@ -363,8 +363,9 @@ class ViewerUSD(ViewerBase):
 
         display_color = mesh_prim.GetDisplayColorPrimvar()
         if colors_np is not None:
-            if not display_color:
-                display_color = mesh_prim.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
+            # displayColor is a schema attribute of every mesh, so the primvar is always defined and its
+            # interpolation stays at the schema default "constant" unless it is authored here.
+            display_color = mesh_prim.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
             display_color.Set(np.clip(colors_np, 0.0, 1.0), self._frame_index)
         elif dynamic and display_color:
             display_color.Set([], self._frame_index)

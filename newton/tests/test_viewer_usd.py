@@ -446,6 +446,28 @@ class TestViewerUSD(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_log_mesh_authors_per_vertex_display_color(self):
+        viewer = self._make_viewer()
+        points = wp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            dtype=wp.vec3,
+        )
+        indices = wp.array([0, 1, 2, 1, 3, 2], dtype=wp.int32)
+        colors = wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]], dtype=wp.vec3)
+
+        viewer.begin_frame(0.0)
+        viewer.log_mesh("/vertex_colors", points, indices, colors=colors)
+        viewer.log_mesh("/single_color", points, indices, color=(0.2, 0.3, 0.4))
+
+        mesh = UsdGeom.Mesh.Get(viewer.stage, viewer._get_path("/vertex_colors"))
+        display_color = mesh.GetDisplayColorPrimvar()
+        self.assertEqual(display_color.GetInterpolation(), UsdGeom.Tokens.vertex)
+        np.testing.assert_allclose(display_color.Get(0), colors.numpy(), atol=1e-6)
+        # A mesh without per-vertex colors authors no display color values.
+        single = UsdGeom.Mesh.Get(viewer.stage, viewer._get_path("/single_color"))
+        self.assertFalse(single.GetDisplayColorPrimvar().GetAttr().HasAuthoredValue())
+        self.assertEqual(single.GetDisplayColorPrimvar().GetInterpolation(), UsdGeom.Tokens.constant)
+
     def test_log_mesh_authors_double_sided_from_backface_culling(self):
         """Map disabled backface culling to double-sided USD meshes."""
         viewer = self._make_viewer()
