@@ -360,7 +360,12 @@ report next to its limit:
   it is attached to is refused, and one below :math:`10^{-6}` gives a warning
   with the lowest fixed-interface frequency. The rule sees a single weakly
   tied coordinate, not a soft cluster of several nodes, and a coordinate with
-  a stiffness diagonal but no coupling at all is kept with a warning;
+  a stiffness diagonal but no coupling at all is kept with a warning. A
+  coordinate whose only coupling is to an interface frame is not flagged
+  either: a part that hangs on the interface alone by a very weak tie is
+  caught only by the later checks (the eigenpair residual and the acceptance
+  checks below), and on the dense path a tie of about :math:`10^{-12}` of the
+  neighboring stiffness can pass;
 - the acceptance checks of :class:`ModalGeneratorCraigBampton` on the reduced
   matrices, run in :meth:`~ModalGeneratorCraigBamptonFEM.reduce`, so that a
   model which could not be built, a soft cluster among them, is refused there.

@@ -168,9 +168,15 @@ class ModalGeneratorCraigBamptonFEM:
     to the model by equally soft springs have ordinary tie ratios. A
     coordinate with a stiffness diagonal and no coupling at all, such as a
     rotation stabilized by a diagonal penalty, is uncoupled rather than
-    weakly tied: it is kept and reported with one warning. A returned mode
-    whose eigenpair residual exceeds ``1e-3`` is not an eigenvector and
-    raises; a residual above ``1e-5`` warns.
+    weakly tied: it is kept and reported with one warning. A coordinate
+    whose only coupling is to an interface frame is not flagged either,
+    because that coupling is measured against its own diagonal: a part
+    that hangs on the interface alone by a very weak tie is caught only by
+    the later checks, the eigenpair residual and the acceptance checks of
+    :meth:`ModalGeneratorCraigBampton.build`, and on the dense path a tie
+    of about ``1e-12`` of the neighboring stiffness can pass. A returned
+    mode whose eigenpair residual exceeds ``1e-3`` is not an eigenvector
+    and raises; a residual above ``1e-5`` warns.
 
     Finally :meth:`reduce` runs the acceptance checks of
     :meth:`ModalGeneratorCraigBampton.build` on the reduced matrices: rigid
